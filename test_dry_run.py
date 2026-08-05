@@ -516,4 +516,107 @@ assert counts_by_word.get("multitudes", 0) >= counts_by_word.get("Stars", 0), co
 assert sum(counts_by_word.values()) == 12
 print("OK: line notes distributed by syllable count, not by one bad interior ASR timestamp")
 
+print("\n--- BUG REGRESSION (round 7): isolated pitch spike gets removed ---")
+from ultrastar_generator.note_detection import _remove_pitch_spikes
+# Reproduces the reported "The" bug's shape directly: a brief, isolated
+# jump to a very different pitch that then returns to the surrounding
+# pitch. Neighbors are close in time and pitch to each other; the spike
+# is short and far from both.
+spiky = [
+    NoteEvent(start=0.00, end=0.30, pitch=0),
+    NoteEvent(start=0.30, end=0.35, pitch=8),    # spike: 50ms, 8 semitones away
+    NoteEvent(start=0.36, end=0.70, pitch=0),
+]
+despiked = _remove_pitch_spikes(spiky, max_duration=0.25, min_jump_semitones=4.0,
+                                 neighbor_similarity_semitones=2.0, max_neighbor_gap=0.15)
+# _remove_pitch_spikes alone absorbs the spike into the previous note,
+# which can leave it newly adjacent to an identical-pitch note on the
+# other side (detect_notes runs one more merge pass afterward to clean
+# that up -- tested separately below at the full-pipeline level).
+assert len(despiked) == 2, f"expected the spike absorbed, leaving 2 same-pitch notes: {despiked}"
+assert despiked[0].pitch == 0 and despiked[1].pitch == 0
+assert despiked[0].end == 0.35 and despiked[1].start == 0.36
+print("OK: spike absorbed into the previous note:", despiked)
+
+# A genuinely different short note between two DIFFERENT-pitched
+# neighbors must NOT be treated as a spike (neighbors aren't "the same
+# pitch as before").
+real_short_note = [
+    NoteEvent(start=0.00, end=0.30, pitch=0),
+    NoteEvent(start=0.30, end=0.35, pitch=8),
+    NoteEvent(start=0.36, end=0.70, pitch=5),   # different from the first neighbor
+]
+kept = _remove_pitch_spikes(real_short_note, max_duration=0.25, min_jump_semitones=4.0,
+                             neighbor_similarity_semitones=2.0, max_neighbor_gap=0.15)
+assert len(kept) == 3, f"a real note between two DIFFERENT pitches should not be treated as a spike: {kept}"
+print("OK: short note between two different-pitched neighbors correctly kept:", [n.pitch for n in kept])
+
+print("\n--- BUG REGRESSION (round 7): fallback pitch borrows nearest pass-1 note, not fresh noisy analysis ---")
+# Reproduces the "The" bug's OTHER half: a word with zero notes in its
+# own zone now borrows the pitch of the nearest pass-1 note (from the
+# FULL note list) instead of running a fresh, isolated pitch read.
+# Needs surrounding words so zone partitioning actually excludes the
+# nearby notes from "the"'s own zone (with only one word in the whole
+# list, everything trivially falls in its one zone).
+fallback_words = [
+    Word(text="start", start=90.0, end=94.9, confidence=0.9, line_id=None),
+    Word(text="the", start=100.0, end=100.15, confidence=0.9, line_id=None),
+    Word(text="end", start=105.1, end=110.0, confidence=0.9, line_id=None),
+]
+all_real_notes = [
+    NoteEvent(start=94.0, end=96.0, pitch=0),    # lands in "start"'s zone
+    NoteEvent(start=103.0, end=106.0, pitch=0),  # lands in "end"'s zone
+]
+fb_syllables, fb_stats = align_words_to_notes(fallback_words, all_real_notes, np.zeros(16000), 16000)
+the_syllable = next(s for s in fb_syllables if s.text.strip() == "the")
+assert fb_stats.words_with_fallback == 1, fb_stats
+assert fb_stats.fallback_used_neighbor == 1
+assert fb_stats.fallback_used_fresh_analysis == 0
+assert the_syllable.midi_note == 0, the_syllable
+print(f"OK: fallback word borrowed pitch {the_syllable.midi_note} from the nearest pass-1 note "
+      f"(neighbor-borrow count={fb_stats.fallback_used_neighbor}, fresh-analysis count={fb_stats.fallback_used_fresh_analysis})")
+
+print("\n--- BUG REGRESSION (round 7): spike removal end-to-end through detect_notes() collapses fully ---")
+# Same spike shape as above, but through the real detect_notes() pipeline
+# (mocked librosa, same technique as the earlier vibrato test), to
+# confirm the post-spike-removal re-merge actually produces ONE note.
+n_pre, n_spike, n_post = 40, 15, 40
+n_frames_spike_test = n_pre + n_spike + n_post
+frame_dur_test = 256 / 22050
+base_midi_spike = 60.0  # C4 (pitch 0)
+spike_midi_val = 68.0   # 8 semitones away
+contour = np.concatenate([
+    np.full(n_pre, base_midi_spike),
+    np.full(n_spike, spike_midi_val),
+    np.full(n_post, base_midi_spike),
+])
+f0_spike_test = 440.0 * 2 ** ((contour - 69) / 12)
+
+fake_librosa_spike = _types.ModuleType("librosa")
+fake_librosa_spike.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
+    f0_spike_test, np.ones(n_frames_spike_test, dtype=bool), np.full(n_frames_spike_test, 0.9),
+)
+fake_librosa_spike.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
+fake_librosa_spike.onset = _FakeOnset()
+
+
+class _FakeFeatureSpike:
+    @staticmethod
+    def rms(y, frame_length, hop_length):
+        return np.full((1, n_frames_spike_test), 0.2)  # uniformly loud -- energy gate isn't the point here
+
+
+fake_librosa_spike.feature = _FakeFeatureSpike()
+_sys.modules["librosa"] = fake_librosa_spike
+importlib.reload(note_detection_mod)
+
+spike_pipeline_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+print(f"Detected {len(spike_pipeline_notes)} note(s) for a base-spike-base contour "
+      f"({n_spike * frame_dur_test * 1000:.0f}ms spike)")
+assert len(spike_pipeline_notes) == 1, f"expected full end-to-end collapse to 1 note, got {spike_pipeline_notes}"
+assert spike_pipeline_notes[0].pitch == 0, spike_pipeline_notes[0]
+print("OK: end-to-end pipeline fully collapsed the spike, no trace of it left:", spike_pipeline_notes)
+
+
+
 

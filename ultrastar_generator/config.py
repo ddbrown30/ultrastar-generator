@@ -97,6 +97,17 @@ SILENCE_THRESHOLD_DB_BELOW_PEAK = 40.0
 # is treated as silence no matter what it's being compared to.
 SILENCE_ABSOLUTE_FLOOR_DB = -50.0
 
+# Spike/outlier note filter: a note this short, that jumps at least this
+# many semitones from BOTH its immediate neighbors, where those neighbors
+# are themselves close in pitch and close in time to the spike, gets
+# removed and folded into the previous note. This targets isolated
+# tracking glitches ("briefly reads a wildly different pitch, then
+# returns to where it was") rather than real, intentional pitch movement.
+SPIKE_MAX_DURATION_SEC = 0.25
+SPIKE_MIN_JUMP_SEMITONES = 4.0
+SPIKE_NEIGHBOR_SIMILARITY_SEMITONES = 2.0
+SPIKE_MAX_NEIGHBOR_GAP_SEC = 0.15
+
 # Musical key-snapping (inspired by the pitch-correction idea in the
 # ultrastar_pitch project): after final notes are assembled, optionally
 # detect the song's most likely key from the pitch-class distribution and

@@ -82,6 +82,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          f"because a long/entirely silent stretch has no louder reference for "
                          f"--silence-threshold-db to compare against (default: "
                          f"{config.SILENCE_ABSOLUTE_FLOOR_DB})")
+    p.add_argument("--spike-max-duration", type=float, default=config.SPIKE_MAX_DURATION_SEC,
+                    help=f"A note this short (seconds) that jumps far in pitch from both neighbors "
+                         f"(which are themselves close to each other) is treated as a tracking "
+                         f"glitch and removed (default: {config.SPIKE_MAX_DURATION_SEC})")
+    p.add_argument("--spike-jump-semitones", type=float, default=config.SPIKE_MIN_JUMP_SEMITONES,
+                    help=f"Minimum pitch jump (semitones) from both neighbors for a short note to "
+                         f"be treated as a spike/glitch (default: {config.SPIKE_MIN_JUMP_SEMITONES})")
     p.add_argument("--no-pass1-debug", action="store_true",
                     help="Don't write the '[PASS1 DEBUG]' .txt (pass-1 notes only, no lyrics) "
                          "that's written by default alongside the real output -- load it in the "
@@ -161,6 +168,8 @@ def run(argv=None) -> int:
         min_note_beats_fraction=args.min_note_beat_fraction,
         silence_threshold_db=args.silence_threshold_db,
         silence_absolute_floor_db=args.silence_floor_db,
+        spike_max_duration_sec=args.spike_max_duration,
+        spike_min_jump_semitones=args.spike_jump_semitones,
         verbose=not args.quiet,
     )
     if not notes:
@@ -216,6 +225,9 @@ def run(argv=None) -> int:
     if stats.fallback_words:
         shown = stats.fallback_words[:15]
         print(f"    fallback words: {', '.join(shown)}" + (" ..." if len(stats.fallback_words) > 15 else ""))
+        print(f"    (pitch source: {stats.fallback_used_neighbor} borrowed from the nearest pass-1 note, "
+              f"{stats.fallback_used_fresh_analysis} needed a fresh isolated re-analysis because no "
+              f"pass-1 notes existed at all -- the latter is the less reliable case)")
     if stats.words_with_melisma or stats.words_with_syllable_merge:
         print(f"    {stats.words_with_melisma} word(s) had melisma (fewer syllables than notes), "
               f"{stats.words_with_syllable_merge} word(s) had syllables merged (more syllables than notes)")

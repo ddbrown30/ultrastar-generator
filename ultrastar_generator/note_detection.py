@@ -217,6 +217,60 @@ def _merge_short_notes(notes: List[NoteEvent], min_duration: float) -> List[Note
     return notes
 
 
+def _remove_pitch_spikes(
+    notes: List[NoteEvent],
+    max_duration: float,
+    min_jump_semitones: float,
+    neighbor_similarity_semitones: float,
+    max_neighbor_gap: float,
+) -> List[NoteEvent]:
+    """Removes an isolated short note that jumps far in pitch from BOTH
+    its neighbors and whose neighbors are close to each other in pitch --
+    i.e. "a brief detour to a very different pitch that then returns to
+    where it was", which is a strong signature of a tracking glitch
+    rather than a real, intentional note. Confirmed useful in practice:
+    caught exactly this pattern in a real fallback-note case (see
+    lyric_alignment.py's neighbor-borrowing fix for the other half of
+    that story).
+
+    A removed spike gets folded into the PREVIOUS note (extending its end
+    to cover the spike's duration) rather than dropped outright, so total
+    time coverage is preserved and nothing downstream sees a gap.
+    """
+    if len(notes) < 3:
+        return notes
+
+    out = list(notes)
+    i = 1
+    while i < len(out) - 1:
+        prev, cur, nxt = out[i - 1], out[i], out[i + 1]
+        dur = cur.end - cur.start
+        gap_before = cur.start - prev.end
+        gap_after = nxt.start - cur.end
+
+        is_spike = (
+            dur <= max_duration
+            and gap_before <= max_neighbor_gap
+            and gap_after <= max_neighbor_gap
+            and abs(prev.pitch - nxt.pitch) <= neighbor_similarity_semitones
+            and abs(cur.pitch - prev.pitch) >= min_jump_semitones
+            and abs(cur.pitch - nxt.pitch) >= min_jump_semitones
+        )
+
+        if is_spike:
+            out[i - 1] = NoteEvent(
+                start=prev.start, end=cur.end, pitch=prev.pitch,
+                confidence=max(prev.confidence, cur.confidence),
+            )
+            del out[i]
+            # Don't advance i: the new triplet at this position (in case
+            # of back-to-back spikes) needs checking too.
+            continue
+        i += 1
+
+    return out
+
+
 def _ensure_nonoverlapping(notes: List[NoteEvent], verbose: bool = True) -> List[NoteEvent]:
     """Hard, final guarantee for pass 1: no note may start before the
     previous one ends. The construction above (sequential frame walk +
@@ -290,6 +344,8 @@ def detect_notes(
     silence_reference_percentile: float = config.SILENCE_REFERENCE_PERCENTILE,
     silence_threshold_db: float = config.SILENCE_THRESHOLD_DB_BELOW_PEAK,
     silence_absolute_floor_db: float = config.SILENCE_ABSOLUTE_FLOOR_DB,
+    spike_max_duration_sec: float = config.SPIKE_MAX_DURATION_SEC,
+    spike_min_jump_semitones: float = config.SPIKE_MIN_JUMP_SEMITONES,
     verbose: bool = True,
 ) -> List[NoteEvent]:
     import librosa
@@ -419,12 +475,33 @@ def detect_notes(
     notes = _merge_short_notes(notes, min_dur)
     n_after_short = len(notes)
 
+    notes = _remove_pitch_spikes(
+        notes,
+        max_duration=spike_max_duration_sec,
+        min_jump_semitones=spike_min_jump_semitones,
+        neighbor_similarity_semitones=config.SPIKE_NEIGHBOR_SIMILARITY_SEMITONES,
+        max_neighbor_gap=config.SPIKE_MAX_NEIGHBOR_GAP_SEC,
+    )
+    n_after_spike = len(notes)
+
+    # Removing a spike can leave two same-pitch notes newly adjacent
+    # (the spike was the only thing between them) -- run the similar-
+    # adjacent merge once more to clean those back up into one note.
+    notes = _merge_similar_adjacent(notes, max_pitch_diff=merge_semitones, max_gap=merge_max_gap_sec)
+    n_after_spike_merge = len(notes)
+
     notes = _ensure_nonoverlapping(notes, verbose=verbose)
 
     if verbose:
         print(f"[pass1] notes: {n_raw} raw segments -> {n_after_similar} after "
               f"similar-pitch merge (<= {merge_semitones} semitone(s), <= {merge_max_gap_sec*1000:.0f}ms gap) "
-              f"-> {n_after_short} after short-note merge (< {min_dur*1000:.0f}ms, ~{min_note_beats_fraction} beat)")
+              f"-> {n_after_short} after short-note merge (< {min_dur*1000:.0f}ms, ~{min_note_beats_fraction} beat) "
+              f"-> {n_after_spike} after spike-outlier removal "
+              f"(<= {spike_max_duration_sec*1000:.0f}ms, >= {spike_min_jump_semitones} semitone jump from both neighbors) "
+              f"-> {n_after_spike_merge} after re-merging notes the spike removal left adjacent")
+        if n_after_short != n_after_spike:
+            print(f"[pass1] removed {n_after_short - n_after_spike} pitch spike(s) -- isolated brief "
+                  f"jumps to a very different pitch that returned to the surrounding pitch afterward")
         if notes:
             durations = [nn.end - nn.start for nn in notes]
             pitches_all = [nn.pitch for nn in notes]

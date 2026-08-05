@@ -38,7 +38,15 @@ Algorithm:
      syllables than notes, "~" melisma continuation if fewer).
   5. Words that end up with zero notes (short/quiet function words, or a
      line whose syllable count exceeded its note count) get a fallback
-     note built from a focused pitch read over their own ASR span.
+     note. Critically, this does NOT run a fresh, isolated pitch analysis
+     on that word's own (often very short, e.g. <0.2s) ASR clip -- a real
+     case of exactly that produced a wildly wrong note (confirmed against
+     the pass-1 debug file: the bad note didn't exist in pass 1's output
+     at all, it was fabricated here, from a noisy, context-starved
+     re-analysis of a tiny clip). Instead, the fallback borrows the pitch
+     of whichever pass-1 note (from the FULL, already-verified note list)
+     is nearest in time -- reusing known-good information instead of
+     manufacturing new, unverified pitch data.
   6. Everything is finally run through postprocess.enforce_monotonic, so
      no matter what happened above, the output can never contain
      overlapping notes.
@@ -67,6 +75,8 @@ class AlignmentStats:
     words_with_notes: int = 0
     words_with_fallback: int = 0             # got zero pass-1 notes
     fallback_words: List[str] = field(default_factory=list)  # "text @ start"
+    fallback_used_neighbor: int = 0            # fallback pitch borrowed from nearest pass-1 note
+    fallback_used_fresh_analysis: int = 0      # fallback pitch from isolated re-analysis (no notes existed at all)
     words_with_melisma: int = 0               # fewer syllables than notes
     words_with_syllable_merge: int = 0        # more syllables than notes
     total_notes_consumed: int = 0
@@ -165,6 +175,19 @@ def _note_type_for(duration: float) -> str:
     return config.NOTE_GOLDEN if duration >= config.GOLDEN_NOTE_MIN_DURATION_SEC else config.NOTE_NORMAL
 
 
+def _nearest_note_pitch(word: Word, all_notes: List[NoteEvent]) -> Optional[int]:
+    """Finds the pass-1 note nearest in time to this word (by distance
+    from the word's midpoint to the note's start or end, whichever is
+    closer) and returns its pitch. Used for the fallback path so an
+    unmatched word borrows already-verified pitch information instead of
+    a fresh, isolated re-analysis of its own (often very short) clip."""
+    if not all_notes:
+        return None
+    mid = (word.start + word.end) / 2.0
+    nearest = min(all_notes, key=lambda n: min(abs(mid - n.start), abs(mid - n.end)))
+    return nearest.pitch
+
+
 def _chunk_syllables(parts: List[str], n_chunks: int) -> List[str]:
     """Merges a syllable list down to exactly n_chunks contiguous text
     chunks (used when a word has more syllables than the audio resolved
@@ -185,16 +208,25 @@ def _chunk_syllables(parts: List[str], n_chunks: int) -> List[str]:
     return chunks
 
 
-def _syllables_for_word(word: Word, notes: List[NoteEvent], y: np.ndarray, sr: int,
-                         stats: AlignmentStats) -> List[Syllable]:
+def _syllables_for_word(word: Word, notes: List[NoteEvent], all_notes: List[NoteEvent],
+                         y: np.ndarray, sr: int, stats: AlignmentStats) -> List[Syllable]:
     if not notes:
         # Fallback: no acoustically-detected note overlapped this word at
-        # all. Build one from a focused pitch read over the word's own
-        # span so we don't just drop lyric coverage.
+        # all. Prefer borrowing the pitch of the nearest already-verified
+        # pass-1 note over running a fresh, isolated pitch analysis on
+        # this word's own (often very short) clip -- see module
+        # docstring point 5 for why: the isolated analysis is a real
+        # source of bad notes in practice.
         stats.words_with_fallback += 1
         stats.fallback_words.append(f'"{word.text}" @ {word.start:.2f}s')
-        hz = median_pitch_in_span(y, sr, word.start, word.end)
-        pitch = hz_to_ultrastar_pitch(hz) if hz else 0
+        neighbor_pitch = _nearest_note_pitch(word, all_notes)
+        if neighbor_pitch is not None:
+            stats.fallback_used_neighbor += 1
+            pitch = neighbor_pitch
+        else:
+            stats.fallback_used_fresh_analysis += 1
+            hz = median_pitch_in_span(y, sr, word.start, word.end)
+            pitch = hz_to_ultrastar_pitch(hz) if hz else 0
         end = max(word.end, word.start + config.MIN_NOTE_DURATION_SEC)
         return [Syllable(
             text=word.text, start=word.start, end=end,
@@ -262,7 +294,7 @@ def align_words_to_notes(
             # Singleton group (no line match, or a one-word line): same as
             # the original per-word behavior, using that word's own notes.
             word = words[indices[0]]
-            all_syllables.extend(_syllables_for_word(word, g_notes, y, sr, stats))
+            all_syllables.extend(_syllables_for_word(word, g_notes, notes, y, sr, stats))
             continue
 
         # Multi-word matched line: redistribute this line's notes across
@@ -273,6 +305,6 @@ def align_words_to_notes(
         syllable_counts = [len(hyphenate(words[i].text)) for i in indices]
         per_word_notes = _split_proportionally_by_syllables(g_notes, syllable_counts)
         for i, w_notes in zip(indices, per_word_notes):
-            all_syllables.extend(_syllables_for_word(words[i], w_notes, y, sr, stats))
+            all_syllables.extend(_syllables_for_word(words[i], w_notes, notes, y, sr, stats))
 
     return enforce_monotonic(all_syllables), stats

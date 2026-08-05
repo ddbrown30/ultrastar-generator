@@ -122,6 +122,23 @@ cross-correlating the video's own audio track against the song.
 > reference line) still falls back to the original per-word zone
 > behavior unchanged.
 
+> **v8 note (a fabricated "bad note" traced to its exact source, plus a
+> requested spike filter):** further real-run feedback found another bad
+> note in the same passage -- this time confirmed, by directly comparing
+> against the pass-1 debug file, to not exist in pass 1's output AT ALL.
+> Root cause: a word with zero notes in its zone was falling back to a
+> fresh, isolated pYIN call on its own (often very short, e.g. ~0.1s)
+> ASR clip -- exactly the kind of context-starved analysis that produces
+> noisy results, which is the same lesson pass 1 itself already learned
+> (see the v3 note above about not running pYIN on tiny clips). Fixed by
+> having the fallback path borrow the pitch of whichever pass-1 note (from
+> the full, already-verified note list) is nearest in time, instead of
+> manufacturing new, unverified pitch data. Separately, a spike/outlier
+> filter was added as requested: a short note that jumps far in pitch
+> from BOTH neighbors, where those neighbors are themselves close in
+> pitch to each other, gets removed and folded into the previous note --
+> tunable via `--spike-max-duration` / `--spike-jump-semitones`.
+
 ## 1. Setup (Windows)
 
 1. **Python 3.10+**: install from [python.org](https://www.python.org/downloads/)
@@ -200,6 +217,11 @@ options:
 --silence-floor-db -50          Absolute silence gate (dBFS); catches a
                                 long/entirely silent stretch that has no
                                 louder reference for the relative gate
+--spike-max-duration 0.25       A note this short that jumps far from
+                                both neighbors (which are close to each
+                                other) is treated as a tracking glitch
+--spike-jump-semitones 4        Minimum pitch jump from both neighbors
+                                to count as a spike/glitch
 --output-dir DIR               Write the .txt somewhere other than next to
                                 the audio
 --work-dir DIR                 Where separated vocal stems are cached
