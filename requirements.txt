@@ -1,0 +1,37 @@
+# Core pipeline
+numpy>=1.24
+scipy>=1.10
+librosa>=0.10
+soundfile>=0.12
+
+# Vocal isolation
+demucs>=4.0
+
+# Speech-to-text with word-level timestamps.
+# faster-whisper is the baseline transcriber; whisperx adds forced
+# alignment (wav2vec2 CTC) on top for much more accurate word boundaries
+# and is used automatically when installed (see transcription.py).
+faster-whisper>=1.0
+whisperx>=3.1
+# whisperx has fairly strict pinned sub-dependencies and occasionally
+# conflicts with a newer torch/torchaudio you may have installed already.
+# If `pip install whisperx` gives you dependency-resolution trouble, it's
+# fine to skip it -- just delete this line and reinstall; the tool
+# automatically falls back to faster-whisper's own word timestamps (with
+# a console warning) when whisperx isn't importable.
+
+# Syllable hyphenation
+pyphen>=0.15
+
+# Metadata reading (duration etc.)
+mutagen>=1.47
+
+# Optional: online lyric lookup (--fetch-lyrics)
+requests>=2.31
+
+# --- PyTorch ---------------------------------------------------------------
+# Demucs and faster-whisper both depend on it. It's deliberately NOT pinned
+# here because the correct build depends on your hardware (CPU-only vs a
+# specific CUDA version). Install it FIRST, following the selector at
+# https://pytorch.org/get-started/locally/ for your system, THEN run
+# `pip install -r requirements.txt`.
