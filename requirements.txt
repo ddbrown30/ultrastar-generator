@@ -23,6 +23,16 @@ whisperx>=3.1
 # Syllable hyphenation
 pyphen>=0.15
 
+# CREPE (learned pitch estimator), cross-checked against pYIN per-frame
+# in note_detection.py -- generally more robust than pYIN against
+# accompaniment bleed in the isolated vocal stem. Falls back to pYIN
+# alone (with a console warning) if not installed; --no-crepe disables.
+torchcrepe>=0.0.23
+
+# Musical key detection for the optional --key-correction polish pass
+# (Krumhansl-Schmuckler key-finding)
+music21>=9.1
+
 # Metadata reading (duration etc.)
 mutagen>=1.47
 

@@ -139,6 +139,56 @@ cross-correlating the video's own audio track against the song.
 > pitch to each other, gets removed and folded into the previous note --
 > tunable via `--spike-max-duration` / `--spike-jump-semitones`.
 
+> **v9 note (CUDA-only, CREPE, reference-aware verification, and a real
+> off-by-one overlap bug):** four changes from one round of real-audio
+> validation against a hand-verified reference for "Stars":
+> 1. **CPU support was removed entirely** -- CUDA is now required, and the
+>    pipeline aborts at startup if it isn't available. `--device` is gone.
+> 2. **CREPE (`torchcrepe`) now runs alongside pYIN** on every frame as a
+>    second, independent pitch estimate (`--no-crepe` to disable). Where
+>    the two agree (within 1 semitone), CREPE's pitch is used with a
+>    confidence boost -- it's a learned model and generally more robust
+>    than pYIN's DSP approach against accompaniment bleed in the isolated
+>    vocal stem. Where they disagree, that frame keeps pYIN's own pitch
+>    (unchanged from before) but downweighted, rather than being marked
+>    unvoiced -- forcing unvoiced would itself fabricate a note boundary
+>    at exactly the frames we're least sure about.
+> 3. **Same-pitch re-articulation can now split.** A real bug: "fall as
+>    Lucifer" sung on one held pitch was merging into one giant note,
+>    because a bare onset was deliberately never enough to split on its
+>    own (see the v3-era fix for consonant transients inside one
+>    sustained note) -- but that meant genuinely re-attacked same-pitch
+>    notes could never split either, even with real per-syllable onsets
+>    and RMS dips confirmed present in the audio. Fixed by allowing a
+>    STRONG onset (top percentile of onset strength -- filters out weak
+>    consonant blips) to split same-pitch audio once the in-progress note
+>    has run long enough that the onset can't just be its own attack. The
+>    split is protected from being silently undone by the very next merge
+>    pass via a `protected_start` flag on the note.
+> 4. **A real, pre-existing off-by-one was found and fixed** while
+>    debugging (3): every raw note segment's end time was computed one
+>    frame too late, so every adjacent pair of raw segments overlapped by
+>    exactly one frame -- silently "fixed" by `_ensure_nonoverlapping`
+>    (and warned about) on every single run, e.g. 49 times on one real
+>    ~200-note song. That guard's own comment says this "shouldn't be
+>    possible by construction"; it turned out it very much was.
+> 5. **Chunk-based re-transcription verification now checks against
+>    reference lyrics, not just self-consistency**, and runs on every
+>    word by default (`--verify-suspicious-only` to restrict back to just
+>    pass 2's flagged words). Previously it only ever compared a fresh
+>    recheck against the word's OWN current text, and always deferred to
+>    a reference-matched word without ever actually checking the recheck
+>    against what the reference expected -- so it could never fix
+>    `lyrics_lookup.py`'s "uneven block" case (a word tagged with a
+>    reference line whose text was deliberately left uncorrected). Now a
+>    word's `reference_text` (the specific reference word it was aligned
+>    to, if any) is what a recheck gets compared against; the reference
+>    is still the most-trusted source when everything disagrees, but a
+>    recheck that actively confirms a different, better answer is used.
+> 6. **`--key-correction` is now on by default** (music21-based, see
+>    section 4), and the ad-hoc key-detection heuristic was replaced with
+>    music21's implementation of Krumhansl-Schmuckler key-finding.
+
 ## 1. Setup (Windows)
 
 1. **Python 3.10+**: install from [python.org](https://www.python.org/downloads/)
@@ -151,10 +201,12 @@ cross-correlating the video's own audio track against the song.
    ffmpeg -version
    ```
 
-3. **PyTorch** (needed by Demucs and faster-whisper): go to
-   https://pytorch.org/get-started/locally/, pick "Windows / Pip / Python /
-   CPU" (or a CUDA version if you have an NVIDIA GPU and want it faster),
-   and run the `pip install ...` command it gives you.
+3. **PyTorch with CUDA** (needed by Demucs, faster-whisper/WhisperX, and
+   CREPE): an NVIDIA GPU is required -- CPU is not supported, and the
+   pipeline aborts at startup if `torch.cuda.is_available()` is False. Go
+   to https://pytorch.org/get-started/locally/, pick "Windows / Pip /
+   Python / CUDA <version>", and run the `pip install ...` command it
+   gives you.
 
 4. **Everything else**:
    ```
@@ -187,8 +239,7 @@ options:
                                 from the filename
 --bpm 120                      Override auto-detected tempo
 --whisper-model medium.en      Bigger/more accurate ASR model (default:
-                                small.en). Try large-v3 if you have a GPU.
---device cuda                  Use an NVIDIA GPU for Demucs + Whisper
+                                small.en). Try large-v3 for better accuracy.
 --fetch-lyrics                 Look up reference lyrics (lyrics.ovh) to
                                 correct mistranscribed words (whole-sequence
                                 alignment, not just low-confidence words)
@@ -199,8 +250,19 @@ options:
 --no-whisperx                  Force faster-whisper's own word timestamps
                                 instead of WhisperX forced alignment
 --no-key-correction             Disable the musical-key pitch-snapping
-                                polish pass (this is already the default;
-                                use --key-correction to opt in)
+                                polish pass (default: ON; music21-based --
+                                see section 4)
+--no-crepe                      Disable the CREPE (torchcrepe) per-frame
+                                pitch cross-check against pYIN (default: ON
+                                -- see section 4)
+--crepe-model full              torchcrepe model size: full (more
+                                accurate, default) or tiny (faster)
+--no-verify-words               Disable chunk-based re-transcription
+                                verification against reference lyrics
+                                (default: ON -- see section 4)
+--verify-suspicious-only        Only verify pass 2's flagged-suspicious
+                                words instead of every word (faster, catches
+                                less)
 --pitch-smooth-window 0.11     Vibrato-suppression filter window (sec);
                                 raise if notes still fragment, lower if
                                 fast runs get smeared together
@@ -296,19 +358,35 @@ gap-based phrasing.
   (rejecting near-silent noise/artifacts that pYIN's pure pitch/
   periodicity detection can otherwise mistake for a confident, real-
   looking pitch -- silence has no loudness-based signature pYIN
-  considers, so this check is deliberately independent of it). Within
-  what's left, pYIN's pitch contour is median-filtered (~110ms window) to
-  suppress vocal vibrato, then split into discrete notes at silence gaps,
-  onset events that also coincide with a real pitch change, and sustained
-  pitch jumps of ~1 semitone or more. A merge pass then combines adjacent
-  notes that are both close in pitch (within 1 semitone) AND close in
-  time -- capped so the total pitch range of anything folded together
-  never exceeds that same 1 semitone, which specifically prevents a real
-  melodic run (several syllables each a step apart) from chain-merging
-  into one flattened note. A second pass folds any note shorter than half
-  a beat into whichever neighbor has the closer pitch. Each note's pitch
-  is a confidence-weighted mode over its frames, not a plain average.
-  This is pass 1, and none of it has any knowledge of the lyrics.
+  considers, so this check is deliberately independent of it). CREPE
+  (`torchcrepe`, `--no-crepe` to disable) then runs as a second,
+  independent per-frame pitch estimate alongside pYIN: where the two
+  agree (within 1 semitone), CREPE's pitch is used with a confidence
+  boost (it's a learned model and generally more robust than pYIN's DSP
+  approach against accompaniment bleed in the isolated vocal stem);
+  where they disagree, that frame keeps pYIN's own pitch but
+  downweighted -- deliberately not marked unvoiced, since that would
+  itself fabricate a note boundary at exactly the frames least trusted.
+  Within what's left, the pitch contour is median-filtered (~110ms
+  window) to suppress vocal vibrato, then split into discrete notes at
+  silence gaps, onset events that also coincide with a real pitch
+  change, and sustained pitch jumps of ~1 semitone or more. Two
+  consecutive syllables sung on the exact SAME pitch (no pitch change at
+  all) can also split, but only at a STRONG onset -- one in the top
+  percentile of onset strength this track actually has, well past a
+  weak consonant/attack transient inside one sustained note -- and only
+  once the in-progress note has already run long enough that the onset
+  can't just be its own attack; that split is then protected from being
+  silently undone by the merge pass below. A merge pass then combines
+  adjacent notes that are both close in pitch (within 1 semitone) AND
+  close in time -- capped so the total pitch range of anything folded
+  together never exceeds that same 1 semitone, which specifically
+  prevents a real melodic run (several syllables each a step apart) from
+  chain-merging into one flattened note. A second pass folds any note
+  shorter than half a beat into whichever neighbor has the closer pitch.
+  Each note's pitch is a confidence-weighted mode over its frames, not a
+  plain average. This is pass 1, and none of it has any knowledge of the
+  lyrics.
 - Words are hyphenated into syllables (via `pyphen`) and then fitted onto
   the notes from pass 1 via a **monotonic timeline partition** -- but at
   the LINE level, not the word level, whenever lyrics.ovh matched a word
@@ -334,15 +412,27 @@ gap-based phrasing.
   with a `~` continuation when a syllable is held across multiple notes).
   **Note timing and pitch always come from pass 1**, never from the ASR
   word boundaries.
-- An optional final polish pass (`--key-correction` to enable; **off by
-  default**) detects the song's most likely musical key from its
-  pitch-class distribution and nudges clearly-out-of-key notes toward the
-  nearest in-key neighbor. This is adapted from the key-correction idea
-  in the open-source `ultrastar_pitch` project, reimplemented from
-  scratch here. It's off by default because it can compound pitch
-  flattening on genuinely chromatic/passing-tone notes -- worth
-  re-enabling and comparing once the segmentation fixes above have been
-  validated against real audio on their own.
+- An optional final polish pass (`--no-key-correction` to disable; **on
+  by default**) detects the song's most likely musical key using
+  `music21`'s implementation of the Krumhansl-Schmuckler key-finding
+  algorithm, and nudges clearly-out-of-key notes toward the nearest
+  in-key neighbor.
+- Chunk-based re-transcription verification (`--no-verify-words` to
+  disable; **on by default, every word** -- `--verify-suspicious-only`
+  restricts it back to just pass 2's flagged words: a "fallback" word
+  that got zero pass-1 notes, or a matched reference line whose
+  syllable count badly outnumbers its assigned note count): each word
+  gets a fresh, tightly-cropped, isolated re-transcription of just that
+  moment in the audio. The rechecked text is compared against the
+  word's specific `reference_text` (the reference-lyrics word it was
+  aligned to, if any -- see `lyrics_lookup.py`), not just against its
+  own current text: an already-correct word is left alone, a wrong word
+  gets corrected to the reference when the recheck confirms it, and the
+  reference is still trusted as the fallback when everything disagrees
+  (consistent with reference lyrics being the pipeline's source of truth
+  for text). With no reference at all (e.g. an ad-lib), the recheck is
+  the only second opinion available. Every decision is logged. This
+  never touches note timing or pitch.
 - Non-overlap is enforced twice: once in continuous seconds
   (`postprocess.enforce_monotonic`, which trusts word order and only
   pushes later notes forward -- it does NOT sort by timestamp, since
@@ -488,8 +578,8 @@ make it much faster to zero in on why.
 
 ## 9. Known limitations / TODO
 
-- No GPU-specific tuning beyond `--device cuda`; large files on CPU-only
-  machines can take several minutes per song (mostly Demucs + Whisper).
+- Requires an NVIDIA GPU with CUDA available -- CPU is not supported. The
+  pipeline aborts at startup if `torch.cuda.is_available()` is False.
 - Golden-note and freestyle/rap (`F`/`R`/`G`) note types aren't inferred
   beyond the simple "long note -> golden" heuristic.
 - `#RELATIVE` notes aren't used (all timestamps are absolute from GAP, as

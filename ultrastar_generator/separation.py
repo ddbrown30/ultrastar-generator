@@ -23,7 +23,6 @@ def isolate_vocals(
     audio_path: Path,
     work_dir: Path,
     model: str = config.DEFAULT_DEMUCS_MODEL,
-    device: str = "cpu",
 ) -> Path:
     """Runs Demucs two-stem separation and returns the path to vocals.wav.
 
@@ -51,7 +50,7 @@ def isolate_vocals(
         sys.executable, "-m", "demucs",
         "--two-stems", "vocals",
         "-n", model,
-        "-d", device,
+        "-d", "cuda",
         "-o", str(out_dir),
         str(audio_path),
     ]

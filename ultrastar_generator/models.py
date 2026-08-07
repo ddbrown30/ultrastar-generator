@@ -20,6 +20,13 @@ class Word:
                                      # belongs to, if lyrics.ovh alignment
                                      # found a match; None if unmatched or
                                      # lyrics lookup wasn't used/available.
+    reference_text: Optional[str] = None  # the specific reference-lyrics
+                                     # word this ASR word was aligned to,
+                                     # if any (see lyrics_lookup.py) -- used
+                                     # by verification.py to check a fresh
+                                     # re-transcription against what the
+                                     # reference actually expected here,
+                                     # not just self-consistency.
 
 
 @dataclass

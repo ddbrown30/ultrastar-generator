@@ -18,20 +18,43 @@ from pathlib import Path
 from typing import List
 
 from . import config
+from . import model_cache
 from .models import Word
 
 
-def _transcribe_with_whisperx(vocals_path: Path, model_name: str, device: str) -> List[Word]:
+def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None,
+                               vad_options: dict = None) -> List[Word]:
     import whisperx
 
-    compute_type = "float16" if device == "cuda" else "int8"
     audio = whisperx.load_audio(str(vocals_path))
 
-    model = whisperx.load_model(model_name, device=device, compute_type=compute_type, language="en")
+    model = model_cache.get_whisperx_asr_model(model_name, vad_options=vad_options)
     result = model.transcribe(audio, language="en", batch_size=16)
 
-    align_model, metadata = whisperx.load_align_model(language_code="en", device=device)
-    aligned = whisperx.align(result["segments"], align_model, metadata, audio, device=device)
+    align_model, metadata = model_cache.get_whisperx_align_model()
+    aligned = whisperx.align(result["segments"], align_model, metadata, audio, device="cuda")
+
+    if debug_log is not None:
+        debug_log.section("RAW WHISPERX OUTPUT (direct from whisperx.align(), before any filtering)")
+        debug_log.line("Columns: start, end, score, text -- a 'DROPPED' word has no usable start/end "
+                        "and never becomes a Word at all (silently missing from everything downstream).")
+        for seg in aligned["segments"]:
+            for w in seg.get("words", []):
+                raw_text = w.get("word")
+                start = w.get("start")
+                end = w.get("end")
+                score = w.get("score")
+                dropped = not (raw_text or "").strip() or start is None or end is None
+                start_s = f"{start:8.3f}" if start is not None else "    None"
+                end_s = f"{end:8.3f}" if end is not None else "    None"
+                score_s = f"{score:.3f}" if score is not None else " None"
+                if dropped:
+                    flag = "  <-- DROPPED (missing text/timing)"
+                elif score is not None and score < 0.3:
+                    flag = "  <-- LOW SCORE"
+                else:
+                    flag = ""
+                debug_log.line(f"  {start_s} - {end_s}  score={score_s}  {raw_text!r}{flag}")
 
     words: List[Word] = []
     for seg in aligned["segments"]:
@@ -50,26 +73,30 @@ def _transcribe_with_whisperx(vocals_path: Path, model_name: str, device: str) -
     return words
 
 
-def _transcribe_with_faster_whisper(vocals_path: Path, model_name: str, device: str) -> List[Word]:
-    from faster_whisper import WhisperModel
-
-    compute_type = "float16" if device == "cuda" else "int8"
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+def _transcribe_with_faster_whisper(vocals_path: Path, model_name: str, debug_log=None,
+                                     vad_filter: bool = True) -> List[Word]:
+    model = model_cache.get_faster_whisper_model(model_name)
 
     segments, _info = model.transcribe(
         str(vocals_path),
         language="en",
         word_timestamps=True,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=300),
+        vad_filter=vad_filter,
+        vad_parameters=dict(min_silence_duration_ms=300) if vad_filter else None,
     )
 
     words: List[Word] = []
+    raw_log_lines = [] if debug_log is not None else None
     for segment in segments:
         if not segment.words:
             continue
         for w in segment.words:
             text = w.word.strip()
+            if raw_log_lines is not None:
+                prob = getattr(w, "probability", None)
+                prob_s = f"{prob:.3f}" if prob is not None else " None"
+                flag = "  <-- DROPPED (empty text)" if not text else ""
+                raw_log_lines.append(f"  {w.start:8.3f} - {w.end:8.3f}  prob={prob_s}  {w.word!r}{flag}")
             if not text:
                 continue
             words.append(Word(
@@ -78,14 +105,23 @@ def _transcribe_with_faster_whisper(vocals_path: Path, model_name: str, device: 
                 end=float(w.end),
                 confidence=float(getattr(w, "probability", 1.0)),
             ))
+
+    if debug_log is not None:
+        debug_log.section("RAW FASTER-WHISPER OUTPUT (direct from model.transcribe(), before any filtering)")
+        debug_log.line("Columns: start, end, probability, text")
+        for line in raw_log_lines:
+            debug_log.line(line)
+
     return words
 
 
 def transcribe_words(
     vocals_path: Path,
     model_name: str,
-    device: str = "cpu",
     prefer_whisperx: bool = config.PREFER_WHISPERX,
+    debug_log=None,
+    vad_filter: bool = True,
+    whisperx_vad_options: dict = None,
 ) -> List[Word]:
     """Returns a flat, time-ordered list of Word objects for the whole track.
 
@@ -93,10 +129,19 @@ def transcribe_words(
     the final note timing -- final timing comes from note_detection.py's
     audio-only analysis. Still, more accurate word boundaries here mean
     fewer/less-drastic corrections needed during alignment.
+
+    `debug_log` records the RAW model output (every word/score, including
+    ones later dropped for missing text/timing) before any of our own
+    filtering -- see debug_log.DebugLog. `vad_filter` only applies to the
+    faster-whisper path. `whisperx_vad_options` only applies to the
+    whisperx path -- see config.WHISPERX_NO_VAD_OPTIONS's docstring for
+    why this fixed a real, confirmed timing bug (word timestamps up to
+    ~6s wrong around sustained/held notes).
     """
     if prefer_whisperx:
         try:
-            return _transcribe_with_whisperx(vocals_path, model_name, device)
+            return _transcribe_with_whisperx(vocals_path, model_name, debug_log=debug_log,
+                                              vad_options=whisperx_vad_options)
         except ImportError:
             print(
                 "whisperx not installed -- falling back to faster-whisper's own "
@@ -107,7 +152,7 @@ def transcribe_words(
             print(f"whisperx transcription failed ({e}); falling back to faster-whisper.")
 
     try:
-        return _transcribe_with_faster_whisper(vocals_path, model_name, device)
+        return _transcribe_with_faster_whisper(vocals_path, model_name, debug_log=debug_log, vad_filter=vad_filter)
     except ImportError as e:
         raise ImportError(
             "Neither whisperx nor faster-whisper is installed. "

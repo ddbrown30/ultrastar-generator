@@ -1,13 +1,17 @@
-"""Writes an intermediate, pass-1-only UltraStar .txt file: every detected
-note, correctly timed and pitched, with placeholder text instead of real
-lyrics. This is a real, loadable UltraStar song file -- open it in the
-editor to check pass 1's timing/pitch in isolation, with no chance of
-pass 2 (lyric fitting) having touched anything.
+"""Writes an intermediate, notes-only UltraStar .txt file: every note at
+whatever stage it's called (pass 1's raw detection, or pass 2's
+key-corrected notes), correctly timed and pitched, with placeholder text
+instead of real lyrics. This is a real, loadable UltraStar song file --
+open it in the editor to check timing/pitch in isolation, with no chance
+of a later pass (lyric fitting, or key correction if this is the pass-1
+file) having touched anything.
 
 Each note's placeholder text is its note name (e.g. "G#3"), which is
 usually more useful for debugging than a generic dot or number: you can
-directly compare what pass 1 detected against what you expect to hear,
-without needing to eyeball the editor's piano roll.
+directly compare what was detected against what you expect to hear,
+without needing to eyeball the editor's piano roll. Diffing the pass-1
+and pass-2 debug files against each other shows exactly which notes key
+correction changed, and by how much.
 """
 
 from __future__ import annotations
@@ -47,6 +51,43 @@ def notes_to_debug_entries(notes: List[NoteEvent], line_gap_sec: float = None) -
     return entries
 
 
+def build_notes_debug_song(
+    notes: List[NoteEvent],
+    artist: str,
+    title: str,
+    mp3: str,
+    bpm: float,
+    gap_ms: int,
+    label: str,
+) -> Song:
+    return Song(
+        title=f"{title} [{label}]",
+        artist=artist,
+        mp3=mp3,
+        bpm=bpm,
+        gap_ms=gap_ms,
+        entries=notes_to_debug_entries(notes),
+    )
+
+
+def write_notes_debug_file(
+    notes: List[NoteEvent],
+    artist: str,
+    title: str,
+    mp3: str,
+    bpm: float,
+    gap_ms: int,
+    output_dir: Path,
+    label: str,
+) -> Path:
+    from .usdx_writer import write_song
+
+    song = build_notes_debug_song(notes, artist, title, mp3, bpm, gap_ms, label)
+    out_path = Path(output_dir) / f"{artist} - {title} [{label}].txt"
+    write_song(song, out_path)
+    return out_path
+
+
 def build_pass1_debug_song(
     notes: List[NoteEvent],
     artist: str,
@@ -55,14 +96,7 @@ def build_pass1_debug_song(
     bpm: float,
     gap_ms: int,
 ) -> Song:
-    return Song(
-        title=f"{title} [PASS1 DEBUG]",
-        artist=artist,
-        mp3=mp3,
-        bpm=bpm,
-        gap_ms=gap_ms,
-        entries=notes_to_debug_entries(notes),
-    )
+    return build_notes_debug_song(notes, artist, title, mp3, bpm, gap_ms, "PASS1 DEBUG")
 
 
 def write_pass1_debug_file(
@@ -74,9 +108,4 @@ def write_pass1_debug_file(
     gap_ms: int,
     output_dir: Path,
 ) -> Path:
-    from .usdx_writer import write_song
-
-    song = build_pass1_debug_song(notes, artist, title, mp3, bpm, gap_ms)
-    out_path = Path(output_dir) / f"{artist} - {title} [PASS1 DEBUG].txt"
-    write_song(song, out_path)
-    return out_path
+    return write_notes_debug_file(notes, artist, title, mp3, bpm, gap_ms, output_dir, "PASS1 DEBUG")

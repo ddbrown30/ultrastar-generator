@@ -133,7 +133,8 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
             for k in range(a1 - a0):
                 w = words[a0 + k]
                 out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
-                                    confidence=w.confidence, line_id=ref_line_ids[b0 + k])
+                                    confidence=w.confidence, line_id=ref_line_ids[b0 + k],
+                                    reference_text=ref_orig[b0 + k])
         elif tag == "replace":
             a_len = a1 - a0
             b_len = b1 - b0
@@ -148,22 +149,29 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                     if new_text != w.text and w.text[:1].isupper() and new_text[:1].islower():
                         new_text = new_text[:1].upper() + new_text[1:]
                     out[a0 + k] = Word(text=new_text, start=w.start, end=w.end,
-                                        confidence=w.confidence, line_id=ref_line_ids[b0 + k])
+                                        confidence=w.confidence, line_id=ref_line_ids[b0 + k],
+                                        reference_text=ref_word)
             else:
                 # Uneven block (ASR split/merged words differently than
                 # the reference does) -- keep ASR text as-is rather than
                 # guess a risky word-for-word mapping, but still tag every
-                # ASR word in the block with a reference line id so
-                # phrase breaks stay correct.
+                # ASR word in the block with a reference line id (so
+                # phrase breaks stay correct) AND a best-guess
+                # reference_text (clamped to the block) -- not trusted
+                # enough to substitute directly here, but a real signal
+                # verification.py can cross-check a fresh, isolated
+                # re-transcription against.
                 for k in range(a_len):
                     w = words[a0 + k]
                     b_idx = min(b0 + k, b1 - 1)
                     out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
-                                        confidence=w.confidence, line_id=ref_line_ids[b_idx])
+                                        confidence=w.confidence, line_id=ref_line_ids[b_idx],
+                                        reference_text=ref_orig[b_idx])
         elif tag == "delete":
             # ASR has word(s) the reference doesn't (ad-libs, hallucinated
             # filler, etc.) -- keep as-is; line_id filled in below from
-            # neighboring context.
+            # neighboring context. No reference word exists to check
+            # against at all.
             for k in range(a1 - a0):
                 w = words[a0 + k]
                 out[a0 + k] = Word(text=w.text, start=w.start, end=w.end, confidence=w.confidence, line_id=None)

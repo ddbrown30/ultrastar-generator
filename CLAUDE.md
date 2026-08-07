@@ -6,7 +6,7 @@ itself, transcribes lyrics, fits the lyrics onto the detected notes, and
 writes a spec-compliant `.txt`.
 
 Full narrative history of every bug found and fixed is in `README.md`
-(the "v1 note" through "v8 note" callouts) — read that before assuming
+(the "v1 note" through "v9 note" callouts) — read that before assuming
 something is broken; it may be a known, already-worked-through issue.
 Run `python test_dry_run.py` before and after any change — it's a
 synthetic-data regression suite (no audio/models needed) covering every
@@ -104,40 +104,183 @@ violated:
   melodic motion into one flattened note happened once already
   (`_merge_similar_adjacent`'s `group_min`/`group_max` tracking exists
   specifically to prevent this).
+- **An onset with no pitch change still needs a way to split, or two
+  legitimately re-attacked same-pitch notes merge into one.** Real bug:
+  "fall as Lucifer" all sung on one held pitch merged into a single
+  ~1.9s note, even though real per-syllable onsets AND real RMS dips
+  were confirmed present in the audio at each word boundary — the
+  segmenter simply never had a path to split on onset alone (an earlier
+  fix deliberately disabled that, to stop consonant transients *inside*
+  one note from causing spurious splits). Fixed with a middle ground:
+  only a STRONG onset (top percentile of onset strength the track
+  actually has) can split same-pitch audio, and only once the
+  in-progress note has run long enough that the onset can't be its own
+  attack (`config.REARTICULATION_STRENGTH_PERCENTILE` /
+  `MIN_DURATION_BEFORE_REARTICULATION_SEC`). The resulting note is
+  tagged `protected_start=True` so the very next merge pass (which would
+  otherwise see "same pitch, ~0 gap" and silently re-merge it) leaves it
+  alone.
+- **A note's end time must come from its last INCLUDED frame, not from
+  the frame index one past it.** Real, pre-existing bug found while
+  debugging the above: `raw_notes` stores an exclusive `end_frame`
+  (frames `[start_frame, end_frame)` belong to the note), but the
+  original code computed `end_t` from `times[end_frame]` — the START of
+  the frame AFTER the note, not the end of the note's own last frame.
+  That made every adjacent pair of raw segments overlap by exactly one
+  `frame_dur`, silently "fixed" by `_ensure_nonoverlapping` (with a
+  warning) on literally every run — 49 times on one real ~200-note song.
+  That guard's docstring calls this "shouldn't be possible by
+  construction, and if it ever fires, that's a real bug" — it was right,
+  and nobody had looked. Fixed by using `times[end_frame - 1]` instead.
+  Worth remembering: a warning that fires constantly stops reading as a
+  warning — if `_ensure_nonoverlapping` (or any similar hard-guarantee
+  check) starts firing routinely again, don't assume it's "just how
+  many overlaps happen"; go find the off-by-one.
+- **Demucs separation is not bit-reproducible run to run, and for a
+  tempo-ambiguous song that's enough to flip the detected BPM.**
+  Confirmed in practice: two separations of the exact same input file
+  (`Les Misérables - Stars.ogg`) produced same-size but different-checksum
+  `vocals.wav` files (almost certainly CUDA/cuDNN non-deterministic
+  algorithm selection at inference, not any intentional test-time
+  randomness — `--shifts` isn't passed, so that's not it). That tiny
+  waveform difference was enough for `librosa.beat.beat_track` to detect
+  105.47 BPM in one run and 109.96 in the other for the same song —
+  `detect_bpm` itself is deterministic given the same audio (confirmed:
+  identical input, 3 repeated calls, identical result), so the whole
+  output's beat grid silently shifts based on which Demucs run you
+  happened to get, not on anything about the pipeline logic. Not fixed at
+  the Demucs level (would mean fighting CUDA determinism settings across a
+  subprocess boundary, for uncertain benefit) — instead, `main.py`'s
+  `work_dir` now defaults to `<audio file's directory>/.ultrastar_work`
+  (not `<output_dir>/.ultrastar_work`), so separation is cached and reused
+  by its OWN directory regardless of `--output-dir` — e.g. comparing
+  `--whisper-model` choices into different `--output-dir`s no longer
+  triggers a fresh, independently-nondeterministic separation each time.
+  If you ever see beat numbers that don't seem to line up with a previous
+  run's reference notes for the same song, check `#BPM` first before
+  assuming a real regression.
+- **Pass 1's own CREPE inference is ALSO not bit-reproducible run to
+  run, with a bigger blast radius than the Demucs case above.**
+  Confirmed directly: calling `detect_notes()` twice in the same process
+  on the exact same cached audio array produced 295 vs 298 notes, 283 of
+  295 compared notes differing in timing/pitch — same underlying cause
+  (CUDA/cuDNN non-deterministic algorithm selection), but this time
+  perturbing the note sequence itself rather than just one tempo value,
+  so it can silently shift which pitch/timing you get for a given song
+  from run to run even with everything else (audio, code, flags) held
+  identical. Partially mitigated (not fully fixed) in
+  `note_detection.py`'s `_crepe_pitch`: forces
+  `torch.use_deterministic_algorithms(True, warn_only=True)` and
+  `cudnn.deterministic=True`/`benchmark=False`, scoped to just that call
+  (restored after, via try/finally) so it can't affect Demucs — a
+  separate subprocess anyway — or WhisperX/pyannote, which run later
+  in-process and haven't been vetted for full deterministic-op coverage.
+  `main.py` also sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` at import time
+  (required before any CUDA context init for cuBLAS ops to honor
+  determinism). Measured: negligible performance cost (+1.2%, 156.6s ->
+  158.5s for a full-track `detect_notes()` call), and no accuracy
+  concern (a deterministic algorithm computes the same math via a fixed
+  op order, not a different/worse one) — but the fix is incomplete:
+  even with both settings, a repeat test still showed 221 of 282 notes
+  differing between two back-to-back calls. The remaining instability
+  doesn't produce any "no deterministic implementation" warning, so it's
+  likely GPU floating-point non-associativity somewhere inside
+  torchcrepe's own inference that these global flags don't reach.
+  Decided (given the fix is free and strictly helps): keep it, don't
+  chase the remainder further. **This means pass-1 pitch/timing output
+  for a given song is still not guaranteed identical between runs** —
+  same caveat as the Demucs/BPM case: check whether you're comparing
+  runs before treating a small pitch/timing difference as a regression.
 
 ## Open threads / where we left off
 
-Discussed but not yet decided/implemented, in rough priority order:
+Done:
 
-1. **Swap `key_correction.py`'s ad-hoc key detection for `music21`**
-   (proper Krumhansl-Schmuckler key-finding) — agreed this is a real
-   existing library that should replace the hand-rolled heuristic.
-   `key_correction.py` is currently OFF by default (`--key-correction`
-   to enable) pending this.
-2. **Chunk-based re-transcription for verification**: for suspicious
-   words (fallback words, or lines with anomalous syllable-to-note
-   ratios), re-run ASR on a tightly cropped window around that timestamp
-   and cross-check against the expected reference word. Agreed as worth
-   building, not yet implemented.
-3. **CREPE and/or Essentia's MELODIA as a pYIN alternative/ensemble**:
-   proposed running CREPE alongside pYIN and using agreement/disagreement
-   as a confidence signal for gating notes, or trying Essentia's
-   `PredominantPitchMelodia` (purpose-built polyphonic melody extraction)
-   as a pYIN replacement. Real architecture change (new heavy
-   dependency) — needs an explicit go-ahead before building, not a
-   "just try it" change.
-4. **MIDI database cross-checking**: considered and deprioritized — no
+1. **`key_correction.py` now uses `music21`** (its implementation of
+   Krumhansl-Schmuckler key-finding) instead of the hand-rolled
+   diatonic-scale-coverage heuristic, and is now **ON by default**
+   (`--no-key-correction` to disable).
+2. **CUDA is now the only supported device.** `--device` is gone;
+   `separation.py`/`transcription.py` hardcode `device="cuda"`, and
+   `main.py` aborts at startup if `torch.cuda.is_available()` is False.
+   CPU fallback paths (`compute_type="int8"` etc.) were removed, not
+   just defaulted away.
+3. **CREPE (`torchcrepe`) runs alongside pYIN** in `note_detection.py`
+   (`--no-crepe` to disable, `--crepe-model` for `full`/`tiny`). Per
+   frame: where CREPE and pYIN agree within
+   `config.CREPE_AGREEMENT_SEMITONES`, CREPE's pitch is used with a
+   confidence boost; where they disagree, pYIN's own pitch is kept
+   (unchanged) but downweighted via `config.CREPE_DISAGREEMENT_CONFIDENCE_SCALE`
+   — deliberately never marked unvoiced, since that would itself
+   fabricate a note boundary at exactly the least-trusted frames.
+4. **Same-pitch re-articulation splitting + a real off-by-one overlap
+   fix**, both in `note_detection.py` — see the two new "Lessons
+   learned" entries above for the detail. Both came out of debugging the
+   real "And if they fall as Lucifer fell" section reported against a
+   hand-verified reference (opening notes G#/F#/G#/A/B/G#; that section's
+   full expected beats/pitches/lyrics are worth asking about if
+   revisiting this — not reproduced here since it's long).
+5. **Chunk-based re-transcription verification redesigned** to actually
+   check against reference lyrics, not just self-consistency
+   (`verification.py`). Every ASR `Word` now carries `reference_text` —
+   the specific reference-lyrics word it was aligned to, if any (set in
+   `lyrics_lookup.align_words_to_reference`, including for the "uneven
+   block" case that deliberately left text uncorrected before). A fresh,
+   isolated recheck is resolved against `reference_text` when present
+   (already-correct words are left alone; a wrong word is corrected to
+   the reference when the recheck confirms it; reference wins as the
+   fallback when everything disagrees) or against the word's own current
+   text otherwise. Runs on **every** word by default now, not just
+   pass-2-flagged-suspicious ones (`config.VERIFY_ALL_WORDS`,
+   `--verify-suspicious-only` to restrict back). Still never touches
+   timing/pitch.
+
+Feedback from this round, worth carrying forward: **new features should
+default to ON** (not gated behind an opt-in flag) unless there's a
+specific reason given for opt-in (like key-correction's original
+flattening-risk concern, since resolved), and **every new/changed
+feature needs a real-audio validation run** against `sandbox/Les
+Misérables - Stars.ogg` before being reported as done, not just
+`test_dry_run.py` — the "Stars" reference notes (opening 6 notes, and
+the full "fall as Lucifer fell...sword" section) are saved in this
+session's memory for that purpose.
+
+Discussed but not yet decided/implemented:
+
+1. **Essentia's MELODIA as a further pYIN/CREPE ensemble member or
+   replacement**: purpose-built polyphonic melody extraction
+   (`PredominantPitchMelodia`). Real architecture change (new heavy
+   dependency) — needs an explicit go-ahead before building.
+2. **MIDI database cross-checking**: considered and deprioritized — no
    reliable, API-searchable public database of vocal MIDI transcriptions
    is known to exist; would mostly add fragile scraping for something
    that'd fail silently on most songs.
+3. **The "sword"/"Stars" note-boundary bug**: found during this round's
+   real-audio validation but NOT fixed — a long, correctly-detected
+   pass-1 melisma note got assigned entirely to the wrong side of a
+   reference-line boundary (`lyric_alignment._assign_notes_to_groups`),
+   because the raw ASR word timestamps at that exact boundary were off
+   by several seconds (WhisperX guessed "sword" was very short; the
+   singer actually holds it for ~3s) with no acoustic pause anywhere
+   nearby to anchor a fix on (the passage is sung legato straight through
+   the line break). Investigated two heuristic fixes (snap the boundary
+   to the nearest note gap; rebalance notes across the boundary by
+   syllable-count deficit/surplus) and rejected both — neither would have
+   actually fixed this specific case, and both risk new false positives
+   elsewhere. A real fix likely needs local re-alignment (re-running
+   forced alignment on a window spanning the boundary) rather than a
+   heuristic on top of the existing word timestamps — bigger lift, not
+   started.
 
 ## Environment notes
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.
-- GPU available (`--device cuda`); WhisperX pulls in pyannote/torch —
-  expect noisy-but-harmless warnings (torchcodec/ffmpeg version
-  mismatches, TF32 reproducibility notices) on startup; these haven't
-  been correctness issues so far.
+- CUDA is required — CPU support was removed entirely, not just
+  defaulted away; the pipeline aborts at startup if
+  `torch.cuda.is_available()` is False. WhisperX pulls in
+  pyannote/torch — expect noisy-but-harmless warnings (torchcodec/ffmpeg
+  version mismatches, TF32 reproducibility notices) on startup; these
+  haven't been correctness issues so far.
 - Demucs writes intermediate stems to `sandbox/.ultrastar_work/` —
   safe to delete between runs to reclaim disk space, and separation is
   cached/skipped if `vocals.wav` already exists there.

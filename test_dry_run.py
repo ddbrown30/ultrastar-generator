@@ -162,6 +162,13 @@ class _FakeOnset:
     def onset_detect(y, sr, hop_length, backtrack, units):
         return np.array([0.0])  # only the very first frame is an onset
 
+    @staticmethod
+    def onset_strength(y, sr, hop_length):
+        # Flat/zero everywhere -- irrelevant to these tests (they're not
+        # about same-pitch re-articulation splitting), but note_detection
+        # always calls this now, so every fake needs to answer it.
+        return np.zeros(max(1, len(y) // hop_length + 1))
+
 
 fake_librosa.onset = _FakeOnset()
 
@@ -265,22 +272,22 @@ assert mixed_notes[0].start >= silent_duration_sec - 0.05, \
 print(f"OK: silent lead-in correctly produced no note; real singing starting at "
       f"{mixed_notes[0].start:.2f}s (silent section was {silent_duration_sec:.2f}s) was preserved")
 
-print("\n--- key_correction: obvious out-of-key note gets snapped ---")
+print("\n--- key_correction: obvious out-of-key note gets snapped (now pass 2, operates on NoteEvent, no lyrics involved) ---")
 from ultrastar_generator.key_correction import snap_to_key
 # Heavily-weighted C major scale (each in-key pitch class repeated 3x so
 # the key detector isn't confused by a single outlier) plus ONE clear
 # outlier at pitch class 6 (F#), which isn't in C major and sits between
 # F(5, in-key) and G(7, in-key).
 in_key = [0, 2, 4, 5, 7, 9, 11] * 3
-c_major_syls = [
-    Syllable(chr(97 + i), i * 0.5, i * 0.5 + 0.4, pc, True)
+c_major_notes = [
+    NoteEvent(start=i * 0.5, end=i * 0.5 + 0.4, pitch=pc)
     for i, pc in enumerate(in_key)
 ]
-outlier_idx = len(c_major_syls)
-c_major_syls.append(Syllable("x", outlier_idx * 0.5, outlier_idx * 0.5 + 0.4, 6, True))
-snapped = snap_to_key(c_major_syls)
-assert snapped[outlier_idx].midi_note in (5, 7), snapped[outlier_idx].midi_note
-print(f"OK: outlier pitch 6 snapped to {snapped[outlier_idx].midi_note}")
+outlier_idx = len(c_major_notes)
+c_major_notes.append(NoteEvent(start=outlier_idx * 0.5, end=outlier_idx * 0.5 + 0.4, pitch=6))
+snapped = snap_to_key(c_major_notes)
+assert snapped[outlier_idx].pitch in (5, 7), snapped[outlier_idx].pitch
+print(f"OK: outlier pitch 6 snapped to {snapped[outlier_idx].pitch}")
 
 print("\n--- BUG REGRESSION (round 3): word order is preserved even with imprecise/fallback timing ---")
 # Reproduces the reported "He knows his way in the dark" scrambling:
@@ -476,18 +483,28 @@ print("OK: line break inserted exactly at the line_id change:", kinds2)
 
 print("\n--- BUG REGRESSION (round 6): a bad interior ASR timestamp no longer swallows a whole line's notes ---")
 # Reproduces the reported "Stars" bug directly: within a matched
-# reference line, one interior word's ASR timing is badly wrong (here,
-# "Stars" is reported as a tiny sliver, and "in" doesn't start until much
-# later than it should) -- under the OLD per-word-zone algorithm this
-# would dump a huge stretch of real, musically-distinct notes onto
-# "Stars" as one giant melisma. The new algorithm distributes a matched
-# line's notes by syllable count instead of trusting each interior word's
-# own timestamp.
+# reference line, one interior word's ASR timing is badly wrong ("Stars"
+# is reported as a tiny sliver) -- under the OLD per-word-zone algorithm
+# this would dump a huge stretch of real, musically-distinct notes onto
+# "Stars" as one giant melisma. The current algorithm instead SPLITS
+# notes at each word's own ASR start/end boundary (see
+# lyric_alignment._split_notes_by_word_boundaries), so a note spanning
+# more than one word's zone gets cut into same-pitch pieces rather than
+# handed whole to whichever word's timestamp happens to contain its
+# midpoint -- a tiny/bad timestamp can only ever claim the sliver of
+# note-time that actually falls inside it. Gaps between words are kept
+# small (<= config.NOTE_ASSIGNMENT_MAX_GAP_SEC) so grouping (purely
+# gap-based, see lyric_alignment._group_words_by_gap) keeps them as ONE
+# group -- a real multi-second gap between interior words of the same
+# line would now correctly be treated as a real phrase boundary, not
+# this bug; the real "Stars" bug's actual raw ASR data (found later, see
+# [[project-stars-reference-notes]]) looked exactly like this: several
+# words compressed with SMALL gaps between them, not one big gap.
 line_words = [
     Word(text="Stars", start=34.2, end=34.7, confidence=0.9, line_id=5),        # 1 syllable
-    Word(text="in", start=38.0, end=38.1, confidence=0.9, line_id=5),           # 1 syllable, badly late
-    Word(text="your", start=38.1, end=38.3, confidence=0.9, line_id=5),         # 1 syllable
-    Word(text="multitudes", start=38.3, end=39.9, confidence=0.9, line_id=5),   # 3 syllables
+    Word(text="in", start=34.8, end=34.9, confidence=0.9, line_id=5),           # 1 syllable, compressed but same phrase
+    Word(text="your", start=34.9, end=35.1, confidence=0.9, line_id=5),         # 1 syllable
+    Word(text="multitudes", start=35.1, end=36.7, confidence=0.9, line_id=5),   # 3 syllables
 ]
 # 12 real, evenly-spaced notes spanning the whole line -- exactly the
 # kind of musically-distinct content seen in the actual pass-1 debug file
@@ -495,8 +512,8 @@ line_words = [
 line_notes = [NoteEvent(start=34.2 + i * 0.45, end=34.2 + i * 0.45 + 0.4, pitch=i % 5) for i in range(12)]
 
 line_syllables, line_stats = align_words_to_notes(line_words, line_notes, np.zeros(16000), 16000)
-assert line_stats.lines_syllable_distributed == 1, line_stats
-# Track note-count per ORIGINAL word (by word-start order), not by
+assert line_stats.lines_word_boundary_split == 1, line_stats
+# Track note-piece-count per ORIGINAL word (by word-start order), not by
 # syllable text -- "multitudes" hyphenates into multiple differently-
 # texted syllables, so grouping by text alone would misattribute them.
 counts_by_word = {}
@@ -507,14 +524,17 @@ for s in line_syllables:
     key = line_words[word_idx].text
     counts_by_word[key] = counts_by_word.get(key, 0) + 1
 print("Notes per word:", counts_by_word)
-# "Stars" (1/6 of the line's 6 total syllables) must NOT dominate --
-# roughly proportional to syllable count (1,1,1,3 syllables out of 6
-# total -> roughly 2,2,2,6 notes out of 12), and specifically nowhere
-# close to swallowing most of the line the way the old bug did.
+# "Stars" (a tiny 0.5s ASR span) must NOT dominate -- it should only get
+# the note pieces whose time actually falls within its own boundary
+# (here: one whole leading note plus a sliver split off the next one),
+# nowhere close to swallowing most of the line the way the old bug did.
+# "multitudes" (spans 35.1-36.7s, most of the line) should get most of
+# the notes/pieces. A word can end up with MORE pieces than the original
+# note count since a single note can now be split across several words.
 assert counts_by_word.get("Stars", 0) <= 4, f"'Stars' still dominating the line: {counts_by_word}"
 assert counts_by_word.get("multitudes", 0) >= counts_by_word.get("Stars", 0), counts_by_word
-assert sum(counts_by_word.values()) == 12
-print("OK: line notes distributed by syllable count, not by one bad interior ASR timestamp")
+assert sum(counts_by_word.values()) >= 12
+print("OK: line notes split by each word's own ASR boundary, not swallowed by one bad interior timestamp")
 
 print("\n--- BUG REGRESSION (round 7): isolated pitch spike gets removed ---")
 from ultrastar_generator.note_detection import _remove_pitch_spikes
@@ -616,6 +636,370 @@ print(f"Detected {len(spike_pipeline_notes)} note(s) for a base-spike-base conto
 assert len(spike_pipeline_notes) == 1, f"expected full end-to-end collapse to 1 note, got {spike_pipeline_notes}"
 assert spike_pipeline_notes[0].pitch == 0, spike_pipeline_notes[0]
 print("OK: end-to-end pipeline fully collapsed the spike, no trace of it left:", spike_pipeline_notes)
+
+print("\n--- BUG REGRESSION: a strong onset backed by a real energy dip splits two "
+      "same-pitch re-articulated notes (previously always merged -- no pitch change "
+      "ever gets a split, no matter how strong the onset) ---")
+n_pre_rearticulate = 30
+n_post_rearticulate = 30
+n_frames_rearticulate = n_pre_rearticulate + n_post_rearticulate
+same_midi = 60.0  # C4 throughout -- no pitch change at all
+f0_rearticulate = np.full(n_frames_rearticulate, 440.0 * 2 ** ((same_midi - 69) / 12))
+
+fake_librosa_rearticulate = _types.ModuleType("librosa")
+fake_librosa_rearticulate.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
+    f0_rearticulate, np.ones(n_frames_rearticulate, dtype=bool), np.full(n_frames_rearticulate, 0.9),
+)
+fake_librosa_rearticulate.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
+
+
+class _FakeOnsetRearticulate:
+    @staticmethod
+    def onset_detect(y, sr, hop_length, backtrack, units):
+        # A single, real re-attack roughly halfway through -- well past
+        # config.MIN_DURATION_BEFORE_REARTICULATION_SEC into the note.
+        onset_frame = n_pre_rearticulate
+        return np.array([onset_frame * hop_length / sr])
+
+    @staticmethod
+    def onset_strength(y, sr, hop_length):
+        # Single onset -> trivially at the top percentile among itself.
+        env = np.zeros(n_frames_rearticulate)
+        env[n_pre_rearticulate] = 5.0
+        return env
+
+
+fake_librosa_rearticulate.onset = _FakeOnsetRearticulate()
+
+
+class _FakeFeatureRearticulate:
+    @staticmethod
+    def rms(y, frame_length, hop_length):
+        return np.full((1, n_frames_rearticulate), 0.2)  # loud throughout
+
+
+fake_librosa_rearticulate.feature = _FakeFeatureRearticulate()
+_sys.modules["librosa"] = fake_librosa_rearticulate
+importlib.reload(note_detection_mod)
+
+rearticulate_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+print(f"Detected {len(rearticulate_notes)} note(s) for a same-pitch re-articulation:", rearticulate_notes)
+assert len(rearticulate_notes) == 2, \
+    f"expected the strong onset to split same-pitch re-articulation into 2 notes, got {rearticulate_notes}"
+assert rearticulate_notes[0].pitch == rearticulate_notes[1].pitch == 0, rearticulate_notes
+print("OK: strong onset + energy dip split two same-pitch notes that a bare pitch-only check would have merged")
+
+print("\n--- weak onset with no pitch change still does NOT split (avoids reintroducing "
+      "the old 'consonant transient inside one note' spurious-split bug) ---")
+
+
+class _FakeOnsetWeak:
+    @staticmethod
+    def onset_detect(y, sr, hop_length, backtrack, units):
+        # Two onsets: a much STRONGER decoy very early (frame 3 -- before
+        # config.MIN_DURATION_BEFORE_REARTICULATION_SEC has elapsed, so it
+        # can't split anything itself) that raises the percentile bar high
+        # enough that the frame-30 onset (the one actually inside the
+        # sustained note) no longer clears it.
+        return np.array([3 * hop_length / sr, n_pre_rearticulate * hop_length / sr])
+
+    @staticmethod
+    def onset_strength(y, sr, hop_length):
+        env = np.zeros(n_frames_rearticulate)
+        env[3] = 10.0
+        env[n_pre_rearticulate] = 1.0
+        return env
+
+
+fake_librosa_rearticulate.onset = _FakeOnsetWeak()
+_sys.modules["librosa"] = fake_librosa_rearticulate
+importlib.reload(note_detection_mod)
+
+weak_onset_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+print(f"Detected {len(weak_onset_notes)} note(s) for a same-pitch run with a uniformly weak onset:",
+      weak_onset_notes)
+assert len(weak_onset_notes) == 1, \
+    f"a uniformly weak onset (no strength signal to distinguish it) should NOT split, got {weak_onset_notes}"
+print("OK: weak/undifferentiated onset did not spuriously split a sustained note")
+
+print("\n--- CREPE cross-check: agreement uses CREPE's (more accurate) pitch ---")
+import torch as _torch
+
+n_frames_crepe = 40
+
+
+class _FakeOnsetNone:
+    @staticmethod
+    def onset_detect(y, sr, hop_length, backtrack, units):
+        return np.array([])
+
+    @staticmethod
+    def onset_strength(y, sr, hop_length):
+        return np.zeros(n_frames_crepe)
+
+
+def _make_fake_librosa_crepe(pyin_midi: float):
+    f0 = np.full(n_frames_crepe, 440.0 * 2 ** ((pyin_midi - 69) / 12))
+    fake = _types.ModuleType("librosa")
+    fake.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
+        f0, np.ones(n_frames_crepe, dtype=bool), np.full(n_frames_crepe, 0.9),
+    )
+    fake.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
+    fake.onset = _FakeOnsetNone()
+
+    class _Feat:
+        @staticmethod
+        def rms(y, frame_length, hop_length):
+            return np.full((1, n_frames_crepe), 0.2)
+
+    fake.feature = _Feat()
+    return fake
+
+
+# pYIN says midi 60.4 (rounds to 60) throughout; CREPE agrees closely
+# (61.0, within config.CREPE_AGREEMENT_SEMITONES) -- final pitch should
+# follow CREPE's value (61), not pYIN's.
+_sys.modules["librosa"] = _make_fake_librosa_crepe(60.4)
+fake_torchcrepe_agree = _types.ModuleType("torchcrepe")
+_crepe_hz_agree = 440.0 * 2 ** ((61.0 - 69) / 12)
+fake_torchcrepe_agree.predict = lambda audio, sr, hop_length, fmin, fmax, model, batch_size, device, return_periodicity: (
+    _torch.full((1, n_frames_crepe), _crepe_hz_agree), _torch.full((1, n_frames_crepe), 0.9),
+)
+_sys.modules["torchcrepe"] = fake_torchcrepe_agree
+importlib.reload(note_detection_mod)
+
+crepe_agree_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=True, use_crepe=True)
+print(f"Detected {len(crepe_agree_notes)} note(s):", crepe_agree_notes)
+assert len(crepe_agree_notes) == 1, crepe_agree_notes
+assert crepe_agree_notes[0].pitch == 1, f"expected CREPE's pitch (61 -> relative 1) to be used, got {crepe_agree_notes[0].pitch}"
+print("OK: CREPE's pitch used over pYIN's when they agree")
+
+print("\n--- CREPE cross-check: disagreement keeps pYIN's pitch, downweights confidence, "
+      "and does NOT fabricate a note split ---")
+_sys.modules["librosa"] = _make_fake_librosa_crepe(60.0)
+fake_torchcrepe_disagree = _types.ModuleType("torchcrepe")
+_crepe_hz_agree_part = 440.0 * 2 ** ((60.0 - 69) / 12)
+_crepe_hz_disagree_part = 440.0 * 2 ** ((75.0 - 69) / 12)  # 15 semitones off pYIN -- clear disagreement
+
+
+def _predict_disagree(audio, sr, hop_length, fmin, fmax, model, batch_size, device, return_periodicity):
+    pitch = _torch.full((1, n_frames_crepe), _crepe_hz_agree_part)
+    pitch[0, 30:] = _crepe_hz_disagree_part
+    periodicity = _torch.full((1, n_frames_crepe), 0.9)
+    return pitch, periodicity
+
+
+fake_torchcrepe_disagree.predict = _predict_disagree
+_sys.modules["torchcrepe"] = fake_torchcrepe_disagree
+importlib.reload(note_detection_mod)
+
+crepe_disagree_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=True, use_crepe=True)
+print(f"Detected {len(crepe_disagree_notes)} note(s):", crepe_disagree_notes)
+assert len(crepe_disagree_notes) == 1, \
+    f"disagreement alone must not fabricate a note boundary, got {crepe_disagree_notes}"
+assert crepe_disagree_notes[0].pitch == 0, \
+    f"disagreeing frames should keep pYIN's pitch (majority vote still 0), got {crepe_disagree_notes[0].pitch}"
+import ultrastar_generator.config as config_mod
+# First 30 frames AGREE with CREPE too (both at pYIN's own pitch), so
+# they get the confidence BOOST just like the all-agreeing test above;
+# only the last 10 frames disagree and get downweighted relative to that
+# -- so the mixed case's overall confidence should land measurably below
+# the all-agreeing case's (1.35, asserted above), not because agreement
+# "helps" less here but because 10/40 frames dropped from boosted to
+# downweighted.
+assert crepe_disagree_notes[0].confidence < crepe_agree_notes[0].confidence, \
+    (crepe_disagree_notes[0].confidence, crepe_agree_notes[0].confidence)
+_downweighted = 0.9 * config_mod.CREPE_DISAGREEMENT_CONFIDENCE_SCALE
+assert crepe_disagree_notes[0].confidence > _downweighted, \
+    "mixed confidence should sit above the fully-downweighted floor (some frames still boosted)"
+print(f"OK: disagreement kept pYIN's pitch and stayed one note, but confidence "
+      f"({crepe_disagree_notes[0].confidence:.3f}) was measurably lower than the all-agreeing "
+      f"case ({crepe_agree_notes[0].confidence:.3f})")
+del _sys.modules["torchcrepe"]
+
+print("\n--- lyric_alignment flags suspicious words: any word whose own ASR span gets zero note pieces ---")
+susp_words = [
+    Word(text="clearly", start=0.0, end=0.5, confidence=0.9),  # gets a real note -> not suspicious
+    Word(text="mumbled", start=2.0, end=2.3, confidence=0.9),  # zero notes -> fallback -> suspicious
+    Word(text="multitudinous", start=5.0, end=5.6, confidence=0.9, line_id=0),  # matched line, gets the note -> not suspicious
+    Word(text="word", start=5.6, end=5.8, confidence=0.9, line_id=0),          # same line, no note overlaps it -> suspicious
+]
+susp_notes = [
+    NoteEvent(start=0.0, end=0.5, pitch=0, confidence=1.0),
+    # nothing near 2.0-2.3s -> "mumbled" is a fallback
+    NoteEvent(start=5.0, end=5.3, pitch=0, confidence=1.0),  # only 1 note for a 2-word line -- entirely
+    # within "multitudinous"'s own span, so word-boundary splitting correctly gives none of it to "word"
+]
+_, susp_stats = align_words_to_notes(susp_words, susp_notes, np.zeros(4410), 22050)
+assert 1 in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_indices
+assert 3 in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_indices
+assert 2 not in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_indices
+assert 0 not in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_indices
+print(f"OK: suspicious word indices correctly identified: {sorted(set(susp_stats.suspicious_word_indices))}")
+
+print("\n--- verification: chunk re-transcription resolves against reference lyrics, "
+      "not just self-consistency ---")
+import ultrastar_generator.verification as verification_mod
+
+
+class _FakeSegment:
+    def __init__(self, text):
+        self.text = text
+
+
+class _SequencedFakeASRModel:
+    """Deterministic fake: returns a fixed sequence of 'rechecked' texts,
+    one per call, in the order verify_words() processes words (sorted
+    index order) -- lets the test drive each of _resolve()'s branches
+    independently."""
+    _responses = ["rumbled", "multitudinous", "totally different", "echo", "echo"]
+
+    def __init__(self, *a, **k):
+        self._iter = iter(self._responses)
+
+    def transcribe(self, audio, language=None, batch_size=None):
+        return {"segments": [{"text": next(self._iter), "start": 0.0, "end": 1.0}]}
+
+
+def _fake_load_model_verify_words(model_name, device=None, compute_type=None, language=None, vad_options=None):
+    return _SequencedFakeASRModel()
+
+
+fake_whisperx_verify_words = _types.ModuleType("whisperx")
+fake_whisperx_verify_words.load_model = _fake_load_model_verify_words
+_sys.modules["whisperx"] = fake_whisperx_verify_words
+verification_mod.model_cache.reset()
+# Earlier tests replaced sys.modules["librosa"] with note_detection-specific
+# fakes that don't implement .resample(); verification.py needs the real
+# thing, so drop the fake and let it re-import genuinely.
+_sys.modules.pop("librosa", None)
+
+verify_test_words = [
+    # 0: no reference at all; recheck disagrees with current text -> replaced with recheck.
+    Word(text="mumbled", start=0.0, end=0.3, confidence=0.9, line_id=None, reference_text=None),
+    # 1: current text does NOT match reference, but the recheck CONFIRMS the
+    # reference (case-insensitively) -> replaced with the reference's own text
+    # (not the recheck's raw casing), fixing lyrics_lookup's "uneven block" case.
+    Word(text="multitude", start=10.0, end=10.3, confidence=0.9, line_id=0, reference_text="Multitudinous"),
+    # 2: current text wrong, recheck ALSO doesn't match reference (3-way
+    # disagreement) -> falls back to trusting the reference anyway.
+    Word(text="Stray", start=20.0, end=20.3, confidence=0.9, line_id=0, reference_text="Stars"),
+    # 3: current text already matches reference -> left alone regardless of
+    # what the recheck (mock says "echo") hears.
+    Word(text="Stars", start=30.0, end=30.3, confidence=0.9, line_id=0, reference_text="Stars"),
+    # 4: no reference; recheck agrees with current text -> left alone.
+    Word(text="echo", start=40.0, end=40.3, confidence=0.9, line_id=None, reference_text=None),
+]
+y_fake = np.zeros(22050 * 42, dtype=np.float32)
+new_words, verify_results = verification_mod.verify_words(
+    verify_test_words, [0, 1, 2, 3, 4], y_fake, 22050, "small.en", verbose=True,
+)
+assert new_words[0].text == "rumbled", new_words[0]
+assert new_words[1].text == "Multitudinous", new_words[1]  # reference's own text, not the recheck's raw casing
+assert new_words[2].text == "Stars", new_words[2]           # forced to reference despite no confirmation
+assert new_words[3].text == "Stars", new_words[3]           # untouched -- already matched reference
+assert new_words[4].text == "echo", new_words[4]            # untouched -- recheck agreed
+assert [r.replaced for r in verify_results] == [True, True, True, False, False], verify_results
+print("OK: verification correctly resolved all 5 cases against reference lyrics:",
+      [w.text for w in new_words])
+del _sys.modules["whisperx"]
+verification_mod.model_cache.reset()
+
+print("\n--- verification._word_spans_from_syllables: reconstructs each word's FINAL "
+      "note-assigned span from its syllable run ---")
+span_words = [
+    Word(text="Lucifer", start=10.0, end=10.5, confidence=0.9),
+    Word(text="fell", start=11.0, end=11.3, confidence=0.9),
+]
+span_syllables = [
+    Syllable(text="Lu", start=10.1, end=10.3, midi_note=0, is_word_start=True),
+    Syllable(text="cifer", start=10.3, end=10.6, midi_note=0, is_word_start=False),
+    Syllable(text="fell", start=10.7, end=11.4, midi_note=0, is_word_start=True),
+]
+spans = verification_mod._word_spans_from_syllables(span_words, span_syllables)
+assert spans == [(10.1, 10.6), (10.7, 11.4)], spans
+print("OK: word spans correctly reconstructed from multi-syllable runs:", spans)
+
+print("\n--- verification.verify_placement: crops a small window at each word's FINAL "
+      "note-assigned position, expands it until the expected word is found, then refines "
+      "the exact position with forced alignment over that confirmed window (the real "
+      "'Stars' bug: text was correct, but pass 3 put it far from where it's really sung) ---")
+
+
+class _ExpandSearchFakeASRModel:
+    """Deterministic fake: 'Stars' isn't found until the search window has
+    grown enough to reach its real position (~60.0s, far from where pass 3
+    assigned it); 'your' is found immediately since pass 3 assigned it
+    correctly. One response per transcribe() call, in call order."""
+    _responses = ["", "", "", "the great Stars shine", "your"]
+
+    def __init__(self, *a, **k):
+        self._iter = iter(self._responses)
+
+    def transcribe(self, audio, language=None, batch_size=None):
+        return {"segments": [{"text": next(self._iter)}]}
+
+
+def _fake_load_model(model_name, device=None, compute_type=None, language=None, vad_options=None):
+    return _ExpandSearchFakeASRModel()
+
+
+def _fake_load_align_model(language_code=None, device=None):
+    return object(), {}
+
+
+_fake_align_responses = {
+    # Window at the point "Stars" is finally found is (44.7, 60.7) -- see
+    # the radius math in the comment below -- so a relative offset of
+    # 15.3s is absolute 60.0s, matching where it's really sung.
+    "the great Stars shine": [
+        {"word": "the", "start": 14.0, "end": 14.2, "score": 0.9},
+        {"word": "great", "start": 14.3, "end": 14.6, "score": 0.9},
+        {"word": "Stars", "start": 15.3, "end": 15.6, "score": 0.9},
+        {"word": "shine", "start": 15.7, "end": 16.0, "score": 0.9},
+    ],
+    # Window at (79.5, 81.5); relative 1.0s is absolute 80.5s, exactly
+    # matching pass 3's (correct) assignment.
+    "your": [
+        {"word": "your", "start": 1.0, "end": 1.3, "score": 0.9},
+    ],
+}
+
+
+def _fake_align(segments, model, metadata, audio, device=None):
+    words_out = _fake_align_responses.get(segments[0]["text"], [])
+    return {"segments": [{"words": words_out}]}
+
+
+fake_whisperx = _types.ModuleType("whisperx")
+fake_whisperx.load_model = _fake_load_model
+fake_whisperx.load_align_model = _fake_load_align_model
+fake_whisperx.align = _fake_align
+_sys.modules["whisperx"] = fake_whisperx
+verification_mod.model_cache.reset()
+
+expand_words = [
+    # "Stars" mis-assigned notes at 52.7s; really sung at ~60.0s. Initial
+    # search radius 1.0s doubles each miss (1, 2, 4, 8) -- at radius 8.0
+    # the window (44.7, 60.7) finally reaches 60.0s.
+    Word(text="Stars", start=80.0, end=80.4, confidence=0.9, line_id=0, reference_text="Stars"),
+    # "your" correctly assigned -- found on the very first (radius 1.0) try.
+    Word(text="your", start=80.5, end=80.8, confidence=0.9, line_id=0, reference_text="your"),
+]
+expand_syllables = [
+    Syllable(text="Stars", start=52.7, end=53.0, midi_note=0, is_word_start=True, line_id=0),
+    Syllable(text="your", start=80.5, end=80.8, midi_note=0, is_word_start=True, line_id=0),
+]
+y_fake_expand = np.zeros(16000 * 100, dtype=np.float32)
+expand_warnings = verification_mod.verify_placement(
+    expand_words, expand_syllables, [0, 1], y_fake_expand, 16000, "small.en", verbose=True,
+)
+assert [w.word_index for w in expand_warnings] == [0], expand_warnings
+assert expand_warnings[0].word_text == "Stars", expand_warnings[0]
+print("OK: expand-search placement check correctly flagged only the mis-assigned word:",
+      [(w.word_index, w.word_text) for w in expand_warnings])
+del _sys.modules["whisperx"]
+verification_mod.model_cache.reset()
 
 
 
