@@ -56,14 +56,31 @@ class VerificationResult:
 @dataclass
 class PlacementWarning:
     """A word whose FINAL note-assigned position (not its original ASR
-    timestamp) doesn't seem to match what's actually sung there -- see
-    verify_placement."""
+    timestamp) doesn't seem to match what's actually sung there, and
+    where the mismatch could NOT be confidently corrected (either not
+    found anywhere in the search radius, or found in-window but forced
+    alignment didn't return a precise per-word position) -- see
+    verify_placement. Genuinely needs a human to look at it."""
     word_index: int
     word_text: str
     reference_text: Optional[str]
     assigned_start: float
     assigned_end: float
     heard_text: str
+
+
+@dataclass
+class PlacementCorrection:
+    """A word whose FINAL note-assigned position was confirmed wrong AND
+    precisely re-located via forced alignment over a window already known
+    to contain it -- see verify_placement. Applied by shifting the word's
+    own (start, end) to the confirmed position and re-running pass 3."""
+    word_index: int
+    word_text: str
+    old_start: float
+    old_end: float
+    new_start: float
+    new_end: float
 
 
 def _normalize(text: str) -> str:
@@ -237,12 +254,15 @@ def verify_placement(
     sr: int,
     model_name: str,
     verbose: bool = True,
-) -> List[PlacementWarning]:
+) -> tuple:
     """Checks whether each word's FINAL note-assigned position is actually
     where it's sung -- catches pass 3 putting a word on the wrong notes
     even when the word's own TEXT is correct (verify_words can't see this:
     it re-transcribes around the word's ORIGINAL ASR timestamp, not where
-    pass 3 actually placed it).
+    pass 3 actually placed it). Returns (corrected_words, corrections,
+    warnings) -- same shape as verify_words: `corrected_words` is `words`
+    unchanged, or a copy with corrected (start, end) where a confident fix
+    was applied.
 
     For each word: crop a small window around its assigned start, run an
     open-vocabulary transcription (whisperx), and check whether the
@@ -264,15 +284,31 @@ def verify_placement(
     says "the flame the sword", and "Stars" itself isn't sung until
     ~beat 381.
 
-    Detection only -- never reassigns notes or changes timing. Two
-    automatic-correction heuristics for this exact bug class (snapping the
-    boundary to the nearest note gap; rebalancing notes by syllable-count
-    deficit/surplus) were already tried and rejected as too risky (see
-    CLAUDE.md's open threads) -- a flagged mismatch needs a human to look
-    at it, not another heuristic guess.
+    When the forced-alignment pass returns a PRECISE per-word position
+    (the expected word matched by name inside the aligned output, not just
+    "somewhere in this confirmed window"), that position is trusted enough
+    to auto-correct: the word's (start, end) is shifted to it (end from the
+    aligner's own word-level end when available, else the original
+    ASR-estimated duration preserved and shifted by the same delta), and
+    alignment.align_words re-runs pass 3 with the corrected word list --
+    same pattern as verify_words already re-running pass 3 after a text
+    correction. This is deliberately NOT one of the two rejected
+    correction heuristics from CLAUDE.md's open threads (snapping to the
+    nearest note gap; rebalancing by syllable-count deficit/surplus) --
+    those guessed a new boundary from indirect signals with no confirmation
+    the guess was right. This instead applies the SAME position that was
+    already positively confirmed present and located by forced alignment
+    for detection -- using it is not a new guess, just not discarding a
+    confirmed answer.
+
+    Only the "not found anywhere" case, and the rarer case where the word
+    was confirmed present in-window but forced alignment didn't return a
+    precise per-word hit (falls back to the raw window start, which could
+    be off by up to the final search radius), remain warnings -- genuinely
+    nothing confident enough to act on automatically.
     """
     if not indices:
-        return []
+        return words, [], []
 
     import whisperx
 
@@ -288,11 +324,13 @@ def verify_placement(
 
     spans = _word_spans_from_syllables(words, syllables)
 
+    new_words = list(words)
+    corrections: List[PlacementCorrection] = []
     warnings: List[PlacementWarning] = []
     sorted_indices = sorted(set(indices))
     progress = ProgressReporter("verify_placement", len(sorted_indices), verbose=verbose)
     for i in sorted_indices:
-        progress.advance(extra=f"{len(warnings)} flagged so far")
+        progress.advance(extra=f"{len(corrections)} corrected, {len(warnings)} flagged so far")
         word = words[i]
         assigned_start, assigned_end = spans[i]
         expected = word.reference_text or word.text
@@ -339,7 +377,8 @@ def verify_placement(
         # there, unlike the abandoned blind-search approach).
         clip = audio16k[int(round(window_start * 16000)):int(round(window_end * 16000))]
         segment = {"text": found_text, "start": found_seg_start, "end": found_seg_end}
-        true_start = None
+        true_start = true_end = None
+        precise = False
         try:
             aligned = whisperx.align([segment], align_model, align_metadata, clip, device="cuda")
             # align() commonly splits one long segment's text into SEVERAL
@@ -352,6 +391,9 @@ def verify_placement(
                 for w in aligned_seg.get("words", []):
                     if _normalize(w.get("word", "")) == expected_norm and w.get("start") is not None:
                         true_start = window_start + float(w["start"])
+                        if w.get("end") is not None:
+                            true_end = window_start + float(w["end"])
+                        precise = True
                         break
                 if true_start is not None:
                     break
@@ -363,6 +405,26 @@ def verify_placement(
         if abs(true_start - assigned_start) <= config.PLACEMENT_MISMATCH_TOLERANCE_SEC:
             continue
 
+        if precise:
+            if true_end is not None and true_end > true_start:
+                new_end = true_end
+            else:
+                new_end = word.end + (true_start - word.start)
+                if new_end <= true_start:
+                    new_end = true_start + config.MIN_NOTE_DURATION_SEC
+            corrections.append(PlacementCorrection(
+                i, word.text, word.start, word.end, true_start, new_end,
+            ))
+            new_words[i] = Word(
+                text=word.text, start=true_start, end=new_end,
+                confidence=word.confidence, line_id=word.line_id,
+                reference_text=word.reference_text,
+            )
+            if verbose:
+                print(f'    [placement] "{word.text}" assigned to notes starting at {assigned_start:.2f}s, '
+                      f'but actually found at {true_start:.2f}s (search radius {radius:.1f}s) -- corrected')
+            continue
+
         warnings.append(PlacementWarning(
             i, word.text, word.reference_text, assigned_start, assigned_end,
             f"found at ~{true_start:.2f}s (search radius {radius:.1f}s)",
@@ -370,6 +432,6 @@ def verify_placement(
         if verbose:
             print(f'    [placement] "{word.text}" assigned to notes starting at {assigned_start:.2f}s, '
                   f'but actually found at ~{true_start:.2f}s (search radius {radius:.1f}s) -- likely a '
-                  f'note-boundary mismatch (not corrected automatically)')
+                  f'note-boundary mismatch (not precisely located enough to auto-correct)')
 
-    return warnings
+    return (new_words if corrections else words), corrections, warnings

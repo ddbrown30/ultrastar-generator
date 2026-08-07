@@ -390,15 +390,20 @@ RECHECK_PAD_SEC = 1.0
 # CONFIRMS a different answer than what's already there (see
 # verification.py's _resolve) -- low blast radius by construction.
 ENABLE_WORD_VERIFICATION = True
-# Placement verification (verify_placement) is OFF by default
-# (--verify-placement to enable). It's detection-only and was never wrong
-# on the cases it flagged, but real-audio runs found the root cause of
-# those mismatches lives further upstream (see CLAUDE.md/[[project-stars-
-# reference-notes]] -- bad WhisperX word timestamps feeding pass 3's
-# zone-boundary math, now being fixed closer to the source) and the check
-# itself is expensive (an expand-search re-transcription loop over every
-# word). Once upstream fixes land, re-evaluate whether this is still
-# worth defaulting on.
+# Placement verification+correction (verify_placement) is OFF by default
+# (--verify-placement to enable). It now auto-corrects a word's (start,
+# end) and re-runs pass 3 when it gets a PRECISE forced-alignment fix
+# (the exact bug this targets: a word's ASR timestamp was badly wrong at
+# a zone boundary with no acoustic pause nearby to anchor a fix on --
+# "sword"/"Stars" in Les Misérables - Stars, see CLAUDE.md's open
+# threads). Kept OFF by default purely for COST, not reliability: it's an
+# expand-search re-transcription loop over every word (when
+# VERIFY_ALL_WORDS is True), which is expensive next to the rest of the
+# pipeline. Only ever corrects on a POSITIVELY CONFIRMED, precisely
+# forced-aligned position -- never guesses (the two heuristic
+# auto-correction ideas that WERE guesses -- snapping to the nearest note
+# gap, rebalancing by syllable-count deficit/surplus -- were tried and
+# rejected; see CLAUDE.md).
 ENABLE_PLACEMENT_VERIFICATION = False
 # Verify every word, not just the ones pass 3 flagged suspicious -- the
 # extra recheck calls are cheap next to Demucs/WhisperX, and this catches

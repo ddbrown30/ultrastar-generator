@@ -234,6 +234,35 @@ Done:
    pass-2-flagged-suspicious ones (`config.VERIFY_ALL_WORDS`,
    `--verify-suspicious-only` to restrict back). Still never touches
    timing/pitch.
+6. **The "sword"/"Stars" note-boundary bug is fixed.** `verification.
+   verify_placement` (see its own docstring for the full expand-search +
+   forced-alignment mechanism) already had everything needed to detect
+   this — it just discarded the confirmed answer instead of using it.
+   Now, when it gets a PRECISE forced-alignment position (not just
+   "confirmed somewhere in this window"), it corrects the word's own
+   `(start, end)` to that position and `alignment.align_words` re-runs
+   pass 3 with the fix applied — same pattern `verify_words` already uses
+   for text corrections, just for timing. This is deliberately NOT
+   either of the two previously-rejected heuristics (snap to nearest note
+   gap; rebalance by syllable-count deficit/surplus) — both of those
+   guessed a new boundary from indirect signals with no confirmation the
+   guess was right; this instead uses the SAME position already
+   positively confirmed present and located by forced alignment for
+   detection. Only a "not found anywhere" or "confirmed in-window but not
+   precisely located" result stays a warning (`PlacementWarning`) —
+   genuinely nothing confident enough to act on. **Confirmed fixed on
+   real audio**: a fresh `--verify-placement` run on `Les Misérables -
+   Stars.ogg` placed "sword," at 58.11s (holding to ~61.95s) and "stars"
+   cleanly starting right at 61.95s — matching pass-1's independently
+   verified truth (58.11–61.95s / 61.95–63.08s) almost to the
+   millisecond, vs. the old output's "sword" truncated to a single
+   ~142ms beat with "Stars" swallowing the rest. The same run also caught
+   and fixed an unrelated real mismatch ("God" assigned at 18.40s,
+   actually sung at 24.54s) — not a one-off fix, the mechanism generalizes.
+   Still **OFF by default** (`config.ENABLE_PLACEMENT_VERIFICATION`,
+   `--verify-placement` to enable) — purely for COST (an expand-search
+   re-transcription loop over every word, ~4 minutes on top of
+   `verify_words`' own ~4 minutes for this one song), not reliability.
 
 Feedback from this round, worth carrying forward: **new features should
 default to ON** (not gated behind an opt-in flag) unless there's a
@@ -255,22 +284,6 @@ Discussed but not yet decided/implemented:
    reliable, API-searchable public database of vocal MIDI transcriptions
    is known to exist; would mostly add fragile scraping for something
    that'd fail silently on most songs.
-3. **The "sword"/"Stars" note-boundary bug**: found during this round's
-   real-audio validation but NOT fixed — a long, correctly-detected
-   pass-1 melisma note got assigned entirely to the wrong side of a
-   reference-line boundary (`lyric_alignment._assign_notes_to_groups`),
-   because the raw ASR word timestamps at that exact boundary were off
-   by several seconds (WhisperX guessed "sword" was very short; the
-   singer actually holds it for ~3s) with no acoustic pause anywhere
-   nearby to anchor a fix on (the passage is sung legato straight through
-   the line break). Investigated two heuristic fixes (snap the boundary
-   to the nearest note gap; rebalance notes across the boundary by
-   syllable-count deficit/surplus) and rejected both — neither would have
-   actually fixed this specific case, and both risk new false positives
-   elsewhere. A real fix likely needs local re-alignment (re-running
-   forced alignment on a window spanning the boundary) rather than a
-   heuristic on top of the existing word timestamps — bigger lift, not
-   started.
 
 ## Environment notes
 

@@ -382,6 +382,10 @@ def run(argv=None) -> int:
         n_replaced = sum(1 for r in stats.verification_results if r.replaced)
         print(f"    verification: re-transcribed {n_checked} suspicious word(s) in isolation, "
               f"replaced {n_replaced}")
+    if stats.placement_corrections:
+        print(f"    placement check: corrected {len(stats.placement_corrections)} word(s) whose FINAL "
+              f"note-assigned position didn't match what's actually sung there (see [placement] lines "
+              f"above) -- pass 3 was re-run with the fix applied")
     if stats.placement_warnings:
         print(f"    placement check: {len(stats.placement_warnings)} word(s) flagged -- the audio at "
               f"their FINAL note-assigned position doesn't say the expected word (see [placement] lines "

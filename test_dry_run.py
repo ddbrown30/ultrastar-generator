@@ -981,7 +981,9 @@ verification_mod.model_cache.reset()
 expand_words = [
     # "Stars" mis-assigned notes at 52.7s; really sung at ~60.0s. Initial
     # search radius 1.0s doubles each miss (1, 2, 4, 8) -- at radius 8.0
-    # the window (44.7, 60.7) finally reaches 60.0s.
+    # the window (44.7, 60.7) finally reaches 60.0s. The fake aligner
+    # returns a precise per-word hit for "Stars", so this should be
+    # AUTO-CORRECTED, not just flagged.
     Word(text="Stars", start=80.0, end=80.4, confidence=0.9, line_id=0, reference_text="Stars"),
     # "your" correctly assigned -- found on the very first (radius 1.0) try.
     Word(text="your", start=80.5, end=80.8, confidence=0.9, line_id=0, reference_text="your"),
@@ -991,13 +993,61 @@ expand_syllables = [
     Syllable(text="your", start=80.5, end=80.8, midi_note=0, is_word_start=True, line_id=0),
 ]
 y_fake_expand = np.zeros(16000 * 100, dtype=np.float32)
-expand_warnings = verification_mod.verify_placement(
+expand_words_out, expand_corrections, expand_warnings = verification_mod.verify_placement(
     expand_words, expand_syllables, [0, 1], y_fake_expand, 16000, "small.en", verbose=True,
 )
-assert [w.word_index for w in expand_warnings] == [0], expand_warnings
-assert expand_warnings[0].word_text == "Stars", expand_warnings[0]
-print("OK: expand-search placement check correctly flagged only the mis-assigned word:",
-      [(w.word_index, w.word_text) for w in expand_warnings])
+assert expand_warnings == [], expand_warnings
+assert [c.word_index for c in expand_corrections] == [0], expand_corrections
+assert expand_corrections[0].word_text == "Stars", expand_corrections[0]
+assert abs(expand_corrections[0].new_start - 60.0) < 0.01, expand_corrections[0]
+assert abs(expand_words_out[0].start - 60.0) < 0.01, expand_words_out[0]
+assert expand_words_out[1].start == 80.5, expand_words_out[1]  # "your" untouched
+print("OK: expand-search placement check correctly auto-corrected the mis-assigned word, "
+      "left the correctly-assigned one untouched:",
+      [(c.word_index, c.word_text, c.new_start) for c in expand_corrections])
+del _sys.modules["whisperx"]
+verification_mod.model_cache.reset()
+
+print("\n--- verification.verify_placement: a word genuinely not findable anywhere in the "
+      "search radius stays a WARNING, never an auto-correction ---")
+
+
+class _NeverFoundFakeASRModel:
+    """Every transcribe() call returns empty text -- the expected word is
+    never in the result, no matter how far the search window grows."""
+    def __init__(self, *a, **k):
+        pass
+
+    def transcribe(self, audio, language=None, batch_size=None):
+        return {"segments": [{"text": ""}]}
+
+
+def _fake_load_model_never(model_name, device=None, compute_type=None, language=None, vad_options=None):
+    return _NeverFoundFakeASRModel()
+
+
+fake_whisperx_never = _types.ModuleType("whisperx")
+fake_whisperx_never.load_model = _fake_load_model_never
+fake_whisperx_never.load_align_model = _fake_load_align_model
+fake_whisperx_never.align = _fake_align
+_sys.modules["whisperx"] = fake_whisperx_never
+verification_mod.model_cache.reset()
+
+never_found_words = [
+    Word(text="ghost", start=10.0, end=10.4, confidence=0.9, line_id=0, reference_text="ghost"),
+]
+never_found_syllables = [
+    Syllable(text="ghost", start=10.0, end=10.4, midi_note=0, is_word_start=True, line_id=0),
+]
+y_fake_never = np.zeros(16000 * 30, dtype=np.float32)
+never_words_out, never_corrections, never_warnings = verification_mod.verify_placement(
+    never_found_words, never_found_syllables, [0], y_fake_never, 16000, "small.en", verbose=True,
+)
+assert never_corrections == [], never_corrections
+assert [w.word_index for w in never_warnings] == [0], never_warnings
+assert never_words_out[0].start == 10.0, never_words_out[0]  # untouched -- nothing confident to act on
+print("OK: a genuinely unfindable word stayed a warning, word list left untouched:",
+      [(w.word_index, w.word_text) for w in never_warnings])
 del _sys.modules["whisperx"]
 verification_mod.model_cache.reset()
 

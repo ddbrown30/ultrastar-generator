@@ -21,11 +21,13 @@ This module's own steps:
      Crops a small window at the assigned position, transcribes it, and
      expands the window until the expected word is found (or gives up);
      once found, forced-alignment over that confirmed window pins down
-     the exact position. Detection only -- never reassigns notes. Off by
-     default: never wrong on what it flagged, but the actual bugs traced
-     back further upstream to bad WhisperX word timestamps -- see
-     config.ENABLE_PLACEMENT_VERIFICATION -- and it's an expensive
-     expand-search re-transcription loop over every word.)
+     the exact position. When that position is precisely located (not
+     just "somewhere in this window"), the word's own (start, end) is
+     corrected to it and pass 3 re-runs with the corrected word list --
+     same pattern as verify_words re-running pass 3 after a text
+     correction, just for timing instead of text. Off by default: it's an
+     expensive expand-search re-transcription loop over every word --
+     see config.ENABLE_PLACEMENT_VERIFICATION.)
 
 Key correction was deliberately moved OUT of this module (it used to run
 here, on Syllable objects, as a final bundled step) and into its own pass
@@ -98,7 +100,18 @@ def align_words(
     if verify_placement:
         placement_indices = list(range(len(words))) if verify_all_words else stats.suspicious_word_indices
         if placement_indices:
-            stats.placement_warnings = _verify_placement_check(
+            corrected_words, placement_corrections, placement_warnings = _verify_placement_check(
                 words, syllables, placement_indices, y, sr, verify_whisper_model, verbose=verbose,
             )
+            if placement_corrections:
+                prior_verification_results = stats.verification_results
+                words = corrected_words
+                if debug_log is not None:
+                    debug_log.section("RE-RUNNING PASS 2 -- verify_placement corrected at least one word's position")
+                syllables, stats = align_words_to_notes(words, notes, y, sr, debug_log=debug_log)
+                # align_words_to_notes always returns a fresh AlignmentStats --
+                # carry forward verify_words' results from before this re-run.
+                stats.verification_results = prior_verification_results
+            stats.placement_corrections = placement_corrections
+            stats.placement_warnings = placement_warnings
     return syllables, stats
