@@ -60,6 +60,35 @@ MIN_NOTE_DURATION_SEC = 0.06
 # _trim_attack's docstring for the short-note fallback that keeps this
 # from ever discarding a short note's only evidence.
 ATTACK_TRIM_SEC = 0.0
+# Alternative/complementary to ATTACK_TRIM_SEC: drop the bottom N% of a
+# note's own frames by CONFIDENCE (wherever they land) before computing
+# its final pitch, instead of a fixed leading time window. PROTOTYPE
+# (2026-08-07). Validated directly against Beauty and the Beast ground
+# truth (bypassing detect_notes/pass-1 entirely, to isolate this from
+# segmentation effects): RMVPE's raw exact-semitone match went 54% -> 59%
+# at the 50th percentile; going further (75th/90th) reversed the gain
+# (too few frames left). 0 = fully off (original behavior). NOT yet
+# validated at full-pipeline scale or on other songs as of this writing
+# -- see _confidence_floor_filter's docstring.
+CONFIDENCE_FLOOR_PERCENTILE = 0.0
+
+# Reconciles a protected_start (re-articulation) split's rounded pitch
+# with its immediate predecessor when they're near-contiguous and land
+# EXACTLY 1 semitone apart -- see _confidence_floor_filter's neighbor,
+# note_detection.py's inline comment at the reconciliation site, for the
+# full mechanism (a real bug found via RMVPE isolation-mode testing on
+# Stars, 2026-08-07: natural intra-note pitch drift straddling a
+# rounding boundary right where a genuine re-attack split landed, so the
+# two fragments independently round to adjacent semitones even though
+# the whole syllable is really one pitch). PROTOTYPE, off by default
+# until validated across multiple songs.
+REARTICULATION_RECONCILE_ENABLED = False
+# How close together (seconds) the two fragments' boundary must be to
+# reconcile -- deliberately much tighter than NOTE_MERGE_MAX_GAP_SEC so
+# this can never fire on the OTHER protected_start path (resuming after
+# a genuine silence gap at a strong onset), which by definition has a
+# real, non-trivial gap before it.
+REARTICULATION_RECONCILE_MAX_GAP_SEC = 0.02
 # A pitch change of at least this many semitones (on the SMOOTHED contour,
 # without a silence gap) is treated as a new note rather than vibrato.
 NOTE_SPLIT_SEMITONES = 1.0
@@ -238,6 +267,40 @@ TRAILING_ARTIFACT_MIN_PRECEDING_DURATION_SEC = 0.5  # the note being
                                             # trailed must itself be a
                                             # real sustained note, not
                                             # another short fragment.
+
+# Consensus-based pitch override (final pass-1 stage, after all other
+# segmentation/merge stages -- pitch only, never touches note timing).
+# Diagnosed on 4 validated songs (batb, stars, sleeping_beauty, gaston):
+# an ISOLATED per-note diagnostic (bypassing the real shipped pipeline --
+# comparing each of {pyin, rmvpe, swiftf0, penn}'s own note-level vote
+# directly to ground truth) found that unanimous agreement among
+# >= CONSENSUS_MIN_AGREEING_SOURCES of them is a reliable signal (61-70%
+# correct) while a vote among DISAGREEING sources is not (34-46%, worse
+# than trusting a single source) -- so this deliberately never resolves
+# disagreement via a vote, only overrides on unanimous agreement, leaving
+# the pipeline's own decision alone otherwise.
+#
+# REAL end-to-end validation (actual shipped pipeline -- pyin primary +
+# CREPE cross-check -- with this override applied on top, real audio, not
+# the isolated diagnostic above) told a different, MIXED story: batb -0.7,
+# stars -3.3 (a real regression on the song where the baseline pipeline
+# was already BEST, 61.5%), sleeping_beauty +2.8, gaston +2.8 -- net
+# average only +0.4pp, not the clean win the isolated diagnostic
+# suggested. Likely explanation: the override only fires where an
+# isolated-source vote disagrees with the CURRENT pipeline's answer, and
+# on a song where the base ensemble is already resolving things well
+# (stars), second-guessing it with a simpler vote (that doesn't have
+# access to the base pipeline's own smoothing/merge context) does more
+# harm than good; the benefit is concentrated on songs where the baseline
+# is already weak. Also adds real compute cost (+15-30s/song, loading
+# RMVPE/SwiftF0/PENN fresh every call). **OFF by default** -- same
+# category as CONFIDENCE_FLOOR_PERCENTILE/REARTICULATION_RECONCILE_ENABLED
+# above (mechanistically sound, doesn't generalize on real end-to-end
+# validation). See note_detection.py's _consensus_pitch_override and
+# project memory for the full validation writeup.
+CONSENSUS_OVERRIDE_ENABLED = False
+CONSENSUS_MIN_AGREEING_SOURCES = 2
+CONSENSUS_SOURCES = ("pyin", "rmvpe", "swiftf0", "penn")
 
 # Musical key-snapping (pass 2, inspired by the pitch-correction idea in
 # the ultrastar_pitch project): detect the song's most likely key from
