@@ -276,14 +276,27 @@ session's memory for that purpose.
 
 Discussed but not yet decided/implemented:
 
-1. **Essentia's MELODIA as a further pYIN/CREPE ensemble member or
-   replacement**: purpose-built polyphonic melody extraction
-   (`PredominantPitchMelodia`). Real architecture change (new heavy
-   dependency) — needs an explicit go-ahead before building.
-2. **MIDI database cross-checking**: considered and deprioritized — no
+1. **MIDI database cross-checking**: considered and deprioritized — no
    reliable, API-searchable public database of vocal MIDI transcriptions
    is known to exist; would mostly add fragile scraping for something
    that'd fail silently on most songs.
+
+Tried and abandoned:
+
+1. **Essentia's MELODIA** as a further pYIN/CREPE/RMVPE ensemble member
+   (purpose-built polyphonic melody extraction, `PredominantPitchMelodia`)
+   — given the go-ahead (2026-08-08), but **Essentia cannot be installed
+   on this Windows environment at all**: PyPI only publishes a source
+   distribution (no prebuilt wheel for any platform), and the source
+   build fails immediately (`IndexError` inside its own custom
+   `setup.py`) — Essentia's build system (waf, wrapping a large C++
+   dependency chain: FFTW, libsamplerate, TagLib, Chromaprint, etc.) has
+   never officially targeted Windows/MSVC. Not a transient/fixable
+   problem — would mean building the whole C++ library from source on a
+   toolchain the project doesn't support. Don't re-attempt a plain `pip
+   install essentia` in a future session expecting a different result;
+   revisiting this would need a real environment change (WSL/Docker) —
+   not attempted, bigger lift, needs its own explicit go-ahead.
 
 ## Environment notes
 
