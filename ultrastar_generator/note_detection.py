@@ -975,8 +975,23 @@ def detect_notes(
     pitch_primary: str = "pyin",  # "pyin" (default) or "rmvpe" -- which
                                    # source's own reading starts as
                                    # midi_raw/voiced_prob before any
-                                   # cross-check is applied. The OTHER
-                                   # source(s) (pYIN, CREPE if use_crepe,
+                                   # cross-check is applied. Briefly
+                                   # switched to "rmvpe" as the default
+                                   # (2026-08-09) on the strength of
+                                   # RMVPE being the best single ISOLATED
+                                   # raw source all session -- REVERTED
+                                   # the same day after real end-to-end
+                                   # validation (pyin+CREPE cross-checks,
+                                   # actual production pipeline, not
+                                   # isolation mode) showed it was a net
+                                   # REGRESSION (-3.3pp average across the
+                                   # 4-song set, losses on 3 of 4 songs,
+                                   # no gain on the 4th) -- see CLAUDE.md.
+                                   # Same lesson as the consensus-override
+                                   # finding earlier this session: an
+                                   # isolated diagnostic doesn't reliably
+                                   # predict real end-to-end impact.
+                                   # The OTHER source(s) (pYIN, CREPE if use_crepe,
                                    # RMVPE if use_rmvpe) are then applied
                                    # as cross-checks via _cross_check, in
                                    # a fixed order (CREPE, then RMVPE) --
@@ -996,6 +1011,22 @@ def detect_notes(
                                    # sweep fast path, see the isolation
                                    # branch's own comment for why/how this
                                    # differs from isolation_source.
+    extra_cross_check_sources: tuple = (),  # e.g. ("swiftf0", "penn") --
+                                   # additional PITCH_SOURCES members
+                                   # cross-checked against the current
+                                   # pitch the SAME way CREPE/RMVPE are
+                                   # (agree -> trust + confidence boost,
+                                   # disagree -> keep current pitch,
+                                   # downweight). Only that source's
+                                   # (midi, confidence) is used -- its own
+                                   # voicing decision is ignored, same as
+                                   # CREPE/RMVPE's cross-check role.
+                                   # EXPERIMENTAL (2026-08-09): for
+                                   # measuring whether SwiftF0/PENN are
+                                   # redundant with pyin/CREPE/RMVPE, not
+                                   # (yet) part of the shipped default --
+                                   # empty tuple is a no-op, existing
+                                   # behavior unchanged.
     verbose: bool = True,
     debug_log=None,
 ) -> List[NoteEvent]:
@@ -1182,6 +1213,27 @@ def detect_notes(
                 print(f"[pass1] RMVPE: {int(np.sum(comparable))} frame(s) comparable to current pitch, "
                       f"{int(np.sum(rmvpe_agree))} agreed (within {config.RMVPE_AGREEMENT_SEMITONES} semitone(s), "
                       f"RMVPE's pitch used), {int(np.sum(rmvpe_disagree))} disagreed (kept current pitch, downweighted)")
+
+        for src_name in extra_cross_check_sources:
+            try:
+                src_midi, src_conf, _src_voiced = PITCH_SOURCES[src_name](
+                    y, sr, hop_length, frame_length, fmin, fmax, len(times),
+                )
+                agreement_semitones = getattr(config, f"{src_name.upper()}_AGREEMENT_SEMITONES")
+                confidence_boost = getattr(config, f"{src_name.upper()}_AGREEMENT_CONFIDENCE_BOOST")
+                disagreement_scale = getattr(config, f"{src_name.upper()}_DISAGREEMENT_CONFIDENCE_SCALE")
+                midi_raw, voiced_prob, src_agree, src_disagree, comparable = _cross_check(
+                    midi_raw, voiced_prob, voiced, src_midi, src_conf,
+                    agreement_semitones, confidence_boost, disagreement_scale,
+                )
+                if verbose:
+                    print(f"[pass1] {src_name}: {int(np.sum(comparable))} frame(s) comparable to current pitch, "
+                          f"{int(np.sum(src_agree))} agreed (within {agreement_semitones} semitone(s), "
+                          f"{src_name}'s pitch used), {int(np.sum(src_disagree))} disagreed "
+                          f"(kept current pitch, downweighted)")
+            except Exception as e:
+                if verbose:
+                    print(f"[pass1] {src_name} cross-check failed ({e}); continuing without it.")
 
     if verbose:
         pyin_frac = float(np.mean(pyin_voiced)) if len(pyin_voiced) else 0.0

@@ -49,6 +49,14 @@ def enforce_monotonic(syllables: List[Syllable]) -> List[Syllable]:
             midi_note=syl.midi_note,
             is_word_start=syl.is_word_start,
             note_type=syl.note_type,
+            line_id=syl.line_id,  # was silently dropped here (defaulted
+                                    # to None on every call) before this
+                                    # fix -- found while threading
+                                    # confidence through the same
+                                    # reconstruction; unrelated to pass 4
+                                    # itself but a real bug worth fixing
+                                    # since it's the same line of code.
+            confidence=syl.confidence,
         ))
         prev_end = end
 

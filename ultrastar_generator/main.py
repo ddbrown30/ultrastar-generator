@@ -32,6 +32,7 @@ from .alignment import align_words
 from .key_correction import snap_to_key
 from .phrasing import build_lines
 from .lyrics_lookup import fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference, alignment_diff_summary
+from .musicxml_reference import apply_musicxml_references
 from .video_sync import estimate_videogap
 from .usdx_writer import write_song
 from .debug_output import write_pass1_debug_file, write_notes_debug_file
@@ -121,6 +122,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Only run enabled verification checks on words pass 3 flagged suspicious "
                          "(fallback words that got zero note pieces) instead of every "
                          "word -- faster, at the cost of catching fewer mistakes.")
+    p.add_argument("--musicxml-reference", default=None,
+                    help="Path to a MusicXML/.mxl file for this song (e.g. hand-downloaded sheet "
+                         "music) -- pass 4, off unless given. Aligns by lyric text against pass 3's "
+                         "output and corrects a syllable's PITCH CLASS (never octave, never timing) "
+                         "where they disagree, once a per-song calibration offset can be trusted "
+                         "(see config.MUSICXML_MIN_CALIBRATION_SAMPLES/_CONFIDENCE). No automatic "
+                         "fetch exists for this file -- see CLAUDE.md.")
+    p.add_argument("--musicxml-part", default=None,
+                    help="Hint: which part name in the MusicXML file carries the lead vocal line, "
+                         "for duet/ensemble arrangements where multiple parts have lyrics (e.g. a "
+                         "character's own name, if the arrangement labels parts that way). Falls "
+                         "back to the lyric-bearing part with the most notes if not given.")
     p.add_argument("--pitch-smooth-window", type=float, default=config.PITCH_SMOOTH_WINDOW_SEC,
                     help=f"Median-filter window (sec) for vibrato suppression before note "
                          f"segmentation (default: {config.PITCH_SMOOTH_WINDOW_SEC}). Raise this "
@@ -151,14 +164,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--spike-jump-semitones", type=float, default=config.SPIKE_MIN_JUMP_SEMITONES,
                     help=f"Minimum pitch jump (semitones) from both neighbors for a short note to "
                          f"be treated as a spike/glitch (default: {config.SPIKE_MIN_JUMP_SEMITONES})")
+    p.add_argument("--pitch-source", default=config.DEFAULT_PITCH_SOURCE, choices=["rmvpe", "ensemble"],
+                    help="Which pass-1 pitch source(s) to use (default: "
+                         f"{config.DEFAULT_PITCH_SOURCE!r}). 'rmvpe': RMVPE alone, its own voicing "
+                         "decision, no cross-check with any other source -- validated 2026-08-09 as "
+                         "a real, reproducible +1.7pp average improvement over the old ensemble "
+                         "default, and faster (no CREPE inference, no cross-check math). 'ensemble': "
+                         "the original pyin-primary + CREPE/RMVPE-cross-check architecture -- "
+                         "--no-crepe/--crepe-model only have any effect in this mode.")
     p.add_argument("--no-crepe", dest="use_crepe", action="store_false", default=config.ENABLE_CREPE,
-                    help="Don't cross-check pYIN against CREPE (torchcrepe) per-frame (default: "
-                         "cross-check is on). Where they agree, CREPE's pitch is used (generally more "
-                         "robust against accompaniment bleed); where they disagree, pYIN's pitch is "
-                         "kept but downweighted rather than discarded.")
+                    help="(--pitch-source ensemble only) Don't cross-check pYIN against CREPE "
+                         "(torchcrepe) per-frame (default: cross-check is on). Where they agree, "
+                         "CREPE's pitch is used (generally more robust against accompaniment bleed); "
+                         "where they disagree, pYIN's pitch is kept but downweighted rather than "
+                         "discarded.")
     p.add_argument("--crepe-model", default=config.DEFAULT_CREPE_MODEL, choices=["full", "tiny"],
-                    help=f"torchcrepe model size -- 'full' is more accurate, 'tiny' is much faster "
-                         f"(default: {config.DEFAULT_CREPE_MODEL})")
+                    help=f"(--pitch-source ensemble only) torchcrepe model size -- 'full' is more "
+                         f"accurate, 'tiny' is much faster (default: {config.DEFAULT_CREPE_MODEL})")
     p.add_argument("--no-pass1-debug", action="store_true",
                     help="Don't write the '[PASS1 DEBUG]' .txt (pass-1 notes only, no lyrics) "
                          "that's written by default alongside the real output -- load it in the "
@@ -253,6 +275,9 @@ def run(argv=None) -> int:
         print(f"Found cover: {companions.cover.name}")
     if companions.background:
         print(f"Found background: {companions.background.name}")
+    if companions.musicxml and not args.musicxml_reference:
+        names = ", ".join(p.name for p in companions.musicxml)
+        print(f"Found MusicXML reference file(s) for pass 4: {names}")
 
     # --- 2. Vocal isolation --------------------------------------------------
     if args.skip_separation:
@@ -280,6 +305,7 @@ def run(argv=None) -> int:
     print("Pass 1: detecting notes from audio (pitch + timing only)...")
     notes = detect_notes(
         y, sr, bpm=bpm,
+        isolation_source="rmvpe" if args.pitch_source == "rmvpe" else None,
         smooth_window_sec=args.pitch_smooth_window,
         pitch_jump_semitones=args.note_split_semitones,
         min_note_beats_fraction=args.min_note_beat_fraction,
@@ -390,6 +416,28 @@ def run(argv=None) -> int:
         print(f"    placement check: {len(stats.placement_warnings)} word(s) flagged -- the audio at "
               f"their FINAL note-assigned position doesn't say the expected word (see [placement] lines "
               f"above); these were NOT corrected automatically and are worth checking by hand")
+
+    # --- 7b. PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s).
+    # An explicit --musicxml-reference always wins; otherwise falls back to
+    # whatever file_discovery.find_companions auto-detected in the song's
+    # own folder (may be zero, one, or several -- all of them are tried).
+    mxl_paths = [args.musicxml_reference] if args.musicxml_reference else [str(p) for p in companions.musicxml]
+    if mxl_paths:
+        print(f"Pass 4: cross-checking pitch against {len(mxl_paths)} MusicXML reference file(s)...")
+        syllables, mxl_stats_list = apply_musicxml_references(
+            syllables, mxl_paths, preferred_part_name=args.musicxml_part,
+            verbose=not args.quiet, debug_log=debug_log,
+        )
+        for path, mxl_stats in zip(mxl_paths, mxl_stats_list):
+            label = Path(path).name
+            if mxl_stats.skipped_reason:
+                print(f"  {label}: skipped -- {mxl_stats.skipped_reason}")
+            else:
+                print(f"  {label}: parts used: {mxl_stats.part_names_used}, {mxl_stats.n_matched}/"
+                      f"{mxl_stats.n_comparable_syllables} syllables matched by lyric text, "
+                      f"calibration offset {mxl_stats.calibration_offset:+d} semitones "
+                      f"({mxl_stats.calibration_confidence:.0%} agreement), "
+                      f"{len(mxl_stats.corrections)} syllable(s) corrected")
 
     entries = build_lines(syllables)
 

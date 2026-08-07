@@ -46,6 +46,7 @@ def notes_to_debug_entries(notes: List[NoteEvent], line_gap_sec: float = None) -
             is_word_start=True,
             note_type=(config.NOTE_GOLDEN if (note.end - note.start) >= config.GOLDEN_NOTE_MIN_DURATION_SEC
                        else config.NOTE_NORMAL),
+            confidence=note.confidence,
         ))
         prev_end = note.end
     return entries

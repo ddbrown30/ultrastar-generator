@@ -12,9 +12,9 @@ Rules implemented (per the user's spec):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from . import config
 
@@ -24,6 +24,14 @@ class Companions:
     video: Optional[Path] = None
     cover: Optional[Path] = None
     background: Optional[Path] = None
+    musicxml: List[Path] = field(default_factory=list)  # .mxl/.musicxml/.xml
+                                    # reference files for pass 4 -- unlike
+                                    # video/cover, these are matched by
+                                    # EXTENSION ALONE, not basename: a
+                                    # downloaded MuseScore file keeps
+                                    # whatever name the source gave it
+                                    # (e.g. "beauty-and-the-beast.mxl"),
+                                    # never "<Artist> - <Title>.mxl".
 
 
 def _same_base(candidate: Path, base_stem: str) -> bool:
@@ -77,6 +85,12 @@ def find_companions(audio_path: Path) -> Companions:
         # first for both and let the user know at the call site.
         result.cover = images[0]
         result.background = images[0]
+
+    # --- MusicXML reference (pass 4) --------------------------------------
+    result.musicxml = sorted(
+        (p for p in candidates if p.suffix.lower() in (".mxl", ".musicxml", ".xml")),
+        key=lambda p: p.name.lower(),  # deterministic order across runs
+    )
 
     return result
 

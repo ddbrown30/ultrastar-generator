@@ -293,17 +293,21 @@ def _note_type_for(duration: float) -> str:
     return config.NOTE_GOLDEN if duration >= config.GOLDEN_NOTE_MIN_DURATION_SEC else config.NOTE_NORMAL
 
 
-def _nearest_note_pitch(word: Word, all_notes: List[NoteEvent]) -> Optional[int]:
+def _nearest_note_pitch(word: Word, all_notes: List[NoteEvent]) -> Optional[Tuple[int, float]]:
     """Finds the pass-1 note nearest in time to this word (by distance
     from the word's midpoint to the note's start or end, whichever is
-    closer) and returns its pitch. Used for the fallback path so an
-    unmatched word borrows already-verified pitch information instead of
-    a fresh, isolated re-analysis of its own (often very short) clip."""
+    closer) and returns (pitch, confidence). Used for the fallback path
+    so an unmatched word borrows already-verified pitch information
+    instead of a fresh, isolated re-analysis of its own (often very
+    short) clip -- the borrowed note's own confidence comes along too,
+    since a borrowed value is inherently less certain than a directly
+    matched one and callers (musicxml_reference.py) should be able to
+    tell the difference."""
     if not all_notes:
         return None
     mid = (word.start + word.end) / 2.0
     nearest = min(all_notes, key=lambda n: min(abs(mid - n.start), abs(mid - n.end)))
-    return nearest.pitch
+    return nearest.pitch, nearest.confidence
 
 
 def _chunk_syllables(parts: List[str], n_chunks: int) -> List[str]:
@@ -337,20 +341,21 @@ def _syllables_for_word(word: Word, notes: List[NoteEvent], all_notes: List[Note
         # source of bad notes in practice.
         stats.words_with_fallback += 1
         stats.fallback_words.append(f'"{word.text}" @ {word.start:.2f}s')
-        neighbor_pitch = _nearest_note_pitch(word, all_notes)
-        if neighbor_pitch is not None:
+        neighbor = _nearest_note_pitch(word, all_notes)
+        if neighbor is not None:
             stats.fallback_used_neighbor += 1
-            pitch = neighbor_pitch
+            pitch, confidence = neighbor
         else:
             stats.fallback_used_fresh_analysis += 1
             hz = median_pitch_in_span(y, sr, word.start, word.end)
             pitch = hz_to_ultrastar_pitch(hz) if hz else 0
+            confidence = 0.0  # no real pass-1 evidence at all -- the least reliable case
         end = max(word.end, word.start + config.MIN_NOTE_DURATION_SEC)
         return [Syllable(
             text=word.text, start=word.start, end=end,
             midi_note=pitch, is_word_start=True,
             note_type=_note_type_for(end - word.start),
-            line_id=word.line_id,
+            line_id=word.line_id, confidence=confidence,
         )]
 
     stats.words_with_notes += 1
@@ -380,6 +385,7 @@ def _syllables_for_word(word: Word, notes: List[NoteEvent], all_notes: List[Note
             is_word_start=(i == 0),
             note_type=_note_type_for(note.end - note.start),
             line_id=word.line_id,
+            confidence=note.confidence,
         ))
     return out
 

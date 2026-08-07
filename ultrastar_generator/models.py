@@ -46,6 +46,18 @@ class Syllable:
     line_id: Optional[int] = None  # propagated from the owning Word; used
                                      # by phrasing.py to force a line break
                                      # exactly where the reference lyrics do.
+    confidence: float = 1.0  # propagated from the owning pass-1 NoteEvent's
+                               # own confidence where one exists (matched
+                               # words); used by musicxml_reference.py to
+                               # weight which syllables are trustworthy
+                               # enough to anchor a per-song pitch-class
+                               # calibration. 1.0 default (rather than 0.0)
+                               # for any construction site that doesn't
+                               # have a real value to report, so an absent
+                               # value reads as "fully trusted", not
+                               # "known bad" -- fine since only
+                               # musicxml_reference.py's OPTIONAL pass 4
+                               # currently reads this field at all.
 
 
 @dataclass

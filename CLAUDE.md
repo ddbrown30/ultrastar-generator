@@ -196,6 +196,165 @@ violated:
 
 Done:
 
+0. **New optional pass 4 (`musicxml_reference.py`): confirms/corrects
+   pass-3 syllable PITCH CLASS (never octave, never timing) against a
+   user-supplied MusicXML/.mxl file** -- e.g. sheet music hand-downloaded
+   from MuseScore (`--musicxml-reference <path>`, off unless given --
+   MuseScore's own free download path was found to be actively blocked
+   platform-side, see the MELODIA/Essentia thread below for the
+   unrelated dependency story; this feature works from a file the user
+   downloads themselves through the normal UI, no automated fetch).
+   Aligns by lyric text (same whole-sequence `difflib` technique
+   `lyrics_lookup.py` already uses), calibrates a per-song PITCH-CLASS
+   offset (absorbs both real transpositions, e.g. +2/+5 semitones, and
+   octave-notation inconsistency between different arrangements/parts of
+   the same song -- confirmed on real files), then corrects any matched
+   syllable that still disagrees once calibrated. Deliberately never
+   touches absolute octave (sheet-music octave notation was found
+   internally inconsistent even within one calibrated file) or timing --
+   matches how UltraStar Deluxe itself scores (pitch class, octave-
+   agnostic, confirmed by the user).
+
+   Calibration is TWO-TIERED: try the full matched population first
+   (works fine for most songs); if that doesn't clear a majority bar,
+   retry using only the top half by OUR OWN note confidence, with a
+   correspondingly lower bar -- a noisy upstream detector dilutes the
+   full-population signal with matches where our own pitch is simply
+   wrong, not real per-song ambiguity, and restricting to higher-
+   confidence matches cleans that up without changing the winning
+   answer. `Syllable` gained a `confidence` field (didn't exist before --
+   pass 1's `NoteEvent.confidence` was being silently dropped by the time
+   pass 3 built its output) to make this possible; threaded through every
+   `Syllable` construction site. Found and fixed a related, unrelated
+   pre-existing bug in the same pass: `postprocess.enforce_monotonic` was
+   silently dropping `line_id` on every call (defaulting to `None`),
+   which could have been quietly breaking reference-line-forced phrasing
+   breaks -- not confirmed how much real impact this had before the fix,
+   worth watching for if a phrasing regression is ever reported.
+
+   **Real end-to-end validation** (realistic proxy pass-3 input --
+   pyin's own weighted-mode pitch per ground-truth word, not clean
+   ground truth -- run through the actual `apply_musicxml_reference`
+   code path, compared before/after against each song's established
+   ground truth): batb 59.0%->96.4% (+37.4pp), stars 57.1%->87.9%
+   (+30.8pp), Bare Necessities 48.0%->62.9% (+14.9pp), Gaston
+   41.1%->90.0% (+48.9pp, the largest of the four -- the two-tier
+   calibration fix specifically targeted Gaston, previously the
+   session's consistently worst-performing song, and it ended up
+   benefiting the most). No regression on the 3 songs that already
+   calibrated fine on the full population -- the confidence-tiered
+   fallback only ever activates when the primary check fails.
+0a. **Auto-detection of MusicXML reference file(s) for pass 4**
+   (2026-08-09, same day as pass 4 itself): `file_discovery.
+   find_companions` now also finds `.mxl`/`.musicxml`/`.xml` files next
+   to the audio, matched by EXTENSION ALONE (unlike video/cover, which
+   match the audio file's own basename -- a downloaded score keeps
+   whatever name its source gave it, e.g. `beauty-and-the-beast.mxl`,
+   never `<Artist> - <Title>.mxl`). `--musicxml-reference` still wins if
+   given explicitly; otherwise every auto-detected file is used. If
+   MULTIPLE reference files are found (or given -- not yet exposed as a
+   multi-value CLI flag, only via auto-detection), ALL of them are
+   applied SEQUENTIALLY (`apply_musicxml_references`, plural) --
+   different arrangements of the same song often lyric-tag different,
+   only partly-overlapping portions of it (confirmed on Once Upon A
+   Dream: one file covered 52.6%, a different arrangement covered a
+   different 25.1%), so using only one leaves real coverage the other
+   file has on the table. Each file gets its own independent
+   calibration; one that can't establish confident calibration is
+   skipped on its own without blocking the others.
+0b. **RMVPE default switch: tried, then REVERTED the same day
+   (2026-08-09) after real end-to-end validation.** `pitch_primary`
+   was switched from `"pyin"` to `"rmvpe"` (with `ENABLE_RMVPE = True`
+   so pyin/CREPE still cross-check it) on the strength of RMVPE being
+   the best single ISOLATED raw pitch source across the whole validated
+   song set all session. Real end-to-end validation (actual production
+   pipeline -- pyin+CREPE cross-checks either way, not isolation mode --
+   across the 4-song core set) showed this was a net REGRESSION, not an
+   improvement: batb 55.0%->55.0% (flat), stars 59.3%->52.7% (-6.6pp),
+   sleeping_beauty 49.3%->44.1% (-5.2pp), gaston 37.6%->36.1% (-1.5pp);
+   average -3.3pp, no gain on any song. **Both `pitch_primary` and
+   `ENABLE_RMVPE` were reverted back to their original pyin-primary
+   defaults the same day** -- see their own comments in
+   `note_detection.py`/`config.py`. Same lesson as the consensus-override
+   finding earlier this session, now confirmed a second time on a bigger
+   decision: an isolated/proxy diagnostic (RMVPE's raw isolation-mode
+   accuracy) does NOT reliably predict real end-to-end pipeline impact,
+   because it can't see how the existing pipeline (segmentation
+   thresholds, cross-check agreement/disagreement scaling) was tuned
+   around a DIFFERENT source's noise characteristics over many prior
+   sessions. **Don't re-attempt this switch on the strength of isolation
+   numbers alone in a future session** -- that reasoning has now failed
+   real validation twice in different forms (RMVPE's own segmentation
+   retuning earlier this session hit a low ceiling for the same
+   underlying reason). A real case for switching would need its own
+   fresh end-to-end validation, not a re-read of the isolation-mode
+   comparison table.
+0c. **Follow-up controlled comparison (same day): confirmed cross-checking
+   itself was the cause of 0b's regression, but also found the isolation-
+   mode numbers were never a clean single-variable comparison to begin
+   with.** Ran RMVPE-primary with cross-checking fully disabled
+   (`cross_check_primary=False, use_crepe=False`), holding VOICING SOURCE
+   constant (pyin's own voiced_flag + energy gate, same as both the
+   pyin-primary baseline and the reverted rmvpe+crosscheck config -- NOT
+   RMVPE's own voicing, which isolation mode uses instead). Real
+   end-to-end results, same 4-song set:
+
+   | Config | batb | stars | sleeping_beauty | gaston | Average |
+   |---|---|---|---|---|---|
+   | pyin-primary (current default) | 55.0% | 59.3% | 49.3% | 37.6% | 50.3% |
+   | rmvpe+crosscheck (0b, reverted) | 55.0% | 52.7% | 44.1% | 36.1% | 47.0% |
+   | rmvpe, NO crosscheck (pyin voicing) | 59.3% | 56.0% | 48.8% | 37.9% | 50.5% |
+   | isolation rmvpe alone (RMVPE's own voicing) | 58.0% | 57.0% | 50.0% | 43.0% | 52.0% |
+
+   Removing cross-check alone recovers +3.5pp (47.0%->50.5%) -- confirms
+   the mechanism: cross-check disagreement never overrides the primary's
+   pitch VALUE, only downweights confidence, but once RMVPE (the more
+   accurate source) is primary, pyin/CREPE disagreeing with it is more
+   often THEM being wrong, not RMVPE -- so the downweighting fires
+   backwards, suppressing RMVPE's own correct frames' influence on the
+   confidence-weighted per-note vote. BUT: "RMVPE primary, no cross-check,
+   pyin's voicing" (50.5%) only ties the current shipped default (50.3%,
+   pyin-primary) -- not a real win either way. The gap between that and
+   isolation mode's 52.0% comes from a THIRD variable never isolated
+   before now: RMVPE's OWN voicing decision, not just its pitch values.
+   **Not yet validated as a real shipped config**: actually shipping
+   `isolation_source="rmvpe"` (RMVPE's own voicing, no cross-check at
+   all) as the default, rather than as a research/testing-only mode --
+   the one remaining real candidate with a plausible (if modest, +1.7pp)
+   edge, not yet tested end-to-end as an actual default. If picked back
+   up, that's the next concrete step, not another isolation-vs-shipped
+   comparison -- this one's already been run.
+0d. **Fresh, real, REPRODUCIBLE validation of `isolation_source="rmvpe"`
+   as an actual default (same day): a genuine positive result, unlike
+   everything else tried in this whole RMVPE-default thread.** Run twice
+   per song specifically to check RMVPE's own documented non-determinism
+   (see "Lessons learned" above) -- both runs were IDENTICAL (0.0pp
+   spread, same note counts, every song), so this result isn't noise:
+
+   | Song | pyin-primary (today) | rmvpe-isolation (both runs) | Delta |
+   |---|---|---|---|
+   | batb | 55.0% | 57.9% | +2.9pp |
+   | stars | 59.3% | 57.1% | -2.2pp |
+   | sleeping_beauty | 49.3% | 50.2% | +0.9pp |
+   | gaston | 37.6% | 42.8% | +5.2pp |
+   | **Average** | **50.3%** | **52.0%** | **+1.7pp** |
+
+   Wins on 3 of 4 songs (gaston most, +5.2pp), loses only on stars
+   (-2.2pp, consistent with the "no universal winner" pattern seen all
+   session for every source). Bigger and more reproducible than the
+   smaller gains already rejected as not worth pursuing this session
+   (RMVPE's own segmentation retuning +0.8pp, its voicing-threshold
+   tuning +0.9pp) -- and unlike those, this SIMPLIFIES the pipeline
+   rather than adding a new tuned constant: no CREPE computation, no
+   cross-check logic at all when this path is used, and noticeably
+   faster (19-26s/song here vs. 111-213s for the cross-check-heavy
+   configs tested earlier in this thread). **Presented to the user for
+   an explicit go-ahead before flipping the shipped default** (a
+   foundational pipeline decision, and the earlier attempt in this same
+   thread had to be reverted after being flipped without waiting for
+   full validation) -- decision not yet made as of this writing; if
+   picked back up, check whether the user actually approved the switch
+   before assuming this is the new default.
 1. **`key_correction.py` now uses `music21`** (its implementation of
    Krumhansl-Schmuckler key-finding) instead of the hand-rolled
    diatonic-scale-coverage heuristic, and is now **ON by default**
@@ -273,30 +432,6 @@ Misérables - Stars.ogg` before being reported as done, not just
 `test_dry_run.py` — the "Stars" reference notes (opening 6 notes, and
 the full "fall as Lucifer fell...sword" section) are saved in this
 session's memory for that purpose.
-
-Discussed but not yet decided/implemented:
-
-1. **MIDI database cross-checking**: considered and deprioritized — no
-   reliable, API-searchable public database of vocal MIDI transcriptions
-   is known to exist; would mostly add fragile scraping for something
-   that'd fail silently on most songs.
-
-Tried and abandoned:
-
-1. **Essentia's MELODIA** as a further pYIN/CREPE/RMVPE ensemble member
-   (purpose-built polyphonic melody extraction, `PredominantPitchMelodia`)
-   — given the go-ahead (2026-08-08), but **Essentia cannot be installed
-   on this Windows environment at all**: PyPI only publishes a source
-   distribution (no prebuilt wheel for any platform), and the source
-   build fails immediately (`IndexError` inside its own custom
-   `setup.py`) — Essentia's build system (waf, wrapping a large C++
-   dependency chain: FFTW, libsamplerate, TagLib, Chromaprint, etc.) has
-   never officially targeted Windows/MSVC. Not a transient/fixable
-   problem — would mean building the whole C++ library from source on a
-   toolchain the project doesn't support. Don't re-attempt a plain `pip
-   install essentia` in a future session expecting a different result;
-   revisiting this would need a real environment change (WSL/Docker) —
-   not attempted, bigger lift, needs its own explicit go-ahead.
 
 ## Environment notes
 

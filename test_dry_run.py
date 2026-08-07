@@ -33,6 +33,18 @@ assert comp.cover and "[CO]" in comp.cover.name
 assert comp.background and "[BG]" in comp.background.name
 print("OK:", artist, title, comp)
 
+print("\n--- file_discovery: MusicXML reference files matched by EXTENSION, not basename "
+      "(unlike video/cover -- a downloaded score keeps its own source filename) ---")
+mxl_a = audio.parent / "some-random-arrangement-name.mxl"
+mxl_b = audio.parent / "another-arrangement.musicxml"
+for p in (mxl_a, mxl_b):
+    if not p.exists():
+        p.write_text("<!-- placeholder for file-discovery test, not real MusicXML -->", encoding="utf-8")
+comp2 = find_companions(audio)
+assert [p.name for p in comp2.musicxml] == sorted([mxl_a.name, mxl_b.name], key=str.lower), comp2.musicxml
+print("OK: both differently-named reference files found, sorted deterministically:",
+      [p.name for p in comp2.musicxml])
+
 print("\n--- tempo math vs. real reference files ---")
 assert abs(beat_duration_ms(300) - 50.0) < 1e-6
 assert seconds_to_beat(23.0, 23000, 300) == 0
@@ -1051,6 +1063,120 @@ print("OK: a genuinely unfindable word stayed a warning, word list left untouche
 del _sys.modules["whisperx"]
 verification_mod.model_cache.reset()
 
+print("\n--- musicxml_reference.apply_musicxml_reference: calibrates at the PITCH-CLASS level "
+      "(absorbs a per-song transposition) and corrects only where confident ---")
+import tempfile as _tempfile
+from ultrastar_generator.musicxml_reference import apply_musicxml_reference
+
+_PC_TO_STEP_ALTER = [
+    ("C", 0), ("C", 1), ("D", 0), ("D", 1), ("E", 0), ("F", 0),
+    ("F", 1), ("G", 0), ("G", 1), ("A", 0), ("A", 1), ("B", 0),
+]
+
+def _make_mxl(words_midi, path):
+    notes_xml = ""
+    for text, midi in words_midi:
+        step, alter = _PC_TO_STEP_ALTER[midi % 12]
+        octave = midi // 12 - 1
+        alter_xml = f"<alter>{alter}</alter>" if alter else ""
+        notes_xml += (
+            f'<note><pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch>'
+            f'<duration>4</duration><type>quarter</type>'
+            f'<lyric><syllabic>single</syllabic><text>{text}</text></lyric></note>'
+        )
+    xml = (
+        '<?xml version="1.0"?><score-partwise version="3.1">'
+        '<part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>'
+        f'<part id="P1"><measure number="1">{notes_xml}</measure></part></score-partwise>'
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml)
+
+# Our own detection has these 6 words a semitone flat of the "true" pitch
+# a MusicXML reference (transposed up 3 semitones from OUR octave/key
+# convention) would show -- calibration should land on pitch-class +3,
+# and correct the one word ("qux") that's off by more than just the
+# transposition.
+our_syllables = [
+    Syllable(text="foo", start=0.0, end=0.5, midi_note=0, is_word_start=True),   # 60 abs
+    Syllable(text="bar", start=0.5, end=1.0, midi_note=2, is_word_start=True),   # 62 abs
+    Syllable(text="baz", start=1.0, end=1.5, midi_note=4, is_word_start=True),   # 64 abs
+    Syllable(text="qux", start=1.5, end=2.0, midi_note=5, is_word_start=True),   # 65 abs -- will be WRONG
+    Syllable(text="quux", start=2.0, end=2.5, midi_note=7, is_word_start=True),  # 67 abs
+    Syllable(text="corge", start=2.5, end=3.0, midi_note=9, is_word_start=True), # 69 abs
+]
+# MXL: same words, all transposed +3 from our octave/key EXCEPT "qux",
+# which disagrees with our pitch by a real (non-calibration) error too.
+mxl_words_midi = [
+    ("foo", 63), ("bar", 65), ("baz", 67), ("qux", 70), ("quux", 70), ("corge", 72),
+]
+with _tempfile.TemporaryDirectory() as tmpdir:
+    mxl_path = f"{tmpdir}/fake_song.musicxml"
+    _make_mxl(mxl_words_midi, mxl_path)
+    corrected, mxl_stats = apply_musicxml_reference(
+        our_syllables, mxl_path, min_calibration_samples=4, verbose=True,
+    )
+    assert mxl_stats.skipped_reason is None, mxl_stats.skipped_reason
+    assert mxl_stats.calibration_offset == 3, mxl_stats.calibration_offset
+    corrected_texts = {c.text for c in mxl_stats.corrections}
+    assert corrected_texts == {"qux"}, corrected_texts
+    # qux: our_pc=(65+60)%12=5, target_pc=(70-3)%12=7 -> diff=+2 -> new=65+2=67
+    assert corrected[3].midi_note == 7, corrected[3]
+    # everything else (already correct once transposition is accounted for) untouched
+    for i in (0, 1, 2, 4, 5):
+        assert corrected[i].midi_note == our_syllables[i].midi_note, (i, corrected[i])
+    print("OK: calibrated to +3 semitones (pitch-class) and corrected only the genuinely "
+          "wrong word, leaving already-correct-after-calibration words untouched:",
+          [(c.text, c.old_pitch, c.new_pitch) for c in mxl_stats.corrections])
+
+    # --- too few matches: should skip, not guess ---
+    _, few_stats = apply_musicxml_reference(
+        our_syllables[:2], mxl_path, min_calibration_samples=4, verbose=False,
+    )
+    assert few_stats.skipped_reason is not None
+    assert few_stats.corrections == []
+    print("OK: too few matched notes correctly skipped calibration:", few_stats.skipped_reason)
+
+print("\n--- musicxml_reference.apply_musicxml_references (plural): applies multiple reference "
+      "files SEQUENTIALLY so coverage accumulates across files with different, only partly "
+      "overlapping lyric coverage -- real case: Once Upon A Dream, two arrangements covering "
+      "different fractions of the song ---")
+from ultrastar_generator.musicxml_reference import apply_musicxml_references
+
+multi_syllables = [
+    Syllable(text="alpha", start=0.0, end=0.5, midi_note=0, is_word_start=True),    # 60
+    Syllable(text="bravo", start=0.5, end=1.0, midi_note=2, is_word_start=True),    # 62
+    Syllable(text="charlie", start=1.0, end=1.5, midi_note=6, is_word_start=True),  # 66 -- WRONG (should be 64)
+    Syllable(text="delta", start=1.5, end=2.0, midi_note=5, is_word_start=True),    # 65
+    Syllable(text="echo", start=2.0, end=2.5, midi_note=7, is_word_start=True),     # 67
+    Syllable(text="foxtrot", start=2.5, end=3.0, midi_note=6, is_word_start=True),  # 66 -- WRONG (should be 69)
+    Syllable(text="golf", start=3.0, end=3.5, midi_note=11, is_word_start=True),    # 71
+]
+with _tempfile.TemporaryDirectory() as tmpdir2:
+    # File 1 covers only the first 4 words, transposed +3.
+    path1 = f"{tmpdir2}/arrangement_one.musicxml"
+    _make_mxl([("alpha", 63), ("bravo", 65), ("charlie", 67), ("delta", 68)], path1)
+    # File 2 covers only the LAST 3 words (no overlap with file 1), transposed +5.
+    path2 = f"{tmpdir2}/arrangement_two.musicxml"
+    _make_mxl([("echo", 72), ("foxtrot", 74), ("golf", 76)], path2)
+
+    corrected2, stats_list = apply_musicxml_references(
+        multi_syllables, [path1, path2], min_calibration_samples=3, verbose=False,
+    )
+    assert len(stats_list) == 2, stats_list
+    assert stats_list[0].calibration_offset == 3, stats_list[0].calibration_offset
+    assert stats_list[1].calibration_offset == 5, stats_list[1].calibration_offset
+    corrected_texts = {c.text for s in stats_list for c in s.corrections}
+    assert corrected_texts == {"charlie", "foxtrot"}, corrected_texts
+    # charlie: our_pc=(66+60)%12=6, target_pc=(67-3)%12=4 -> diff=-2 -> new=66-2=64
+    assert corrected2[2].midi_note == 4, corrected2[2]
+    # foxtrot: our_pc=(66+60)%12=6, target_pc=(74-5)%12=9 -> diff=+3 -> new=66+3=69
+    assert corrected2[5].midi_note == 9, corrected2[5]
+    for i in (0, 1, 3, 4, 6):
+        assert corrected2[i].midi_note == multi_syllables[i].midi_note, (i, corrected2[i])
+    print("OK: two non-overlapping reference files each calibrated independently and corrected "
+          "only their own genuinely-wrong word, coverage accumulating across both files:",
+          [(c.text, c.old_pitch, c.new_pitch) for s in stats_list for c in s.corrections])
 
 
 

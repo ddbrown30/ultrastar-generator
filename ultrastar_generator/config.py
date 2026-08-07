@@ -193,13 +193,43 @@ CREPE_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
 # (see CREPE_* above and _cross_check's docstring): agreement within
 # RMVPE_AGREEMENT_SEMITONES trusts RMVPE's pitch with a confidence boost;
 # disagreement keeps the current pitch but downweights it. Never marks a
-# frame unvoiced, for the same reason as CREPE. PROTOTYPE (2026-08-07,
-# not yet validated at full-pipeline scale) -- off by default until a
-# real-audio validation run confirms it's a net improvement; see
-# `pitch_primary` in note_detection.detect_notes() for swapping RMVPE in
-# as the PRIMARY source (pYIN becomes the cross-check) instead of a third
-# member alongside pYIN-primary.
+# frame unvoiced, for the same reason as CREPE.
+#
+# OFF by default. Briefly switched on (2026-08-09) alongside
+# `pitch_primary="rmvpe"` on the strength of RMVPE being the best single
+# ISOLATED raw source all session -- REVERTED the same day after real
+# end-to-end validation (actual production pipeline, not isolation mode)
+# showed the switch was a net REGRESSION (-3.3pp average across the
+# 4-song set, losses on 3 of 4 songs, no gain on the 4th). See CLAUDE.md
+# for the full numbers and `pitch_primary`'s own comment in
+# note_detection.detect_notes(). Don't re-flip this back to True in a
+# future session on the strength of isolation-mode numbers alone --
+# that's exactly the reasoning that was already tried and disproven here.
 ENABLE_RMVPE = False
+
+# main.py's real pipeline default for WHICH pitch source(s) pass 1 uses --
+# "rmvpe" (isolation_source="rmvpe": RMVPE alone, its own voicing
+# decision, zero cross-check with any other source) or "ensemble"
+# (the original pyin-primary + CREPE/RMVPE-as-cross-check architecture,
+# `isolation_source=None`, `--no-crepe`/`--crepe-model` apply). Switched
+# to "rmvpe" 2026-08-09 after real end-to-end validation, run TWICE per
+# song specifically to rule out RMVPE's own documented non-determinism
+# (both runs were IDENTICAL): +1.7pp average across the 4-song set
+# (wins on 3 of 4 songs, loses only on stars), and simpler/faster than
+# the ensemble (no CREPE, no cross-check math) -- see CLAUDE.md item 0d
+# for the full numbers and the two REJECTED attempts that came before
+# this one (plain pitch_primary="rmvpe" with the ensemble's cross-checks
+# still attached was a real regression; disabling just the cross-check
+# while keeping pyin's own voicing was only a wash -- RMVPE's OWN voicing
+# decision, only present in true isolation, turned out to be where the
+# actual advantage lives). NOT the same as `detect_notes()`'s own
+# `isolation_source` parameter default, which stays `None` on purpose --
+# changing THAT would silently change behavior for test_dry_run.py and
+# every validation script from this whole session that calls
+# detect_notes() directly without passing isolation_source; this constant
+# only drives main.py's real CLI pipeline call site.
+DEFAULT_PITCH_SOURCE = "rmvpe"
+
 RMVPE_DEVICE = "cpu"  # onnxruntime CUDA build requires CUDA 13 + cuDNN 9,
                        # incompatible with this project's torch cu126
                        # stack; DirectML crashed/hung with garbled UTF-16
@@ -210,6 +240,21 @@ RMVPE_DEVICE = "cpu"  # onnxruntime CUDA build requires CUDA 13 + cuDNN 9,
 RMVPE_AGREEMENT_SEMITONES = 1.0
 RMVPE_AGREEMENT_CONFIDENCE_BOOST = 1.5
 RMVPE_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
+
+# SwiftF0/PENN cross-check tuning (2026-08-09, for the "how much of the
+# pyin/CREPE/RMVPE/SwiftF0/PENN ensemble is actually pulling its weight"
+# experiment -- see note_detection.detect_notes()'s `extra_cross_check_
+# sources` param). Mirrors CREPE/RMVPE's own values exactly -- no
+# evidence yet to justify different per-source tuning, and tuning these
+# separately would be its own, much bigger undertaking not attempted
+# here; this experiment is about WHICH sources to keep, not how to tune
+# the ones that stay.
+SWIFTF0_AGREEMENT_SEMITONES = 1.0
+SWIFTF0_AGREEMENT_CONFIDENCE_BOOST = 1.5
+SWIFTF0_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
+PENN_AGREEMENT_SEMITONES = 1.0
+PENN_AGREEMENT_CONFIDENCE_BOOST = 1.5
+PENN_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
 
 # A frame this many dB quieter than the track's own "loud" reference level
 # (the 90th percentile of RMS energy, not the absolute peak, so one loud
@@ -442,6 +487,51 @@ PLACEMENT_SEARCH_MAX_RADIUS_SEC = 10.0
 # and this shouldn't cry wolf over sub-second imprecision, only real
 # multi-beat placement errors.
 PLACEMENT_MISMATCH_TOLERANCE_SEC = 1.0
+
+# Pass 4 (optional, musicxml_reference.py): confirms/corrects pass-3
+# syllable PITCH CLASS (never octave, never timing) against a
+# user-supplied MusicXML file -- e.g. hand-downloaded sheet music for the
+# same song. No automatic fetch exists (see CLAUDE.md's "MuseScore
+# reference data" section for why: MuseScore's own free/automated
+# download path was found to be actively blocked by the platform as of
+# 2026-08, and no reliable alternative source was found either) -- this
+# only ever runs when --musicxml-reference points at a real file.
+#
+# Real validation (2026-08-08, several already-validated songs, manually
+# downloaded MXL files): sheet-music vocal-melody data agrees with
+# trusted ground truth on PITCH CLASS 93-98% of the time once a per-song
+# calibration offset is removed -- far above any of this project's own
+# audio-only pitch sources. Coverage (how much of the song a given
+# arrangement lyric-tags) varies a lot more, 23-91%.
+#
+# Minimum matched notes required before trusting a per-song calibration
+# offset at all -- too few and a "clear majority" could just be chance.
+MUSICXML_MIN_CALIBRATION_SAMPLES = 8
+# The modal pitch-class offset among matched notes must cover at least
+# this fraction of all matches, or calibration is considered too
+# ambiguous to trust (real case found needing this: Gaston, merging all
+# 3 vocal parts, showed a genuine bimodal split between two DIFFERENT
+# raw semitone offsets that still agree at the pitch-class level, but a
+# less careful check could land on a shaky plurality from actual noise).
+MUSICXML_MIN_CALIBRATION_CONFIDENCE = 0.5
+# When the full-population calibration above doesn't clear that bar,
+# retry using only the top half of matches by OUR OWN note confidence --
+# a noisy upstream detector (real case: Gaston, our baseline pyin
+# accuracy only ~41%) dilutes the calibration signal with matches where
+# our own pitch is simply wrong, not real per-song ambiguity; restricting
+# to higher-confidence matches measurably cleans that up (confirmed:
+# Gaston went from 39.5% agreement over all matches to 46.1% over the
+# top half, same winning offset both times -- not a different answer,
+# less noise around the same one). A LOWER bar is used for this retry on
+# purpose: a plurality among an already-noise-reduced population is more
+# trustworthy than the same plurality over the full one.
+MUSICXML_MIN_CALIBRATION_CONFIDENCE_HIGH_CONF_SUBSET = 0.4
+# A syllable's confidence after pass 4 corrects it -- boosted above
+# whatever it came in with (the low-confidence case is exactly what this
+# mechanism targets), but not set to 1.0: it's still calibrated-by-
+# inference from a different source, not a direct pass-1 acoustic
+# measurement.
+MUSICXML_CORRECTED_CONFIDENCE = 0.75
 
 
 
