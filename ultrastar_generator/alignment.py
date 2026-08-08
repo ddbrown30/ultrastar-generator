@@ -1,15 +1,13 @@
 """Glue module for pass 3 (lyric/word alignment). Pipeline order (see
 main.py):
 
-  pass 1 (note_detection.detect_notes) -> pass 2 (key_correction.snap_to_key,
-  optional, on by default -- operates on pass 1's raw NoteEvent list,
-  BEFORE any lyrics exist) -> transcription/lyrics lookup -> pass 3 (this
-  module) -> phrasing.build_lines().
+  pass 1 (note_detection.detect_notes) -> transcription/lyrics lookup ->
+  pass 3 (this module) -> phrasing.build_lines().
 
 This module's own steps:
 
   (notes, words) -> lyric_alignment.align_words_to_notes()  (fit lyrics onto
-     the pass-2 note grid)
+     the pass-1 note grid)
   -> verification.verify_words()  (optional, on by default: re-transcribes words
      in isolation, cross-checks against reference lyrics where available, and
      re-runs word-to-note fitting if any text changed)
@@ -28,13 +26,6 @@ This module's own steps:
      correction, just for timing instead of text. Off by default: it's an
      expensive expand-search re-transcription loop over every word --
      see config.ENABLE_PLACEMENT_VERIFICATION.)
-
-Key correction was deliberately moved OUT of this module (it used to run
-here, on Syllable objects, as a final bundled step) and into its own pass
-2, running on notes alone before word-fitting -- so it can never depend on
-or affect which word gets which note, and so this module's own output can
-be inspected or written out completely independently of whatever key
-correction changes.
 """
 
 from __future__ import annotations
@@ -98,7 +89,7 @@ def align_words(
             if any(r.replaced for r in verify_results):
                 words = corrected_words
                 if debug_log is not None:
-                    debug_log.section("RE-RUNNING PASS 2 -- verify_words corrected at least one word")
+                    debug_log.section("RE-RUNNING PASS 3 -- verify_words corrected at least one word")
                 syllables, stats = align_words_to_notes(
                     words, notes, y, sr, debug_log=debug_log,
                     snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
@@ -115,7 +106,7 @@ def align_words(
                 prior_verification_results = stats.verification_results
                 words = corrected_words
                 if debug_log is not None:
-                    debug_log.section("RE-RUNNING PASS 2 -- verify_placement corrected at least one word's position")
+                    debug_log.section("RE-RUNNING PASS 3 -- verify_placement corrected at least one word's position")
                 syllables, stats = align_words_to_notes(
                     words, notes, y, sr, debug_log=debug_log,
                     snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,

@@ -14,9 +14,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from . import config
+
+
+class AmbiguousInputError(ValueError):
+    """More than one candidate file could plausibly be the song's primary
+    audio/video source, and there's no principled way to auto-pick one."""
+
+
+class NoAudioSourceFoundError(ValueError):
+    """The input folder has no real audio file, no .mp4, and no .avi with
+    an audio track -- nothing usable was found at all."""
 
 
 @dataclass
@@ -71,6 +81,19 @@ def find_companions(audio_path: Path) -> Companions:
         p for p in candidates
         if p.suffix.lower() in config.VIDEO_EXTS and _same_base(p, base_stem)
     ]
+    if not videos:
+        # No basename-matched video -- if there's exactly one video file
+        # in the folder at all, it's unambiguous even though its name
+        # doesn't relate to the audio file's own name (real case: a
+        # SingStar-style rip where the audio is "music.ogg" but there's a
+        # single "video.mpg" sitting right next to it -- same reasoning
+        # as file_discovery.resolve_artist_title's folder-name fallback:
+        # a strict naming-convention match failing doesn't mean there's
+        # nothing to find, just that this file predates/ignores the
+        # convention).
+        untagged_videos = [p for p in candidates if p.suffix.lower() in config.VIDEO_EXTS]
+        if len(untagged_videos) == 1:
+            videos = untagged_videos
     if videos:
         # Prefer exact-stem match over a tagged one, if both somehow exist.
         videos.sort(key=lambda p: p.stem.lower() != base_stem.lower())
@@ -98,6 +121,13 @@ def find_companions(audio_path: Path) -> Companions:
         # first for both and let the user know at the call site.
         result.cover = images[0]
         result.background = images[0]
+    else:
+        # No basename-matched/tagged image at all -- same single-
+        # unambiguous-candidate fallback as video, above.
+        untagged_images = [p for p in candidates if p.suffix.lower() in config.IMAGE_EXTS]
+        if len(untagged_images) == 1:
+            result.cover = untagged_images[0]
+            result.background = untagged_images[0]
 
     # --- MusicXML reference (pass 4) --------------------------------------
     # ".mxl"/".musicxml" are unambiguous. Bare ".xml" is NOT -- e.g. these
@@ -113,17 +143,112 @@ def find_companions(audio_path: Path) -> Companions:
     return result
 
 
-def parse_artist_title(audio_path: Path) -> tuple[str, str]:
-    """Parses "<Artist> - <Title>.<ext>" into (artist, title).
+def resolve_primary_source(input_dir: Path, audio_file_override: Optional[str] = None) -> Tuple[Path, str]:
+    """Figures out which file in a song folder is the primary audio/video
+    source, and how it should be treated. Returns (path, kind), kind one of:
+      "audio"          -- a real audio file (config.AUDIO_EXTS) was found.
+      "video_as_audio" -- no real audio file, but exactly one video file
+                           UltraStar Deluxe can use directly as #MP3 was
+                           (config.VIDEO_DIRECT_AUDIO_EXTS: .mp4/.mpg/
+                           .mpeg) -- it'll serve as BOTH the audio source
+                           and #VIDEO.
+      "avi_extract"    -- no real audio file and no direct-audio video,
+                           but exactly one .avi was -- UltraStar Deluxe
+                           can't use .avi as #MP3 directly, so its audio
+                           track must be extracted into a real standalone
+                           file (see media_extract.py).
 
-    Splits on the FIRST " - " occurrence, since artist or title names could
-    themselves contain hyphens without surrounding spaces (e.g. "Jean-Luc").
+    `audio_file_override` (a bare filename within input_dir) wins outright
+    over all of the above, always resolving to kind "audio" -- this is the
+    escape hatch for a folder with more than one real audio file, which
+    this function otherwise refuses to guess between.
+
+    Raises AmbiguousInputError if more than one candidate exists at
+    whichever tier is reached (naming the candidates), or
+    NoAudioSourceFoundError if nothing usable exists at any tier.
     """
-    stem = Path(audio_path).stem
-    if " - " not in stem:
+    input_dir = Path(input_dir)
+
+    if audio_file_override:
+        override_path = input_dir / audio_file_override
+        if not override_path.is_file():
+            raise NoAudioSourceFoundError(f"--audio-file {audio_file_override!r} not found in {input_dir}")
+        return override_path, "audio"
+
+    candidates = [p for p in input_dir.iterdir() if p.is_file()]
+
+    audio_files = sorted(p for p in candidates if p.suffix.lower() in config.AUDIO_EXTS)
+    if len(audio_files) == 1:
+        return audio_files[0], "audio"
+    if len(audio_files) > 1:
+        names = ", ".join(p.name for p in audio_files)
+        raise AmbiguousInputError(
+            f"Found more than one audio file in {input_dir}: {names}. "
+            f"Pass --audio-file <name> to pick which one to use."
+        )
+
+    direct_audio_video_files = sorted(
+        p for p in candidates if p.suffix.lower() in config.VIDEO_DIRECT_AUDIO_EXTS)
+    if len(direct_audio_video_files) == 1:
+        return direct_audio_video_files[0], "video_as_audio"
+    if len(direct_audio_video_files) > 1:
+        names = ", ".join(p.name for p in direct_audio_video_files)
+        raise AmbiguousInputError(
+            f"No audio file, but found more than one usable video file in {input_dir}: {names}. "
+            f"Pass --audio-file <name> to pick which one to use."
+        )
+
+    avi_files = sorted(p for p in candidates if p.suffix.lower() == ".avi")
+    if len(avi_files) == 1:
+        return avi_files[0], "avi_extract"
+    if len(avi_files) > 1:
+        names = ", ".join(p.name for p in avi_files)
+        raise AmbiguousInputError(
+            f"No audio file or usable video, but found more than one .avi in {input_dir}: {names}. "
+            f"Pass --audio-file <name> to pick which one to use."
+        )
+
+    raise NoAudioSourceFoundError(
+        f"No usable audio source found in {input_dir} -- expected one of "
+        f"{config.AUDIO_EXTS}, or a single {config.VIDEO_DIRECT_AUDIO_EXTS} or .avi file."
+    )
+
+
+def _split_artist_title(name: str) -> tuple[str, str]:
+    """Splits on the FIRST " - " occurrence, since artist or title names
+    could themselves contain hyphens without surrounding spaces (e.g.
+    "Jean-Luc")."""
+    if " - " not in name:
         raise ValueError(
-            f'Could not parse "<Artist> - <Title>" from filename: {stem!r}. '
+            f'Could not parse "<Artist> - <Title>" from {name!r}. '
             f"Pass --artist and --title explicitly instead."
         )
-    artist, title = stem.split(" - ", 1)
+    artist, title = name.split(" - ", 1)
     return artist.strip(), title.strip()
+
+
+def parse_artist_title(audio_path: Path) -> tuple[str, str]:
+    """Parses "<Artist> - <Title>.<ext>" into (artist, title) from the
+    AUDIO FILE's own name."""
+    return _split_artist_title(Path(audio_path).stem)
+
+
+def resolve_artist_title(audio_path: Path, input_dir: Path) -> Tuple[Optional[str], Optional[str]]:
+    """Tries the audio file's own name first (parse_artist_title's usual
+    contract); if that fails -- e.g. a ripped/downloaded file keeping a
+    generic name like "music.ogg" while the FOLDER it's in is still named
+    "<Artist> - <Title>" (a real, confirmed case: this project's own
+    "Beauty And The Beast - Beauty And The Beast" SingStar-rip test song)
+    -- falls back to the input folder's own name. Uses the folder's raw
+    `.name` (not `.stem`, which would wrongly treat a dot inside a folder
+    name as a file extension to strip, since folders don't have real
+    extensions). Returns (None, None) if neither works -- never raises,
+    unlike `parse_artist_title` itself."""
+    try:
+        return parse_artist_title(audio_path)
+    except ValueError:
+        pass
+    try:
+        return _split_artist_title(Path(input_dir).name)
+    except ValueError:
+        return None, None

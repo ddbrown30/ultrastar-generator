@@ -48,3 +48,11 @@ def seconds_to_beat_length(duration_sec: float, bpm_as_written: float) -> int:
     ms = duration_sec * 1000.0
     length = int(round(ms / beat_duration_ms(bpm_as_written)))
     return max(1, length)
+
+
+def beat_to_seconds(beat: int, gap_ms: int, bpm_as_written: float) -> float:
+    """Inverse of seconds_to_beat -- used to parse an EXISTING .txt file's
+    own beat numbers back into seconds, using the GAP/BPM values read from
+    THAT file's own header (not necessarily this run's own detected
+    values). See usdx_parser.py."""
+    return (gap_ms + beat * beat_duration_ms(bpm_as_written)) / 1000.0

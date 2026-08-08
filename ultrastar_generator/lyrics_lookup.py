@@ -38,7 +38,7 @@ import difflib
 import re
 import urllib.parse
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from . import config
 from .models import Word
@@ -62,57 +62,141 @@ class LyricsResult:
     source: str = ""  # "lrclib" or "lyrics.ovh", for diagnostics/logging.
 
 
-def _fetch_from_lrclib(artist: str, title: str, duration_sec: Optional[float] = None) -> Optional[LyricsResult]:
-    """Queries LRCLIB's search API and picks the best candidate.
+@dataclass
+class LrcLibCandidate:
+    """One raw LRCLIB search result -- richer than LyricsResult (keeps
+    display metadata + `instrumental`/raw `duration`) so a human can
+    browse/pick between candidates in the GUI's search popup, not just
+    accept whichever one `_fetch_from_lrclib`'s own scoring would have
+    auto-picked."""
+    track_name: str
+    artist_name: str
+    album_name: str
+    duration: Optional[float]
+    plain_lyrics: str
+    synced_lyrics: Optional[str]
+    instrumental: bool
+
+    def to_lyrics_result(self) -> "LyricsResult":
+        return LyricsResult(plain_lyrics=self.plain_lyrics, synced_lyrics=self.synced_lyrics, source="lrclib")
+
+
+def search_lrclib(artist: str = "", title: str = "", q: str = "") -> List[LrcLibCandidate]:
+    """Raw LRCLIB search -- returns EVERY result LRCLIB gives back,
+    unfiltered (including instrumental/lyric-less candidates, clearly
+    tagged), for a human to browse in the GUI's manual search popup.
+    Never picks a winner itself -- see `_fetch_from_lrclib` for the
+    automatic-pick path built on top of this. Returns [] on any failure
+    (no `requests`, no network, no results) -- best-effort only.
+
+    `q`, if given, uses LRCLIB's own broader free-text search (matches
+    across track/artist/album together) INSTEAD of the artist/title
+    fields -- LRCLIB's API treats `q` as an alternative to `artist_name`/
+    `track_name`, not something combined with them."""
+    try:
+        import requests
+    except ImportError:
+        return []
+    params = {"q": q} if q else {"artist_name": artist, "track_name": title}
+    try:
+        resp = requests.get(
+            "https://lrclib.net/api/search",
+            params=params,
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return []
+        raw = resp.json()
+    except Exception:
+        return []
+    if not raw:
+        return []
+    return [
+        LrcLibCandidate(
+            track_name=c.get("trackName") or "",
+            artist_name=c.get("artistName") or "",
+            album_name=c.get("albumName") or "",
+            duration=c.get("duration"),
+            plain_lyrics=c.get("plainLyrics") or "",
+            synced_lyrics=c.get("syncedLyrics") or None,
+            instrumental=bool(c.get("instrumental")),
+        )
+        for c in raw
+    ]
+
+
+def _real_lrclib_candidates(candidates: List[LrcLibCandidate],
+                             duration_sec: Optional[float]) -> List[LrcLibCandidate]:
+    """Filters to candidates worth treating as genuine options for
+    ambiguity-prompt purposes: not instrumental, has real lyrics, and --
+    if both durations are known -- not wildly off from our own audio's
+    length (a generous 3x the normal scoring tolerance, just to exclude
+    obviously-different recordings, not to pick a winner)."""
+    real = []
+    for c in candidates:
+        if c.instrumental or not c.plain_lyrics:
+            continue
+        if duration_sec is not None and c.duration:
+            if abs(c.duration - duration_sec) > 3 * config.LRCLIB_DURATION_TOLERANCE_SEC:
+                continue
+        real.append(c)
+    return real
+
+
+def _score_lrclib_candidate(c: LrcLibCandidate, duration_sec: Optional[float]) -> float:
+    """Same scoring `_fetch_from_lrclib` always used, factored out so
+    both the automatic-pick path and (if it ever needs one) a caller can
+    share one definition of "best"."""
+    if c.instrumental or not c.plain_lyrics:
+        return -1.0
+    s = 0.0
+    if duration_sec is not None and c.duration:
+        diff = abs(c.duration - duration_sec)
+        s += max(0.0, 1.0 - diff / config.LRCLIB_DURATION_TOLERANCE_SEC)
+    if c.synced_lyrics:
+        s += 0.1
+    return s
+
+
+def _fetch_from_lrclib(
+        artist: str, title: str, duration_sec: Optional[float] = None,
+        on_ambiguous: Optional[Callable[[List[LrcLibCandidate]], Optional[LrcLibCandidate]]] = None,
+) -> Optional[LyricsResult]:
+    """Searches LRCLIB and picks the best candidate.
 
     LRCLIB can return multiple candidates for the same artist/title
     (different recordings, albums, or -- same failure mode as lyrics.ovh
     hit for Gaston this session -- an occasional wrong-language mistag).
-    Duration closeness to OUR OWN audio is the main disambiguator: an
-    instrumental-only or lyric-less candidate is excluded outright, and a
-    candidate whose duration is far from ours is heavily penalized (but
-    not excluded -- still better than nothing if it's the only candidate).
-    A small bonus favors a candidate that also has synced lyrics, since
-    that's strictly more useful when a duration-tie needs breaking.
-    """
-    try:
-        import requests
-    except ImportError:
-        return None
+    Duration closeness to OUR OWN audio is the main automatic
+    disambiguator: an instrumental-only or lyric-less candidate is
+    excluded outright, and a candidate whose duration is far from ours is
+    heavily penalized (but not excluded -- still better than nothing if
+    it's the only candidate). A small bonus favors a candidate that also
+    has synced lyrics, since that's strictly more useful when a
+    duration-tie needs breaking.
 
-    try:
-        resp = requests.get(
-            "https://lrclib.net/api/search",
-            params={"artist_name": artist, "track_name": title},
-            timeout=8,
-        )
-        if resp.status_code != 200:
-            return None
-        candidates = resp.json()
-    except Exception:
-        return None
+    `on_ambiguous`, if given, is called with the "real" (already
+    instrumental/no-lyrics/wildly-off-duration filtered) candidates
+    whenever there's more than one -- letting a human (the GUI's
+    ambiguity-prompt checkbox) pick instead of trusting the automatic
+    score. A returned candidate is used directly; returning None (user
+    cancelled) falls through to the normal automatic pick below.
+    """
+    candidates = search_lrclib(artist, title)
     if not candidates:
         return None
 
-    def score(c: dict) -> float:
-        if c.get("instrumental") or not c.get("plainLyrics"):
-            return -1.0
-        s = 0.0
-        if duration_sec is not None and c.get("duration"):
-            diff = abs(c["duration"] - duration_sec)
-            s += max(0.0, 1.0 - diff / config.LRCLIB_DURATION_TOLERANCE_SEC)
-        if c.get("syncedLyrics"):
-            s += 0.1
-        return s
+    if on_ambiguous is not None:
+        real = _real_lrclib_candidates(candidates, duration_sec)
+        if len(real) > 1:
+            chosen = on_ambiguous(real)
+            if chosen is not None:
+                return chosen.to_lyrics_result()
 
-    best = max(candidates, key=score)
-    if score(best) < 0:
+    best = max(candidates, key=lambda c: _score_lrclib_candidate(c, duration_sec))
+    if _score_lrclib_candidate(best, duration_sec) < 0:
         return None
-    return LyricsResult(
-        plain_lyrics=best["plainLyrics"],
-        synced_lyrics=best.get("syncedLyrics") or None,
-        source="lrclib",
-    )
+    return best.to_lyrics_result()
 
 
 def _fetch_from_lyrics_ovh(artist: str, title: str) -> Optional[LyricsResult]:
@@ -142,13 +226,19 @@ def _fetch_from_lyrics_ovh(artist: str, title: str) -> Optional[LyricsResult]:
     return LyricsResult(plain_lyrics=lyrics, synced_lyrics=None, source="lyrics.ovh")
 
 
-def fetch_reference_lyrics(artist: str, title: str, duration_sec: Optional[float] = None) -> Optional[LyricsResult]:
+def fetch_reference_lyrics(
+        artist: str, title: str, duration_sec: Optional[float] = None,
+        on_ambiguous: Optional[Callable[[List[LrcLibCandidate]], Optional[LrcLibCandidate]]] = None,
+) -> Optional[LyricsResult]:
     """Tries LRCLIB first, falls back to lyrics.ovh if LRCLIB has nothing
     usable. `duration_sec` (our own audio's length) helps LRCLIB's search
     disambiguate between same-title candidates; pass it when available.
+    `on_ambiguous`, if given, lets a human resolve a genuinely ambiguous
+    LRCLIB result (see `_fetch_from_lrclib`'s own docstring) -- never set
+    outside the GUI, so the CLI's own behavior is completely unchanged.
     Returns None if neither source has anything -- best-effort only.
     """
-    result = _fetch_from_lrclib(artist, title, duration_sec)
+    result = _fetch_from_lrclib(artist, title, duration_sec, on_ambiguous=on_ambiguous)
     if result is not None:
         return result
     return _fetch_from_lyrics_ovh(artist, title)

@@ -1,6 +1,6 @@
 """Pass 3 of the pipeline: fits transcribed words onto the note grid that
-note_detection.py (pass 1) and key_correction.py (pass 2) already built
-from the audio alone, with no lyrics involved.
+note_detection.py (pass 1) already built from the audio alone, with no
+lyrics involved.
 
 This is deliberately note-driven, not word-driven: pitch/timing accuracy
 was the top priority in the reported bugs, so we treat the acoustically
@@ -504,7 +504,7 @@ def align_words_to_notes(
     final = enforce_monotonic(all_syllables)
 
     if debug_log is not None:
-        debug_log.section("FINAL SYLLABLES (post pass-2, this is what gets written to the .txt)")
+        debug_log.section("FINAL SYLLABLES (this is what gets written to the .txt)")
         debug_log.line("Columns: start, end, duration, pitch, word_start, text")
         for s in final:
             debug_log.line(f"  {s.start:8.3f} - {s.end:8.3f}  ({s.end - s.start:6.3f}s)  "

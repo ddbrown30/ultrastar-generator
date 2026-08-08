@@ -778,7 +778,7 @@ Done:
    default in `apply_musicxml_reference`/`apply_musicxml_references` was
    also changed to pull from this config constant directly (matching
    how every other `ENABLE_*` toggle in this codebase works, e.g.
-   `ENABLE_CREPE`/`ENABLE_KEY_CORRECTION`/`ENABLE_WORD_VERIFICATION` --
+   `ENABLE_CREPE`/`ENABLE_WORD_VERIFICATION` --
    NOT kept as a hardcoded-False library default with only the CLI
    overriding it, unlike the deliberately-separate `isolation_source`/
    pitch-source case earlier in this document). `test_dry_run.py`'s
@@ -1411,10 +1411,27 @@ Done:
    real risk once shipped. If picked back up later: the refined
    adjacent-and-full-line-coverage design above is already validated
    against real data and ready to implement, not just a sketch.
-1. **`key_correction.py` now uses `music21`** (its implementation of
-   Krumhansl-Schmuckler key-finding) instead of the hand-rolled
-   diatonic-scale-coverage heuristic, and is now **ON by default**
-   (`--no-key-correction` to disable).
+1. **Key correction (`key_correction.py`) was later root-caused as
+   actively harmful and has been REMOVED ENTIRELY from the codebase.**
+   (Superseded: this item originally reported switching it to `music21`'s
+   Krumhansl-Schmuckler key-finding and enabling it by default -- that
+   default was reverted the same session it was tried, see `config.py`'s
+   own historical comment before removal, and the pass never came back
+   on by default afterward.) Root cause, confirmed via a direct
+   pass-1-vs-pass-2 diff on a real song ("Stars", real key confirmed E
+   major by the user): a single global detected key applied blindly to
+   every note will snap legitimate out-of-scale notes (e.g. deliberate
+   modal-mixture/borrowed tones) to the wrong pitch -- dozens of notes
+   changed throughout the song, including blanket-snapping every
+   legitimate C-natural to B just because C isn't diatonic in E major.
+   Confirmed still off/unused by any real workflow before deletion, so
+   this was a clean removal: `key_correction.py` deleted; the
+   `--key-correction`/`--no-key-correction` CLI flags, `--no-pass2-debug`
+   flag, `[PASS2 DEBUG]` debug file, `ENABLE_KEY_CORRECTION` config
+   constant, and `PipelineOptions.key_correction`/`no_pass2_debug` fields
+   all removed; the GUI's "Key correction" checkbox removed. `music21`
+   itself stays a dependency -- pass 4 (`musicxml_reference.py`) and
+   `file_discovery.py` use it independently for MusicXML parsing.
 2. **CUDA is now the only supported device.** `--device` is gone;
    `separation.py`/`transcription.py` hardcode `device="cuda"`, and
    `main.py` aborts at startup if `torch.cuda.is_available()` is False.
@@ -1494,6 +1511,552 @@ Misérables - Stars.ogg` before being reported as done, not just
 `test_dry_run.py` — the "Stars" reference notes (opening 6 notes, and
 the full "fall as Lucifer fell...sword" section) are saved in this
 session's memory for that purpose.
+
+## Folder-based input, mp4/avi support, embedded cover art, YouTube input,
+## existing-file verification, batch mode, GUI, launcher (2026-08-08)
+
+Large feature set, planned and tracked via a phased plan (Phase 0 through
+F) approved with the user before implementation. Each phase gets its own
+real-audio/real-media validation, not just `test_dry_run.py`, per this
+project's own established policy above.
+
+**Phase 0 (foundational refactor) -- DONE.** `main.py`'s CLI entry point
+was a single 300-line `run(argv) -> int` doing everything from arg-parsing
+through writing the final `.txt`, `sys.exit`-driven throughout -- nothing
+later in this feature set (existing-file verification's early-return,
+batch mode's per-song exception isolation, the GUI calling the pipeline
+in-process) could be built cleanly on top of that shape. Extracted the
+whole body into `run_pipeline(input_dir, output_dir, opts: config.
+PipelineOptions, *, log=print) -> PipelineResult` -- never calls
+`sys.exit`, catches every "expected" failure (bad path, no notes/words
+detected, etc.) into `PipelineResult(success=False, error=...)` instead.
+`run()` is now a thin CLI wrapper: parse args -> build `PipelineOptions`
+-> call `run_pipeline` -> map to an exit code. Every `print(...)` in the
+extracted body became `log(...)` (mechanical, real work across dozens of
+call sites) -- deliberately did NOT thread `log` further down into
+submodules (`note_detection.py`/`musicxml_reference.py`/`lyrics_lookup.py`/
+`verification.py` all still `print()` directly) to avoid touching the
+pitch/timing code this project has been careful with all session; the GUI
+(Phase E) captures that output via `contextlib.redirect_stdout` at the
+call boundary instead. `config.PipelineOptions` (had existed as dead code,
+zero call sites, referencing a `genius_token`/`device` field from a
+since-replaced lyrics source and a since-removed CPU fallback path) was
+replaced with a version covering every real `PipelineOptions` field.
+**Verified**: `test_dry_run.py` green throughout; a real-audio run through
+`run_pipeline` against `sandbox/Beauty And The Beast - Beauty And The
+Beast/` produced a pass-1 debug file BYTE-IDENTICAL to a pre-refactor run
+(confirms `isolation_source="rmvpe"`'s documented reproducibility held,
+and the refactor introduced zero behavioral drift) -- a full mocked-
+everything synthetic smoke test was considered and deliberately skipped
+as disproportionate effort (would need to fake Demucs/torch.cuda/
+WhisperX/lyrics-fetch simultaneously) given the real-audio diff already
+gives a stronger, more direct answer for a mechanical extraction.
+
+**Phase A (folder-based input, mp4/avi, embedded cover art) -- DONE.**
+The CLI's positional argument is now a FOLDER, not a single file
+(`--output-dir` is now REQUIRED and must differ from the input folder --
+enforced with a hard check at the top of `run_pipeline`). New
+`file_discovery.resolve_primary_source(input_dir, audio_file_override)`
+decides what's inside: exactly one real audio file (`config.AUDIO_EXTS`)
+-> normal path unchanged; none but exactly one `.mp4` -> that file serves
+as BOTH `#MP3` and `#VIDEO` directly (confirmed working in the user's
+UltraStar Deluxe install -- no separate audio extraction needed for
+*output*, only an internally-cached wav for our own Demucs/pass-1/
+WhisperX analysis, since nothing in this codebase had ever tested feeding
+Demucs an mp4 directly); none but exactly one `.avi` -> its audio track
+is extracted into a real standalone mp3 (new `media_extract.py`,
+generalizing `video_sync.py`'s own pre-existing ffmpeg subprocess pattern
+-- that module's private `_extract_audio_wav` was deleted in favor of the
+shared `media_extract.extract_audio_track`), and the avi itself becomes
+`#VIDEO`; an avi with NO audio track aborts cleanly (`media_extract.
+has_audio_stream`, ffprobe-based, checked BEFORE attempting extraction --
+never assumes ffmpeg's own failure mode is informative enough on its
+own); more than one candidate at any tier -> `AmbiguousInputError` naming
+the candidates, requiring a new `--audio-file <name>` override (decided
+with the user: never silently guess which file is the song). New
+`song_input.resolve_song_folder` orchestrates this plus the pre-existing
+`find_companions` plus a NEW fallback: if no `.jpg`/`.jpeg` companion was
+found, `cover_extract.extract_embedded_cover` (new module, finally wires
+up `mutagen` -- listed in `requirements.txt` since early in this project
+but never actually called until now) tries ID3 APIC (mp3), MP4 `covr`
+atom, FLAC's native picture list, and OGG/Opus's base64 vorbis-comment
+picture block, sniffing the real image type from magic bytes rather than
+trusting a container's claimed MIME type. New `output_staging.
+stage_companions_to_output` copies whichever companions the output
+actually references into the output folder (feature 2's requirement) --
+runs once, late, and correctly copies an identical mp3_src/video_src
+(the mp4-as-audio case) only ONCE despite serving both roles. New
+`ResolvedInput.videogap_applicable` flag skips `estimate_videogap`
+entirely (not just "no video") when the video and audio are the same
+file or one was extracted directly from the other -- correlating a
+signal against itself or a trimmed copy of itself is meaningless.
+`work_dir` simplifies to `input_dir / ".ultrastar_work"` (directly
+available now that input is already a folder, same cache-reuse guarantee
+as before).
+
+**Verified for real**, not just via `test_dry_run.py`'s new synthetic
+tests (`resolve_primary_source`'s branching, `cover_extract`'s per-format
+extraction + magic-byte sniffing, `output_staging`'s copy-and-dedup
+logic): built real fixture files via ffmpeg (a real mp4 with an audio
+track, a real avi with an audio track, a real avi with NO audio track, a
+real mp3 with a mutagen-embedded ID3 cover, two real mp3s in one folder)
+and ran `resolve_song_folder` against each directly -- all 5 scenarios
+passed, including the avi-no-audio clean abort and the ambiguous-folder
+error + `--audio-file` override. Then two REAL FULL PIPELINE runs: (a) a
+regression check on `sandbox/Beauty And The Beast - Beauty And The
+Beast/` through the new folder-based CLI -- pass-1 note count matched
+the Phase 0 baseline exactly (182), and the output folder correctly
+contained a COPY of `music.ogg` (feature 2 confirmed working, not just
+staged-but-untested); (b) a real mp4-as-audio run using gaston's own real
+music-video mp4 (copied, not moved, into an isolated test folder so
+gaston's own real sandbox data was never touched) -- confirmed `#MP3` and
+`#VIDEO` both correctly point at the same mp4 in the final `.txt`, NO
+`#VIDEOGAP` line was written (confirms the degenerate-self-correlation
+guard fired -- no "Estimating VIDEOGAP" log line appeared either), and
+pass-1/transcription produced sane, non-degenerate numbers (518 notes,
+392 words) close to this same song's own previously-recorded numbers
+from earlier in this session (505 notes via its normal mp3 companion --
+the small difference is consistent with a different audio re-encode
+through the mp4 container plus this project's own already-documented
+pass-1 non-determinism, not a sign of something broken).
+
+**Phase B (existing-file verification) -- DONE.** New `usdx_parser.
+parse_usdx_file` parses an UltraStar `.txt` back into structured
+`Syllable`/`LineBreak` data -- the exact inverse of `usdx_writer.
+render_song`'s grammar, using a new `tempo.beat_to_seconds` (the missing
+inverse of `seconds_to_beat`). Tolerant of `,` as the BPM decimal
+separator (real files in the wild use it, even though this project's own
+writer only ever emits `.`) and a leading `P1`/`P2` duet marker (parses
+P1 only). Fails closed (`UsdxParseError`) on anything structurally
+invalid -- never partially trusts a malformed parse.
+
+New `verify_existing_song.py`, shaped like `musicxml_reference.py`'s
+calibrate-then-compare pattern but calibration-free (this compares two
+timelines of the SAME audio, not two independently-timed recordings the
+way `lrc_timing.py`'s LRCLIB comparison does): word-level whole-sequence
+text alignment, pitch compared at PITCH CLASS (mod 12, matching how
+UltraStar Deluxe itself scores), timing compared with the same
+repeat-instance bucketing guard validated in 0i (a repeated chorus/line
+can otherwise pair against the wrong sung instance). `verdict` is
+`"COULD_NOT_VERIFY"` (never `"PASS"`) whenever too few words matched to
+trust the comparison at all. New config constants
+(`EXISTING_TXT_MIN_MATCHED`/`_MIN_PITCH_ACCURACY`/`_TIMING_TOLERANCE_SEC`/
+`_MIN_TIMING_AGREEMENT`); **`ENABLE_EXISTING_TXT_CHECK` defaults OFF** --
+the one deliberate exception to this project's "new features default on"
+convention, decided with the user: unlike every other on-by-default
+feature here (which only ever ADDS a correction), this one can result in
+NOT writing output the user expected on a plain re-run.
+
+Wired into `run_pipeline`: an existing file is detected early (either an
+explicit `--existing-txt <path>`, always wins, no filename-matching
+needed -- same convention as `--musicxml-reference`; or auto-detected via
+`--existing-txt-check` matching `"<Artist> - <Title>.txt"` in the input
+folder) but only actually parsed/compared LATE, after pass 3/4, once a
+fully fresh syllable sequence exists. On `PASS`, the EXISTING file is
+copied byte-for-byte into `output_dir` (not the freshly-built `Song`) and
+`PipelineResult.regenerated = False`; on `PROBLEMS_FOUND`/
+`COULD_NOT_VERIFY`, proceeds exactly as a normal run. Critically,
+companion staging (Phase A) runs on BOTH branches, unconditionally --
+`output_dir != input_dir` still needs a self-contained output folder even
+when the existing file is kept as-is.
+
+**Verified for real**, addressing the plan's own flagged uncertainty
+about whether the default thresholds are actually calibrated against
+real self-noise (pass-1 pitch detection is not fully reproducible
+run-to-run even on identical audio, per this project's own documented
+CREPE/RMVPE non-determinism) rather than picked by analogy: ran
+`sandbox/Beauty And The Beast - Beauty And The Beast/` through the real
+pipeline twice -- once normally, once again pointing `--existing-txt` at
+the FIRST run's own output file. Result: 115 words matched, **100%
+pitch-class accuracy, 100% timing agreement -> PASS**, the second run's
+output folder ended up byte-identical to the first (confirmed via `diff`)
+plus still had its own copy of the companion audio file (confirms the
+"stage on both branches" rule actually holds in the real pipeline, not
+just in the plan). Then ran a THIRD time pointing `--existing-txt` at a
+deliberately-corrupted copy of the same file (every pitch shifted +5
+semitones, a real non-multiple-of-12 error) -- correctly landed on **0%
+pitch-class accuracy -> PROBLEMS_FOUND**, and correctly fell through to
+writing a fresh, uncorrupted regeneration rather than keeping the bad
+file. Both the PASS/keep and PROBLEMS_FOUND/regenerate paths are now
+real, end-to-end confirmed, not just unit-tested.
+
+**Phase C (YouTube input) -- DONE.** New dependency `yt-dlp` (optional,
+only imported when `--youtube-url` is actually used, same
+graceful-degrade convention as `whisperx`/`torchcrepe`). New
+`youtube_source.download_youtube_source(url, dest_dir, audio_only)`
+downloads to a deterministic filename (`youtube_download.mp3` or `.mp4`
+-- deliberately NOT named from the video's own title, since that isn't a
+reliable "Artist - Title" source, which is exactly why `--youtube-url`
+requires `--artist`/`--title` explicitly). New CLI flags `--youtube-url`,
+`--youtube-audio-only` (default ON -- matches the user's own stated
+common case of not wanting the video) / `--youtube-video`.
+
+**Key design simplification found during implementation**: the download
+step just lands directly IN `input_dir`, then falls through to the exact
+same folder-resolution logic Phase A already built -- an otherwise-empty
+folder containing one freshly-downloaded mp3 or mp4 is auto-classified
+correctly (`kind="audio"` or `"mp4_as_audio"`) with ZERO special-casing
+needed in `song_input.py`/`file_discovery.py`. The original plan
+considered a dedicated bypass of `resolve_primary_source`'s
+auto-detection for this case; turned out to be unnecessary once actually
+implemented -- natural auto-detection already does the right thing.
+Wired inside `run_pipeline` itself (not just the CLI wrapper), so the
+GUI (Phase E) gets YouTube support for free by setting the same
+`PipelineOptions` fields, no separate code path to build there.
+
+**Verified for real** (per the plan's own stated requirement -- a real
+download, not just mocked): a new synthetic test (fake `yt_dlp` module,
+same `sys.modules` injection convention this project's test suite
+already uses for `whisperx`/`librosa`/`requests`) covers
+`download_youtube_source`'s own logic -- deterministic output filename,
+`YoutubeDownloadError` on a download failure -- without needing network
+access for every test run. Then real, live downloads against a short
+(19s), well-known, stable public test video: both audio-only (produced a
+real 305KB mp3) and video mode (downloaded separate video+audio streams
+and correctly muxed them into a 534KB mp4) worked directly. Then a full
+REAL pipeline run through `--youtube-url` end to end: downloaded audio,
+correctly auto-classified as `kind="audio"`, ran Demucs/pass-1/
+WhisperX/pass-3 for real (transcribed actual real speech from the
+video), wrote a real output `.txt` with `#MP3:youtube_download.mp3`, and
+correctly staged a copy of the downloaded mp3 into the output folder
+alongside it (companion staging from Phase A working correctly for a
+YouTube-sourced file too, not just local ones).
+
+**Phase D (batch mode) -- DONE.** New `batch.py`'s `run_batch(parent_dir,
+output_parent_dir, opts, log=print) -> List[Tuple[str, PipelineResult]]`
+runs `run_pipeline` once per IMMEDIATE subdirectory of `parent_dir`
+(never the parent itself), catching even an exception `run_pipeline`
+itself didn't already turn into a `PipelineResult` -- one bad song must
+never abort the rest of the batch. Output mirrors the input 1:1
+(`output_parent_dir/<song folder name>/`). New `--batch` CLI flag.
+`work_dir`-per-song falls out of Phase 0's design for free (each
+subfolder is its own `input_dir`, so each naturally gets its own
+`.ultrastar_work`) -- the only new guard needed is rejecting `--batch`
+together with `--work-dir` (a shared override would collide every song's
+Demucs cache into one directory), and also with `--artist`/`--title`/
+`--existing-txt`/`--youtube-url` (none of which make sense applied
+identically across multiple different songs) -- checked and rejected
+with a clear error BEFORE any processing starts, not discovered
+mid-batch. `run()` exits `0` if every song succeeded, `2` (distinct from
+the single-song failure code `1`) if any song failed -- lets scripts
+tell "total failure" apart from "partial batch failure."
+
+**Verified for real**: built a real parent folder with 3 subdirectories
+-- 2 real songs (Chicago, Ordinary Day; audio + their already-cached
+`.ultrastar_work` copied over so this didn't need to re-pay Demucs
+separation) and 1 deliberately empty/broken folder -- and ran `--batch`
+against it. Confirmed: the broken folder failed with a clean
+`NoAudioSourceFoundError` message (not a stack trace) and the batch
+CONTINUED to the next song rather than aborting; both real songs
+succeeded end-to-end; the final per-song summary correctly reported
+"2/3 succeeded" with a clear per-song breakdown; the output folder
+correctly mirrored the input structure (`output/Chicago/`,
+`output/OrdinaryDay/`, using the SUBFOLDER's own name, not the parsed
+artist/title -- and no `output/BrokenEmpty/` at all, since that song
+never got far enough to write anything); exit code was `2` as designed.
+Also directly confirmed the CLI rejects `--batch --work-dir ...` and
+`--batch --artist ... --title ...` with a clear error before any
+processing starts.
+
+**Phase E (Tkinter GUI) -- DONE.** New `ultrastar_generator/gui.py`
+(stdlib `tkinter`/`ttk` only, per the user's decision -- no new
+dependency). Wraps the exact same `run_pipeline`/`run_batch` the CLI
+uses -- there is only ever one real pipeline implementation, the GUI is
+purely a front end over it. Mode selector (single folder / batch parent
+folder / YouTube URL) with dynamic field show/hide; folder pickers via
+`filedialog.askdirectory`; a curated subset of the ~30 CLI flags on the
+main surface (fetch-lyrics, verify-words,
+verify-placement, existing-txt-check, musicxml-force-calibration,
+whisper-model, pitch-source), with the rarer/experimental flags
+(`--lrc-timing-check`, `--zone-boundary-snap`, `--no-video-sync`,
+`--quiet`) behind a collapsible "Advanced" section rather than
+cluttering the main view. CUDA availability checked once at startup
+(disables Run + shows the error inline, mirroring `run()`'s own single
+check). No mid-run Cancel in v1 (Demucs/WhisperX calls aren't cleanly
+interruptible without significant extra plumbing) -- documented as a
+known limitation. No image preview (Tkinter's native `PhotoImage` only
+handles PNG/GIF/PPM, not JPEG, without adding Pillow, which isn't a
+current dependency) -- out of scope unless requested later.
+
+Runs the pipeline on a background `threading.Thread` (Tk itself isn't
+thread-safe -- only the main thread may touch widgets) and captures
+ALL of its output -- including `print()` calls from deep inside
+pitch/timing submodules that were deliberately NOT rewired to accept a
+`log` callback (see Phase 0) -- via `contextlib.redirect_stdout` at the
+call boundary, feeding a `queue.Queue` that a `self.after(100, ...)`
+polling loop drains on the main thread into the log `Text` widget. This
+is a correction from an earlier draft of the plan, which had leaned
+toward threading a `log` callback deep into submodules instead --
+`redirect_stdout` at the boundary is both lower-risk (touches zero lines
+in the pitch/timing code) and higher-coverage (catches everything, not
+just what a threaded callback happened to reach).
+
+**Verified for real**, per the plan's own stated requirement (a real
+interactive run, not just construction): first, a smoke test constructing
+the real `App` and exercising mode-switching/option-building without
+entering the event loop (`update_idletasks()` needed to actually flush
+Tkinter's geometry manager -- confirmed the visibility-toggle logic for
+YouTube fields / the Audio-file-override field / the Advanced section all
+correctly show/hide per mode, not just that they don't crash). Then a
+full REAL run driven programmatically through the actual GUI mechanism
+(set the real input/output folder StringVars, call the real `_on_run()`,
+pump the Tk event loop in a loop while the real background thread
+processed `Chicago - When You're Good to Mama` end to end, reusing its
+already-cached Demucs separation from earlier in this session -- 47s
+total): confirmed the Run button was disabled the instant the run
+started and re-enabled only after it finished, the log widget received
+6462 characters of LIVE output during the run (not just a final dump),
+and the correct real output `.txt` was written with the right artist/
+title/cover/background (parsed from the filename with no override
+needed, same as the CLI path). Also directly launched the real GUI
+process (not just constructed the `App` object) to confirm no startup
+crash under `python -m ultrastar_generator.gui`.
+
+**Phase F (launcher) -- DONE, and the whole 10-feature plan is now
+complete.** New `run_gui.bat` at the repo root, following the exact same
+`BATCH_DIR`/`VENV_PATH` convention `launch_env.bat`/`setup.bat` already
+use (so all three stay consistent if the venv location ever changes).
+Checks the venv actually exists first (clear error + `pause` pointing at
+`setup.bat` if not, rather than a cryptic failure) before launching
+`venv\Scripts\pythonw.exe -m ultrastar_generator.gui` via `start ""` --
+`pythonw.exe`, not `python.exe`, so no console window appears alongside
+the GUI window itself.
+
+**Verified for real**: invoked `run_gui.bat` directly via PowerShell the
+same way Windows Explorer would (a fresh double-click, not from an
+already-activated dev shell) -- confirmed it correctly spawned a real
+`pythonw` process (no console window, no manual venv activation step
+needed) and cleaned up afterward.
+
+**This closes out the full folder-based-input/mp4-avi-support/embedded-
+cover/existing-file-verification/YouTube-input/batch-mode/GUI/launcher
+feature set.** All 7 phases (0, A, B, C, D, E, F) done, each with its own
+real-audio/real-media/real-interactive verification, not just synthetic
+tests -- `test_dry_run.py` sits at 76 passing checks by the end (up from
+the session's earlier baseline), still green throughout. Nothing was
+committed to git during implementation (per this project's "only commit
+when the user asks" convention) -- everything from Phase 0 onward is
+still sitting as uncommitted working-tree changes as of this writing.
+
+## GUI polish, key-correction removal, interactive LRCLIB lyrics
+## selection (2026-08-08)
+
+A follow-up 16-item request, planned and tracked as 7 phases (G1-G7),
+addressing rough edges found using the GUI built in the previous section
+plus two substantial new pieces of work. Each phase real-verified per
+this project's own established policy, not just via `test_dry_run.py`
+(which reached 82 passing checks by the end, still green throughout).
+
+**Phase G1 -- key correction removed entirely (not just left
+off-by-default).** `key_correction.py` deleted outright; every reference
+removed from `main.py` (`--key-correction`/`--no-key-correction`/
+`--no-pass2-debug` flags, the `snap_to_key` call, the `[PASS2 DEBUG]`
+file write), `config.py` (`ENABLE_KEY_CORRECTION`,
+`PipelineOptions.key_correction`/`no_pass2_debug`), `gui.py` (the "Key
+correction" checkbox), `test_dry_run.py`, and stale prose in
+`debug_log.py`/`alignment.py`/`lyric_alignment.py`/`README.md`. This was
+already confirmed net-harmful and off-by-default from earlier in the
+session (a single global detected key blindly snaps legitimate
+out-of-scale/modal-mixture notes -- see the historical entry earlier in
+this file); this phase just finished the job by deleting the dead code
+rather than leaving it as an unused opt-in. Also fixed a real,
+previously-unnoticed inconsistency this removal exposed: several runtime
+log lines/debug-section headers (`lyric_alignment`'s own fit-words step,
+`verify_words`/`verify_placement`'s re-run points) called themselves
+"pass 2" even though `lyric_alignment.py`'s own docstring had always
+called itself "pass 3" -- now consistently "pass 3" everywhere, since
+removing key_correction (which WAS genuinely pass 2) resolves the
+ambiguity rather than creating a new one.
+
+**Phase G2 -- `--output-dir` is now optional.** `run_pipeline`'s
+`output_dir` parameter is `Optional[Path] = None`; when omitted, it
+defaults to `<input_dir>/Output/<Artist> - <Title>`, computed AFTER
+artist/title are resolved (the input==output collision guard moved to
+run after this default is computed, since a computed default can never
+collide with input_dir by construction). `run_batch`'s
+`output_parent_dir` is optional the same way -- when omitted, each
+subfolder falls through to `run_pipeline`'s own per-song default
+independently. **Real-verified**: a real CLI run against the Chicago
+sandbox song omitting `--output-dir` wrote to exactly
+`<input>/Output/Chicago - When You're Good to Mama/....txt` as designed.
+
+**Phase G3 -- debug files (`[DEBUG LOG]`, `[PASS1 DEBUG]`) now write into
+`<input>/.ultrastar_work`, not the output folder.** Simple path-source
+change in `main.py`; companion staging (`stage_companions_to_output`)
+was already scoped to only ever copy mp3/video/cover/background, so
+debug files were never at risk of leaking into a copied companion set.
+**Real-verified**: re-ran the same Chicago song, confirmed both debug
+files landed under `.ultrastar_work` (byte-identical content, just a
+different location) and the output folder held only the real output
+files.
+
+**Phase G4 -- GUI: folder-picker memory, live placeholders, a real
+audio-file picker, tooltips, non-yanking log scroll.** New
+`gui_settings.json` (`Path.home()/.ultrastar_generator/`) remembers the
+last-used input/output folder per field key, falling back to the
+directory the program was launched from. New `PlaceholderEntry` (wraps
+`ttk.Entry`) shows live grey preview text for Output folder/Artist/Title
+when empty and unfocused -- computed via the SAME real functions
+`run_pipeline` itself uses (`file_discovery.resolve_primary_source` +
+`parse_artist_title`, plus the Phase G2 default-path formula), so there
+is exactly one place that knows how to compute these, not two that could
+drift apart; `effective_value()` returns `None` while a placeholder is
+showing, so `_build_opts()` never mistakes preview text for real input.
+Placeholders live-update via a carefully one-directional `trace_add` wiring
+(input_dir/audio_file -> artist+title+output previews; artist/title ->
+output preview only) specifically designed to avoid a self-referential
+trace loop (a `PlaceholderEntry` writing its own preview into its own
+bound var must never re-trigger its own refresh). The audio-file field
+gained a real `Browse...` button (`filedialog.askopenfilename`, filtered
+to `AUDIO_EXTS + VIDEO_EXTS`). New reusable `Tooltip` helper (borderless
+`Toplevel` on hover) applied to every control, text condensed from the
+CLI's own `--help` strings so the two surfaces don't drift. Log
+auto-scroll now checks `yview()[1] >= 0.99` before re-snapping to the
+bottom on each new line, so scrolling up to read something during a live
+run no longer gets yanked back down. **Real-verified**: a full real
+pipeline run driven through the actual GUI mechanism (background thread,
+`_on_run`), output folder left blank, confirmed the run wrote to the
+Phase G2 default path AND the Phase G3 debug-file location together,
+through the placeholder-driven flow end to end.
+
+**Phase G5 -- intermediate-file cleanup + "Open Output Folder" button.**
+New `main.delete_intermediates(work_dir)` deletes only `separated/` and
+`extracted/` under a work_dir (deliberately not the whole work_dir, since
+debug files now live there too post-Phase-G3) -- shared by both an
+automatic path (`PipelineOptions.delete_intermediates`, wired through a
+`run_pipeline`/`_run_pipeline_body` split so cleanup runs in a `finally`
+regardless of which of the body's several early-return failure paths was
+hit -- work_dir may be partially populated even on a failure) and a new
+GUI "Delete Intermediate Files Now" button (confirmation dialog first,
+operates directly on the input folder's `.ultrastar_work` without
+running anything). New GUI "Open Output Folder" button opens the folder
+ONE LEVEL ABOVE the actual per-song output (e.g. `.../Output/`, not
+`.../Output/<Artist> - <Title>/`) via `os.startfile` -- prefers the last
+real completed run's own output path (threaded back from the worker
+thread through the existing log queue with a tagged tuple, not a second
+unsynchronized attribute write) and falls back to computing it from
+current field values otherwise. **Real-verified**: a real CLI run with
+`--delete-intermediates` confirmed `separated/` was gone afterward while
+both debug files survived; also caught and fixed a stale log line
+("Intermediate files kept in...") that was still printed even when the
+flag was set, since it's written before the wrapper's `finally` runs.
+
+**Phase G6 -- YouTube thumbnail becomes the cover art.**
+`youtube_source.download_youtube_source` now passes `writethumbnail:
+True` plus an `FFmpegThumbnailsConvertor` (format `jpg`) postprocessor to
+yt-dlp, then renames the resulting `youtube_download.jpg` to
+`youtube_download [CO].jpg` -- matching `file_discovery.find_companions`'
+own pre-existing `[CO]`-tag convention by construction (the downloaded
+audio/video is always named `youtube_download.<ext>`), so the cover is
+picked up with **zero new code** in `file_discovery.py`/`song_input.py`.
+Best-effort: a video with no fetchable thumbnail is a silent no-op, never
+a failed download. **Real-verified**: a real download (the same short,
+well-known "Me at the zoo" test video used for this project's original
+YouTube verification) produced a real 23KB JPEG thumbnail, correctly
+renamed and picked up by `find_companions` as `.cover` with no changes
+to that function at all.
+
+**Phase G7 -- interactive LRCLIB lyrics search/disambiguation (largest
+phase).** Two independent entry points, per the user's explicit
+clarification during planning:
+1. **Manual pre-run search** (always available, single-song mode): a new
+   "Search Lyrics..." button runs a real LRCLIB search
+   (`lyrics_lookup.search_lrclib`, new -- returns every raw candidate,
+   unfiltered, unlike the existing auto-pick path) and opens
+   `LrcLibSearchDialog` (new `gui.py` class: candidate list on the left,
+   lyrics preview on the right, synced-lyrics availability noted). A
+   picked candidate is stored as `self.pinned_lyrics` and shown next to
+   the button with a `Clear` option; `PipelineOptions.pinned_lyrics`
+   (threaded through `run_pipeline`) always wins outright over the
+   automatic fetch when set, skipping the network call entirely.
+2. **Automatic mid-run ambiguity prompt** (checkbox, OFF by default,
+   single-song mode only, only consulted when nothing was pre-pinned):
+   `fetch_reference_lyrics`/`_fetch_from_lrclib` gained an
+   `on_ambiguous(real_candidates) -> Optional[LrcLibCandidate]`
+   parameter -- called only when more than one "real" candidate remains
+   after filtering out instrumental/no-lyrics/wildly-off-duration
+   results (a new `_real_lrclib_candidates`, 3x the normal scoring
+   tolerance -- generous on purpose, this is an existence check, not a
+   ranking). The GUI's callback (`_make_ambiguity_callback`) runs ON the
+   background pipeline thread, schedules the SAME `LrcLibSearchDialog` on
+   the main thread via `self.after(0, ...)` (the only safe way to touch
+   Tk widgets from another thread), and blocks the background thread on
+   a `threading.Event` until the dialog closes -- `wait_window()`'s own
+   nested event loop keeps the main thread fully responsive during the
+   pause. A cancelled/declined dialog falls through to the normal
+   automatic pick, never leaves lyrics unset.
+
+   Batch mode NEVER triggers either mechanism (per the user's explicit
+   decision) -- `_build_opts()` forces `pinned_lyrics`/
+   `lyrics_ambiguity_prompt`/`lyrics_disambiguation_callback` to
+   None/False/None whenever `mode == "batch"`, regardless of what the
+   (disabled-in-batch-mode) checkbox/pin state happen to hold, so
+   `run_batch`'s pipeline calls can never receive a callback to invoke in
+   the first place -- confirmed directly via the real `_build_opts()`
+   method, not a mock.
+
+   **Real-verified, both mechanisms, full real pipeline runs, live
+   network** (Chicago sandbox song -- LRCLIB genuinely returns 5 real
+   candidates for it, no synthetic fixture needed): (1) manual search +
+   pin -- searched for real, deliberately pinned the LAST (non-
+   auto-winning) candidate, ran the full pipeline, confirmed the log
+   line `"Using manually-selected lyrics: ..."` named exactly that
+   candidate and that no fresh automatic fetch ever happened; (2)
+   automatic prompt -- real run with the checkbox on and nothing pinned,
+   confirmed the pipeline genuinely paused, the REAL dialog opened with
+   the 5 real candidates, picking one (via a real Tk timer callback, not
+   a mock) resumed the run to a normal successful completion.
+
+**Nothing committed during this phase either** -- same "only commit when
+asked" convention as the rest of this session's work.
+
+**Follow-up refinements, same day, after the above was reported done:**
+1. **`--output-dir`'s meaning changed: it's now the PARENT folder a
+   "<Artist> - <Title>" folder gets created under, not the final folder
+   itself** (superseding Phase G2's original design above). E.g.
+   `--output-dir C:\output` now produces `C:\output\<Artist> - <Title>\`;
+   the default (when omitted) changed to just `<input_dir>\Output` as
+   that parent -- previously it was already
+   `<input_dir>\Output\<Artist> - <Title>`, so the DEFAULT case's actual
+   final path is unchanged, only the explicit-value case's behavior and
+   the field's own meaning changed. The input==output collision guard
+   moved to compare the FINAL computed folder against input_dir (not the
+   given parent), since a given parent equalling input_dir is now
+   perfectly fine (it just means "put my per-song folder inside my own
+   input folder") -- only an exact collision of the final folder itself
+   is still rejected. `batch.py` needed no logic change (it already just
+   forwards a path to `run_pipeline` as `output_dir`) -- it inherits an
+   extra nesting level automatically when an explicit
+   `output_parent_dir` is given (`output_parent_dir/<song folder
+   name>/<Artist> - <Title>/`), documented in its own docstring.
+   **Real-verified**: a real CLI run with `--output-dir` pointed at a
+   fresh temp folder confirmed the output landed at exactly
+   `<given-folder>\<Artist> - <Title>\...`.
+2. **GUI output-folder placeholder is now a fixed relative path,
+   `.\Output\`** -- no longer computed from/dependent on artist/title at
+   all (matches the field's new PARENT-only meaning; the
+   `<Artist> - <Title>` part is created automatically downstream, not
+   something the user needs to see previewed). `_open_output_folder`'s
+   fallback logic updated to match: the field's own real/placeholder
+   value is now used AS the target directly (no more `.parent`
+   stripping, since the field no longer includes the Artist-Title
+   segment).
+3. **The LRCLIB search dialog now has its own editable Artist/Title
+   search fields** (pre-filled from the resolved artist/title when
+   known, auto-searches once on open) instead of firing a single fixed
+   search before the dialog even appears -- the user can freely edit and
+   re-search for anything, not just what was auto-detected. Same dialog
+   class serves both entry points: the manual "Search Lyrics..." button
+   now just opens the dialog (letting IT do the initial search), and the
+   automatic mid-run ambiguity prompt passes its already-found
+   `initial_candidates` straight in (skipping the dialog's own
+   auto-search, avoiding a redundant duplicate network call) while still
+   pre-filling the search fields for a manual re-search if desired.
+   **Real-verified** (GUI-level, mocked network): dialog auto-searches
+   using pre-filled terms on open; editing the fields and searching
+   again returns and uses the NEW results, not the original ones; the
+   ambiguity-prompt path's `initial_candidates` correctly skips the
+   redundant auto-search while keeping the fields usable.
 
 ## Environment notes
 

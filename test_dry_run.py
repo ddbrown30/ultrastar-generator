@@ -12,8 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from ultrastar_generator.file_discovery import find_companions, parse_artist_title
-from ultrastar_generator.tempo import beat_duration_ms, seconds_to_beat, seconds_to_beat_length
+from ultrastar_generator.file_discovery import (find_companions, parse_artist_title,
+                                                 resolve_artist_title, resolve_primary_source,
+                                                 AmbiguousInputError, NoAudioSourceFoundError)
+from ultrastar_generator.tempo import beat_duration_ms, seconds_to_beat, seconds_to_beat_length, beat_to_seconds
 from ultrastar_generator.syllables import hyphenate
 from ultrastar_generator.models import Syllable, LineBreak, Song, Word
 from ultrastar_generator.phrasing import build_lines
@@ -31,7 +33,80 @@ comp = find_companions(audio)
 assert comp.video and comp.video.name == "Bon Jovi - Its My Life.mp4"
 assert comp.cover and "[CO]" in comp.cover.name
 assert comp.background and "[BG]" in comp.background.name
+
+print("\n--- file_discovery.resolve_artist_title: falls back to the input FOLDER's name "
+      "when the audio file's own name doesn't parse (real case: a ripped/downloaded song "
+      "keeps a generic filename like 'music.ogg' while its folder is 'Artist - Title') ---")
+import tempfile as _tempfile_artist_title
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    normal_folder = Path(_tmp) / "some_folder"
+    normal_folder.mkdir()
+    parseable_audio = normal_folder / "Bon Jovi - Its My Life.mp3"
+    artist2, title2 = resolve_artist_title(parseable_audio, normal_folder)
+    assert (artist2, title2) == ("Bon Jovi", "Its My Life"), (artist2, title2)
+print("OK: when the audio filename parses fine, resolve_artist_title uses it directly (folder name ignored)")
+
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    named_folder = Path(_tmp) / "Bon Jovi - Its My Life"
+    named_folder.mkdir()
+    unparseable_audio = named_folder / "music.mp3"
+    artist3, title3 = resolve_artist_title(unparseable_audio, named_folder)
+    assert (artist3, title3) == ("Bon Jovi", "Its My Life"), (artist3, title3)
+print("OK: when the audio filename doesn't parse, resolve_artist_title falls back to the folder's own name")
+
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    unparseable_folder = Path(_tmp) / "random_folder_name"
+    unparseable_folder.mkdir()
+    unparseable_audio2 = unparseable_folder / "music.mp3"
+    artist4, title4 = resolve_artist_title(unparseable_audio2, unparseable_folder)
+    assert (artist4, title4) == (None, None), (artist4, title4)
+print("OK: when NEITHER the audio filename nor the folder name parse, resolve_artist_title "
+      "returns (None, None) rather than raising")
+
+# A dot inside the folder name must not be misread as a file extension
+# (Path.stem would strip it; resolve_artist_title uses the folder's raw
+# .name specifically to avoid that).
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    dotted_folder = Path(_tmp) / "Mr. Roboto - Styx"
+    dotted_folder.mkdir()
+    unparseable_audio3 = dotted_folder / "track01.mp3"
+    artist5, title5 = resolve_artist_title(unparseable_audio3, dotted_folder)
+    assert (artist5, title5) == ("Mr. Roboto", "Styx"), (artist5, title5)
+print("OK: a dot inside the folder name (e.g. 'Mr. Roboto - Styx') is NOT misread as a file "
+      "extension when falling back to the folder name")
 print("OK:", artist, title, comp)
+
+print("\n--- file_discovery.find_companions: falls back to a single unambiguous video/image "
+      "even when its name doesn't match the audio file's basename (real case: a SingStar-style "
+      "rip with audio 'music.ogg' + unrelated 'video.mpg'/'cover.jpg' names) ---")
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    rip_folder = Path(_tmp) / "Beauty And The Beast - Beauty And The Beast"
+    rip_folder.mkdir()
+    rip_audio = rip_folder / "music.ogg"
+    rip_audio.write_bytes(b"fake-audio")
+    (rip_folder / "video.mpg").write_bytes(b"fake-video")
+    (rip_folder / "cover.jpg").write_bytes(b"fake-cover")
+    rip_comp = find_companions(rip_audio)
+    assert rip_comp.video is not None and rip_comp.video.name == "video.mpg", rip_comp.video
+    assert rip_comp.cover is not None and rip_comp.cover.name == "cover.jpg", rip_comp.cover
+    assert rip_comp.background is not None and rip_comp.background.name == "cover.jpg", rip_comp.background
+print("OK: a single non-matching-name video (.mpg) and image are both picked up via the "
+      "unambiguous-single-candidate fallback")
+
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    # TWO non-matching, untagged images -- genuinely ambiguous, must NOT
+    # guess (same principle as the existing "multiple untagged images"
+    # case, just extended to the no-basename-match case too).
+    ambiguous_folder = Path(_tmp) / "Some Song"
+    ambiguous_folder.mkdir()
+    ambiguous_audio = ambiguous_folder / "track.mp3"
+    ambiguous_audio.write_bytes(b"fake-audio")
+    (ambiguous_folder / "poster.jpg").write_bytes(b"fake-1")
+    (ambiguous_folder / "screenshot.jpg").write_bytes(b"fake-2")
+    ambiguous_comp = find_companions(ambiguous_audio)
+    assert ambiguous_comp.cover is None and ambiguous_comp.background is None, ambiguous_comp
+print("OK: two non-matching, untagged images stays ambiguous -- correctly finds nothing rather than "
+      "guessing which one is the cover")
 
 print("\n--- file_discovery: MusicXML reference files matched by EXTENSION, not basename "
       "(unlike video/cover -- a downloaded score keeps its own source filename) ---")
@@ -45,6 +120,94 @@ assert [p.name for p in comp2.musicxml] == sorted([mxl_a.name, mxl_b.name], key=
 print("OK: both differently-named reference files found, sorted deterministically:",
       [p.name for p in comp2.musicxml])
 
+print("\n--- file_discovery.resolve_primary_source: folder-based input resolution ---")
+import tempfile as _tempfile_fd
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "Artist - Title.mp3").write_bytes(b"")
+    path, kind = resolve_primary_source(d)
+    assert (path.name, kind) == ("Artist - Title.mp3", "audio"), (path, kind)
+print("OK: single real audio file -> kind='audio'")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "Artist - Title.mp3").write_bytes(b"")
+    (d / "Artist - Title (alt take).ogg").write_bytes(b"")
+    try:
+        resolve_primary_source(d)
+        assert False, "should have raised AmbiguousInputError"
+    except AmbiguousInputError as e:
+        assert "Artist - Title.mp3" in str(e) and "alt take" in str(e), e
+print("OK: two real audio files -> AmbiguousInputError naming both candidates")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "Artist - Title.mp3").write_bytes(b"")
+    (d / "Artist - Title (alt take).ogg").write_bytes(b"")
+    path, kind = resolve_primary_source(d, audio_file_override="Artist - Title (alt take).ogg")
+    assert (path.name, kind) == ("Artist - Title (alt take).ogg", "audio"), (path, kind)
+print("OK: --audio-file override resolves the ambiguity")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "video.mp4").write_bytes(b"")
+    path, kind = resolve_primary_source(d)
+    assert (path.name, kind) == ("video.mp4", "video_as_audio"), (path, kind)
+print("OK: no real audio, one mp4 -> kind='video_as_audio'")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "video.mpg").write_bytes(b"")
+    path, kind = resolve_primary_source(d)
+    assert (path.name, kind) == ("video.mpg", "video_as_audio"), (path, kind)
+print("OK: no real audio, one mpg -> kind='video_as_audio' (UltraStar Deluxe accepts .mpg as #MP3 directly)")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "video.mpeg").write_bytes(b"")
+    path, kind = resolve_primary_source(d)
+    assert (path.name, kind) == ("video.mpeg", "video_as_audio"), (path, kind)
+print("OK: no real audio, one mpeg -> kind='video_as_audio'")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "old_recording.avi").write_bytes(b"")
+    path, kind = resolve_primary_source(d)
+    assert (path.name, kind) == ("old_recording.avi", "avi_extract"), (path, kind)
+print("OK: no real audio, no direct-audio video, one avi -> kind='avi_extract' "
+      "(UltraStar Deluxe can NOT use .avi as #MP3 directly, unlike mp4/mpg/mpeg)")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "video.mp4").write_bytes(b"")
+    (d / "old_recording.avi").write_bytes(b"")
+    path, kind = resolve_primary_source(d)
+    assert (path.name, kind) == ("video.mp4", "video_as_audio"), (path, kind)
+print("OK: mp4 present alongside an avi -> mp4 wins (preferred over avi)")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "video.mp4").write_bytes(b"")
+    (d / "video.mpg").write_bytes(b"")
+    try:
+        resolve_primary_source(d)
+        assert False, "should have raised AmbiguousInputError"
+    except AmbiguousInputError:
+        pass
+print("OK: two different direct-audio-usable video files (mp4 + mpg) -> AmbiguousInputError, "
+      "not a silent guess")
+
+with _tempfile_fd.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "cover.jpg").write_bytes(b"")
+    try:
+        resolve_primary_source(d)
+        assert False, "should have raised NoAudioSourceFoundError"
+    except NoAudioSourceFoundError:
+        pass
+print("OK: nothing usable in the folder -> NoAudioSourceFoundError")
+
 print("\n--- tempo math vs. real reference files ---")
 assert abs(beat_duration_ms(300) - 50.0) < 1e-6
 assert seconds_to_beat(23.0, 23000, 300) == 0
@@ -53,6 +216,14 @@ t = 8300 + 200 * beat_duration_ms(120)
 assert seconds_to_beat(t / 1000.0, 8300, 120) == 200
 assert seconds_to_beat(48.030, 48030, 382.7) == 0
 print("OK: beat math matches all 3 spot-checks")
+
+for t_sec, gap_ms, bpm in [(23.0, 23000, 300), (48.030, 48030, 382.7), (100.456, 8300, 120)]:
+    beat = seconds_to_beat(t_sec, gap_ms, bpm)
+    round_tripped = beat_to_seconds(beat, gap_ms, bpm)
+    # round-trip through an integer beat necessarily loses sub-beat precision --
+    # must land back within one beat's own duration, not exactly at t_sec.
+    assert abs(round_tripped - t_sec) <= beat_duration_ms(bpm) / 1000.0 + 1e-9, (t_sec, round_tripped)
+print("OK: beat_to_seconds round-trips seconds_to_beat within one beat's own duration")
 
 print("\n--- syllables (regex fallback, no pyphen installed here) ---")
 for w in ["reciprocity", "mothering", "cowboy", "I'm", "highway,", "always"]:
@@ -283,23 +454,6 @@ assert mixed_notes[0].start >= silent_duration_sec - 0.05, \
     f"note started during the silent section: {mixed_notes[0]}"
 print(f"OK: silent lead-in correctly produced no note; real singing starting at "
       f"{mixed_notes[0].start:.2f}s (silent section was {silent_duration_sec:.2f}s) was preserved")
-
-print("\n--- key_correction: obvious out-of-key note gets snapped (now pass 2, operates on NoteEvent, no lyrics involved) ---")
-from ultrastar_generator.key_correction import snap_to_key
-# Heavily-weighted C major scale (each in-key pitch class repeated 3x so
-# the key detector isn't confused by a single outlier) plus ONE clear
-# outlier at pitch class 6 (F#), which isn't in C major and sits between
-# F(5, in-key) and G(7, in-key).
-in_key = [0, 2, 4, 5, 7, 9, 11] * 3
-c_major_notes = [
-    NoteEvent(start=i * 0.5, end=i * 0.5 + 0.4, pitch=pc)
-    for i, pc in enumerate(in_key)
-]
-outlier_idx = len(c_major_notes)
-c_major_notes.append(NoteEvent(start=outlier_idx * 0.5, end=outlier_idx * 0.5 + 0.4, pitch=6))
-snapped = snap_to_key(c_major_notes)
-assert snapped[outlier_idx].pitch in (5, 7), snapped[outlier_idx].pitch
-print(f"OK: outlier pitch 6 snapped to {snapped[outlier_idx].pitch}")
 
 print("\n--- BUG REGRESSION (round 3): word order is preserved even with imprecise/fallback timing ---")
 # Reproduces the reported "He knows his way in the dark" scrambling:
@@ -539,6 +693,98 @@ assert best is not None and best.source == "lrclib"
 assert best.plain_lyrics == "close duration, synced", best.plain_lyrics
 assert best.synced_lyrics == "[00:01.00]line one\n[00:05.00]line two", best.synced_lyrics
 print("OK: correct candidate chosen among instrumental/far-duration/synced-tiebreak options")
+
+print("\n--- lyrics_lookup.search_lrclib: returns ALL raw candidates unfiltered (for the manual search UI) ---")
+from ultrastar_generator.lyrics_lookup import search_lrclib, LrcLibCandidate
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=lrclib_candidates)
+all_candidates = search_lrclib("Beauty and the Beast", "Gaston")
+assert len(all_candidates) == 4, len(all_candidates)  # including the instrumental one
+assert all(isinstance(c, LrcLibCandidate) for c in all_candidates)
+assert any(c.instrumental for c in all_candidates), "instrumental candidate must NOT be filtered out here"
+assert all_candidates[3].synced_lyrics == "[00:01.00]line one\n[00:05.00]line two"
+print("OK: search_lrclib returns every candidate as-is, including the instrumental one, for a human to browse")
+
+print("\n--- lyrics_lookup.search_lrclib: q= does a broader free-text search INSTEAD of artist/title ---")
+
+
+class _ParamRecordingRequestsModule:
+    """Records exactly what params were sent, to confirm q= is used alone
+    (not combined with artist_name/track_name) when given."""
+    def __init__(self, payload):
+        self.payload = payload
+        self.last_params = None
+
+    def get(self, url, params=None, timeout=None):
+        self.last_params = params
+        return _FakeLRCLIBResponse(self.payload)
+
+
+fake_q_module = _ParamRecordingRequestsModule(lrclib_candidates[:1])
+_sys.modules["requests"] = fake_q_module
+q_results = search_lrclib(q="some broad free-text query")
+assert fake_q_module.last_params == {"q": "some broad free-text query"}, fake_q_module.last_params
+assert len(q_results) == 1
+print("OK: search_lrclib(q=...) sends only 'q', not artist_name/track_name")
+
+fake_at_module = _ParamRecordingRequestsModule(lrclib_candidates[:1])
+_sys.modules["requests"] = fake_at_module
+search_lrclib("Some Artist", "Some Title")
+assert fake_at_module.last_params == {"artist_name": "Some Artist", "track_name": "Some Title"}, \
+    fake_at_module.last_params
+print("OK: search_lrclib(artist, title) without q still sends artist_name/track_name as before")
+del _sys.modules["requests"]
+
+print("\n--- lyrics_lookup._fetch_from_lrclib: on_ambiguous callback (GUI disambiguation path) ---")
+# Dedicated fixture (config.LRCLIB_DURATION_TOLERANCE_SEC == 60.0, so the
+# ambiguity filter's 3x-tolerance cutoff is 180s): duration_sec=100 makes
+# the 350s candidate's diff (250s) clearly exceed 180s -> excluded from
+# "real" candidates, while the two ~100s candidates (diff 5s/10s) stay in.
+ambiguous_candidates = [
+    {"trackName": "Song", "artistName": "Artist", "duration": 30,
+     "instrumental": True, "plainLyrics": None, "syncedLyrics": None},  # excluded: instrumental
+    {"trackName": "Song", "artistName": "Artist", "duration": 350,
+     "instrumental": False, "plainLyrics": "wildly different recording", "syncedLyrics": None},  # excluded: duration
+    {"trackName": "Song", "artistName": "Artist", "duration": 105,
+     "instrumental": False, "plainLyrics": "candidate A", "syncedLyrics": None},
+    {"trackName": "Song", "artistName": "Artist", "duration": 110,
+     "instrumental": False, "plainLyrics": "candidate B", "syncedLyrics": None},
+]
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=ambiguous_candidates)
+seen_real_candidates = []
+
+
+def _pick_second(candidates):
+    seen_real_candidates.append(candidates)
+    return candidates[1]  # deliberately NOT the auto-pick winner (candidate A scores higher: closer duration)
+
+
+chosen = _fetch_from_lrclib("Artist", "Song", duration_sec=100.0, on_ambiguous=_pick_second)
+assert len(seen_real_candidates) == 1
+real_seen = seen_real_candidates[0]
+assert len(real_seen) == 2, [c.plain_lyrics for c in real_seen]
+assert {c.plain_lyrics for c in real_seen} == {"candidate A", "candidate B"}
+assert chosen is not None and chosen.plain_lyrics == "candidate B"
+print("OK: on_ambiguous is offered only the filtered 'real' candidates (instrumental and wildly-off-duration "
+      "both excluded), and its choice is used directly -- even when it's NOT what automatic scoring would pick")
+
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=ambiguous_candidates)
+
+
+def _decline(candidates):
+    return None  # user cancelled the popup
+
+
+declined = _fetch_from_lrclib("Artist", "Song", duration_sec=100.0, on_ambiguous=_decline)
+assert declined is not None and declined.plain_lyrics == "candidate A", declined
+print("OK: on_ambiguous returning None (user cancelled) falls through to the normal automatic pick")
+
+# A single-real-candidate case must NOT invoke on_ambiguous at all -- no ambiguity to resolve.
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=[ambiguous_candidates[0], ambiguous_candidates[2]])
+was_called = []
+_fetch_from_lrclib("Artist", "Song", duration_sec=105.0, on_ambiguous=lambda c: was_called.append(c) or None)
+assert not was_called, "on_ambiguous must not fire when there's only one real candidate"
+print("OK: on_ambiguous is never invoked when there's only one real (non-instrumental) candidate")
+del _sys.modules["requests"]
 
 print("\n--- lyrics_lookup.fetch_reference_lyrics: falls back to lyrics.ovh when LRCLIB has nothing ---")
 _sys.modules["requests"] = _FakeRequestsModule(
@@ -1466,5 +1712,328 @@ print(f"OK: constant-offset tier correctly failed on real drift (deltas spread a
       f"robust fit recovered slope={drift_stats.calibration_slope:+.4f}, offset={drift_stats.calibration_offset_sec:+.1f}s, "
       f"flagged only the genuine outlier: {flagged_texts}")
 
+print("\n--- cover_extract: embedded-cover-art extraction (mutagen) ---")
+from ultrastar_generator import cover_extract
+
+_JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 50
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+
+assert cover_extract._sniff_image_ext(_JPEG_BYTES) == ".jpg"
+assert cover_extract._sniff_image_ext(_PNG_BYTES) == ".png"
+assert cover_extract._sniff_image_ext(b"not an image") is None
+print("OK: magic-byte sniffing correctly identifies jpg/png and rejects garbage")
 
 
+class _FakeAPIC:
+    def __init__(self, data):
+        self.data = data
+
+
+class _FakeID3Tags:
+    def __init__(self, apics):
+        self._apics = apics
+
+    def getall(self, key):
+        return self._apics if key == "APIC" else []
+
+
+assert cover_extract._from_id3(_FakeID3Tags([_FakeAPIC(_JPEG_BYTES)])) == _JPEG_BYTES
+assert cover_extract._from_id3(_FakeID3Tags([])) is None
+print("OK: ID3 APIC extraction reads the first embedded picture's raw bytes")
+
+assert cover_extract._from_mp4({"covr": [_PNG_BYTES]}) == _PNG_BYTES
+assert cover_extract._from_mp4({}) is None
+print("OK: MP4 'covr' atom extraction works")
+
+from mutagen.flac import Picture as _FlacPicture
+import base64 as _base64
+_pic = _FlacPicture()
+_pic.data = _JPEG_BYTES
+_pic.mime = "image/jpeg"
+_pic.type = 3
+_block = _base64.b64encode(_pic.write()).decode("ascii")
+assert cover_extract._from_vorbis_comment_block({"metadata_block_picture": [_block]}) == _JPEG_BYTES
+assert cover_extract._from_vorbis_comment_block({}) is None
+print("OK: OGG/Opus base64 vorbis-comment picture block round-trips correctly")
+
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fake_audio = d / "Some Artist - Some Song.mp3"
+    fake_audio.write_bytes(b"not a real audio file")  # extraction must fail gracefully, not crash
+    result = cover_extract.extract_embedded_cover(fake_audio, d / "out")
+    assert result is None, result
+print("OK: a file mutagen can't parse at all -> None, never raises")
+
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fake_audio = d / "Some Artist - Some Song.mp3"
+    fake_audio.write_bytes(b"")
+    _orig_extract_raw = cover_extract._extract_raw_picture
+    cover_extract._extract_raw_picture = lambda p: _JPEG_BYTES  # bypass mutagen's own container validation
+    try:
+        out_path = cover_extract.extract_embedded_cover(fake_audio, d / "out")
+    finally:
+        cover_extract._extract_raw_picture = _orig_extract_raw  # restore the real function
+    assert out_path is not None and out_path.name == "Some Artist - Some Song [CO].jpg", out_path
+    assert out_path.read_bytes() == _JPEG_BYTES
+print(f"OK: extracted cover written with find_companions' own [CO] tag convention: {out_path.name}")
+
+print("\n--- output_staging.stage_companions_to_output ---")
+from ultrastar_generator.output_staging import stage_companions_to_output
+
+with _tempfile.TemporaryDirectory() as root:
+    root = Path(root)
+    in_dir = root / "in"
+    out_dir = root / "out"
+    in_dir.mkdir()
+    mp3 = in_dir / "song.mp3"
+    mp3.write_bytes(b"mp3-bytes")
+    video = in_dir / "song.mp4"
+    video.write_bytes(b"video-bytes")
+    cover = in_dir / "song [CO].jpg"
+    cover.write_bytes(b"cover-bytes")
+
+    staged = stage_companions_to_output(out_dir, mp3_src=mp3, video_src=video, cover_src=cover)
+    assert staged.mp3 == "song.mp3" and staged.video == "song.mp4" and staged.cover == "song [CO].jpg"
+    assert staged.background is None
+    assert (out_dir / "song.mp3").read_bytes() == b"mp3-bytes"
+    assert (out_dir / "song.mp4").read_bytes() == b"video-bytes"
+    assert (out_dir / "song [CO].jpg").read_bytes() == b"cover-bytes"
+print("OK: mp3/video/cover copied into the output folder under their own basenames")
+
+with _tempfile.TemporaryDirectory() as root:
+    root = Path(root)
+    in_dir = root / "in"
+    out_dir = root / "out"
+    in_dir.mkdir()
+    mp4 = in_dir / "song.mp4"
+    mp4.write_bytes(b"mp4-bytes")
+
+    staged = stage_companions_to_output(out_dir, mp3_src=mp4, video_src=mp4)
+    assert staged.mp3 == staged.video == "song.mp4"
+    assert len(list(out_dir.iterdir())) == 1, "identical mp3/video source must only be copied ONCE"
+print("OK: identical mp3_src/video_src (mp4-as-audio case) copied exactly once, both roles reference it")
+
+print("\n--- main.delete_intermediates: scoped to separated/+extracted/, leaves debug files alone ---")
+import tempfile as _tempfile_delint
+from ultrastar_generator.main import delete_intermediates as _delete_intermediates
+with _tempfile_delint.TemporaryDirectory() as tmp:
+    work_dir = Path(tmp) / ".ultrastar_work"
+    (work_dir / "separated" / "htdemucs" / "song").mkdir(parents=True)
+    (work_dir / "separated" / "htdemucs" / "song" / "vocals.wav").write_bytes(b"fake-vocals")
+    (work_dir / "extracted").mkdir(parents=True)
+    (work_dir / "extracted" / "audio.mp3").write_bytes(b"fake-extracted-audio")
+    debug_log = work_dir / "Some Artist - Some Song [DEBUG LOG].txt"
+    debug_log.write_text("debug content", encoding="utf-8")
+    pass1_debug = work_dir / "Some Artist - Some Song [PASS1 DEBUG].txt"
+    pass1_debug.write_text("pass1 debug content", encoding="utf-8")
+
+    _delete_intermediates(work_dir)
+
+    assert not (work_dir / "separated").exists(), "separated/ should be deleted"
+    assert not (work_dir / "extracted").exists(), "extracted/ should be deleted"
+    assert debug_log.is_file(), "debug log must survive delete_intermediates"
+    assert pass1_debug.is_file(), "pass-1 debug file must survive delete_intermediates"
+print("OK: delete_intermediates removes separated/+extracted/ but leaves debug files under work_dir alone")
+
+# A work_dir with no separated/extracted subfolders at all must not raise.
+with _tempfile_delint.TemporaryDirectory() as tmp:
+    empty_work_dir = Path(tmp) / ".ultrastar_work"
+    empty_work_dir.mkdir()
+    _delete_intermediates(empty_work_dir)  # must not raise
+print("OK: delete_intermediates on a work_dir with nothing to delete is a silent no-op")
+
+print("\n--- usdx_parser.parse_usdx_file: round-trips usdx_writer.render_song's own grammar ---")
+from ultrastar_generator.usdx_parser import parse_usdx_file, UsdxParseError, ParsedSong
+
+roundtrip_syllables = [
+    Syllable(text="Hello", start=1.000, end=1.400, midi_note=3, is_word_start=True),
+    Syllable(text="world", start=1.500, end=1.900, midi_note=5, is_word_start=True),
+    Syllable(text="a", start=3.000, end=3.100, midi_note=0, is_word_start=True),
+    Syllable(text="gain", start=3.100, end=3.500, midi_note=2, is_word_start=False),
+]
+roundtrip_entries = [
+    roundtrip_syllables[0], roundtrip_syllables[1],
+    LineBreak(start=2.000, end=3.000),
+    roundtrip_syllables[2], roundtrip_syllables[3],
+]
+roundtrip_song = Song(
+    title="Round Trip Test", artist="Test Artist", mp3="test.mp3",
+    bpm=200.0, gap_ms=1000, entries=roundtrip_entries,
+)
+with _tempfile.TemporaryDirectory() as d:
+    out_path = Path(d) / "Test Artist - Round Trip Test.txt"
+    from ultrastar_generator.usdx_writer import write_song
+    write_song(roundtrip_song, out_path)
+    parsed = parse_usdx_file(out_path)
+
+assert parsed.title == "Round Trip Test" and parsed.artist == "Test Artist"
+assert abs(parsed.bpm - 200.0) < 1e-6 and parsed.gap_ms == 1000
+parsed_syllables = [e for e in parsed.entries if isinstance(e, Syllable)]
+assert [s.text for s in parsed_syllables] == ["Hello", "world", "a", "gain"]
+assert [s.is_word_start for s in parsed_syllables] == [True, True, True, False]
+assert [s.midi_note for s in parsed_syllables] == [3, 5, 0, 2]
+for orig, rt in zip(roundtrip_syllables, parsed_syllables):
+    # round-tripped through integer beats -- must land within one beat's
+    # own duration at this BPM (50ms @ 200bpm*4), not bit-exact.
+    assert abs(orig.start - rt.start) < 0.06, (orig, rt)
+line_breaks = [e for e in parsed.entries if isinstance(e, LineBreak)]
+assert len(line_breaks) == 1 and abs(line_breaks[0].start - 2.0) < 0.06
+print("OK: parse_usdx_file round-trips render_song's own output exactly (text, pitch, word-starts, "
+      "timing within one beat's quantization)")
+
+with _tempfile.TemporaryDirectory() as d:
+    garbage_path = Path(d) / "garbage.txt"
+    garbage_path.write_text("#TITLE:Bad\n#ARTIST:Bad\n#BPM:200\n#GAP:0\nthis is not a valid note line\nE\n",
+                             encoding="utf-8")
+    try:
+        parse_usdx_file(garbage_path)
+        assert False, "should have raised UsdxParseError"
+    except UsdxParseError:
+        pass
+print("OK: a structurally invalid file raises UsdxParseError (fails closed, never a partial parse)")
+
+with _tempfile.TemporaryDirectory() as d:
+    missing_bpm_path = Path(d) / "missing_bpm.txt"
+    missing_bpm_path.write_text("#TITLE:Bad\n#ARTIST:Bad\n#GAP:0\n: 0 1 0 hi\nE\n", encoding="utf-8")
+    try:
+        parse_usdx_file(missing_bpm_path)
+        assert False, "should have raised UsdxParseError"
+    except UsdxParseError:
+        pass
+print("OK: a missing required tag (#BPM) raises UsdxParseError")
+
+print("\n--- verify_existing_song: compares an existing .txt's pitch/timing against a fresh pipeline run ---")
+from ultrastar_generator.verify_existing_song import verify_existing_song
+
+def _mk_word_syllables(words_start_pitch, start_offset=0.0):
+    """words_start_pitch: [(text, start_sec, midi_note), ...] -- each its own word-start syllable."""
+    return [Syllable(text=t, start=s + start_offset, end=s + start_offset + 0.3, midi_note=p, is_word_start=True)
+            for t, s, p in words_start_pitch]
+
+base_words = [(f"word{i}", float(i), (i * 3) % 12) for i in range(15)]
+
+# Case 1: existing file matches the fresh run closely -> PASS
+existing_ok = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
+                          entries=_mk_word_syllables(base_words))
+fresh_ok = _mk_word_syllables(base_words, start_offset=0.02)  # trivial jitter, well within tolerance
+result = verify_existing_song(existing_ok, fresh_ok, min_matched=10, verbose=True)
+assert result.verdict == "PASS", result
+print(f"OK: closely-matching existing file -> PASS ({result.pitch_class_accuracy:.0%} pitch, "
+      f"{result.timing_within_tolerance_pct:.0%} timing)")
+
+# Case 2: existing file's pitches are all wrong (shifted by a non-multiple-of-12 amount) -> PROBLEMS_FOUND
+wrong_pitch_words = [(t, s, (p + 5) % 12) for t, s, p in base_words]
+existing_wrong_pitch = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
+                                   entries=_mk_word_syllables(wrong_pitch_words))
+result = verify_existing_song(existing_wrong_pitch, fresh_ok, min_matched=10, verbose=True)
+assert result.verdict == "PROBLEMS_FOUND", result
+assert result.pitch_class_accuracy < 0.5, result.pitch_class_accuracy
+print(f"OK: existing file with wrong pitches -> PROBLEMS_FOUND ({result.pitch_class_accuracy:.0%} pitch accuracy)")
+
+# Case 3: existing file's timing is way off (several seconds late) -> PROBLEMS_FOUND
+late_words = [(t, s + 5.0, p) for t, s, p in base_words]
+existing_late = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
+                            entries=_mk_word_syllables(late_words))
+result = verify_existing_song(existing_late, fresh_ok, min_matched=10, verbose=True)
+assert result.verdict == "PROBLEMS_FOUND", result
+assert result.timing_within_tolerance_pct < 0.5, result.timing_within_tolerance_pct
+print(f"OK: existing file with badly-off timing -> PROBLEMS_FOUND "
+      f"({result.timing_within_tolerance_pct:.0%} timing agreement)")
+
+# Case 4: too few words in common -> COULD_NOT_VERIFY, never a false PASS
+tiny_existing = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
+                            entries=_mk_word_syllables(base_words[:3]))
+result = verify_existing_song(tiny_existing, fresh_ok, min_matched=10, verbose=False)
+assert result.verdict == "COULD_NOT_VERIFY", result
+print(f"OK: too few matched words -> COULD_NOT_VERIFY, not a false PASS ({result.reason})")
+
+print("\n--- youtube_source.download_youtube_source (fake yt_dlp module, no real network) ---")
+from ultrastar_generator.youtube_source import YoutubeDownloadError
+
+
+class _FakeYoutubeDL:
+    def __init__(self, opts):
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def download(self, urls):
+        # Simulate yt-dlp actually producing the expected output file, PLUS
+        # (if writethumbnail is set, as it now always is) a converted
+        # thumbnail -- real yt-dlp's FFmpegThumbnailsConvertor always lands
+        # it at "<outtmpl base>.jpg" regardless of audio/video mode.
+        out_tmpl = self.opts["outtmpl"]
+        ext = "mp4" if "merge_output_format" in self.opts else "mp3"
+        Path(out_tmpl % {"ext": ext}).write_bytes(b"fake-downloaded-bytes")
+        if self.opts.get("writethumbnail"):
+            Path(out_tmpl % {"ext": "jpg"}).write_bytes(b"fake-thumbnail-bytes")
+
+
+class _FakeYoutubeDLFails:
+    def __init__(self, opts):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def download(self, urls):
+        raise RuntimeError("Video unavailable")
+
+
+class _FakeYtDlpModule:
+    def __init__(self, cls):
+        self.YoutubeDL = cls
+
+
+import sys as _sys
+_sys.modules["yt_dlp"] = _FakeYtDlpModule(_FakeYoutubeDL)
+from ultrastar_generator.youtube_source import download_youtube_source
+with _tempfile.TemporaryDirectory() as d:
+    out = download_youtube_source("https://example.com/fake", Path(d), audio_only=True)
+    assert out.name == "youtube_download.mp3" and out.read_bytes() == b"fake-downloaded-bytes"
+    cover = Path(d) / "youtube_download [CO].jpg"
+    assert cover.is_file() and cover.read_bytes() == b"fake-thumbnail-bytes"
+    assert not (Path(d) / "youtube_download.jpg").exists(), "raw thumbnail should be renamed, not left behind"
+with _tempfile.TemporaryDirectory() as d:
+    out = download_youtube_source("https://example.com/fake", Path(d), audio_only=False)
+    assert out.name == "youtube_download.mp4"
+    assert (Path(d) / "youtube_download [CO].jpg").is_file()
+print("OK: successful download resolves to the expected deterministic filename (mp3 audio-only / mp4 video), "
+      "and the thumbnail is renamed to the [CO]-tagged cover convention find_companions already knows")
+
+
+class _FakeYoutubeDLNoThumbnail(_FakeYoutubeDL):
+    def download(self, urls):
+        # Simulate yt-dlp succeeding at the real download but failing to
+        # find/convert a thumbnail for this particular video -- must not
+        # fail the overall download.
+        out_tmpl = self.opts["outtmpl"]
+        ext = "mp4" if "merge_output_format" in self.opts else "mp3"
+        Path(out_tmpl % {"ext": ext}).write_bytes(b"fake-downloaded-bytes")
+
+
+_sys.modules["yt_dlp"] = _FakeYtDlpModule(_FakeYoutubeDLNoThumbnail)
+with _tempfile.TemporaryDirectory() as d:
+    out = download_youtube_source("https://example.com/fake", Path(d), audio_only=True)
+    assert out.is_file()
+    assert not (Path(d) / "youtube_download [CO].jpg").exists()
+    assert not (Path(d) / "youtube_download.jpg").exists()
+print("OK: a video with no fetchable thumbnail still downloads successfully (thumbnail rename is a silent no-op)")
+
+_sys.modules["yt_dlp"] = _FakeYtDlpModule(_FakeYoutubeDLFails)
+with _tempfile.TemporaryDirectory() as d:
+    try:
+        download_youtube_source("https://example.com/fake", Path(d), audio_only=True)
+        assert False, "should have raised YoutubeDownloadError"
+    except YoutubeDownloadError as e:
+        assert "Video unavailable" in str(e), e
+print("OK: a download failure (network/private/removed video) raises YoutubeDownloadError, never a raw exception")
+del _sys.modules["yt_dlp"]

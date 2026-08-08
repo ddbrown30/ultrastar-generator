@@ -249,9 +249,6 @@ options:
 --no-video-sync                Skip auto-VIDEOGAP detection
 --no-whisperx                  Force faster-whisper's own word timestamps
                                 instead of WhisperX forced alignment
---no-key-correction             Disable the musical-key pitch-snapping
-                                polish pass (default: ON; music21-based --
-                                see section 4)
 --no-crepe                      Disable the CREPE (torchcrepe) per-frame
                                 pitch cross-check against pYIN (default: ON
                                 -- see section 4)
@@ -271,7 +268,7 @@ options:
                                 get merged into a neighbor
 --no-pass1-debug                Don't write the pass-1-only debug .txt
                                 (written by default -- see section 3)
---quiet                         Suppress the verbose [pass1]/[pass2]
+--quiet                         Suppress the verbose [pass1]
                                 diagnostic console output
 --silence-threshold-db 40       Relative silence gate: a frame this many
                                 dB quieter than the track's own loud
@@ -302,8 +299,8 @@ Two things are always on by default to make it possible to tell *where*
 in the pipeline something went wrong, without needing to read source:
 
 **The pass-1 debug file.** Every run writes
-`<Artist> - <Title> [PASS1 DEBUG].txt` next to the real output (disable
-with `--no-pass1-debug`). It's a fully valid, loadable UltraStar file --
+`<Artist> - <Title> [PASS1 DEBUG].txt` into `<input-folder>/.ultrastar_work`
+(disable with `--no-pass1-debug`). It's a fully valid, loadable UltraStar file --
 same audio, same BPM/GAP, same note timing and pitch -- but every note's
 lyric is replaced with its own note name (e.g. "G#3") instead of a real
 word. Load it in the UltraStar editor and you're looking at pass 1's
@@ -412,11 +409,6 @@ gap-based phrasing.
   with a `~` continuation when a syllable is held across multiple notes).
   **Note timing and pitch always come from pass 1**, never from the ASR
   word boundaries.
-- An optional final polish pass (`--no-key-correction` to disable; **on
-  by default**) detects the song's most likely musical key using
-  `music21`'s implementation of the Krumhansl-Schmuckler key-finding
-  algorithm, and nudges clearly-out-of-key notes toward the nearest
-  in-key neighbor.
 - Chunk-based re-transcription verification (`--no-verify-words` to
   disable; **on by default, every word** -- `--verify-suspicious-only`
   restricts it back to just pass 2's flagged words: a "fallback" word
@@ -512,9 +504,8 @@ ultrastar_generator/
   transcription.py    WhisperX (preferred) / faster-whisper word timestamps
   lyrics_lookup.py    lyrics.ovh fetch + whole-sequence word alignment
                         (text correction + per-word reference line id)
-  lyric_alignment.py Pass 2: fits words onto the pass-1 note grid,
+  lyric_alignment.py Pass 3: fits words onto the pass-1 note grid,
                         propagates line id, reports AlignmentStats
-  key_correction.py    Optional musical-key pitch-snapping polish pass
   postprocess.py       Non-overlap enforcement (seconds-level, order-
                         preserving -- does NOT sort by timestamp)
   tempo.py             BPM detection + beat<->seconds conversion
@@ -523,9 +514,8 @@ ultrastar_generator/
                         lyric line-id changes, falls back to gap-based
   debug_output.py       Builds/writes the pass-1-only debug .txt
   video_sync.py         VIDEOGAP estimation
-  alignment.py          Pass-2 + phrasing glue (pass 1 is called
-                        directly by main.py now, to keep the two passes
-                        clearly separated)
+  alignment.py          Lyrics-lookup + pass-3 + phrasing glue (pass 1
+                        is called directly by main.py)
   usdx_writer.py        Renders/writes the final .txt; ALSO does the
                         authoritative integer-beat non-overlap check
   main.py                CLI
@@ -551,10 +541,6 @@ every bug reported so far:
   since real pYIN needs real audio/libraries not available in this
   sandbox) and confirms it collapses into a single note, matching the
   "There," example from feedback
-- **key correction** -- confirms an out-of-key note gets snapped, and
-  this test caught a real bug during development (the original
-  equidistant-neighbor handling was accidentally a no-op for every
-  standard diatonic scale; fixed by tie-breaking on pitch-class frequency)
 
 Run it with:
 

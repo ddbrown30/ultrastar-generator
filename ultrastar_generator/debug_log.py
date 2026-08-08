@@ -67,7 +67,7 @@ class DebugLog:
 
     def log_notes(self, notes: "List[NoteEvent]", label: str) -> None:
         """Dumps a NoteEvent list with FULL FLOAT-SECOND precision -- unlike
-        the '[PASS1 DEBUG]'/'[PASS2 DEBUG]' .txt files, which quantize every
+        the '[PASS1 DEBUG]' .txt file, which quantizes every
         note's start/end to integer beats for the UltraStar format (lossy:
         a note's true continuous-time boundary gets rounded, and a very
         short note's true duration can be invisibly stretched to the

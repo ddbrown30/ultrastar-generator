@@ -1,17 +1,13 @@
-"""Writes an intermediate, notes-only UltraStar .txt file: every note at
-whatever stage it's called (pass 1's raw detection, or pass 2's
-key-corrected notes), correctly timed and pitched, with placeholder text
+"""Writes an intermediate, notes-only UltraStar .txt file: pass 1's raw
+detected notes, correctly timed and pitched, with placeholder text
 instead of real lyrics. This is a real, loadable UltraStar song file --
 open it in the editor to check timing/pitch in isolation, with no chance
-of a later pass (lyric fitting, or key correction if this is the pass-1
-file) having touched anything.
+of a later pass (lyric fitting) having touched anything.
 
 Each note's placeholder text is its note name (e.g. "G#3"), which is
 usually more useful for debugging than a generic dot or number: you can
 directly compare what was detected against what you expect to hear,
-without needing to eyeball the editor's piano roll. Diffing the pass-1
-and pass-2 debug files against each other shows exactly which notes key
-correction changed, and by how much.
+without needing to eyeball the editor's piano roll.
 """
 
 from __future__ import annotations

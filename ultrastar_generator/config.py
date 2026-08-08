@@ -1,6 +1,7 @@
 """Defaults and constants shared across the pipeline."""
 
 from dataclasses import dataclass
+from typing import Any, Callable, List, Optional
 
 # --- UltraStar note types -------------------------------------------------
 NOTE_NORMAL = ":"
@@ -11,8 +12,32 @@ NOTE_RAP_GOLDEN = "G"
 
 # --- Audio / file conventions ---------------------------------------------
 AUDIO_EXTS = (".mp3", ".ogg", ".oga")
-VIDEO_EXTS = (".avi", ".mp4")
+# All companion-#VIDEO-eligible extensions (file_discovery.find_companions).
+VIDEO_EXTS = (".avi", ".mp4", ".mpg", ".mpeg")
+# Video containers UltraStar Deluxe can use directly as #MP3 (confirmed by
+# the user) when no real audio file exists -- .mp4/.mpg/.mpeg all work;
+# .avi does NOT and must have its audio extracted into a real standalone
+# file first (see file_discovery.resolve_primary_source's "video_as_audio"
+# vs. "avi_extract" tiers, and media_extract.py).
+VIDEO_DIRECT_AUDIO_EXTS = (".mp4", ".mpg", ".mpeg")
 IMAGE_EXTS = (".jpg", ".jpeg")
+
+# --- Folder-based input resolution (file_discovery.py, media_extract.py,
+# cover_extract.py, song_input.py) -------------------------------------------
+# When no real audio file (AUDIO_EXTS) exists in the input folder, a video
+# file stands in as the audio source. mp4 is preferred over avi (it can
+# serve as BOTH #MP3 and #VIDEO directly -- confirmed working in UltraStar
+# Deluxe), falling back to avi (which cannot double as #MP3 -- its audio
+# track must be actually EXTRACTED into a real standalone mp3 via ffmpeg
+# first; see media_extract.extract_audio_track).
+AVI_EXTRACTED_MP3_QUALITY = 2  # ffmpeg libmp3lame VBR scale, 0=best/largest .. 9=worst/smallest
+
+# Embedded cover-art extraction (mutagen, cover_extract.py) only runs when
+# no .jpg/.jpeg companion was already found next to the resolved audio
+# source. Matches file_discovery.find_companions' own "[CO]"/"[BG]" tag
+# naming convention, so a later find_companions call on the same folder
+# reads an extracted cover identically to a hand-placed one.
+EMBEDDED_COVER_TAG_SUFFIX = " [CO]"
 
 # --- Pipeline defaults ------------------------------------------------------
 DEFAULT_LANGUAGE = "English"
@@ -347,22 +372,6 @@ CONSENSUS_OVERRIDE_ENABLED = False
 CONSENSUS_MIN_AGREEING_SOURCES = 2
 CONSENSUS_SOURCES = ("pyin", "rmvpe", "swiftf0", "penn")
 
-# Musical key-snapping (pass 2, inspired by the pitch-correction idea in
-# the ultrastar_pitch project): detect the song's most likely key from
-# pass 1's raw pitch-class distribution and nudge out-of-scale notes to
-# the nearest in-key neighbor. OFF by default (again -- was briefly ON):
-# root-caused as actively harmful on real material, confirmed via a
-# direct pass-1-vs-pass-2 diff on a real song ("Stars", real key
-# confirmed E major by the user) -- dozens of notes changed throughout
-# the whole song, including blanket-snapping every legitimate C-natural
-# (a deliberate modal-mixture/borrowed note, not noise) to B just because
-# C isn't diatonic in E major. A single global detected key, applied
-# blindly to every note, is the wrong model for harmonically
-# sophisticated material -- real songs legitimately use out-of-scale
-# notes on purpose. Available via --key-correction for anyone who wants
-# it anyway; see [PASS2 DEBUG] to see exactly what it would change.
-ENABLE_KEY_CORRECTION = False
-
 # Word-level timestamp source. "whisperx" uses forced alignment (wav2vec2
 # CTC) for much more accurate word boundaries than Whisper's own decoder
 # timestamps; falls back to faster-whisper automatically if whisperx isn't
@@ -606,6 +615,30 @@ LRC_TIMING_MIN_DRIFT_CONFIDENCE = 0.5
 LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC = 1.5
 
 
+# --- Existing-file verification (verify_existing_song.py) ------------------
+# When an existing "<Artist> - <Title>.txt" is found in the input folder (or
+# --existing-txt points at one), this compares its own pitch/timing against
+# a FRESH pipeline run of the same audio, and only overwrites it if real
+# problems are found. OFF by default -- decided with the user: unlike this
+# project's other on-by-default features (which only ever ADD a correction
+# on top of what's already there), this one can result in NOT writing
+# output the user expected on a plain re-run, which is a qualitatively
+# different kind of surprise than "one more automatic fix."
+ENABLE_EXISTING_TXT_CHECK = False
+EXISTING_TXT_MIN_MATCHED = 10
+# NOT YET EMPIRICALLY VALIDATED -- picked by analogy to this project's other
+# calibration/agreement bars, not measured against this pipeline's own
+# run-to-run self-agreement. Before trusting these for real, run the same
+# already-validated song's pipeline twice and measure how much the
+# pipeline agrees with ITSELF (pass-1 pitch detection is not fully
+# reproducible run-to-run even on identical audio -- see CLAUDE.md's
+# CREPE/RMVPE non-determinism notes), so these bars are calibrated against
+# real self-noise rather than guessed.
+EXISTING_TXT_MIN_PITCH_ACCURACY = 0.85
+EXISTING_TXT_TIMING_TOLERANCE_SEC = 0.5
+EXISTING_TXT_MIN_TIMING_AGREEMENT = 0.85
+
+
 # --- Reference lyrics (lyrics_lookup.py) ------------------------------------
 # LRCLIB (lrclib.net) is tried first -- community-sourced, has a real search
 # API (artist_name/track_name, not lyrics.ovh's rigid /artist/title path),
@@ -636,16 +669,64 @@ REFERENCE_LYRICS_MIN_MATCH_RATIO = 0.25
 
 @dataclass
 class PipelineOptions:
-    artist: str = None
-    title: str = None
-    output_dir: str = None
+    """Every knob `run_pipeline`/`run_batch` (main.py) need, decoupled from
+    argparse -- lets the GUI (gui.py) and the CLI (main.py's `run()`) build
+    this the same way and call the exact same pipeline code. Field defaults
+    mirror `build_arg_parser`'s own defaults exactly; keep the two in sync
+    when either changes. Supersedes an earlier, stale version of this class
+    that referenced a `genius_token`/`device` field from a since-replaced
+    lyrics source and a since-removed CPU fallback path -- this version was
+    unused by any code before this rewrite."""
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    audio_file: Optional[str] = None  # disambiguates a folder with >1 real audio file
+    work_dir: Optional[str] = None
     whisper_model: str = DEFAULT_WHISPER_MODEL
+    verify_whisper_model: str = DEFAULT_WHISPER_MODEL
     demucs_model: str = DEFAULT_DEMUCS_MODEL
-    bpm_override: float = None
+    bpm_override: Optional[float] = None
     skip_separation: bool = False
-    vocals_path: str = None
+    vocals_path: Optional[str] = None
     fetch_lyrics: bool = True
-    genius_token: str = None
-    device: str = "cuda"  # only "cuda" is supported
-    keep_intermediate: bool = True
-    work_dir: str = None
+    no_video_sync: bool = False
+    no_whisperx: bool = False
+    whisperx_no_vad: bool = ENABLE_WHISPERX_NO_VAD
+    verify_words: bool = ENABLE_WORD_VERIFICATION
+    verify_placement: bool = ENABLE_PLACEMENT_VERIFICATION
+    verify_all_words: bool = VERIFY_ALL_WORDS
+    musicxml_reference: Optional[str] = None
+    musicxml_part: Optional[str] = None
+    musicxml_force_calibration: bool = ENABLE_MUSICXML_FORCE_CALIBRATION
+    lrc_timing_check: bool = ENABLE_LRC_TIMING_CHECK
+    zone_boundary_snap: bool = ENABLE_ZONE_BOUNDARY_SNAP
+    pitch_smooth_window: float = PITCH_SMOOTH_WINDOW_SEC
+    note_split_semitones: float = NOTE_SPLIT_SEMITONES
+    min_note_beat_fraction: float = MIN_NOTE_BEATS_FRACTION
+    silence_threshold_db: float = SILENCE_THRESHOLD_DB_BELOW_PEAK
+    silence_floor_db: float = SILENCE_ABSOLUTE_FLOOR_DB
+    spike_max_duration: float = SPIKE_MAX_DURATION_SEC
+    spike_jump_semitones: float = SPIKE_MIN_JUMP_SEMITONES
+    pitch_source: str = DEFAULT_PITCH_SOURCE
+    use_crepe: bool = ENABLE_CREPE
+    crepe_model: str = DEFAULT_CREPE_MODEL
+    no_pass1_debug: bool = False
+    no_debug_log: bool = False
+    quiet: bool = False
+    # New in the folder-based/batch/YouTube/GUI rework -- see CLAUDE.md.
+    existing_txt_check: bool = ENABLE_EXISTING_TXT_CHECK
+    existing_txt_path: Optional[str] = None
+    youtube_url: Optional[str] = None
+    youtube_audio_only: bool = True
+    batch: bool = False
+    delete_intermediates: bool = False
+    # Interactive LRCLIB disambiguation -- GUI only, never set by the CLI.
+    # `pinned_lyrics` (actually a lyrics_lookup.LrcLibCandidate; kept as a
+    # forward-reference string here to avoid a circular import, since
+    # lyrics_lookup.py itself imports this module) is a manual pre-run
+    # pick that always wins outright, skipping the network fetch entirely.
+    # `lyrics_disambiguation_callback` is the GUI's mid-run fallback for
+    # when nothing was pre-picked -- only ever consulted when
+    # `lyrics_ambiguity_prompt` is on AND `pinned_lyrics` is None.
+    pinned_lyrics: Optional["LrcLibCandidate"] = None
+    lyrics_ambiguity_prompt: bool = False
+    lyrics_disambiguation_callback: Optional[Callable[[List[Any]], Optional[Any]]] = None

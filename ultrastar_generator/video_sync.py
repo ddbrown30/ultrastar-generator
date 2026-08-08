@@ -10,24 +10,13 @@ VIDEOGAP = offset.
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-
-def _extract_audio_wav(src: Path, dst: Path, sr: int = 16000) -> bool:
-    if shutil.which("ffmpeg") is None:
-        return False
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src),
-        "-vn", "-ac", "1", "-ar", str(sr), "-f", "wav", str(dst),
-    ]
-    proc = subprocess.run(cmd, capture_output=True)
-    return proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+from .media_extract import extract_audio_track
 
 
 def estimate_videogap(
@@ -44,7 +33,7 @@ def estimate_videogap(
     sr = 16000
     with tempfile.TemporaryDirectory() as tmp:
         video_wav = Path(tmp) / "video_audio.wav"
-        if not _extract_audio_wav(video_path, video_wav, sr=sr):
+        if not extract_audio_track(video_path, video_wav, as_mp3=False, sr=sr):
             return None  # no audio track in the video, or ffmpeg unavailable
 
         try:

@@ -29,8 +29,8 @@ pyphen>=0.15
 # alone (with a console warning) if not installed; --no-crepe disables.
 torchcrepe>=0.0.23
 
-# Musical key detection for the optional --key-correction polish pass
-# (Krumhansl-Schmuckler key-finding)
+# MusicXML parsing for pass 4's reference-score pitch correction
+# (--musicxml-reference) and MusicXML companion-file auto-detection.
 music21>=9.1
 
 # Metadata reading (duration etc.)
@@ -38,6 +38,11 @@ mutagen>=1.47
 
 # Optional: online lyric lookup (--fetch-lyrics)
 requests>=2.31
+
+# Optional: YouTube download source (--youtube-url). Only imported when
+# that flag is actually used -- same "gracefully degrade if missing"
+# convention as whisperx/torchcrepe above.
+yt-dlp>=2024.1
 
 # --- PyTorch ---------------------------------------------------------------
 # Demucs and faster-whisper both depend on it. It's deliberately NOT pinned
