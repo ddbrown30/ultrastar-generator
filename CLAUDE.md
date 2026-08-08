@@ -1365,6 +1365,52 @@ Done:
    logic, etc.) without a fundamentally different signal than "nearby
    pass-1 onset," which this result suggests isn't precise enough on
    its own.
+
+0q. **Investigated the reference-line-vs-musical-phrase tension flagged
+   in 0f ("Under The Sea" merging into one line when it's really two
+   repeated phrases) -- ACCEPTED as a known limitation, not building a
+   fix.** `--zone-boundary-snap`'s own predecessor of the idea
+   (cross-checking against LRCLIB's SYNCED lyrics for a different line
+   split) was tried first and doesn't help: checked little_mermaid's
+   own cached synced-lyrics dump directly -- LRCLIB's SYNCED version
+   merges "under the sea under the sea" into one line just like its
+   PLAIN version does, so there's no second LRCLIB signal to
+   cross-check against for this case.
+
+   Confirmed the bug is real and currently live: little_mermaid's actual
+   output has "under the sea? Under the sea," as ONE undivided line
+   (~8 syllables, under the 12-syllable 1.5x safety net) because both
+   chorus repetitions share one reference line_id and `phrasing.py`'s
+   `known_same_line` rule never breaks those except for the length
+   safety net.
+
+   Proposed and validated (real-data scan, not implemented) a candidate
+   fix: detect an EXACT repeated multi-word sub-phrase within a
+   reference line as a targeted signal (distinct from a generic gap-
+   duration heuristic, which can't tell "real pause mid-phrase" from
+   "two merged phrases" -- that's exactly why `known_same_line` exists
+   in the first place). A naive version (any repeated 2+-word n-gram
+   anywhere in the line) was scanned against 494 real lines across all
+   11 test-set songs: only 2 of 28 flagged lines were genuine (little_
+   mermaid's "under the sea" chorus x3, ordinary_day's "it's all right
+   it's all right") -- the rest were false positives from (1) a single
+   word repeated as an ad-lib/refrain run (gaston's "town town town...",
+   ordinary_day's "wayheyhey..." runs, sleeping_beauty_ouad's "no no
+   no") and (2) a short 2-word fragment reused inside one otherwise-
+   flowing sentence (javert_suicide's "the law ... the law", stars'
+   "those who ... those who"). A refined rule -- require the repeat to
+   be ADJACENT and cover (nearly) the WHOLE line, with the repeated unit
+   itself containing >= 2 DISTINCT words -- correctly kept only the 2
+   genuine cases and rejected every false positive in the scan.
+
+   **User's decision: leave phrasing.py as-is, mark this an accepted
+   issue rather than build the refined fix.** Hand-editing the rare
+   real case is an acceptable mitigation; this doesn't warrant another
+   mechanism given the project's now-two-time experience (0p,
+   `verify_placement`) of well-validated-looking fixes still carrying
+   real risk once shipped. If picked back up later: the refined
+   adjacent-and-full-line-coverage design above is already validated
+   against real data and ready to implement, not just a sketch.
 1. **`key_correction.py` now uses `music21`** (its implementation of
    Krumhansl-Schmuckler key-finding) instead of the hand-rolled
    diatonic-scale-coverage heuristic, and is now **ON by default**
