@@ -945,6 +945,138 @@ Done:
    regions to get a cleaner confirm/deny than gaston's sparse-coverage
    case allowed. Decision on whether to build actual correction (and
    what form it should take) is deliberately deferred until then.
+
+0k. **Follow-up same-day run: `--lrc-timing-check` on 4 more songs
+   (batb, stars, sleeping_beauty_ouad, little_mermaid) -- real, live
+   LRCLIB fetches, real full pipeline. Result: all 4 ABSTAINED, none
+   produced a calibration or any flags:**
+
+   | Song | synced lines | our lines | matched by text | outcome |
+   |---|---|---|---|---|
+   | batb | 18 | 13 | 6 | skipped: best offset only 33% agreement (< bar) |
+   | stars | 41 | 41 | 16 | skipped: best offset only 19% agreement (< bar) |
+   | sleeping_beauty_ouad | 14 | 10 | 2 | skipped: only 2 matched (< 5 required) |
+   | little_mermaid | 71 | 70 | 27 | skipped: best offset only 15% agreement (< bar) |
+
+   Combined with the earlier 2-song round (0j: gaston calibrated
+   cleanly at 83% agreement/24 matched; tarzan correctly abstained at
+   26%), that's now **6 songs tested, 1 clean calibration (gaston),
+   5 abstentions.** This is the diagnostic's conservative bucket-mode
+   design working as intended -- it is refusing to guess rather than
+   outputting a low-confidence offset -- but a 1-in-6 hit rate this low
+   means the underlying signal (LRC-synced-lyrics line timing vs. our
+   own) is USABLE far less often on real LRCLIB data than the earlier
+   2-song sample suggested. Two effects are plausibly compounding, not
+   yet separated:
+   1. **Match-finding itself is strict and probably under-counting.**
+      `apply_lrc_timing_check` matches at the WHOLE-LINE level (each
+      line's tokens joined into a single string, difflib treats that
+      whole string as one sequence element -- an "equal" opcode
+      requires every word in the line to agree, one substitution/
+      contraction/ASR slip anywhere in the line drops the whole line
+      from the candidate pool). This is a stricter technique than the
+      WORD-level whole-sequence alignment used everywhere else in this
+      project (`lyrics_lookup.py`, `musicxml_reference.py`,
+      `compare_full_pipeline_output.py`) -- none of those require a
+      whole line to match atomically. Plausible real effect here, not
+      yet confirmed: real true-positive line pairs are being missed
+      whenever our own line-grouping (by `Syllable.line_id`) splits/
+      merges lines differently than LRCLIB's own convention (already a
+      confirmed real phenomenon, see 0f's "Under The Sea" merged-line
+      example) or when a word inside an otherwise-correct line differs.
+   2. **Among lines that DO match, agreement is often scattered rather
+      than clustered** (19-33% best-bucket agreement on 3 of 4 songs
+      here) -- consistent with either genuine per-line timing variance
+      (no single constant offset exists against whatever recording
+      LRCLIB's synced version came from) or the same repeated-line/
+      wrong-instance mismatch class 0i already found and specifically
+      engineered around for WORD-level timing comparison (bucketed-mode
+      + 3s cutoff) -- `lrc_timing.py` already has an analogous bucketed-
+      mode step, so it's already guarding against exactly this, but a
+      chorus-heavy song could still have enough distinct wrong-instance
+      pairings to prevent any bucket from dominating.
+
+   **Not yet decided**: whether to invest in word-level line matching
+   (denser candidate pool, mirrors the project's established alignment
+   technique elsewhere) to see if match count/confidence improves, or
+   to treat this low hit-rate as evidence the signal is too sparse on
+   real LRCLIB data to be worth pursuing further as-is. Deliberately
+   not choosing without the user's input, given `verify_placement`'s
+   own precedent this session of a well-intentioned mechanism-level fix
+   not translating into a real end-to-end win.
+
+0l. **Investigated 0k directly with real data (temporary debug dump added
+   to `apply_lrc_timing_check`, then reverted -- not shipped) on stars
+   and little_mermaid, the two songs with the most matched lines. Found
+   TWO distinct, compounding causes -- and the word-level-matching idea
+   floated in 0k turned out NOT to be the fix, once tested:**
+
+   1. **Confirmed real (recall problem): whole-line exact matching
+      massively undercounts true line correspondences.** Dumping both
+      sides' actual line text side-by-side showed the vast majority of
+      "unmatched" our-lines are genuinely the same line as their LRC
+      counterpart, just off by 1-3 words -- almost always short,
+      truncated, or misheard ASR words that survived reference-lyric
+      correction (`'the hu world is a mess'` vs LRC's `'the human world
+      is a mess'`; `'un the sea'` vs `'under the sea'`, repeated
+      throughout little_mermaid; `'they in for a worser worser fate'`
+      vs `'they in for a worser fate'`). A fuzzy per-line ratio matcher
+      recovered candidates for all 70/70 (little_mermaid) and 41/41
+      (stars) of our own lines, vs. the current exact matcher's 27 and
+      16 respectively -- confirms 0k's hypothesis on RECALL.
+
+   2. **Found and NOT anticipated by 0k (the actual reason calibration
+      still fails even with more candidates): the our-vs-LRC time delta
+      is not a constant per song for either test case -- it DRIFTS
+      smoothly and substantially over the song's length, at a strikingly
+      similar relative rate on both:**
+      - little_mermaid: delta grows from -0.5s near t=0 to -10.4s by
+        t=119.5s (~-8.3% relative), then jumps to +5s for the last ~30s
+        (likely a structural difference, e.g. a bridge/spoken segment
+        LRCLIB's recording has that ours doesn't, or vice versa -- there's
+        a ~30s gap in matched lines right where the sign flips).
+      - stars: delta grows from -1.2s at t=24.6s to -12.7s by t=153.9s
+        (~-8.9% relative), no flip (shorter song, simpler structure).
+
+      Both songs drift at essentially the same ~8-9% relative rate despite
+      being unrelated songs from unrelated LRCLIB entries -- too similar
+      to plausibly be two independent "different recording, different
+      tempo" coincidences; more likely points to something systematic in
+      how a meaningful fraction of LRCLIB's synced-lyrics entries are
+      timed (e.g. sourced from a sped-up/slowed-down video rip -- not
+      confirmed, would need LRCLIB-side investigation to pin down further).
+      **Ruled out our own pipeline as the cause**: little_mermaid's own
+      note-timing accuracy against ground truth was independently
+      validated as excellent in 0i (130ms mean / 75ms median / 95.8%
+      within 500ms) -- a real, growing drift of 10+ seconds by mid-song
+      is nothing like that, and 0i's ground-truth check has no
+      relationship to LRCLIB at all, so this isn't the same error
+      showing up twice.
+
+      **This means the word-level-matching fix from 0k does NOT actually
+      solve the calibration problem for these two songs, tested directly**:
+      re-running the SAME bucket-mode calibration logic on the fuzzy
+      matcher's fuller candidate list gave best-bucket confidence of 13%
+      (little_mermaid) and 10% (stars) -- both slightly WORSE than the
+      current exact matcher's 15% and 19%. More candidates just added more
+      points scattered along the same drift curve; they don't cluster any
+      better, because there genuinely isn't one constant offset to find.
+      Confirms recall was never the bottleneck for these two songs --
+      the drift is.
+
+   **Implication**: fixing the line-matcher (0k's proposal) is real but
+   insufficient on its own. A calibration model that could handle a
+   *linear drift* (offset + rate, fit over matched-line deltas vs. time)
+   rather than a single constant would be needed to get real use out of
+   songs like these -- a materially bigger design change than "loosen the
+   matcher," and one that pushes further toward eventual auto-correction
+   (0j's own stated next gate) on a signal whose root cause (why the drift
+   exists at all) still isn't confirmed. **Not started -- needs the user's
+   direction before building**, per the same `verify_placement` caution
+   already invoked in 0k: this project has one concrete precedent this
+   session of a plausible-sounding mechanism-level fix not translating
+   into a real win, and building a drift-tolerant calibrator is a bigger
+   lift than that was.
 1. **`key_correction.py` now uses `music21`** (its implementation of
    Krumhansl-Schmuckler key-finding) instead of the hand-rolled
    diatonic-scale-coverage heuristic, and is now **ON by default**
