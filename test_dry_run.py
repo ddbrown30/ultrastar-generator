@@ -638,6 +638,62 @@ assert counts_by_word.get("multitudes", 0) >= counts_by_word.get("Stars", 0), co
 assert sum(counts_by_word.values()) >= 12
 print("OK: line notes split by each word's own ASR boundary, not swallowed by one bad interior timestamp")
 
+print("\n--- zone-boundary snapping (EXPERIMENTAL, config.ENABLE_ZONE_BOUNDARY_SNAP): a real pass-1 "
+      "note onset near the raw ASR-midpoint boundary reassigns a note to the correct word when enabled, "
+      "and is a no-op (matches current default behavior) when disabled -- reproduces the sleeping_beauty_"
+      "wonder 'I' bug shape: a real sustained note starts before the crude ASR-gap-midpoint suggests ---")
+snap_words = [
+    Word(text="Odd", start=0.0, end=2.0, confidence=0.9, line_id=20),
+    Word(text="I", start=6.0, end=6.5, confidence=0.9, line_id=21),
+]
+# Raw boundary = midpoint(2.0, 6.0) = 4.0. A real note starts at 3.6s (the
+# genuine, pass-1-detected onset of "I"'s singing) -- its own MIDPOINT
+# (3.85) falls on the WRONG side of the raw 4.0 boundary, so without
+# snapping it's misassigned to "Odd" instead of "I".
+snap_notes = [
+    NoteEvent(start=0.0, end=1.0, pitch=5),
+    NoteEvent(start=1.0, end=2.0, pitch=5),
+    NoteEvent(start=3.6, end=4.1, pitch=7),   # the ambiguous one -- real onset for "I"
+    NoteEvent(start=4.6, end=6.3, pitch=7),   # unambiguously "I" either way
+]
+
+
+def _counts_by_word(words, syllables):
+    counts = {}
+    word_idx = -1
+    for s in syllables:
+        if s.is_word_start:
+            word_idx += 1
+        counts[words[word_idx].text] = counts.get(words[word_idx].text, 0) + 1
+    return counts
+
+
+unsnapped, _ = align_words_to_notes(snap_words, snap_notes, np.zeros(16000), 16000, snap_boundaries=False)
+unsnapped_counts = _counts_by_word(snap_words, unsnapped)
+assert unsnapped_counts == {"Odd": 3, "I": 1}, unsnapped_counts
+print("OK: snapping disabled (default) -- unchanged from current behavior:", unsnapped_counts)
+
+snapped, _ = align_words_to_notes(snap_words, snap_notes, np.zeros(16000), 16000,
+                                   snap_boundaries=True, snap_radius_sec=0.5)
+snapped_counts = _counts_by_word(snap_words, snapped)
+assert snapped_counts == {"Odd": 2, "I": 2}, snapped_counts
+print("OK: snapping enabled -- boundary snapped to the real 3.6s note onset, "
+      "correctly reassigning it to \"I\":", snapped_counts)
+
+# --- ambiguity guard: TWO onset candidates in range -> no snap (can't tell which is "the" boundary) ---
+ambig_notes = [
+    NoteEvent(start=0.0, end=1.0, pitch=5),
+    NoteEvent(start=1.0, end=2.0, pitch=5),
+    NoteEvent(start=3.6, end=4.1, pitch=7),
+    NoteEvent(start=4.3, end=6.3, pitch=7),   # a SECOND onset candidate within 0.5s of the 4.0 boundary
+]
+ambig_snapped, _ = align_words_to_notes(snap_words, ambig_notes, np.zeros(16000), 16000,
+                                         snap_boundaries=True, snap_radius_sec=0.5)
+ambig_counts = _counts_by_word(snap_words, ambig_snapped)
+assert ambig_counts == {"Odd": 3, "I": 1}, ambig_counts
+print("OK: two competing onset candidates in range -> left the raw ASR-midpoint boundary alone "
+      "(ambiguous, not confidently correctable):", ambig_counts)
+
 print("\n--- BUG REGRESSION (round 7): isolated pitch spike gets removed ---")
 from ultrastar_generator.note_detection import _remove_pitch_spikes
 # Reproduces the reported "The" bug's shape directly: a brief, isolated
@@ -1364,6 +1420,51 @@ few_lines_stats = apply_lrc_timing_check(lrc_syllables[:2], lrc_text, verbose=Fa
 assert few_lines_stats.skipped_reason is not None
 assert few_lines_stats.flags == []
 print("OK: too few matched lines correctly skipped calibration:", few_lines_stats.skipped_reason)
+
+# --- real per-song DRIFT (not just a constant offset) -- confirmed on real
+# audio (stars, tarzan, little_mermaid all showed this, see CLAUDE.md 0k-0m):
+# delta = offset + slope*lrc_start, spread widely enough that no single
+# 1-second bucket covers the required fraction, so the constant-offset
+# tier must fail before the robust drift-fit tier is tried. Also folds in
+# a word-level-recall check: line 3's LRC text has one word deliberately
+# wrong ("gamma3" instead of "beta3"), which the old whole-line-exact
+# match would have dropped entirely -- majority-vote word-level matching
+# should still recover it as a candidate. One genuine outlier (a
+# wrong-instance-style mismatch) should get flagged without dragging the
+# robust fit off course.
+drift_syllables = []
+for i in range(11):
+    t0 = 10.5 * i + 5.0
+    drift_syllables.append(Syllable(text=f"alpha{i}", start=t0, end=t0 + 0.4, midi_note=0, is_word_start=True, line_id=200 + i))
+    drift_syllables.append(Syllable(text=f"beta{i}", start=t0 + 0.5, end=t0 + 0.9, midi_note=0, is_word_start=True, line_id=200 + i))
+outlier_start = 200.0
+drift_syllables.append(Syllable(text="alpha11", start=outlier_start, end=outlier_start + 0.4, midi_note=0, is_word_start=True, line_id=211))
+drift_syllables.append(Syllable(text="beta11", start=outlier_start + 0.5, end=outlier_start + 0.9, midi_note=0, is_word_start=True, line_id=211))
+
+
+def _lrc_ts(t):
+    mm, ss = int(t) // 60, t - (int(t) // 60) * 60
+    return f"[{mm:02d}:{ss:05.2f}]"
+
+
+drift_lrc_lines = []
+for i in range(11):
+    words = f"alpha{i} beta{i}" if i != 3 else f"alpha{i} gamma{i}"  # line 3: one word deliberately wrong
+    drift_lrc_lines.append(f"{_lrc_ts(10.0 * i)}{words}")
+drift_lrc_lines.append(f"{_lrc_ts(110.0)}alpha11 beta11")
+drift_lrc_text = "\n".join(drift_lrc_lines) + "\n"
+
+drift_stats = apply_lrc_timing_check(drift_syllables, drift_lrc_text, verbose=True)
+assert drift_stats.skipped_reason is None, drift_stats.skipped_reason
+assert drift_stats.calibration_kind == "drift", drift_stats.calibration_kind
+assert abs(drift_stats.calibration_slope - 0.05) < 0.01, drift_stats.calibration_slope
+assert abs(drift_stats.calibration_offset_sec - 5.0) < 0.5, drift_stats.calibration_offset_sec
+assert drift_stats.n_matched_lines == 12, drift_stats.n_matched_lines  # includes line 3 via word-level recall
+flagged_texts = {f.text for f in drift_stats.flags}
+assert flagged_texts == {"alpha11"}, flagged_texts
+print(f"OK: constant-offset tier correctly failed on real drift (deltas spread across many buckets), "
+      f"robust fit recovered slope={drift_stats.calibration_slope:+.4f}, offset={drift_stats.calibration_offset_sec:+.1f}s, "
+      f"flagged only the genuine outlier: {flagged_texts}")
 
 
 

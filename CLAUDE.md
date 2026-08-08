@@ -1077,6 +1077,294 @@ Done:
    session of a plausible-sounding mechanism-level fix not translating
    into a real win, and building a drift-tolerant calibrator is a bigger
    lift than that was.
+
+0m. **Extended 0l's deep-dive (same debug dump, reverted again) to the
+   remaining 4 tested songs (batb, sleeping_beauty_ouad, gaston, tarzan)
+   -- corrects 0l's "consistent ~8-9% rate, probably systematic" theory:
+   the real picture is genuinely per-song, not one universal cause.**
+
+   - **gaston (the one song that calibrated cleanly): confirmed FLAT.**
+     20/24 exact matches sit within +-0.3s of a single 0.0s offset --
+     the only outliers are the 2 already-known late-song lines (0j,
+     t~189-191s), a real localized error, not drift. Good control case
+     any new calibration logic must not regress.
+   - **tarzan: real drift, but much smaller than little_mermaid/stars**
+     -- roughly -3.2% relative (vs. their ~8-9%), plus 2 clear wrong-
+     repeat-instance outliers ("son of man" / "the power to be strong"
+     both recur elsewhere in the song).
+   - **batb: NOT a smooth drift -- a discrete STEP.** Two tight clusters
+     of matches, ~+69s (t~82-86s) then a jump down to ~+14-15s (t~108-
+     121s). Most likely a different edit/arrangement (an extended
+     spoken/instrumental passage present in one recording but not the
+     other), not a tempo mismatch -- a linear model would badly misfit
+     this song; a robust/outlier-tolerant fit that can lock onto
+     whichever cluster has more support is the right shape of fix, not
+     "always assume one line."
+   - **sleeping_beauty_ouad: still just 2 exact matches, both for a
+     line that's part of the song's genuine call-and-response duet
+     repeat** (already flagged unreliable for text-based alignment in
+     0i) -- almost certainly wrong-instance noise, not real signal.
+     Expect this song to keep correctly abstaining under any matching
+     improvement.
+
+   **Conclusion driving the actual implementation (0n)**: the fix isn't
+   "always fit offset+rate" -- it's a robust estimator that tolerates
+   outliers and only introduces a slope when the data genuinely supports
+   one, so gaston stays a clean flat case, tarzan/little_mermaid/stars
+   pick up a real slope, batb's minority cluster gets rejected as an
+   outlier rather than blended into a wrong compromise line, and ouad
+   keeps abstaining. All 6 songs' real our-line/lrc-line data was already
+   captured in these dump runs, making it possible to prototype and
+   validate the new calibration math OFFLINE against real data before
+   touching the shipped pipeline again.
+
+0n. **Shipped the drift-tolerant calibration designed in 0m, real-audio
+   validated. `lrc_timing.py` rewritten:**
+
+   1. **Matching**: the old whole-line EXACT match (`apply_lrc_timing_
+      check`'s original `difflib.SequenceMatcher` over whole-line
+      strings) is replaced by `_match_lines_word_level` -- one word-level
+      whole-sequence alignment (still order-preserving, so still
+      resistant to picking a wrong repeated-line instance), then a
+      majority vote per our-line to decide which LRC line it really
+      corresponds to. Fixes the undercounting root-caused in 0l (e.g.
+      "the hu world is a mess" now matches LRC's "the human world is a
+      mess" on the 3-of-4-words majority, where the old exact matcher
+      dropped the line entirely).
+   2. **Calibration is now two-tiered** (`config.LRC_TIMING_MIN_DRIFT_
+      SAMPLES=10`, `LRC_TIMING_MIN_DRIFT_CONFIDENCE=0.5`, `LRC_TIMING_
+      DRIFT_INLIER_TOLERANCE_SEC=1.5`, all new): tier 1 is the original
+      constant-offset bucket-mode, UNCHANGED, tried first -- so a song
+      that already calibrated cleanly (gaston) keeps using the exact
+      same technique. Only if tier 1 fails does tier 2 (`_robust_linear_
+      fit`, Theil-Sen median-of-pairwise-slopes) get a chance, gated
+      stricter than tier 1 (more samples, higher inlier fraction) since
+      a 2-parameter fit can trivially "fit" a handful of points.
+
+   **Real end-to-end validation, shipped code path (not the temporary
+   debug dump used for 0k-0m's investigation)**, `--lrc-timing-check` on
+   gaston (regression check) + stars + tarzan (the two that should now
+   calibrate per 0m's offline prediction):
+
+   | Song | before (0j/0k) | after |
+   |---|---|---|
+   | gaston | constant +0.0s, 83%/24 matched | constant +0.0s, 81%/58 matched -- same tier, same offset, more candidates, no regression |
+   | stars | skipped (19%/16) | **drift +0.8s, -0.0856s/LRC-s, 100%/39 matched, 0 flags** |
+   | tarzan | skipped (26%, below bar) | **drift -0.5s, -0.0425s/LRC-s, 88%/32 matched, 3 flagged** (t~13.5s and two "son"/"Son" lines at t~137-139s -- both regions independently identified as real outliers during 0m's manual line-by-line inspection, not new/surprising) |
+
+   **Follow-up same-day run completed the set -- little_mermaid, batb,
+   and sleeping_beauty_ouad also confirmed on the shipped code path**,
+   matching 0m's offline predictions closely:
+
+   | Song | shipped-code result |
+   |---|---|
+   | little_mermaid | **drift +1.9s, -0.0712s/LRC-s, 56%/66 matched** (predicted 55%) -- 29/66 flagged, but NOT scattered noise: they resolve into two coherent secondary regions, a middle passage consistently ~-2.7s off (t~87-124s) and the late "Under the sea" reprise consistently ~+15.4s off (t~152-180s) -- both independently identified as real structural differences during 0m's manual inspection, not new |
+   | batb | **still correctly skipped** -- "constant-offset best candidate +15.0s covers 31% (need 40%), drift fit only reached 31% inliers (need 50%)" -- confirms the two-cluster arrangement-edit jump still isn't fittable by either tier, exactly as 0m predicted |
+   | sleeping_beauty_ouad | **constant +67.0s, 40%/5 matched** -- lands on the same borderline case flagged as a risk in 0m (this song's known duet-repeat structural ambiguity, not a new regression -- the same risk existed before under a different candidate set) |
+
+   All 6 originally-tested songs are now confirmed on the real shipped
+   code path, not just the offline prototype: 3 real wins (stars, tarzan,
+   little_mermaid), 2 unchanged-safe abstentions (batb, and effectively
+   sleeping_beauty_ouad given its known unreliability), 1 unchanged
+   already-working case (gaston).
+
+   `test_dry_run.py` gained a new synthetic test exercising both fixes
+   at once: 11 lines with a real linear drift (spread across enough 1-
+   second buckets that tier 1 must fail), one line with a deliberately
+   wrong LRC word (recall check), and one genuine outlier (wrong-
+   instance-style mismatch, must get flagged without dragging the fit
+   off course) -- recovers slope/offset within tolerance and flags only
+   the outlier. Existing tests (clean constant-offset case) unchanged
+   and still pass, confirming tier 1 behavior is untouched.
+
+   Still **OFF by default** (`config.ENABLE_LRC_TIMING_CHECK`,
+   `--lrc-timing-check`), still purely DIAGNOSTIC (flags only, never
+   auto-corrects) -- same reasoning as 0j: the flagging signal itself
+   hasn't yet been cross-validated against real ground-truth timing
+   error, and this project has one concrete `verify_placement` precedent
+   this session of a well-intentioned mechanism-level fix not
+   translating into a real end-to-end win. **That validation is now
+   done -- see 0o, and the result is decisive: don't build
+   auto-correction from this signal.**
+
+0o. **Ground-truth cross-validation done (the gate 0j/0n called for) --
+   DECISIVE NEGATIVE RESULT: flagged lines do NOT have larger real
+   timing error than unflagged ones. Don't build auto-correction from
+   this signal as currently designed.**
+
+   User asked directly: "we were doing this so that we could start using
+   the lyric timing to improve accuracy, correct?" -- yes, that was
+   always the eventual goal, but per the module's own docstring
+   auto-correction was gated behind confirming flagged lines actually
+   correlate with real problems first (exactly the check that would have
+   caught `verify_placement`'s regression earlier if it had existed
+   then). Built that check now: word-level whole-sequence text alignment
+   between our own output and each song's real ground-truth `notes.txt`
+   (shipped SingStar data, same source used throughout this project's
+   pitch validation), with the same repeat-instance safety filter 0i
+   already established (bucket deltas at 200ms resolution, keep only
+   candidates near the dominant cluster) -- scratchpad-only, not kept in
+   repo (same category as `compare_full_pipeline_output.py`).
+
+   Real results, the 2 songs (of the driftcal reruns) that actually
+   produced flags with ground truth available:
+
+   | Song | flagged mean real error | unflagged mean real error | unflagged median |
+   |---|---|---|---|
+   | tarzan_son_of_man | 0.03s (n=1 with a nearby GT match) | 0.05s (n=19) | 0.02s |
+   | little_mermaid | 0.11s (n=15) | 0.19s (n=32) | 0.10s |
+
+   Flagged lines are AS ACCURATE OR MORE ACCURATE than unflagged ones on
+   both songs -- the opposite of what would be needed to justify
+   correction. Individual flagged-line real errors (little_mermaid, all
+   with a nearby GT match): 0.01-0.45s, nothing remotely close to the
+   multi-second residuals `lrc_timing.py` itself reported for these same
+   lines (e.g. 'Under' flagged at +15.4s residual, real error 0.08s).
+   This confirms what 0m/0n's investigation already suspected but hadn't
+   directly proven: the drift `lrc_timing.py` detects reflects LRCLIB's
+   synced lyrics being timed to a DIFFERENT recording/arrangement than
+   ours, not a defect in our own output -- our own timing was already
+   correct at those exact positions.
+
+   A 3rd song (Chicago - When You're Good to Mama, newly added to the
+   test set by the user, real ground-truth `.txt` provided alongside the
+   audio) calibrated cleanly with ZERO flags (constant +0.0s, 57%/44
+   matched) -- no comparison possible there, but its 37 unflagged matches
+   averaged 0.30s/0.12s (mean/median) real error, a sane baseline
+   consistent with this project's other established timing-accuracy
+   numbers (0i: 154ms/83ms average across 7 songs).
+
+   **Conclusion: do not build auto-correction on top of the current
+   `lrc_timing.py` line-level drift/offset mechanism.** The signal it
+   flags is real (LRCLIB and our own recording genuinely disagree) but
+   doesn't mean what correction would need it to mean (that OUR output
+   is wrong). This isn't a "gate not yet cleared, try again later"
+   situation -- it's evidence the current mechanism measures the wrong
+   thing for this purpose. If synced-lyrics timing is revisited as an
+   accuracy signal in the future, it would need a fundamentally
+   different approach (e.g. something that can distinguish "LRC's
+   recording differs from ours" from "our own note-to-word timing is
+   wrong", which line-level offset/drift alone cannot do) -- not a
+   refinement of the existing calibration mechanism. Given this, the
+   diagnostic-only behavior stays as-is (it's still useful as a coarse
+   "these two recordings differ here" signal, e.g. for the user's own
+   manual review), but this closes out the "use LRC timing to improve
+   accuracy via correction" thread as originally envisioned.
+
+   **CORRECTION, same day, found while validating a follow-up idea
+   (0p): the comparison script above had a real parsing bug that
+   undercounted matches by 5-10x.** Its regex used `\s+` for the
+   separator right before the note-text field, which greedily consumed
+   BOTH the field separator AND (when present) the leading space that
+   marks a new word in our own pipeline's output convention -- so most
+   words were silently glued onto their neighbor and could then only
+   ever match ground truth by coincidence. Made worse by a second,
+   independent discovery: SingStar's shipped `notes.txt` files don't
+   even use that leading-space convention at all -- they mark word
+   starts with a TRAILING space instead (e.g. `"Oh "` / `"the "` /
+   `"po"` + `"wer "`), completely different from our own pipeline's
+   format. Fixed by making the parser convention-agnostic: concatenate
+   the whole note-text stream into one string and split on whitespace
+   wherever it falls, rather than assuming which side the marker space
+   is on.
+
+   Re-ran with the fixed parser -- match counts jumped 5-10x (tarzan
+   19->164, little_mermaid 34->336, chicago 37->207), and the resulting
+   accuracy numbers now land close to this project's own previously-
+   established ground-truth figures (0i's compare_timing() table),
+   which is good independent confirmation the fix is correct rather than
+   just different:
+
+   | Song | flagged mean real error | unflagged mean real error | unflagged median |
+   |---|---|---|---|
+   | tarzan_son_of_man | 0.02s (n=2) | 0.12s (n=163) | 0.02s |
+   | little_mermaid | 0.21s (n=26) | 0.17s (n=333) | 0.08s |
+
+   **The headline conclusion survives, but is less clean-cut than first
+   reported.** tarzan's flagged lines are still MORE accurate than
+   unflagged (even more so with the larger sample). little_mermaid
+   flipped from "flagged slightly better" to "flagged slightly worse"
+   on the mean (0.21s vs 0.17s) -- and with the fixed parser, 2 of its
+   26 matched flagged lines now show real errors that are actually
+   non-trivial (0.90s "Play", 1.16s "Under") vs. the rest sitting at
+   0.01-0.49s. That's a weak positive signal buried in mostly noise, not
+   the clean "flagged==accurate" result originally reported, but also
+   not strong or consistent enough on its own to justify auto-correction
+   -- the majority of flagged lines are still small real errors, and
+   tarzan still points the other way entirely. **Verdict unchanged**:
+   don't build auto-correction from this signal as currently designed.
+
+0p. **Tried "snap zone/word boundaries to a nearby pass-1 note onset"
+   (`--zone-boundary-snap`, EXPERIMENTAL) for the timing gap identified
+   at the top of this thread (dense ASR passages / large ASR gaps
+   causing a zone boundary to land near, but not exactly at, a real
+   note onset -- e.g. gaston's "bites" cluster, sleeping_beauty_wonder's
+   early "I"). REAL END-TO-END RESULT: no improvement on any of 5 tested
+   songs, mild regression on most. Don't pursue further as designed.**
+
+   Both `_assign_notes_to_groups` (between-GROUP zone boundaries) and
+   `_split_notes_by_word_boundaries` (within-group WORD boundaries)
+   compute a boundary as the clamped-monotonic midpoint of two ASR
+   timestamps, with zero reference to where pass-1 notes actually
+   begin -- confirmed via the docstrings/code as the same mechanism in
+   both places. New `_snap_boundary_to_note_onset` (`lyric_alignment.py`)
+   refines that raw boundary by snapping it to a pass-1 note START when
+   exactly ONE exists within `config.ZONE_BOUNDARY_SNAP_RADIUS_SEC`
+   (0.5s) -- deliberately conservative: zero candidates (nothing to snap
+   to) or multiple (ambiguous which one is "the" boundary) both leave
+   the raw ASR midpoint untouched, same "only act when confident"
+   principle `verify_placement` uses. Threaded through as an opt-in
+   param (`snap_boundaries`, default `config.ENABLE_ZONE_BOUNDARY_SNAP
+   = False`) all the way from `main.py`'s new `--zone-boundary-snap`
+   flag down to both boundary functions -- zero effect on default runs.
+   Synthetic test added (`test_dry_run.py`) reproducing the
+   sleeping_beauty_wonder "I" bug shape exactly: a real note onset 0.4s
+   before the raw ASR-midpoint boundary reassigns correctly when
+   snapping is on, is a no-op when off, and a second synthetic case
+   confirms the ambiguity guard (two candidate onsets in range -> no
+   snap).
+
+   **Real end-to-end validation** (same word-level ground-truth
+   comparison technique validated in 0o, same parser-bug fix applied,
+   large samples): baseline (no snap) vs. `--zone-boundary-snap`, all 5
+   songs with real ground truth:
+
+   | Song | baseline mean/median/<=500ms | snap mean/median/<=500ms |
+   |---|---|---|
+   | batb | 205ms/135ms/94% (n=108) | 219ms/136ms/94% (n=108) |
+   | tarzan_son_of_man | 121ms/25ms/96% (n=164) | 128ms/25ms/96% (n=164) |
+   | little_mermaid | 165ms/75ms/94% (n=336) | 165ms/79ms/94% (n=336) |
+   | chicago | 161ms/107ms/97% (n=207) | 170ms/114ms/97% (n=207) |
+   | ordinary_day | 145ms/97ms/98% (n=133) | 146ms/97ms/98% (n=133) |
+
+   **Not a single song improved.** Confirmed the snap mechanism is
+   genuinely firing (diffed the two runs' `[DEBUG LOG]` NOTE-ZONE
+   ASSIGNMENT sections for batb -- boundary values really do differ,
+   e.g. one boundary moved from 85.0125s to 84.81668...s, matching a
+   real nearby note start) and that pass-1 itself is unaffected (batb's
+   two `[PASS1 DEBUG]` files are byte-identical, confirming
+   `isolation_source="rmvpe"`'s documented reproducibility holds here
+   too) -- so the flat-to-negative result is a real effect of the
+   snapping logic, not noise from an unrelated source. Same shape of
+   outcome as `verify_placement`'s own real-audio validation: a
+   well-motivated, synthetically-verified mechanism that doesn't
+   generalize positively once tested end-to-end -- this is now a SECOND
+   independent instance of that exact pattern in this project. Likely
+   explanation (not confirmed further): real audio has messier, more
+   numerous onset candidates than the clean synthetic test case, so
+   "exactly one confident candidate nearby" fires on more false
+   positives (snapping to an onset that ISN'T really the word boundary
+   -- a consonant transient, backing-track bleed, etc.) than true
+   positives in practice.
+
+   **Decision: keep `--zone-boundary-snap` in the codebase (off by
+   default, as implemented) but do not invest further in this
+   direction.** Consistent with `verify_placement`'s own precedent --
+   kept as an available option, not deleted, but not a promising avenue
+   to keep refining (tighter radius, different candidate-selection
+   logic, etc.) without a fundamentally different signal than "nearby
+   pass-1 onset," which this result suggests isn't precise enough on
+   its own.
 1. **`key_correction.py` now uses `music21`** (its implementation of
    Krumhansl-Schmuckler key-finding) instead of the hand-rolled
    diatonic-scale-coverage heuristic, and is now **ON by default**

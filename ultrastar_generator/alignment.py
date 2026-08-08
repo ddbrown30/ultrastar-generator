@@ -59,6 +59,8 @@ def align_words(
     verify_placement: bool = config.ENABLE_PLACEMENT_VERIFICATION,
     verify_all_words: bool = config.VERIFY_ALL_WORDS,
     verify_whisper_model: str = config.DEFAULT_WHISPER_MODEL,
+    snap_boundaries: bool = config.ENABLE_ZONE_BOUNDARY_SNAP,
+    snap_radius_sec: float = config.ZONE_BOUNDARY_SNAP_RADIUS_SEC,
     debug_log=None,
     verbose: bool = True,
 ) -> tuple:
@@ -83,7 +85,10 @@ def align_words(
     decisions -- pass None to skip (no-op either way if the DebugLog
     itself was constructed with path=None).
     """
-    syllables, stats = align_words_to_notes(words, notes, y, sr, debug_log=debug_log)
+    syllables, stats = align_words_to_notes(
+        words, notes, y, sr, debug_log=debug_log,
+        snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
+    )
     if verify_words:
         indices = list(range(len(words))) if verify_all_words else stats.suspicious_word_indices
         if indices:
@@ -94,7 +99,10 @@ def align_words(
                 words = corrected_words
                 if debug_log is not None:
                     debug_log.section("RE-RUNNING PASS 2 -- verify_words corrected at least one word")
-                syllables, stats = align_words_to_notes(words, notes, y, sr, debug_log=debug_log)
+                syllables, stats = align_words_to_notes(
+                    words, notes, y, sr, debug_log=debug_log,
+                    snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
+                )
             stats.verification_results = verify_results
 
     if verify_placement:
@@ -108,7 +116,10 @@ def align_words(
                 words = corrected_words
                 if debug_log is not None:
                     debug_log.section("RE-RUNNING PASS 2 -- verify_placement corrected at least one word's position")
-                syllables, stats = align_words_to_notes(words, notes, y, sr, debug_log=debug_log)
+                syllables, stats = align_words_to_notes(
+                    words, notes, y, sr, debug_log=debug_log,
+                    snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
+                )
                 # align_words_to_notes always returns a fresh AlignmentStats --
                 # carry forward verify_words' results from before this re-run.
                 stats.verification_results = prior_verification_results

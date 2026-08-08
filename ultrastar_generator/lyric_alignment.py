@@ -161,9 +161,26 @@ def _group_words_by_gap(words: List[Word], max_gap_sec: float) -> List[List[int]
     return groups
 
 
+def _snap_boundary_to_note_onset(
+    raw_boundary: float, note_starts: List[float], radius_sec: float,
+) -> float:
+    """Refines an ASR-timestamp-derived boundary by snapping it to a
+    nearby pass-1 note ONSET, when exactly one exists within radius_sec.
+    See config.ENABLE_ZONE_BOUNDARY_SNAP's comment for why: ASR word
+    timestamps are known-imprecise at fine boundaries, while a pass-1
+    note onset is a real acoustic event. Deliberately does nothing when
+    zero (nothing to snap to) or multiple (ambiguous which one is "the"
+    boundary) onsets are in range -- only acts when there's exactly one
+    confident candidate."""
+    candidates = [t for t in note_starts if abs(t - raw_boundary) <= radius_sec]
+    return candidates[0] if len(candidates) == 1 else raw_boundary
+
+
 def _assign_notes_to_groups(
     group_spans: List[Tuple[float, float]], notes: List[NoteEvent], debug_log=None,
     group_labels: Optional[List[str]] = None,
+    snap_boundaries: bool = False,
+    snap_radius_sec: float = config.ZONE_BOUNDARY_SNAP_RADIUS_SEC,
 ) -> List[List[NoteEvent]]:
     """Same monotonic zone-partition technique as before, generalized to
     operate on (start, end) spans that may represent a single word OR a
@@ -173,10 +190,13 @@ def _assign_notes_to_groups(
     if n == 0 or not notes:
         return assigned
 
+    note_starts = [note.start for note in notes] if snap_boundaries else []
     boundaries: List[float] = []
     running_max = float("-inf")
     for i in range(n - 1):
         raw = (group_spans[i][1] + group_spans[i + 1][0]) / 2.0
+        if snap_boundaries:
+            raw = _snap_boundary_to_note_onset(raw, note_starts, snap_radius_sec)
         running_max = max(running_max, raw, group_spans[i][0])
         boundaries.append(running_max)
 
@@ -208,7 +228,9 @@ def _assign_notes_to_groups(
 
 
 def _split_notes_by_word_boundaries(
-    notes: List[NoteEvent], word_spans: List[Tuple[float, float]]
+    notes: List[NoteEvent], word_spans: List[Tuple[float, float]],
+    snap_boundaries: bool = False,
+    snap_radius_sec: float = config.ZONE_BOUNDARY_SNAP_RADIUS_SEC,
 ) -> List[List[NoteEvent]]:
     """Distributes a contiguous, time-ordered note list across len(word_spans)
     words using each word's own ASR (start, end) as the cut point, SPLITTING
@@ -226,10 +248,13 @@ def _split_notes_by_word_boundaries(
     if not notes:
         return [[] for _ in range(n_words)]
 
+    note_starts = [note.start for note in notes] if snap_boundaries else []
     boundaries: List[float] = []
     running_max = float("-inf")
     for i in range(n_words - 1):
         raw = (word_spans[i][1] + word_spans[i + 1][0]) / 2.0
+        if snap_boundaries:
+            raw = _snap_boundary_to_note_onset(raw, note_starts, snap_radius_sec)
         running_max = max(running_max, raw, word_spans[i][0])
         boundaries.append(running_max)
 
@@ -396,11 +421,20 @@ def align_words_to_notes(
     y: np.ndarray,
     sr: int,
     debug_log=None,
+    snap_boundaries: bool = config.ENABLE_ZONE_BOUNDARY_SNAP,
+    snap_radius_sec: float = config.ZONE_BOUNDARY_SNAP_RADIUS_SEC,
 ) -> tuple:
     """Top-level entry point for pass 3. Returns (syllables, stats):
     a flat, time-ordered, non-overlapping list of Syllable objects ready
     for phrasing.build_lines, plus an AlignmentStats summary for
     diagnostics/logging.
+
+    snap_boundaries (EXPERIMENTAL, see config.ENABLE_ZONE_BOUNDARY_SNAP):
+    refines both the between-GROUP zone boundaries and the within-group
+    WORD boundaries by snapping to a nearby pass-1 note onset when exactly
+    one is found -- targets cases where an imprecise ASR timestamp places
+    the boundary near, but not exactly at, where the audio actually starts
+    a new note.
     """
     stats = AlignmentStats(total_words=len(words))
     if not words:
@@ -423,7 +457,10 @@ def align_words_to_notes(
                             f"ASR span=({span[0]:.3f}, {span[1]:.3f})  {text!r}")
 
     group_labels = [" ".join(words[i].text for i in indices) for indices in word_groups]
-    group_notes = _assign_notes_to_groups(group_spans, notes, debug_log=debug_log, group_labels=group_labels)
+    group_notes = _assign_notes_to_groups(
+        group_spans, notes, debug_log=debug_log, group_labels=group_labels,
+        snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
+    )
 
     all_syllables: List[Syllable] = []
     for indices, g_notes in zip(word_groups, group_notes):
@@ -446,7 +483,9 @@ def align_words_to_notes(
         stats.words_in_word_boundary_split_lines += len(indices)
         word_spans = [(words[i].start, words[i].end) for i in indices]
         n_notes = len(g_notes)
-        per_word_notes = _split_notes_by_word_boundaries(g_notes, word_spans)
+        per_word_notes = _split_notes_by_word_boundaries(
+            g_notes, word_spans, snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
+        )
         for i, w_notes in zip(indices, per_word_notes):
             if not w_notes:
                 # No note overlapped this word's own ASR span -- it's

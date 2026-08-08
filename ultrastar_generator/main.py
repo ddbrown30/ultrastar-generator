@@ -154,6 +154,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-lrc-timing-check", dest="lrc_timing_check", action="store_false",
                     help="Disable the LRC timing check (no-op unless --lrc-timing-check or "
                          "config.ENABLE_LRC_TIMING_CHECK enabled it).")
+    p.add_argument("--zone-boundary-snap", dest="zone_boundary_snap", action="store_true",
+                    default=config.ENABLE_ZONE_BOUNDARY_SNAP,
+                    help="EXPERIMENTAL, off by default. Refines pass 3's zone/word boundaries (which "
+                         "are computed purely from ASR-timestamp midpoints) by snapping to a nearby "
+                         "pass-1 note onset when exactly one exists within "
+                         f"{config.ZONE_BOUNDARY_SNAP_RADIUS_SEC}s -- targets cases where an "
+                         "imprecise ASR timestamp places the boundary near, but not exactly at, "
+                         "where the audio actually starts a new note. Never adds/removes/moves a "
+                         "note, only chooses a different cut point. Not yet validated end-to-end.")
+    p.add_argument("--no-zone-boundary-snap", dest="zone_boundary_snap", action="store_false",
+                    help="Explicitly disable zone-boundary snapping (already off by default).")
     p.add_argument("--pitch-smooth-window", type=float, default=config.PITCH_SMOOTH_WINDOW_SEC,
                     help=f"Median-filter window (sec) for vibrato suppression before note "
                          f"segmentation (default: {config.PITCH_SMOOTH_WINDOW_SEC}). Raise this "
@@ -414,7 +425,8 @@ def run(argv=None) -> int:
     syllables, stats = align_words(words, notes, y, sr,
                                     verify_words=args.verify_words, verify_placement=args.verify_placement,
                                     verify_all_words=args.verify_all_words,
-                                    verify_whisper_model=args.verify_whisper_model, debug_log=debug_log,
+                                    verify_whisper_model=args.verify_whisper_model,
+                                    snap_boundaries=args.zone_boundary_snap, debug_log=debug_log,
                                     verbose=not args.quiet)
     print(f"  {stats.words_with_notes}/{stats.total_words} words matched to pass-2 notes directly "
           f"({stats.total_notes_consumed} notes consumed); "

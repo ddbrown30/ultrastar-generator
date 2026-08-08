@@ -418,6 +418,24 @@ NOTE_ASSIGNMENT_MAX_GAP_SEC = 0.35
 # of "drop any short note" territory.
 SLIVER_DROP_MAX_DURATION_SEC = 0.12
 
+# Refines a zone/word boundary (both _assign_notes_to_groups and
+# _split_notes_by_word_boundaries use the same ASR-timestamp midpoint
+# technique) by snapping it to a nearby pass-1 NOTE ONSET when exactly one
+# exists within this radius -- ASR word timestamps are known-imprecise at
+# fine-grained boundaries (see CLAUDE.md's "Lessons learned"), while a
+# pass-1 note onset is a real acoustic event this project already treats
+# as ground truth everywhere else. Deliberately conservative: only snaps
+# when there's exactly one onset candidate in range (zero = nothing to
+# snap to, keep the ASR midpoint; more than one = ambiguous, which onset
+# is "the" boundary isn't clear, so also keep the ASR midpoint rather than
+# guess). EXPERIMENTAL, off by default pending real end-to-end validation
+# -- see CLAUDE.md and the verify_placement precedent this session of a
+# well-diagnosed, individually-correct fix that still regressed net
+# end-to-end; this needs the same real-audio, multi-song check before
+# being trusted, not just a fix on the one case it was designed for.
+ENABLE_ZONE_BOUNDARY_SNAP = False
+ZONE_BOUNDARY_SNAP_RADIUS_SEC = 0.5
+
 # --- Chunk-based re-transcription verification (verification.py) ----------
 # A word that got zero pass-1 notes (a "fallback" word -- see
 # lyric_alignment.py) is always considered suspicious.
@@ -570,6 +588,22 @@ LRC_TIMING_MIN_CALIBRATION_CONFIDENCE = 0.4
 # coarser than word-level pitch calibration, so this is deliberately
 # more forgiving than any word-level tolerance would be.
 LRC_TIMING_FLAG_TOLERANCE_SEC = 2.0
+# Fallback tried only when the constant-offset check above fails: a
+# robust (Theil-Sen) fit of delta = offset + slope*lrc_start, for songs
+# where LRCLIB's synced timestamps drift smoothly relative to ours
+# instead of sitting at one constant offset -- confirmed real on real
+# audio (stars, tarzan, little_mermaid all had a genuine drift, not
+# just noise around a constant -- see CLAUDE.md). Both bars are stricter
+# than the constant-offset case: a 2-parameter fit can trivially match a
+# handful of points exactly (e.g. any 2 points define a line), so more
+# samples and a higher inlier fraction are required before trusting it.
+LRC_TIMING_MIN_DRIFT_SAMPLES = 10
+LRC_TIMING_MIN_DRIFT_CONFIDENCE = 0.5
+# A candidate counts as an inlier to the fitted drift line if its own
+# residual is within this many seconds -- same order of magnitude as the
+# constant-offset case's 1-second bucket width, not the (looser)
+# post-calibration flag tolerance above.
+LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC = 1.5
 
 
 # --- Reference lyrics (lyrics_lookup.py) ------------------------------------

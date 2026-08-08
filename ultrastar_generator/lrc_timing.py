@@ -19,15 +19,23 @@ actually correlates with real problems, and only THEN consider building
 an actual correction step.
 
 Calibration mirrors musicxml_reference.py's approach but for TIME instead
-of PITCH CLASS: LRC line timestamps and our own per-song timing can be
-offset by a roughly constant amount (e.g. a different silence-trim/lead-in
-in whichever recording LRCLIB's synced version was made from), so a
-per-song calibration offset is established first (mode of per-line
-deltas, not mean/median -- see compare_full_pipeline_output.py's own
+of PITCH CLASS: LRC line timestamps and our own per-song timing are
+first assumed to differ by a roughly constant amount (e.g. a different
+silence-trim/lead-in in whichever recording LRCLIB's synced version was
+made from), calibrated as the mode of per-line deltas at 1-second
+resolution (not mean/median -- see compare_full_pipeline_output.py's own
 "Lessons learned" this session on why a straight median isn't robust
-against a song with many closely-matching false candidates), then only
-lines that still disagree with the calibrated expectation by more than
-a tolerance get flagged.
+against a song with many closely-matching false candidates). Real audio
+testing found this constant-offset assumption doesn't always hold,
+though (see CLAUDE.md's 0k-0m) -- several songs showed a real, roughly
+LINEAR drift instead (the offset grows smoothly over the song, up to
+~9%/s of elapsed time on some songs, most likely because whichever
+recording LRCLIB's synced lyrics were timed against isn't quite the same
+edit/tempo as ours). When the constant-offset check fails, a second,
+stricter attempt fits offset+slope with a robust (Theil-Sen) estimator,
+tolerant of the wrong-repeated-line-instance and different-arrangement
+outliers real songs showed (see `_robust_linear_fit`). Only lines that
+still disagree with whichever calibration won get flagged.
 """
 
 from __future__ import annotations
@@ -36,7 +44,8 @@ import re
 import difflib
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from statistics import median
+from typing import Dict, List, Optional, Tuple
 
 from . import config
 from .models import Syllable
@@ -83,6 +92,8 @@ class LRCTimingStats:
     n_our_lines: int = 0
     n_matched_lines: int = 0
     calibration_offset_sec: Optional[float] = None
+    calibration_slope: float = 0.0   # 0.0 for a constant-offset calibration
+    calibration_kind: Optional[str] = None   # "constant" or "drift"
     calibration_confidence: float = 0.0
     flags: List[LineTimingFlag] = field(default_factory=list)
     skipped_reason: Optional[str] = None
@@ -115,21 +126,122 @@ def _reconstruct_lines(syllables: List[Syllable]) -> List[Tuple[int, float, List
     return [tuple(lines[lid]) for lid in order]
 
 
+def _match_lines_word_level(
+    our_lines: List[Tuple[int, float, List[str]]],
+    lrc_lines: List[Tuple[float, str]],
+) -> List[Tuple[int, float, float]]:
+    """Matches our_lines to lrc_lines at the WORD level via one whole-
+    sequence alignment (order-preserving -- still resistant to pairing a
+    repeated line against the wrong occurrence, unlike an independent
+    per-line nearest-neighbor search), then re-derives a per-LINE
+    correspondence by majority vote of each our-line's own matched words.
+
+    Recovers correspondences a whole-line exact match misses whenever a
+    line differs by only a word or two -- confirmed the common case on
+    real audio: ASR words that survived reference-lyric correction only
+    partially (e.g. "the hu world is a mess" vs LRC's "the human world
+    is a mess"). Requiring only a MAJORITY (not all) of a line's own
+    words to agree tolerates this without requiring exact text equality.
+
+    Returns (our_line_idx, lrc_start_sec, delta_sec) triples, at most one
+    per our-line (its single best-voted LRC line).
+    """
+    our_words: List[Tuple[int, str]] = []
+    for i, (_, _, tokens) in enumerate(our_lines):
+        our_words.extend((i, t) for t in tokens)
+    lrc_words: List[Tuple[int, str]] = []
+    for j, (_, text) in enumerate(lrc_lines):
+        for w in text.split():
+            n = _normalize(w)
+            if n:
+                lrc_words.append((j, n))
+
+    a = [w for _, w in our_words]
+    b = [w for _, w in lrc_words]
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    pair_votes: Dict[Tuple[int, int], int] = {}
+    for tag, a0, a1, b0, b1 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        for k in range(a1 - a0):
+            key = (our_words[a0 + k][0], lrc_words[b0 + k][0])
+            pair_votes[key] = pair_votes.get(key, 0) + 1
+
+    our_wordcount = Counter(i for i, _ in our_words)
+    best_for_our: Dict[int, Tuple[int, int]] = {}
+    for (oi, lj), v in pair_votes.items():
+        if oi not in best_for_our or v > best_for_our[oi][1]:
+            best_for_our[oi] = (lj, v)
+
+    candidates = []
+    for oi, (lj, v) in best_for_our.items():
+        if v >= max(1, (our_wordcount[oi] + 1) // 2):
+            our_start = our_lines[oi][1]
+            lrc_start = lrc_lines[lj][0]
+            candidates.append((oi, lrc_start, our_start - lrc_start))
+    candidates.sort(key=lambda c: c[0])
+    return candidates
+
+
+def _robust_linear_fit(
+    candidates: List[Tuple[int, float, float]],
+    inlier_tolerance_sec: float,
+) -> Optional[Tuple[float, float, float, int]]:
+    """Theil-Sen (median-of-pairwise-slopes) robust fit of
+    delta = offset + slope*lrc_start. Robust to outliers by construction
+    -- a single wrong-repeated-line-instance match, or a whole cluster of
+    lines from a differently-arranged passage, can't drag the median slope
+    far the way it would an ordinary least-squares fit.
+
+    Returns (offset, slope, confidence, n_inliers), or None if there are
+    fewer than 2 distinct lrc_start values to compute a slope from.
+    confidence is the fraction of candidates within inlier_tolerance_sec
+    of the fitted line.
+    """
+    pts = [(lrc_start, delta) for _, lrc_start, delta in candidates]
+    slopes = []
+    for i in range(len(pts)):
+        ti, di = pts[i]
+        for j in range(i + 1, len(pts)):
+            tj, dj = pts[j]
+            if abs(tj - ti) < 1e-6:
+                continue
+            slopes.append((dj - di) / (tj - ti))
+    if not slopes:
+        return None
+    slope = median(slopes)
+    intercept = median(d - slope * t for t, d in pts)
+    residuals = [d - (intercept + slope * t) for t, d in pts]
+    n_inliers = sum(1 for r in residuals if abs(r) <= inlier_tolerance_sec)
+    confidence = n_inliers / len(pts)
+    return intercept, slope, confidence, n_inliers
+
+
 def apply_lrc_timing_check(
     syllables: List[Syllable],
     synced_lyrics: str,
     min_calibration_samples: int = config.LRC_TIMING_MIN_CALIBRATION_SAMPLES,
     min_calibration_confidence: float = config.LRC_TIMING_MIN_CALIBRATION_CONFIDENCE,
+    min_drift_samples: int = config.LRC_TIMING_MIN_DRIFT_SAMPLES,
+    min_drift_confidence: float = config.LRC_TIMING_MIN_DRIFT_CONFIDENCE,
+    drift_inlier_tolerance_sec: float = config.LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC,
     flag_tolerance_sec: float = config.LRC_TIMING_FLAG_TOLERANCE_SEC,
     verbose: bool = True,
     debug_log=None,
 ) -> LRCTimingStats:
     """Aligns pass-3's own lines (grouped by Syllable.line_id) against
-    LRCLIB's synced-lyrics lines by TEXT (whole-sequence difflib, same
-    technique used throughout this project), calibrates a per-song time
-    offset once enough lines agree closely on one (mode of per-line
-    deltas, see module docstring), then flags any line whose delta from
-    that calibrated offset exceeds flag_tolerance_sec.
+    LRCLIB's synced-lyrics lines by TEXT (word-level whole-sequence
+    match, see `_match_lines_word_level`), calibrates a per-song time
+    offset, then flags any line whose delta from the calibrated
+    expectation exceeds flag_tolerance_sec.
+
+    Calibration is two-tiered (see module docstring): first tries a
+    single constant offset (mode of per-line deltas at 1s resolution --
+    the original, higher-precision technique); if that isn't confident
+    enough, falls back to a robust offset+slope fit tolerant of a real
+    per-song timing drift. Whichever tier succeeds is what lines get
+    flagged against; if neither does, this returns with skipped_reason
+    set and no flags.
 
     Returns stats only -- `syllables` is never modified. See module
     docstring for why this doesn't auto-correct yet.
@@ -148,19 +260,7 @@ def apply_lrc_timing_check(
         stats.skipped_reason = "no line_id-tagged syllables to check (reference lyrics unavailable/didn't cover this song)"
         return stats
 
-    our_tokens = [" ".join(tokens) for _, _, tokens in our_lines]
-    lrc_tokens = [" ".join(_normalize(w) for w in text.split() if _normalize(w)) for _, text in lrc_lines]
-
-    sm = difflib.SequenceMatcher(None, our_tokens, lrc_tokens, autojunk=False)
-    candidates = []  # (our_line_idx, lrc_line_idx, delta_sec)
-    for tag, a0, a1, b0, b1 in sm.get_opcodes():
-        if tag != "equal":
-            continue
-        for k in range(a1 - a0):
-            our_idx, lrc_idx = a0 + k, b0 + k
-            _, our_start, _ = our_lines[our_idx]
-            lrc_start, _ = lrc_lines[lrc_idx]
-            candidates.append((our_idx, lrc_idx, our_start - lrc_start))
+    candidates = _match_lines_word_level(our_lines, lrc_lines)
     stats.n_matched_lines = len(candidates)
 
     if verbose:
@@ -176,34 +276,51 @@ def apply_lrc_timing_check(
             print(f"[lrc-timing] skipping: {stats.skipped_reason}")
         return stats
 
-    # Mode at coarse (1s) resolution -- line-level timestamps are far
-    # less precise than word-level, so a fine bucket would just split a
-    # real single cluster across several adjacent buckets.
+    # Tier 1: constant offset -- mode at coarse (1s) resolution, since
+    # line-level timestamps are far less precise than word-level, so a
+    # fine bucket would just split a real single cluster across several
+    # adjacent buckets.
     BUCKET_SEC = 1.0
-    bucket_counts = Counter(round(d / BUCKET_SEC) for _, _, d in candidates)
+    bucket_counts = Counter(round(delta / BUCKET_SEC) for _, _, delta in candidates)
     best_bucket, n_agree = bucket_counts.most_common(1)[0]
-    confidence = n_agree / len(candidates)
-    offset = best_bucket * BUCKET_SEC
-
-    stats.calibration_offset_sec = offset
-    stats.calibration_confidence = confidence
+    offset, slope, confidence, kind = best_bucket * BUCKET_SEC, 0.0, n_agree / len(candidates), "constant"
 
     if confidence < min_calibration_confidence:
-        stats.skipped_reason = (
-            f"no clear per-song time calibration (best candidate {offset:+.1f}s covers "
-            f"{confidence:.0%} of {len(candidates)} matched lines -- below the required bar)"
-        )
-        if verbose:
-            print(f"[lrc-timing] skipping: {stats.skipped_reason}")
-        return stats
+        # Tier 2: a real per-song drift, not just noise around one
+        # constant -- confirmed on real audio (stars, tarzan,
+        # little_mermaid), see module docstring. Stricter gate than tier
+        # 1: a 2-parameter fit can trivially match a handful of points
+        # exactly, so this needs both more samples and a higher inlier
+        # fraction before it's trusted.
+        fit = _robust_linear_fit(candidates, drift_inlier_tolerance_sec) if len(candidates) >= min_drift_samples else None
+        if fit is None or fit[2] < min_drift_confidence:
+            stats.skipped_reason = (
+                f"no clear per-song time calibration -- constant-offset best candidate {offset:+.1f}s "
+                f"covers {confidence:.0%} of {len(candidates)} matched lines (need {min_calibration_confidence:.0%}), "
+                f"and drift fit " + (
+                    f"only reached {fit[2]:.0%} inliers (need {min_drift_confidence:.0%})" if fit
+                    else f"needs >= {min_drift_samples} matched lines"
+                )
+            )
+            if verbose:
+                print(f"[lrc-timing] skipping: {stats.skipped_reason}")
+            return stats
+        offset, slope, confidence, _ = fit
+        kind = "drift"
+
+    stats.calibration_offset_sec = offset
+    stats.calibration_slope = slope
+    stats.calibration_kind = kind
+    stats.calibration_confidence = confidence
 
     if verbose:
-        print(f"[lrc-timing] calibration offset: {offset:+.1f}s, {confidence:.0%} agreement "
-              f"over {len(candidates)} matched line(s)")
+        drift_desc = f", drift {slope:+.4f}s per LRC-second" if kind == "drift" else ""
+        print(f"[lrc-timing] calibration ({kind}): offset {offset:+.1f}s{drift_desc}, "
+              f"{confidence:.0%} agreement over {len(candidates)} matched line(s)")
 
-    for our_idx, lrc_idx, delta in candidates:
-        expected = lrc_lines[lrc_idx][0] + offset
-        residual = delta - offset
+    for our_idx, lrc_start, delta in candidates:
+        expected = lrc_start + offset + slope * lrc_start
+        residual = delta - (offset + slope * lrc_start)
         if abs(residual) <= flag_tolerance_sec:
             continue
         first_syl_idx, our_start, _ = our_lines[our_idx]
