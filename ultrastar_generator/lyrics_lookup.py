@@ -1,5 +1,4 @@
-"""Online lyric lookup (lyrics.ovh), used for two things per the current
-requirements:
+"""Online lyric lookup, used for two things per the current requirements:
 
   1. Correcting ASR mistranscriptions -- e.g. whisper hearing "is" where
      the singer actually sang "his". This is NOT gated on ASR confidence
@@ -17,10 +16,20 @@ requirements:
      it gets matched to, and phrasing.py forces a line break wherever an
      aligned word's line id changes.
 
-This never touches note timing -- reference lyrics have no timing
-information at all, only text and line structure. If the lookup fails
-(no network, song not found, etc.) everything downstream just falls back
-to ASR text and gap-based phrasing, same as if this were disabled.
+Two sources, tried in order:
+  - LRCLIB (lrclib.net, free, no key required) -- tried FIRST. Has a real
+    search API (artist_name/track_name query params, returns several
+    candidates to choose from) rather than lyrics.ovh's rigid single-shot
+    "/artist/title" path, and often has synced (per-line-timestamped)
+    lyrics (`LyricsResult.synced_lyrics`, LRC format) -- not consumed by
+    anything yet, but available for a future timing-anchored use.
+  - lyrics.ovh -- fallback, tried only if LRCLIB has nothing usable.
+
+This never touches note timing from the plain-lyrics path -- reference
+lyrics text has no timing information at all, only text and line
+structure. If both lookups fail (no network, song not found, etc.)
+everything downstream just falls back to ASR text and gap-based phrasing,
+same as if this were disabled.
 """
 
 from __future__ import annotations
@@ -28,18 +37,85 @@ from __future__ import annotations
 import difflib
 import re
 import urllib.parse
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from . import config
 from .models import Word
 
 # Lines that are pure section/annotation markers (e.g. "[Chorus]",
-# "[Verse 2]") or lyrics.ovh's occasional trailing credit line, not
-# actual sung content -- these get filtered out before line numbering.
+# "[Verse 2]") or a source's occasional trailing credit line, not actual
+# sung content -- these get filtered out before line numbering.
 _ANNOTATION_LINE_RE = re.compile(r"^\s*\[.*\]\s*$")
 _CREDIT_LINE_RE = re.compile(r"^\s*(paroles|lyrics powered by|www\.)", re.IGNORECASE)
 
 
-def fetch_reference_lyrics(artist: str, title: str) -> Optional[str]:
+@dataclass
+class LyricsResult:
+    """A fetched reference-lyrics candidate, from whichever source
+    answered first."""
+    plain_lyrics: str
+    synced_lyrics: Optional[str] = None  # LRC format ("[mm:ss.xx]text" per
+                                          # line), LRCLIB only -- None from
+                                          # lyrics.ovh, or when LRCLIB has
+                                          # no synced version for this song.
+    source: str = ""  # "lrclib" or "lyrics.ovh", for diagnostics/logging.
+
+
+def _fetch_from_lrclib(artist: str, title: str, duration_sec: Optional[float] = None) -> Optional[LyricsResult]:
+    """Queries LRCLIB's search API and picks the best candidate.
+
+    LRCLIB can return multiple candidates for the same artist/title
+    (different recordings, albums, or -- same failure mode as lyrics.ovh
+    hit for Gaston this session -- an occasional wrong-language mistag).
+    Duration closeness to OUR OWN audio is the main disambiguator: an
+    instrumental-only or lyric-less candidate is excluded outright, and a
+    candidate whose duration is far from ours is heavily penalized (but
+    not excluded -- still better than nothing if it's the only candidate).
+    A small bonus favors a candidate that also has synced lyrics, since
+    that's strictly more useful when a duration-tie needs breaking.
+    """
+    try:
+        import requests
+    except ImportError:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://lrclib.net/api/search",
+            params={"artist_name": artist, "track_name": title},
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return None
+        candidates = resp.json()
+    except Exception:
+        return None
+    if not candidates:
+        return None
+
+    def score(c: dict) -> float:
+        if c.get("instrumental") or not c.get("plainLyrics"):
+            return -1.0
+        s = 0.0
+        if duration_sec is not None and c.get("duration"):
+            diff = abs(c["duration"] - duration_sec)
+            s += max(0.0, 1.0 - diff / config.LRCLIB_DURATION_TOLERANCE_SEC)
+        if c.get("syncedLyrics"):
+            s += 0.1
+        return s
+
+    best = max(candidates, key=score)
+    if score(best) < 0:
+        return None
+    return LyricsResult(
+        plain_lyrics=best["plainLyrics"],
+        synced_lyrics=best.get("syncedLyrics") or None,
+        source="lrclib",
+    )
+
+
+def _fetch_from_lyrics_ovh(artist: str, title: str) -> Optional[LyricsResult]:
     """Fetches raw lyric text from the free lyrics.ovh API. Returns None
     on any failure (network, not found, etc.) -- this is best-effort only.
 
@@ -58,9 +134,46 @@ def fetch_reference_lyrics(artist: str, title: str) -> Optional[str]:
         if resp.status_code != 200:
             return None
         data = resp.json()
-        return data.get("lyrics")
+        lyrics = data.get("lyrics")
     except Exception:
         return None
+    if not lyrics:
+        return None
+    return LyricsResult(plain_lyrics=lyrics, synced_lyrics=None, source="lyrics.ovh")
+
+
+def fetch_reference_lyrics(artist: str, title: str, duration_sec: Optional[float] = None) -> Optional[LyricsResult]:
+    """Tries LRCLIB first, falls back to lyrics.ovh if LRCLIB has nothing
+    usable. `duration_sec` (our own audio's length) helps LRCLIB's search
+    disambiguate between same-title candidates; pass it when available.
+    Returns None if neither source has anything -- best-effort only.
+    """
+    result = _fetch_from_lrclib(artist, title, duration_sec)
+    if result is not None:
+        return result
+    return _fetch_from_lyrics_ovh(artist, title)
+
+
+def reference_matches_transcript(ref_lines: List[str], words: List[Word],
+                                  min_ratio: float = config.REFERENCE_LYRICS_MIN_MATCH_RATIO) -> bool:
+    """Sanity-checks a fetched reference against the ASR transcript's OWN
+    vocabulary before it's trusted at all -- catches a wrong-song or
+    wrong-language reference (confirmed real case: Gaston's lyrics.ovh
+    lookup silently returned Spanish lyrics for an English song) that
+    would otherwise get treated as ground truth for TEXT and corrupt the
+    whole song. A right reference and a same-audio ASR transcript should
+    share the large majority of their words; a wrong one shares almost
+    none. Source-independent by design -- applies whichever source
+    answered.
+    """
+    if not ref_lines or not words:
+        return False
+    ref_norm, _, _ = _tokenize_lines(ref_lines)
+    asr_norm = [_normalize(w.text) for w in words if _normalize(w.text)]
+    if not ref_norm or not asr_norm:
+        return False
+    ratio = difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False).ratio()
+    return ratio >= min_ratio
 
 
 def parse_lyrics_lines(raw_lyrics: str) -> List[str]:

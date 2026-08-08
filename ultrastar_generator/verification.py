@@ -142,11 +142,23 @@ def _resolve(word: Word, rechecked: Optional[str], verbose: bool) -> tuple:
         return ref, (ref != cur), log
 
     # No reference expectation at all (ad-lib, or lyrics lookup
-    # unavailable/didn't cover this word) -- the recheck is the only
-    # second opinion we have.
+    # unavailable/didn't cover this word). There's no independent
+    # confirmation available here -- just one noisy signal (the isolated
+    # recheck) against another (the original full-context ASR text) --
+    # and the recheck is the LESS reliable of the two: it runs on a tiny,
+    # few-hundred-ms crop with none of the surrounding-context whisper had
+    # for its first pass, same failure class as this project's other
+    # "never trust inference from a tiny isolated clip alone" lessons
+    # (see CLAUDE.md). Confirmed in practice: real full-pipeline runs
+    # where lyrics lookup failed showed this branch replacing already-
+    # correct short words with hallucinated multi-word phrases (e.g.
+    # "I" -> "Whoo-hoo!", "why" -> "the white little"). So: log a
+    # disagreement for visibility, but never act on it unconfirmed --
+    # keep the more reliable full-context text.
     if rechecked and not _fuzzy_match(cur, rechecked):
-        log = f'    recheck: "{cur}" @ {word.start:.2f}s -> heard "{rechecked}" (no reference; replaced)'
-        return rechecked, True, log
+        log = (f'    recheck: "{cur}" @ {word.start:.2f}s -> heard "{rechecked}" '
+               f'(no reference to confirm either way) -- kept original')
+        return cur, False, log
     return cur, False, None
 
 

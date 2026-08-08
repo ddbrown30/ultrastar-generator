@@ -45,6 +45,19 @@ def _same_base(candidate: Path, base_stem: str) -> bool:
     return re.match(pattern, stem, flags=re.IGNORECASE) is not None
 
 
+def _looks_like_musicxml(path: Path) -> bool:
+    """Cheap content sniff for a bare ".xml" file: real MusicXML declares
+    a "score-partwise"/"score-timewise" root somewhere near the top of
+    the file. Reading raw text (not parsing) is enough and avoids paying
+    a full XML-parse cost on every random .xml a song folder happens to
+    contain."""
+    try:
+        head = path.read_text(encoding="utf-8", errors="ignore")[:4096]
+    except OSError:
+        return False
+    return "score-partwise" in head or "score-timewise" in head
+
+
 def find_companions(audio_path: Path) -> Companions:
     audio_path = Path(audio_path)
     base_stem = audio_path.stem
@@ -87,10 +100,15 @@ def find_companions(audio_path: Path) -> Companions:
         result.background = images[0]
 
     # --- MusicXML reference (pass 4) --------------------------------------
-    result.musicxml = sorted(
-        (p for p in candidates if p.suffix.lower() in (".mxl", ".musicxml", ".xml")),
-        key=lambda p: p.name.lower(),  # deterministic order across runs
-    )
+    # ".mxl"/".musicxml" are unambiguous. Bare ".xml" is NOT -- e.g. these
+    # SingStar rips ship their own "notes.xml" (a different, proprietary
+    # format, root tag "{http://www.singstargame.com}MELODY") right next
+    # to the real audio/lyrics, which crashed music21.converter.parse
+    # when trusted by extension alone. Content-sniff any bare ".xml" so
+    # only files that actually look like MusicXML get picked up.
+    xml_candidates = [p for p in candidates if p.suffix.lower() in (".mxl", ".musicxml")]
+    xml_candidates += [p for p in candidates if p.suffix.lower() == ".xml" and _looks_like_musicxml(p)]
+    result.musicxml = sorted(xml_candidates, key=lambda p: p.name.lower())  # deterministic order
 
     return result
 

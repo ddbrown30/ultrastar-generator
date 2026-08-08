@@ -533,6 +533,71 @@ MUSICXML_MIN_CALIBRATION_CONFIDENCE_HIGH_CONF_SUBSET = 0.4
 # measurement.
 MUSICXML_CORRECTED_CONFIDENCE = 0.75
 
+# Whether pass 4 applies the best available calibration offset even when
+# it doesn't clear MUSICXML_MIN_CALIBRATION_CONFIDENCE/_HIGH_CONF_SUBSET,
+# rather than skipping the file entirely (see apply_musicxml_reference's
+# force_calibration param). ON by default as of 2026-08-08: validated
+# real end-to-end on all 7 MXL-having songs in the test set -- 4 showed
+# NO change (batb, stars, gaston, sleeping_beauty_ouad -- their normal
+# calibration already clears the bar on its own, so this is provably a
+# no-op for them), 1 showed a small real gain (tarzan_son_of_man,
+# +1.9pp), and 2 showed large real gains (little_mermaid +21.6pp,
+# jungle_book_bare_necessities +19.0pp -- both had confirmed-unreliable
+# pass-1 pitch for acoustic reasons -- see CLAUDE.md 0h -- where even a
+# weakly-calibrated MXL reference beats trusting pass 1 at all). Zero
+# regressions found across the whole set.
+ENABLE_MUSICXML_FORCE_CALIBRATION = True
+
+
+# --- LRC (LRCLIB synced-lyrics) line timing check (lrc_timing.py) ----------
+# DIAGNOSTIC ONLY as of 2026-08-08 -- flags lines, never corrects them yet.
+# See lrc_timing.py's module docstring for why: `verify_placement` was
+# built with the same good intentions for a related problem and, when
+# validated for real, produced a net REGRESSION on every metric on both
+# songs tested, despite fixing some individual real cases. Not enabling
+# this by default, or building auto-correction, until the flagging
+# signal itself is cross-validated against real ground-truth timing
+# error to confirm it's trustworthy.
+ENABLE_LRC_TIMING_CHECK = False
+# Minimum matched lines required before trusting a per-song time
+# calibration offset at all -- mirrors MUSICXML_MIN_CALIBRATION_SAMPLES.
+LRC_TIMING_MIN_CALIBRATION_SAMPLES = 5
+# The modal per-line delta (1-second buckets) must cover at least this
+# fraction of matched lines, or calibration is too ambiguous to trust.
+LRC_TIMING_MIN_CALIBRATION_CONFIDENCE = 0.4
+# Once calibrated, a line's residual (its own delta minus the calibration
+# offset) beyond this is flagged. Line-level timestamps are inherently
+# coarser than word-level pitch calibration, so this is deliberately
+# more forgiving than any word-level tolerance would be.
+LRC_TIMING_FLAG_TOLERANCE_SEC = 2.0
+
+
+# --- Reference lyrics (lyrics_lookup.py) ------------------------------------
+# LRCLIB (lrclib.net) is tried first -- community-sourced, has a real search
+# API (artist_name/track_name, not lyrics.ovh's rigid /artist/title path),
+# and often has synced (per-line-timestamped) lyrics. lyrics.ovh is kept as
+# a fallback for whatever LRCLIB doesn't have.
+#
+# LRCLIB's /api/search can return several same-title candidates (different
+# recordings/albums, or occasionally a wrong-language mistag). Preferred
+# candidate = closest match to our audio's own duration; a candidate whose
+# duration is off by more than this is heavily penalized rather than
+# outright excluded (still usable as a last resort if nothing better exists).
+LRCLIB_DURATION_TOLERANCE_SEC = 60.0
+
+# Real case that motivated this: Gaston's lyrics.ovh lookup silently
+# returned a SPANISH-language reference for an English song (same
+# artist/title string, wrong recording) -- verify_words then trusted it as
+# ground truth for TEXT and corrupted the whole song. Any reference source
+# can make this mistake, not just lyrics.ovh, so the gate lives here,
+# independent of which source answered: the fetched reference's own word
+# vocabulary must overlap the ASR transcript's vocabulary by at least this
+# much (difflib.SequenceMatcher.ratio() over normalized word-token
+# sequences) before it's trusted at all. A right-language, right-song
+# reference and a same-language ASR transcript of the same audio should
+# share the large majority of their words; a wrong-song/wrong-language
+# reference shares almost none.
+REFERENCE_LYRICS_MIN_MATCH_RATIO = 0.25
 
 
 @dataclass

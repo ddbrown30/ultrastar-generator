@@ -31,8 +31,10 @@ from .note_detection import detect_notes
 from .alignment import align_words
 from .key_correction import snap_to_key
 from .phrasing import build_lines
-from .lyrics_lookup import fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference, alignment_diff_summary
+from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
+                             alignment_diff_summary, reference_matches_transcript)
 from .musicxml_reference import apply_musicxml_references
+from .lrc_timing import apply_lrc_timing_check
 from .video_sync import estimate_videogap
 from .usdx_writer import write_song
 from .debug_output import write_pass1_debug_file, write_notes_debug_file
@@ -134,6 +136,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "for duet/ensemble arrangements where multiple parts have lyrics (e.g. a "
                          "character's own name, if the arrangement labels parts that way). Falls "
                          "back to the lyric-bearing part with the most notes if not given.")
+    p.add_argument("--no-musicxml-force-calibration", dest="musicxml_force_calibration",
+                    action="store_false", default=config.ENABLE_MUSICXML_FORCE_CALIBRATION,
+                    help="Without a confident calibration offset (config."
+                         "MUSICXML_MIN_CALIBRATION_CONFIDENCE), pass 4 normally still applies the best "
+                         "available offset anyway rather than skipping the file -- validated real "
+                         "end-to-end on all 7 MXL-having songs in the test set: 0 regressions, up to "
+                         "+21.6pp on songs where pass 1 was confirmed unreliable (see CLAUDE.md). Pass "
+                         "this flag to go back to skipping uncalibratable files instead. Never touches "
+                         "octave or timing, same as normal pass 4.")
+    p.add_argument("--lrc-timing-check", dest="lrc_timing_check", action="store_true",
+                    default=config.ENABLE_LRC_TIMING_CHECK,
+                    help="EXPERIMENTAL, off by default. Cross-checks each line's assigned start time "
+                         "against LRCLIB's synced lyrics (when available), once a per-song time "
+                         "calibration offset can be trusted. DIAGNOSTIC ONLY -- flags disagreeing lines "
+                         "in the console/debug log, never moves anything (see lrc_timing.py).")
+    p.add_argument("--no-lrc-timing-check", dest="lrc_timing_check", action="store_false",
+                    help="Disable the LRC timing check (no-op unless --lrc-timing-check or "
+                         "config.ENABLE_LRC_TIMING_CHECK enabled it).")
     p.add_argument("--pitch-smooth-window", type=float, default=config.PITCH_SMOOTH_WINDOW_SEC,
                     help=f"Median-filter window (sec) for vibrato suppression before note "
                          f"segmentation (default: {config.PITCH_SMOOTH_WINDOW_SEC}). Raise this "
@@ -356,27 +376,36 @@ def run(argv=None) -> int:
 
     # --- 6. Reference lyrics: correct ASR text AND mark phrase/line breaks --
     ref_lines = None
+    synced_lyrics_text = None
     if args.fetch_lyrics:
-        print("Fetching reference lyrics from lyrics.ovh...")
-        reference = fetch_reference_lyrics(artist, title)
+        print("Fetching reference lyrics (LRCLIB, falling back to lyrics.ovh)...")
+        reference = fetch_reference_lyrics(artist, title, duration_sec=len(y) / sr)
         if reference:
-            ref_lines = parse_lyrics_lines(reference)
-            print(f"  Got {len(ref_lines)} reference line(s).")
-            corrected = align_words_to_reference(words, ref_lines)
-            diffs = alignment_diff_summary(words, corrected)
-            if diffs:
-                print(f"  Corrected {len(diffs)} word(s) against the reference lyrics:")
-                for d in diffs[:20]:
-                    print(f"    {d}")
-                if len(diffs) > 20:
-                    print(f"    ... and {len(diffs) - 20} more")
+            candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
+            if not reference_matches_transcript(candidate_lines, words):
+                print(f"  Got a reference from {reference.source}, but its words barely overlap "
+                      f"the transcript (likely wrong song/language) -- discarding it, "
+                      f"continuing with ASR text and gap-based phrasing only.")
             else:
-                print("  ASR text already matched the reference; no corrections needed.")
-            debug_log.log_reference_corrections(diffs)
-            words = corrected
+                ref_lines = candidate_lines
+                synced_lyrics_text = reference.synced_lyrics
+                print(f"  Got {len(ref_lines)} reference line(s) from {reference.source}"
+                      f"{' (synced)' if reference.synced_lyrics else ''}.")
+                corrected = align_words_to_reference(words, ref_lines)
+                diffs = alignment_diff_summary(words, corrected)
+                if diffs:
+                    print(f"  Corrected {len(diffs)} word(s) against the reference lyrics:")
+                    for d in diffs[:20]:
+                        print(f"    {d}")
+                    if len(diffs) > 20:
+                        print(f"    ... and {len(diffs) - 20} more")
+                else:
+                    print("  ASR text already matched the reference; no corrections needed.")
+                debug_log.log_reference_corrections(diffs)
+                words = corrected
         else:
-            print("  Could not fetch reference lyrics (not found, or no network); "
-                  "continuing with ASR text and gap-based phrasing only.")
+            print("  Could not fetch reference lyrics (not found on LRCLIB or lyrics.ovh, or no "
+                  "network); continuing with ASR text and gap-based phrasing only.")
     else:
         print("Lyric lookup disabled (--no-fetch-lyrics); using ASR text and gap-based phrasing only.")
 
@@ -426,6 +455,7 @@ def run(argv=None) -> int:
         print(f"Pass 4: cross-checking pitch against {len(mxl_paths)} MusicXML reference file(s)...")
         syllables, mxl_stats_list = apply_musicxml_references(
             syllables, mxl_paths, preferred_part_name=args.musicxml_part,
+            force_calibration=args.musicxml_force_calibration,
             verbose=not args.quiet, debug_log=debug_log,
         )
         for path, mxl_stats in zip(mxl_paths, mxl_stats_list):
@@ -438,6 +468,20 @@ def run(argv=None) -> int:
                       f"calibration offset {mxl_stats.calibration_offset:+d} semitones "
                       f"({mxl_stats.calibration_confidence:.0%} agreement), "
                       f"{len(mxl_stats.corrections)} syllable(s) corrected")
+
+    # --- 7c. LRC line-timing check (optional, off by default): flags lines whose
+    # assigned start disagrees with LRCLIB's synced-lyrics timing. DIAGNOSTIC
+    # ONLY -- never moves anything, see lrc_timing.py's module docstring for why.
+    if args.lrc_timing_check and synced_lyrics_text:
+        print("Checking line timing against LRCLIB's synced lyrics (diagnostic only)...")
+        lrc_stats = apply_lrc_timing_check(syllables, synced_lyrics_text,
+                                            verbose=not args.quiet, debug_log=debug_log)
+        if lrc_stats.skipped_reason:
+            print(f"  skipped -- {lrc_stats.skipped_reason}")
+        else:
+            print(f"  calibration offset {lrc_stats.calibration_offset_sec:+.1f}s "
+                  f"({lrc_stats.calibration_confidence:.0%} agreement), "
+                  f"{len(lrc_stats.flags)}/{lrc_stats.n_matched_lines} line(s) flagged")
 
     entries = build_lines(syllables)
 

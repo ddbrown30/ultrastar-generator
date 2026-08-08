@@ -348,13 +348,603 @@ Done:
    rather than adding a new tuned constant: no CREPE computation, no
    cross-check logic at all when this path is used, and noticeably
    faster (19-26s/song here vs. 111-213s for the cross-check-heavy
-   configs tested earlier in this thread). **Presented to the user for
-   an explicit go-ahead before flipping the shipped default** (a
-   foundational pipeline decision, and the earlier attempt in this same
-   thread had to be reverted after being flipped without waiting for
-   full validation) -- decision not yet made as of this writing; if
-   picked back up, check whether the user actually approved the switch
-   before assuming this is the new default.
+   configs tested earlier in this thread). **Shipped**: `isolation_source
+   ="rmvpe"` is now `main.py`'s real default (via `config.
+   DEFAULT_PITCH_SOURCE = "rmvpe"` and the `--pitch-source` CLI flag,
+   `choices=["rmvpe","ensemble"]`) -- `detect_notes()`'s own function
+   default was deliberately left untouched so `test_dry_run.py` and ad
+   hoc scripts aren't silently affected.
+0e. **First real full-8-song end-to-end CLI batch run with the shipped
+   defaults (rmvpe isolation-mode pitch + MXL auto-detection), comparing
+   FINAL pipeline output (not a proxy) against each song's own ground
+   truth.** Found and fixed one real regression from this session's own
+   MXL auto-detection work: `file_discovery.find_companions` matched
+   `.xml` by extension ALONE, which also matches these SingStar rips'
+   own `notes.xml` companion file (a different, proprietary format --
+   root tag `{http://www.singstargame.com}MELODY`, not MusicXML at all).
+   `music21.converter.parse` threw on it and crashed the WHOLE run for
+   every song that happens to ship one (6 of 8 in this batch -- only
+   Stars and Gaston don't have a `notes.xml` sitting next to their
+   audio). Fixed at the root: bare `.xml` candidates are now content-
+   sniffed (`_looks_like_musicxml`, checks for a `score-partwise`/
+   `score-timewise` tag near the top of the file) before being trusted;
+   `.mxl`/`.musicxml` extensions remain trusted unconditionally (real
+   MuseScore downloads, unambiguous). Also hardened
+   `apply_musicxml_references` (plural) to catch a per-file parse
+   exception and record it as `skipped_reason` instead of crashing the
+   whole run -- so a future unexpected companion file degrades
+   gracefully instead of taking down pass 4 entirely.
+
+   After the fix, all 8 songs completed successfully. Final-output-vs-
+   ground-truth pitch accuracy (word/syllable text aligned via the same
+   whole-sequence difflib technique used throughout this project;
+   exact-MIDI or pitch-class per each song's already-established
+   convention -- see the ground-truth table further down):
+
+   | Song | metric | coverage | accuracy |
+   |---|---|---|---|
+   | batb | exact | 72.1% | 98.0% |
+   | stars (partial OMR anchors) | pitch-class | 89.0% | 88.9% |
+   | sleeping_beauty_ouad | exact | 19.9% | 9.5% |
+   | gaston | pitch-class | 2.6% | 20.0% |
+   | little_mermaid | pitch-class | 74.6% | 59.3% |
+   | sleeping_beauty_wonder | exact | 59.7% | 23.9% |
+   | tarzan_son_of_man | exact | 40.1% | 88.0% |
+   | jungle_book_bare_necessities | pitch-class | 60.9% | 35.7% |
+
+   **The low scores are NOT a pitch-source regression -- they trace to
+   two separate, PRE-EXISTING lyrics-text issues, unrelated to this
+   session's rmvpe/MXL work, that this was the first real test exposing
+   at full-pipeline scale:**
+   1. `lyrics.ovh` reference-lyric lookup failed outright ("not found,
+      or no network") for sleeping_beauty_ouad, sleeping_beauty_wonder,
+      tarzan_son_of_man, and jungle_book_bare_necessities -- 4 of 8
+      songs, all Disney-soundtrack titles that may just not be well
+      indexed there. Without a reference, `verification.verify_words`'s
+      `_resolve()` no-reference branch (`verification.py` ~line 144)
+      blindly trusts a fresh isolated few-hundred-ms re-transcription
+      over the original whole-context ASR text whenever they disagree --
+      and isolated-clip ASR is a known-unreliable signal (same failure
+      class as the long-documented "never run pYIN on a tiny isolated
+      clip" pitch lesson above, just for text/Whisper instead of pitch).
+      In practice this REPLACES already-correct short words with
+      hallucinated garbage (confirmed in the logs, e.g. "I"->"Whoo-hoo!",
+      "why"->"the white little"), which is why coverage against ground
+      truth collapses for exactly these 4 songs. tarzan still scored
+      88% accuracy despite this, so the underlying pitch detection isn't
+      the problem -- the TEXT alignment used to find comparable notes is.
+   2. Gaston's `lyrics.ovh` lookup returned a SPANISH-language reference
+      (words like "quiero"/"verte"/"pueblo" -- confirmed in the log),
+      not the English original, for artist/title "Beauty and the Beast"/
+      "Gaston". `verify_words` then trusted that wrong-language reference
+      as ground truth for TEXT, corrupting the whole song's lyrics.
+      Explains gaston's 2.6% coverage outlier by itself.
+
+   **FIXED, same day, see 0f below**: the `_resolve()` no-reference
+   fallback trusting an isolated recheck over full-context ASR without
+   any confidence gate, and the wrong-language reference problem (fixed
+   via the LRCLIB migration + `reference_matches_transcript` gate, not
+   by patching `lyrics_lookup.fetch_reference_lyrics`'s matching itself).
+   This paragraph is kept for the historical diagnosis; don't read it as
+   still-open.
+
+   On the 3 songs where reference-lyric lookup worked AND matched the
+   right language (batb, stars, little_mermaid) -- the closest to a
+   clean read on the new pitch-source default's real accuracy --
+   average is (98.0+88.9+59.3)/3 = 82.1%, all with real (not proxy)
+   full-pipeline output. Outputs for all 8 songs kept at
+   `sandbox/full-pipeline-validation/<song_key>/` (nothing suppressed --
+   pass-1 debug file, debug log, and final .txt all present) for
+   independent inspection.
+0f. **Both 0e follow-up bugs fixed same day, plus one more found by the
+   user inspecting real output (`batb`) directly -- 3 real fixes total,
+   all real-audio re-validated:**
+   1. **`lyrics_lookup.py` now tries LRCLIB (lrclib.net) FIRST, falling
+      back to lyrics.ovh only if LRCLIB has nothing.** LRCLIB has a real
+      search API (`artist_name`/`track_name` query params returning
+      several candidates, picked by closeness to OUR OWN audio duration
+      -- `_fetch_from_lrclib`) instead of lyrics.ovh's rigid single-shot
+      path, and often includes synced (per-line-timestamped) lyrics
+      (`LyricsResult.synced_lyrics`, LRC format -- fetched and stored,
+      not consumed by anything yet, see the still-open item below).
+      `fetch_reference_lyrics` now returns a `LyricsResult`
+      (`plain_lyrics`/`synced_lyrics`/`source`), not a raw string.
+      **Also added `reference_matches_transcript`** (difflib ratio
+      between the fetched reference's word vocabulary and the ASR
+      transcript's own vocabulary, `config.
+      REFERENCE_LYRICS_MIN_MATCH_RATIO = 0.25`) as a source-independent
+      safety net -- rejects a wrong-song/wrong-language reference
+      before it's ever trusted, regardless of which source answered.
+      Real validation, live network, all 8 songs: LRCLIB found real
+      lyrics for 6 of 8 (up from 3 of 8 under lyrics.ovh alone) --
+      including recovering the correct ENGLISH lyrics for Gaston (the
+      0e Spanish-lyrics bug). Only sleeping_beauty_wonder and
+      jungle_book_bare_necessities still have no reference anywhere
+      (confirmed absent from both sources, not a bug).
+   2. **`verification.py`'s `_resolve()` no-reference branch no longer
+      blindly replaces already-correct text.** It used to trust ANY
+      disagreeing isolated few-hundred-ms recheck over the original
+      full-context ASR word whenever no reference existed to adjudicate
+      -- exactly the "never trust inference from a tiny isolated clip"
+      failure class already documented above for pitch, just for
+      ASR/text. Now: log the disagreement for visibility, but keep the
+      more reliable full-context text when nothing can confirm the
+      recheck. `test_dry_run.py` updated to match (word 0 in the
+      verify_words test now stays unchanged, `replaced=False`).
+   3. **`phrasing.py`'s reference-line priority was never actually
+      absolute -- found by the user inspecting real batb output.**
+      `build_lines` OR'd a raw gap check (`gap >= MIN_LINE_GAP_SEC`)
+      into `force_break` unconditionally, even when `Syllable.line_id`
+      confirmed the next word was still part of the SAME reference
+      line -- contradicting the module's own docstring. Real, confirmed
+      case: "Just a little change" (one reference line) has an audible
+      pause before "change" long enough to trip the gap heuristic, so
+      it was being split into "Just a little" / "change" as two output
+      lines; same for "Both a little scared", "Ever just as sure",
+      "Certain as the sun", "Song as old as rhyme" -- all one-line
+      reference phrases, all spuriously split. Fixed: when both the
+      current line and the next word have a KNOWN, MATCHING line_id,
+      nothing breaks the line early except the pre-existing
+      implausible-length safety net (1.5x `MAX_SYLLABLES_PER_LINE`) --
+      the reference wins outright, even over a long gap. New regression
+      test added (`test_dry_run.py`, "long silence gap WITHIN a single
+      confirmed reference line"). Confirmed fixed against real batb
+      output after re-running.
+
+      **Open tension this fix creates, not yet resolved:** a reference
+      LINE is a typographic convention from whoever transcribed it, not
+      guaranteed to be one musical PHRASE. Confirmed real case: LRCLIB's
+      Under The Sea merges "Under the sea, under the sea" into ONE line
+      (lyrics.ovh had it as two) -- if that's actually sung as two
+      distinct phrases with a real pause, the phrasing fix above will
+      now NEVER break there, producing a run-on line where two are
+      musically correct. Not fixed -- would need either a much-higher
+      "this reference line is absurdly-implausibly two phrases" gap
+      threshold that still respects the reference by default, or some
+      other signal; flagged for the user rather than guessed at.
+
+   Real full-8-song re-validation after all three fixes (pitch-CLASS
+   accuracy -- the metric that actually matches how UltraStar Deluxe
+   itself scores, octave-agnostic; see pass 4's own docstring):
+
+   | Song | pitch-class accuracy | coverage |
+   |---|---|---|
+   | batb | 100.0% | 73.6% |
+   | stars (partial OMR anchors) | 88.9% | 89.0% |
+   | sleeping_beauty_ouad | 89.8% | 28.0% |
+   | gaston | 93.6% | 64.7% |
+   | little_mermaid | 38.9% | 66.5% |
+   | sleeping_beauty_wonder | 28.8% | 76.6% |
+   | tarzan_son_of_man | 96.6% | 60.3% |
+   | jungle_book_bare_necessities | 39.0% | 71.7% |
+   | **Average** | **71.95%** | |
+
+   Gaston's fix is the standout, real-audio-confirmed result: EXACT-MIDI
+   accuracy alone is meaningless for gaston/little_mermaid/jungle_book
+   (their ground truth is independently known octave-ambiguous, see the
+   pitch-class-only convention table above) -- but even so, gaston's
+   coverage against ground truth went from 2.6% to 64.7% purely from
+   fixing the Spanish-lyrics bug (nothing about pitch detection changed).
+
+   **Two accuracy patterns identified, NEITHER caused by this round's
+   fixes -- one is harmless and CLOSED, the other is real and still
+   open (both corrected below after further digging same session --
+   see the superseded original framing was wrong on both counts):**
+   - **sleeping_beauty_ouad is a whole-song, consistent, CLEAN octave/
+     register selection difference -- not a real pitch problem, and
+     NOT worth pursuing further.** 56 of 58 matched-note offsets are
+     an EXACT multiple of 12 semitones (41 at -12, 11 at 0, 4 at -24);
+     only 2/58 are anything else. Since UltraStar Deluxe scores pitch
+     CLASS, not exact octave (confirmed by the user, see pass 4's own
+     docstring), a clean octave transposition is already fully
+     forgiven -- that's exactly why pitch-class accuracy here is 89.8%
+     (later 96.6% after the duet-merge/melisma-token comparison-script
+     fixes below). This is likely `isolation_source="rmvpe"` picking a
+     different (but internally consistent) octave register for this
+     song's vocal range -- cosmetically odd, but harmless for real
+     gameplay. Closed; don't chase this one further.
+   - **little_mermaid's poor pitch-class accuracy is REAL, and is NOT
+     an octave problem at all, despite superficially looking like one.**
+     (An earlier pass at this data wrongly attributed it to a lyrics-
+     source-driven note-reassignment regression; that was DISPROVEN the
+     same session -- see the A/B test in 0g's introduction: running the
+     exact same song with lyrics lookup fully disabled produced 549/549
+     IDENTICAL notes, start time and pitch, vs the LRCLIB run. Pass 1/
+     pass 3 pitch/timing genuinely cannot see which lyrics source was
+     used, so that explanation was wrong; the swing between reported
+     numbers across runs was a text-matching artifact, not a real
+     pipeline difference -- see 0g.) The REAL signature, found by
+     checking whether little_mermaid's errors are clean multiples of 12
+     the same way ouad's are: they are NOT. The single -12 bucket alone
+     (171 of ~364 matched) accounts for essentially 100% of its 47%
+     "correct" count -- every other offset in its histogram (-13, -11,
+     -14, -15, -10, -9, -8 semitones, roughly matching -12's own count
+     combined) is NEAR an octave but not exactly one, so none of it is
+     forgiven by pitch-class comparison, and none of it would be
+     forgiven by real UltraStar scoring either. This is genuine pitch-
+     detection inaccuracy on roughly half this song's notes, not a
+     register/octave choice. **ROOT-CAUSED AND FIXED later the same
+     day, see 0h below -- don't read this as still open.**
+
+   **Not yet built**: actually consuming `LyricsResult.synced_lyrics`
+   for anything. Real feasibility check done (Tarzan - Son Of Man,
+   fetched fresh synced lyrics, compared LRC per-line timestamps against
+   that song's own final-output line-start times): timestamps land
+   within a few seconds of our own line starts throughout the song, not
+   exact but clearly the same recording/timing, not noise -- confirms
+   there's real signal, same spirit as musicxml_reference.py's
+   calibration-offset pattern but for TIME instead of pitch. A concrete,
+   scoped design was proposed to the user (calibrate a per-song time
+   offset the same two-tier confidence way pass 4 does, use it to
+   flag/correct badly-drifted line placements -- cheaper than
+   `verify_placement`'s re-transcription loop since it needs no fresh
+   ASR call) but building it was NOT started -- check whether the user
+   actually asked for it before assuming this is done.
+0g. **Tried and rejected (real prototype, real audio): separating lead
+   vocal from backing/harmony vocals does NOT explain or fix
+   little_mermaid's poor pitch accuracy.** Hypothesis going in: "Under
+   The Sea" has a near-constant background chorus through most of its
+   runtime (unlike the cleaner solo songs that scored well), and RMVPE
+   is a monophonic pitch tracker (confirmed by reading `_rmvpe_pitch` --
+   it returns exactly one `(frequency, confidence)` per frame, no
+   voice-count/polyphony signal at all) that has to arbitrarily pick one
+   voice whenever several sing at once -- 15-second-bucketed accuracy
+   was pervasively mediocre (20-56%) across nearly the whole song, not
+   localized to one passage, consistent with a near-constant confusion
+   source rather than a single bad moment.
+
+   Installed `audio-separator` (wraps UVR's models,
+   `pip install audio-separator[gpu]`) and ran its best-scoring karaoke
+   model, `Mel-Roformer-Karaoke-Aufr33-Viperx` (SDR 8.4 vs the older
+   MDX-Net karaoke model's 5.4), on top of the existing Demucs vocals
+   stem to further split lead vocal from backing/harmony. Compared
+   pass-1 (`isolation_source="rmvpe"`) pitch accuracy on the lead-only
+   stem against the current Demucs-only baseline, using TIME-OVERLAP
+   note matching against ground truth (dominant pass-1 note pitch
+   within each ground-truth note's window) -- deliberately NOT the
+   lyrics/ASR text-matching methodology used elsewhere this session,
+   to avoid the exact measurement-noise problem already found and
+   documented in 0f (different text -> different matched subset ->
+   different reported number, same underlying pitch).
+
+   Result: pitch-class accuracy 47.0% (baseline) vs 45.2% (lead-vocal-
+   isolated) -- no improvement, actually very slightly worse, and the
+   offset histograms are nearly IDENTICAL between the two conditions
+   (both dominated by -12, -13, -11, -14 semitones in almost the same
+   proportions).
+
+   **Two follow-up attempts, same session, same negative result --
+   this is now a well-tested dead end, not a one-off:** user listened
+   to the separated stems directly and reported no audible difference
+   from the original; a quantitative check confirmed it
+   (`corr(original, "lead") = 0.97`, the "backing" stem the model
+   split out was ~4x quieter than the lead and only ~23% of the
+   original's energy -- i.e. the model found little to separate in the
+   first place, not that separation itself failed). Tried (1) the
+   highest-SDR-scoring karaoke model available via `audio-separator`
+   at the time (`MelBand Roformer | Karaoke by Gabox`, SDR 8.69 vs
+   Aufr33-Viperx's 8.45) on the same Demucs vocals stem -- correlation
+   with the original was 0.972, essentially identical to Aufr33-
+   Viperx's 0.969: a stronger model found the same small amount of
+   separable content, not more. (2) Ran the SAME Gabox model directly
+   on the ORIGINAL FULL MIX instead of the pre-Demucs-isolated vocals
+   stem -- its "vocals" stem correlates 0.96 with Demucs's OWN vocals
+   output, meaning on a full mix this model just re-derives a plain
+   vocals-vs-instrumental split (Demucs's job), not a lead-vs-backing
+   split; not a different/better separation, a different problem.
+
+   All four conditions' real pitch-class accuracy (Demucs baseline,
+   Aufr33-Viperx-on-Demucs-vocals, Gabox-on-Demucs-vocals, Gabox-on-
+   full-mix): 47.0% / 45.2% / 45.1% / 47.0% -- statistically flat, and
+   EVERY condition shows the same dominant -12-semitone offset in
+   nearly the same proportion. This conclusively rules out harmony/
+   backing-vocal confusion as little_mermaid's problem -- neither model
+   choice nor input pipeline (pre-isolated vocals vs. full mix) moved
+   the number at all. **Don't re-attempt lead-vocal/harmony separation
+   for this song -- this thread is closed, tested three different ways
+   with converging null results.**
+
+   **IMPORTANT correction, same session, caught by the user pushing
+   back on the framing above:** this is NOT the same mechanism as
+   sleeping_beauty_ouad's octave issue, and calling it "an octave bias"
+   at all was misleading -- checked and corrected immediately after
+   writing it. UltraStar Deluxe scores pitch CLASS, so a pure/clean
+   octave difference (ouad's actual problem, see above) is already
+   fully forgiven and harmless. little_mermaid's -12 bucket (171 of
+   ~364 matched) is real and accounts for basically its entire pitch-
+   class-correct count, but EVERY OTHER offset in its histogram (-13,
+   -11, -14, -15, -10, -9, -8 -- roughly matching -12's own count
+   combined) is near-but-not-exactly an octave, so none of THAT is
+   forgiven, by pitch-class comparison or by real UltraStar scoring.
+   That's the actual problem: genuine pitch-detection inaccuracy on
+   roughly half this song's notes that happens to often land in the
+   neighborhood of an octave below truth, not a register/octave
+   SELECTION issue the way ouad's cleanly is. Framing this as "the same
+   RMVPE octave-selection mechanism as ouad" (as an earlier version of
+   this note did) would send a future investigation in the wrong
+   direction -- ouad's fix target would be "why does RMVPE pick a
+   different but internally-consistent octave here" (probably not
+   worth chasing, it's harmless); little_mermaid's real question is
+   "why is RMVPE's actual pitch value wrong, not just its octave" for
+   about half this song's notes, still genuinely unsolved.
+
+0h. **Root cause found (same day, deeper dig): this is a genuine acoustic
+   ambiguity in rough/character vocal production, confirmed across FOUR
+   independent pitch estimators, NOT a training-distribution gap in any
+   one of them -- and a real, validated fix shipped for it.**
+
+   Traced specific little_mermaid errors back to raw per-frame RMVPE
+   output (cached from earlier in the session, confirmed still valid --
+   RMVPE isolation mode is bit-reproducible for this song, verified
+   earlier). The "wrong" pitch traces are NOT low-confidence or noisy --
+   confidence during these errors (0.77 avg) is nearly as high as during
+   harmless clean-octave cases (0.81), and the traces themselves are
+   smooth, stable, well-tracked contours, just locked onto the wrong
+   frequency. Cross-checked 3 specific flagged notes against the
+   INDEPENDENT MusicXML sheet music (not just our own ground truth) --
+   the sheet music agreed with ground truth exactly every time (70=70,
+   65=65, 70=70), ruling out ground-truth error as the explanation.
+   Checked the accompaniment stem's own detected pitch at those same
+   moments -- no match to RMVPE's wrong values, ruling out simple
+   instrumental bleed-through too.
+
+   The decisive test: the user noted the recording's only unusual trait
+   is the singer's vocal delivery (Sebastian's Jamaican-accented
+   reggae-style singing for little_mermaid) -- prompting a check of
+   jungle_book_bare_necessities too (Baloo/Phil Harris, gravelly jazz
+   talk-singing, also a poor scorer). Its raw-frame error histogram is
+   nearly IDENTICAL in shape to little_mermaid's (-12 dominant/harmless,
+   then -13, -11, -14 as the next-biggest buckets in matching
+   proportions) -- while batb (clean legit Broadway voice) shows ZERO of
+   this pattern. Then tested ALL FOUR cached pitch sources for
+   jungle_book (pyin, RMVPE, SwiftF0, PENN -- four different
+   architectures/training data: classical DSP, U-Net+GRU trained on
+   Mandarin-pop, small CNN trained on speech+synthetic, cross-domain
+   speech+music CNN) -- ALL FOUR converge on the SAME wrong answer in
+   the same proportions (pitch-class accuracy 37-48% across all four,
+   same -12/-13/-11/-14 shape every time). Four independently-trained
+   estimators agreeing on the same wrong answer rules out "pick a
+   better-trained model" as a fix -- the ambiguity is in the raw
+   acoustic signal itself (very likely vocal fry / non-clean glottal
+   vibration common in rough/growled vocal production, which can make
+   the actual dominant periodicity genuinely different from the
+   "musical" pitch a human parses out through top-down melodic
+   expectation), not in any one model's training distribution. Checked
+   what pretrained singing-pitch models exist trained on more diverse
+   vocal STYLES specifically (not just noise-robustness) -- RMVPE
+   (MIR-1K/MIR_ST500/Cmedia, Mandarin-pop), PENN (MDB+PTDB, cross-domain
+   speech/music), SwiftF0 (NSynth+PTDB-TUG+synthetic Mandarin TTS
+   speech), ROSVOT (2024, noise-robustness-focused via MUSAN
+   augmentation, not confirmed style-diverse) -- none of the readily
+   available options target this specifically, consistent with the
+   four-way convergence result: no pitch source in existence was going
+   to fix this on its own.
+
+   **Fix: `musicxml_reference.py` gained `force_calibration` (new
+   parameter on `apply_musicxml_reference`/`apply_musicxml_references`,
+   `main.py`'s `--musicxml-force-calibration` CLI flag, EXPERIMENTAL/
+   off by default).** Normal pass 4 skips a song entirely when our own
+   pitch can't establish confident calibration against the MXL
+   reference (exactly little_mermaid's and jungle_book's case -- the
+   normal bar measures agreement against pass 1, which is the actual
+   problem here). `force_calibration=True` applies the best available
+   offset anyway (full population, or the high-confidence subset if
+   it's the stronger signal -- reuses the existing two-tier logic,
+   just removes the "give up" branch) and corrects every matched
+   syllable's pitch class from it, however weak the calibration
+   confidence. Still never touches octave or timing, same guarantee as
+   normal pass 4.
+
+   Real end-to-end validation, full pipeline, both hard-case songs:
+
+   | Song | baseline pitch-class | force_calibration | delta |
+   |---|---|---|---|
+   | little_mermaid | 37.7% | 59.3% | +21.6pp |
+   | jungle_book_bare_necessities | 39.0% | 58.0% | +19.0pp |
+
+   Coverage unchanged in both cases (this only touches pitch, never
+   text-matching), so the gain is 100% real pitch-quality improvement,
+   not a measurement-methodology artifact. Both songs' calibration
+   confidence was genuinely weak even after forcing (little_mermaid
+   40%, jungle_book 40% full-population/38% subset -- neither clears
+   the normal bars), and it still won decisively over trusting pass 1
+   at all. **Provably a no-op for already-well-calibrated songs**: the
+   force-only code path is only ever entered when the full-population
+   confidence is already below `MUSICXML_MIN_CALIBRATION_CONFIDENCE`,
+   so songs where normal calibration already clears the bar (batb,
+   gaston, tarzan, stars) are completely unaffected by this flag --
+   not just untested, provably unreachable for them.
+
+   **Decided and shipped, same day**: user asked for the remaining 4
+   MXL-having songs to be tested too (stars, sleeping_beauty_ouad,
+   gaston, tarzan_son_of_man) before deciding on a default -- full real
+   end-to-end results, all 7 MXL-having songs now covered
+   (sleeping_beauty_wonder has no MXL file at all, trivially unaffected):
+
+   | Song | baseline pitch-class | force_calibration | delta |
+   |---|---|---|---|
+   | batb | 100.0% | 100.0% | 0 |
+   | stars | 86.4% | 86.4% | 0 |
+   | sleeping_beauty_ouad | 96.6% | 96.6% | 0 |
+   | gaston | 93.6% | 93.6% | 0 |
+   | tarzan_son_of_man | 96.6% | 98.5% | +1.9pp |
+   | little_mermaid | 37.7% | 59.3% | +21.6pp |
+   | jungle_book_bare_necessities | 39.0% | 58.0% | +19.0pp |
+
+   Every song showed zero or positive change, zero regressions -- per
+   the user's own stated criterion, this is now `config.
+   ENABLE_MUSICXML_FORCE_CALIBRATION = True` (default), with
+   `--no-musicxml-force-calibration` to opt back out. The function-level
+   default in `apply_musicxml_reference`/`apply_musicxml_references` was
+   also changed to pull from this config constant directly (matching
+   how every other `ENABLE_*` toggle in this codebase works, e.g.
+   `ENABLE_CREPE`/`ENABLE_KEY_CORRECTION`/`ENABLE_WORD_VERIFICATION` --
+   NOT kept as a hardcoded-False library default with only the CLI
+   overriding it, unlike the deliberately-separate `isolation_source`/
+   pitch-source case earlier in this document). `test_dry_run.py`'s
+   existing calibration tests were unaffected (they either already
+   clear the confidence bar normally, or hit the too-few-matches early
+   exit before force_calibration would ever matter); the new ambiguous-
+   population test's "normal mode" branch now passes
+   `force_calibration=False` explicitly, since the function's own
+   default flipped.
+
+0i. **New validation dimension: NOTE TIMING accuracy (start-time
+   deviation from ground truth), not just pitch.** Every prior
+   validation this session measured pitch only -- alignment was by TEXT
+   match, and once two notes were paired only their pitch got compared;
+   timing was parsed but never scored. Built `compare_timing()`
+   (scratchpad `compare_full_pipeline_output.py`) to close that gap:
+   same text-based pairing, but scores `|out_start - gt_start|`.
+
+   **Found and fixed a real methodology bug this immediately exposed**:
+   `difflib`'s text-only alignment has no notion of time, so a repeated
+   lyric/phrase (chorus hook, reprise, echo) can get ground truth's
+   occurrence paired against a DIFFERENT sung instance of the same text
+   in our output -- a real alignment ambiguity, not a real timing error,
+   but it corrupts pitch comparison too, not just timing (a fixed-offset
+   pitch agreement can survive across instances if the repeat is
+   melodically identical, silently passing what should be an invalid
+   comparison). A fixed absolute distance cutoff doesn't work (confirmed
+   two ways): different songs repeat at different intervals, so no one
+   cutoff is both loose enough for real widely-spaced songs and tight
+   enough for closely-spaced ones; and a raw per-song MEDIAN isn't
+   robust either -- if repeat-artifacts actually outnumber real matches
+   (confirmed real case: sleeping_beauty_ouad), the median itself gets
+   pulled into the wrong cluster and the filter inverts, REJECTING real
+   matches and keeping artifacts. Working fix: bucket all candidate
+   deltas at 200ms resolution, take the bucket with the most candidates
+   as the reference point (real matches cluster tightly regardless of
+   song -- confirmed under ~200ms median everywhere once artifacts are
+   removed -- while artifacts spread across many different offsets
+   depdepending on where in the song each repeat lands, so the tightest
+   single bucket is reliably the true cluster even when outnumbered),
+   then reject anything >3s from that reference.
+
+   This fixed 7 of 8 songs cleanly. `sleeping_beauty_ouad` resisted
+   every version of the fix -- hand-inspected its actual output content
+   and found why: it's a genuine duet where the SAME verse is legitimately
+   sung 2-3 times as call-and-response echo (confirmed both ground truth
+   and our own output are individually correct), which whole-song text
+   alignment fundamentally can't disambiguate. Flagged as unreliable for
+   this methodology rather than chased further -- diminishing returns on
+   one duet-structured song.
+
+   **Real timing results, 7 reliable songs** (mean/median absolute
+   start-time error, and % of matched notes within 500ms):
+
+   | Song | mean | median | <=500ms |
+   |---|---|---|---|
+   | batb | 206ms | 130ms | 94.7% |
+   | gaston | 243ms | 162ms | 92.4% |
+   | little_mermaid | 130ms | 75ms | 95.8% |
+   | sleeping_beauty_wonder | 223ms | 114ms | 86.5% |
+   | tarzan_son_of_man | 135ms | 25ms | 95.9% |
+   | jungle_book_bare_necessities | 91ms | 75ms | 100.0% |
+   | stars | 49ms | 0ms | 100.0% |
+   | **Average** | **154ms** | **83ms** | **95.1%** |
+
+   Timing is a real strength of the pipeline overall -- 95% of notes
+   land within half a second of ground truth.
+
+   **Dug into the worst individual outliers (gaston, sleeping_beauty_
+   wonder) and found two real, distinct, non-artifact root causes, both
+   instances of an already-documented risk (architecture note: "don't
+   trust individual ASR word timestamps for fine-grained boundaries"),
+   just two different concrete triggers for it:**
+   1. Gaston's outlier cluster at t=115-118s traces (confirmed via the
+      debug log) to a single dense 13-word/~7-second `_group_words_by_
+      gap` group ("one! When the rest can match nobody bites like
+      Gaston! For there's no one,") -- imprecise interior ASR word
+      timestamps in a passage this dense cascade into note-boundary-
+      split errors for several neighboring words at once, not just one.
+   2. sleeping_beauty_wonder's worst outlier ("I", ~2s early) traces to
+      a large (~4s) ASR gap between word groups ("odd melody" ends
+      34.17s, "I wonder," starts 38.08s) -- the zone boundary between
+      them is placed at the ASR-timestamp MIDPOINT (36.13s), but a real
+      sustained note appears to actually start around 35.7s, so part of
+      what's musically still the previous word's note gets assigned to
+      "I" instead, displacing it early.
+
+   **Tested whether `--verify-placement` (the existing, off-by-default
+   expand-search fix built for exactly this problem class) actually
+   helps -- real, surprising, negative result on both songs:**
+
+   | Song | metric | baseline | with verify-placement | delta |
+   |---|---|---|---|---|
+   | gaston | pitch-class | 93.6% | 92.2% | -1.4pp |
+   | gaston | timing mean/median | 243/162ms | 413/176ms | worse |
+   | gaston | timing <=500ms | 92.4% | 85.2% | -7.2pp |
+   | sleeping_beauty_wonder | exact | 34.6% | 33.3% | -1.3pp |
+   | sleeping_beauty_wonder | timing mean/median | 223/114ms | 339/119ms | worse |
+   | sleeping_beauty_wonder | timing <=500ms | 86.5% | 80.4% | -6.1pp |
+
+   `--verify-placement` DID correctly flag/fix some individual real
+   problems (confirmed: several "Gaston" mentions got genuinely
+   relocated to their correct position; it also correctly flagged the
+   diagnosed "bites" as suspicious, just couldn't confidently relocate
+   it within its search radius) -- but the NET effect on both tested
+   songs was a real regression on every metric, not just noise. Likely
+   mechanism (not fully confirmed): pass 3 re-running after a placement
+   fix can shift NEIGHBORING words' zone/boundary calculations too,
+   and the fix itself comes from the SAME kind of re-transcription-based
+   text matching that's vulnerable to the same ambiguity classes (dense
+   passages, repeated words -- Gaston says "Gaston" constantly) as the
+   original problem. **This changes what CLAUDE.md previously said about
+   `--verify-placement`** ("OFF by default... purely for COST, not
+   reliability") -- that framing is no longer accurate on this evidence;
+   there's a real, now-demonstrated reliability question too, not just a
+   cost one. Don't turn this on by default without addressing that.
+
+0j. **Built `lrc_timing.py` -- the LRCLIB synced-lyrics timing feature
+   flagged as unbuilt in 0f/0g, now built as a DIAGNOSTIC-ONLY line-
+   timing cross-check.** `apply_lrc_timing_check()`: parses LRC-format
+   synced lyrics (`parse_lrc`), aligns pass-3's own lines (grouped by
+   `Syllable.line_id`, same grouping `phrasing.py` uses for `-` breaks)
+   against LRC's lines by text (same difflib technique used throughout),
+   calibrates a per-song TIME offset (mode at 1s-bucket resolution --
+   same robust-mode technique validated this session for
+   `compare_full_pipeline_output.py`'s own timing comparison, not a
+   plain mean/median), then FLAGS (never moves) any line whose residual
+   after calibration exceeds `LRC_TIMING_FLAG_TOLERANCE_SEC` (2.0s).
+   `--lrc-timing-check` / `config.ENABLE_LRC_TIMING_CHECK` (**False**,
+   deliberately off by default).
+
+   **Deliberately does NOT auto-correct, unlike pass 4's MXL pitch
+   calibration** -- explicit, considered choice given 0h/0i's fresh
+   lesson: `verify_placement` was built with the same good intentions
+   for a related problem and produced a real, measured regression when
+   validated end-to-end, despite fixing individual real cases. Shipping
+   a correction here before confirming the signal itself is trustworthy
+   would risk repeating that exact mistake.
+
+   Real validation, 2 songs (both with synced lyrics available):
+   - **gaston**: calibrated cleanly (+0.0s offset, 83% agreement over 24
+     matched lines), flagged 2 lines near the end (t~189-191s). Ground
+     truth doesn't have dense matched coverage in exactly that window to
+     directly confirm those 2 specific lines, but there IS a confirmed
+     real +2252ms error nearby (177.78s, same region, already found via
+     0i's ground-truth timing work) -- suggestive, not conclusive.
+     Notably did NOT flag the ALREADY-CONFIRMED "bites" cluster from
+     0i -- expected: that was an INTERIOR-word error within an
+     otherwise-correctly-anchored line, below line-level granularity.
+     This is the real tradeoff of choosing line-level over word-level
+     (the user's own explicit choice, given verify_placement's fresh
+     regression made word-level feel riskier to attempt first).
+   - **tarzan_son_of_man**: correctly found NO clear calibration (best
+     candidate only 26% agreement, below the 40% bar) and skipped
+     rather than guessing -- exactly the intended conservative behavior,
+     and plausible given tarzan's own timing is already excellent
+     (0i: 25ms median) so there may be no consistent single offset to
+     find against whatever recording LRCLIB's synced version came from.
+
+   **Only 2 data points, 1 producing flags -- not enough to validate
+   the signal is trustworthy yet, and NOT enabled by default.** Next
+   step if picked back up: run on more synced-lyrics songs, and
+   specifically try to get denser ground-truth coverage in flagged
+   regions to get a cleaner confirm/deny than gaston's sparse-coverage
+   case allowed. Decision on whether to build actual correction (and
+   what form it should take) is deliberately deferred until then.
 1. **`key_correction.py` now uses `music21`** (its implementation of
    Krumhansl-Schmuckler key-finding) instead of the hand-rolled
    diatonic-scale-coverage heuristic, and is now **ON by default**
@@ -419,9 +1009,15 @@ Done:
    and fixed an unrelated real mismatch ("God" assigned at 18.40s,
    actually sung at 24.54s) — not a one-off fix, the mechanism generalizes.
    Still **OFF by default** (`config.ENABLE_PLACEMENT_VERIFICATION`,
-   `--verify-placement` to enable) — purely for COST (an expand-search
-   re-transcription loop over every word, ~4 minutes on top of
-   `verify_words`' own ~4 minutes for this one song), not reliability.
+   `--verify-placement` to enable). Originally reasoned to be purely a
+   COST tradeoff (an expand-search re-transcription loop over every
+   word, ~4 minutes on top of `verify_words`' own ~4 minutes), not a
+   reliability one — **that turned out to be wrong, see 0i below**: real
+   end-to-end testing on gaston and sleeping_beauty_wonder found a net
+   REGRESSION on every pitch/timing metric on both songs, despite
+   correctly fixing some individual real problems. There's a genuine
+   reliability question here too now, not just cost — don't default
+   this on without addressing it.
 
 Feedback from this round, worth carrying forward: **new features should
 default to ON** (not gated behind an opt-in flag) unless there's a

@@ -478,6 +478,78 @@ assert aligned[2].start == 0.4 and aligned[2].end == 0.6
 print("OK: corrected words:", diffs)
 print("OK: line ids:", [w.line_id for w in aligned])
 
+print("\n--- lyrics_lookup.reference_matches_transcript: rejects a wrong-song/wrong-language "
+      "reference before it's ever trusted (real case: Gaston's lyrics.ovh lookup silently "
+      "returned Spanish lyrics for an English song) ---")
+from ultrastar_generator.lyrics_lookup import reference_matches_transcript
+matching_words = [Word(text=w, start=float(i), end=float(i) + 0.5, confidence=0.9)
+                   for i, w in enumerate(["He", "knows", "his", "way", "in", "the", "dark"])]
+assert reference_matches_transcript(ref_lines_test, matching_words) is True
+wrong_language_words = [Word(text=w, start=float(i), end=float(i) + 0.5, confidence=0.9)
+                         for i, w in enumerate(["quiero", "verte", "otro", "modelo", "patron"])]
+assert reference_matches_transcript(ref_lines_test, wrong_language_words) is False
+print("OK: right-language reference accepted, wrong-language reference rejected")
+
+print("\n--- lyrics_lookup._fetch_from_lrclib: picks the best candidate by duration closeness, "
+      "excludes instrumental/lyric-less candidates, breaks ties toward a synced-lyrics candidate ---")
+from ultrastar_generator.lyrics_lookup import _fetch_from_lrclib, fetch_reference_lyrics
+
+
+class _FakeLRCLIBResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class _FakeRequestsModule:
+    """Deterministic fake for the `requests` module -- lyrics_lookup.py
+    does `import requests` lazily inside each fetch function, so
+    installing this in sys.modules before calling is enough."""
+    def __init__(self, search_payload=None, search_status=200, ovh_payload=None, ovh_status=200):
+        self.search_payload = search_payload
+        self.search_status = search_status
+        self.ovh_payload = ovh_payload
+        self.ovh_status = ovh_status
+        self.urls_requested = []
+
+    def get(self, url, params=None, timeout=None):
+        self.urls_requested.append(url)
+        if "lrclib.net" in url:
+            return _FakeLRCLIBResponse(self.search_payload, self.search_status)
+        return _FakeLRCLIBResponse(self.ovh_payload, self.ovh_status)
+
+
+lrclib_candidates = [
+    {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 60,
+     "instrumental": True, "plainLyrics": None, "syncedLyrics": None},  # excluded: instrumental
+    {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 300,
+     "instrumental": False, "plainLyrics": "way off duration", "syncedLyrics": None},  # far duration
+    {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 178,
+     "instrumental": False, "plainLyrics": "close duration, no sync", "syncedLyrics": None},
+    {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 179,
+     "instrumental": False, "plainLyrics": "close duration, synced",
+     "syncedLyrics": "[00:01.00]line one\n[00:05.00]line two"},
+]
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=lrclib_candidates)
+best = _fetch_from_lrclib("Beauty and the Beast", "Gaston", duration_sec=180.0)
+assert best is not None and best.source == "lrclib"
+assert best.plain_lyrics == "close duration, synced", best.plain_lyrics
+assert best.synced_lyrics == "[00:01.00]line one\n[00:05.00]line two", best.synced_lyrics
+print("OK: correct candidate chosen among instrumental/far-duration/synced-tiebreak options")
+
+print("\n--- lyrics_lookup.fetch_reference_lyrics: falls back to lyrics.ovh when LRCLIB has nothing ---")
+_sys.modules["requests"] = _FakeRequestsModule(
+    search_payload=[], ovh_payload={"lyrics": "fallback lyrics text"},
+)
+fallback_result = fetch_reference_lyrics("Some Artist", "Some Title", duration_sec=120.0)
+assert fallback_result is not None and fallback_result.source == "lyrics.ovh", fallback_result
+assert fallback_result.plain_lyrics == "fallback lyrics text", fallback_result
+print("OK: empty LRCLIB search result correctly fell back to lyrics.ovh")
+del _sys.modules["requests"]
+
 print("\n--- phrasing forces a break exactly on a line_id change (even with no silence gap) ---")
 line_syls = [
     Syllable("He", 0.0, 0.2, 4, True, line_id=0),
@@ -492,6 +564,24 @@ assert kinds2.count("LineBreak") == 1, kinds2
 break_pos = kinds2.index("LineBreak")
 assert [type(e).__name__ for e in line_entries[:break_pos]] == ["Syllable", "Syllable"]
 print("OK: line break inserted exactly at the line_id change:", kinds2)
+
+print("\n--- BUG REGRESSION: a long silence gap WITHIN a single confirmed reference line no longer "
+      "forces a spurious mid-line break (real case: \"Just a little change\" was being split into "
+      "\"Just a little\" / \"change\" because of an audible pause before \"change\", even though "
+      "both words shared the same reference line_id) ---")
+same_line_gap_syls = [
+    Syllable("Just", 0.0, 0.2, 4, True, line_id=0),
+    Syllable(" a", 0.2, 0.4, 4, True, line_id=0),
+    Syllable(" little", 0.4, 0.6, 4, True, line_id=0),
+    # long gap before the next word (well over MIN_LINE_GAP_SEC's 0.35s),
+    # but SAME line_id -- must NOT break.
+    Syllable(" change", 1.5, 2.0, 4, True, line_id=0),
+]
+same_line_entries = build_lines(same_line_gap_syls)
+assert all(type(e).__name__ == "Syllable" for e in same_line_entries), \
+    [type(e).__name__ for e in same_line_entries]
+print("OK: no break inserted despite the long gap, since line_id confirmed it's still one line:",
+      [type(e).__name__ for e in same_line_entries])
 
 print("\n--- BUG REGRESSION (round 6): a bad interior ASR timestamp no longer swallows a whole line's notes ---")
 # Reproduces the reported "Stars" bug directly: within a matched
@@ -887,7 +977,10 @@ verification_mod.model_cache.reset()
 _sys.modules.pop("librosa", None)
 
 verify_test_words = [
-    # 0: no reference at all; recheck disagrees with current text -> replaced with recheck.
+    # 0: no reference at all; recheck disagrees with current text -> kept
+    # (an isolated recheck is a less reliable signal than the original
+    # full-context ASR text, and there's no reference to confirm the
+    # disagreement either way -- see verification.py's _resolve()).
     Word(text="mumbled", start=0.0, end=0.3, confidence=0.9, line_id=None, reference_text=None),
     # 1: current text does NOT match reference, but the recheck CONFIRMS the
     # reference (case-insensitively) -> replaced with the reference's own text
@@ -906,12 +999,12 @@ y_fake = np.zeros(22050 * 42, dtype=np.float32)
 new_words, verify_results = verification_mod.verify_words(
     verify_test_words, [0, 1, 2, 3, 4], y_fake, 22050, "small.en", verbose=True,
 )
-assert new_words[0].text == "rumbled", new_words[0]
+assert new_words[0].text == "mumbled", new_words[0]         # untouched -- no reference to confirm the recheck
 assert new_words[1].text == "Multitudinous", new_words[1]  # reference's own text, not the recheck's raw casing
 assert new_words[2].text == "Stars", new_words[2]           # forced to reference despite no confirmation
 assert new_words[3].text == "Stars", new_words[3]           # untouched -- already matched reference
 assert new_words[4].text == "echo", new_words[4]            # untouched -- recheck agreed
-assert [r.replaced for r in verify_results] == [True, True, True, False, False], verify_results
+assert [r.replaced for r in verify_results] == [False, True, True, False, False], verify_results
 print("OK: verification correctly resolved all 5 cases against reference lyrics:",
       [w.text for w in new_words])
 del _sys.modules["whisperx"]
@@ -1137,6 +1230,45 @@ with _tempfile.TemporaryDirectory() as tmpdir:
     assert few_stats.corrections == []
     print("OK: too few matched notes correctly skipped calibration:", few_stats.skipped_reason)
 
+    # --- force_calibration: a genuinely ambiguous population (4 different
+    # offsets, each covering exactly 1/4 of matches -- below both the
+    # full-population AND high-confidence-subset bars either way) is
+    # skipped normally, but force_calibration=True applies the best
+    # available offset anyway rather than giving up -- built for songs
+    # where our own pass-1 pitch is confirmed unreliable for acoustic
+    # reasons, so even a weak MXL-based calibration beats none at all.
+    ambiguous_our = [
+        Syllable(text=w, start=float(i), end=float(i) + 0.4, midi_note=0, is_word_start=True)
+        for i, w in enumerate(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"])
+    ]
+    # offsets in order: 2,5,7,9,2,5,7,9 -- each covers exactly 2/8 = 25%,
+    # below both MUSICXML_MIN_CALIBRATION_CONFIDENCE (50%) and
+    # _HIGH_CONF_SUBSET (40%), for the full population AND the top half.
+    ambiguous_mxl = list(zip(
+        ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"],
+        [62, 65, 67, 69, 62, 65, 67, 69],
+    ))
+    with _tempfile.TemporaryDirectory() as tmpdir2:
+        amb_path = f"{tmpdir2}/ambiguous_song.musicxml"
+        _make_mxl(ambiguous_mxl, amb_path)
+
+        _, normal_stats = apply_musicxml_reference(
+            ambiguous_our, amb_path, min_calibration_samples=4, force_calibration=False, verbose=False,
+        )
+        assert normal_stats.skipped_reason is not None, "expected a skip without force_calibration"
+        assert normal_stats.corrections == []
+
+        forced, forced_stats = apply_musicxml_reference(
+            ambiguous_our, amb_path, min_calibration_samples=4, force_calibration=True, verbose=True,
+        )
+        assert forced_stats.skipped_reason is None, forced_stats.skipped_reason
+        assert forced_stats.calibration_offset is not None
+        assert len(forced_stats.corrections) > 0, "expected force_calibration to apply SOME correction"
+        print(f"OK: normal mode skipped an ambiguous population "
+              f"({normal_stats.skipped_reason}), force_calibration applied offset "
+              f"{forced_stats.calibration_offset:+d} anyway and corrected "
+              f"{len(forced_stats.corrections)}/8 syllables")
+
 print("\n--- musicxml_reference.apply_musicxml_references (plural): applies multiple reference "
       "files SEQUENTIALLY so coverage accumulates across files with different, only partly "
       "overlapping lyric coverage -- real case: Once Upon A Dream, two arrangements covering "
@@ -1177,6 +1309,61 @@ with _tempfile.TemporaryDirectory() as tmpdir2:
     print("OK: two non-overlapping reference files each calibrated independently and corrected "
           "only their own genuinely-wrong word, coverage accumulating across both files:",
           [(c.text, c.old_pitch, c.new_pitch) for s in stats_list for c in s.corrections])
+
+print("\n--- lrc_timing.apply_lrc_timing_check: calibrates a per-song TIME offset against LRCLIB "
+      "synced lyrics (mirrors musicxml_reference's pitch calibration, but for line start time), "
+      "flags a line that disagrees even after calibration -- DIAGNOSTIC ONLY, never moves anything ---")
+from ultrastar_generator.lrc_timing import apply_lrc_timing_check, parse_lrc
+
+lrc_syllables = [
+    Syllable(text="hello", start=10.0, end=10.4, midi_note=0, is_word_start=True, line_id=0),
+    Syllable(text="world", start=10.5, end=10.9, midi_note=0, is_word_start=True, line_id=0),
+    Syllable(text="how", start=15.0, end=15.4, midi_note=0, is_word_start=True, line_id=1),
+    Syllable(text="are", start=15.5, end=15.9, midi_note=0, is_word_start=True, line_id=1),
+    Syllable(text="you", start=16.0, end=16.4, midi_note=0, is_word_start=True, line_id=1),
+    # "goodbye now" -- deliberately drifted far beyond what calibration explains
+    Syllable(text="goodbye", start=25.0, end=25.4, midi_note=0, is_word_start=True, line_id=2),
+    Syllable(text="now", start=25.5, end=25.9, midi_note=0, is_word_start=True, line_id=2),
+    Syllable(text="see", start=30.0, end=30.4, midi_note=0, is_word_start=True, line_id=3),
+    Syllable(text="you", start=30.5, end=30.9, midi_note=0, is_word_start=True, line_id=3),
+    Syllable(text="soon", start=31.0, end=31.4, midi_note=0, is_word_start=True, line_id=3),
+    Syllable(text="thanks", start=35.0, end=35.4, midi_note=0, is_word_start=True, line_id=4),
+    Syllable(text="a", start=35.5, end=35.9, midi_note=0, is_word_start=True, line_id=4),
+    Syllable(text="lot", start=36.0, end=36.4, midi_note=0, is_word_start=True, line_id=4),
+]
+# LRC lines are consistently 2.0s EARLIER than our own assigned starts,
+# except "goodbye now" which is 10.0s earlier (an 8.0s residual after
+# the +2.0s calibration is removed -- should get flagged).
+lrc_text = (
+    "[00:08.00]hello world\n"
+    "[00:13.00]how are you\n"
+    "[00:15.00]goodbye now\n"
+    "[00:28.00]see you soon\n"
+    "[00:33.00]thanks a lot\n"
+)
+parsed_lrc = parse_lrc(lrc_text)
+assert parsed_lrc == [
+    (8.0, "hello world"), (13.0, "how are you"), (15.0, "goodbye now"),
+    (28.0, "see you soon"), (33.0, "thanks a lot"),
+], parsed_lrc
+
+lrc_stats = apply_lrc_timing_check(lrc_syllables, lrc_text, verbose=True)
+assert lrc_stats.skipped_reason is None, lrc_stats.skipped_reason
+assert abs(lrc_stats.calibration_offset_sec - 2.0) < 1e-6, lrc_stats.calibration_offset_sec
+assert lrc_stats.n_matched_lines == 5, lrc_stats.n_matched_lines
+flagged_texts = {f.text for f in lrc_stats.flags}
+assert flagged_texts == {"goodbye"}, flagged_texts
+assert abs(lrc_stats.flags[0].delta_sec - 8.0) < 1e-6, lrc_stats.flags[0].delta_sec
+# never modifies the syllables themselves -- diagnostic only
+assert lrc_syllables[5].start == 25.0, lrc_syllables[5]
+print(f"OK: calibrated to {lrc_stats.calibration_offset_sec:+.1f}s and flagged only the genuinely "
+      f"drifted line: {[(f.text, f.delta_sec) for f in lrc_stats.flags]}")
+
+# --- too few matched lines: should skip, not guess ---
+few_lines_stats = apply_lrc_timing_check(lrc_syllables[:2], lrc_text, verbose=False)
+assert few_lines_stats.skipped_reason is not None
+assert few_lines_stats.flags == []
+print("OK: too few matched lines correctly skipped calibration:", few_lines_stats.skipped_reason)
 
 
 
