@@ -1920,10 +1920,10 @@ Phase G2 default path AND the Phase G3 debug-file location together,
 through the placeholder-driven flow end to end.
 
 **Phase G5 -- intermediate-file cleanup + "Open Output Folder" button.**
-New `main.delete_intermediates(work_dir)` deletes only `separated/` and
+New `main.delete_work_files(work_dir)` deletes only `separated/` and
 `extracted/` under a work_dir (deliberately not the whole work_dir, since
 debug files now live there too post-Phase-G3) -- shared by both an
-automatic path (`PipelineOptions.delete_intermediates`, wired through a
+automatic path (`PipelineOptions.delete_work_files`, wired through a
 `run_pipeline`/`_run_pipeline_body` split so cleanup runs in a `finally`
 regardless of which of the body's several early-return failure paths was
 hit -- work_dir may be partially populated even on a failure) and a new
@@ -1936,7 +1936,7 @@ real completed run's own output path (threaded back from the worker
 thread through the existing log queue with a tagged tuple, not a second
 unsynchronized attribute write) and falls back to computing it from
 current field values otherwise. **Real-verified**: a real CLI run with
-`--delete-intermediates` confirmed `separated/` was gone afterward while
+`--delete-work-files` confirmed `separated/` was gone afterward while
 both debug files survived; also caught and fixed a stale log line
 ("Intermediate files kept in...") that was still printed even when the
 flag was set, since it's written before the wrapper's `finally` runs.
@@ -2540,6 +2540,200 @@ unrelated to any of these fixes. `musicxml_reference.py`'s pass 4 already
 handles exactly this kind of calibration for its own use case; extending
 `verify_existing_song` to do the same for cross-source comparisons was
 judged out of scope for this bug-fix round.
+
+### Fourth real bug: untexted MXL continuation notes (tied holds, slurred
+### slides) were silently dropped (2026-08-08)
+
+User tested Chicago again and flagged two more issues: (1) the "ty" in
+"reciprocity" is a slide from G# down to C# with a fermata, present in
+the MXL, that "you should know about" (fermata *duration* precision
+explicitly deprioritized as acceptable manual cleanup; the *pitch
+content* of the slide was the real concern); (2) general timing still
+off by up to a few hundred ms in places, with a concrete example
+("There's a lot of favors").
+
+Root-caused both to the same bug in `load_mxl_vocal_words`
+(`mxl_lrc_generator.py`): any MXL note with no lyric text at all was
+unconditionally skipped --
+
+```python
+for n in chosen_part.flatten().notes:
+    if n.isChord or not n.lyrics:
+        continue
+```
+
+-- including real tied continuation notes (undershoots a syllable's true
+notated duration) and real slurred pitch-change continuations (loses a
+genuine second sung pitch entirely). Confirmed directly via `music21` on
+the real `mama.mxl`:
+
+```
+offset=50.0  dur=1.0  midi=80 (G#5)  lyric='ty!"'  spanners=['Slur']
+offset=51.0  dur=1.0  midi=73 (C#5)  lyric=None    spanners=['Slur']  expressions=['Fermata']
+
+offset=107.5 dur=0.5  midi=78  lyric='fa'  tie=start
+offset=108.0 dur=1.0  midi=78  lyric=None  tie=stop
+offset=109.0 dur=3.0  midi=78  lyric='vere'
+```
+
+Fixed: a lyric-less note is no longer unconditionally skipped. If a word
+is currently being built AND the note starts exactly where the last
+syllable's note ends (contiguous, no rest in between), it's treated as a
+real continuation -- tied + same pitch merges into the previous
+syllable's duration (extends it in place, no new note); otherwise
+(slurred/untied, or a different pitch) it becomes a new syllable entry
+with empty text, which `_text_for_mxl_syllables`'s existing
+melisma-padding already renders correctly.
+
+**The contiguity check was necessary, found via a real false positive
+during validation**: an early version without it also glued two
+unrelated notes ~8 quarter notes after "reciprocity"'s own fermata note
+onto that same word, purely because no new lyric-bearing note happened
+to intervene -- those notes turned out to be a separate
+instrumental/vocalise passage after a real rest, not part of
+"reciprocity" at all. Gating on exact contiguity (next note's offset ==
+previous syllable's own end) fixed it while keeping both real cases
+(the immediately-adjacent "ty" slide and "fa" tie) working.
+
+New unit test (`test_dry_run.py`): builds a real, small `music21` score
+programmatically (no external fixture file), writes it to a temp
+`.musicxml`, and calls the real `load_mxl_vocal_words` on it -- covers
+the tied-merge case, the slurred-new-syllable case, and confirms a
+non-contiguous untexted note (after a rest) is correctly left
+unattached. `load_mxl_vocal_words` had never been unit tested before
+(only real-file-validated, matching `musicxml_reference.load_vocal_notes`'s
+own precedent) -- this closes that gap given the fix is specifically
+about tie/slur parsing correctness.
+
+**Real re-validation, same Chicago song, same `--lrclib-id 37066985`**:
+- "ty" now renders as two real notes in the actual output --
+  `465 11 20 ty` (G#5) immediately followed by `476 11 13 ~` (C#5) --
+  the slide is now genuinely present end to end, not just in the MXL
+  source.
+- "There's a lot of favors": word START times landed much closer to
+  ground truth than before -- "There's" 69.86s (truth 69.90s, Δ43ms),
+  "lot" 70.57s (truth 70.55s, Δ22ms), "fa" 71.20s (truth 71.05s,
+  Δ154ms) -- all sub-200ms. **At the time this was written, "fa"/"vors"'
+  own estimated DURATION still overshot real ground truth substantially
+  (fa+vors together spanning ~1.77s vs. ground truth's ~800ms) -- traced
+  and fixed the same day, see the next entry below.
+- `verify_existing_song` aggregate numbers vs. ground truth are
+  essentially unchanged at the whole-song level (109 words matched, 99%
+  timing agreement, coverage fresh=94%/existing=52%, pitch class reading
+  0% only due to the already-documented +1-semitone calibration
+  artifact, not a regression) -- expected, since only a minority of
+  words in the song have tied/slurred continuation notes; the fix's
+  impact shows up in the specific affected regions (confirmed above),
+  not as a large aggregate swing.
+- `test_dry_run.py` full suite green throughout (114+ checks).
+
+### Fifth real bug: ASR word-matching compared against the MXL's raw OCR
+### text instead of the already-resolved clean text (2026-08-09)
+
+User pushed back on the "not fully resolved" note above with real
+WhisperX output for "There's a lot of favors":
+```
+69.865 -  70.325  score=0.753  "There's"
+70.385 -  70.425  score=0.896  'a'
+70.585 -  70.885  score=0.996  'lot'
+70.945 -  71.005  score=0.532  'of'
+71.145 -  71.826  score=0.835  'favorites'
+```
+and asked directly why "favors"/"favorites"' own precise ASR timing
+wasn't used for "fa"'s start and "vors"' end.
+
+Reconstructed the REAL `Word` list from this run's own debug log (same
+data `transcribe_words` itself produces -- confirmed by reading
+`transcription.py`'s debug-dump code path directly) and replayed
+`place_words_via_asr`'s exact per-line matching for this line:
+```
+mxl_norm_line: ["there's", 'a', 'lot', 'of', 'favere']
+asr_norm:      ["there's", 'a', 'lot', 'of', 'favors', "i'm"]
+equal   ["there's", 'a', 'lot', 'of'] <-> ["there's", 'a', 'lot', 'of']
+replace ['favere']                    <-> ['favors', "i'm"]
+```
+Root cause: `place_words_via_asr` matched against `mxl_words[i].norm` --
+the MXL's own raw OCR text ("favere") -- never the already-resolved
+CLEAN text (`word_clean_text[i]` == "favors", computed by
+`assign_words_to_lines` via the LRC line, already used for DISPLAY text
+since the earlier "MATIZON"/"systern" fix) -- so a word whose MXL OCR and
+ASR transcription each garbled it differently never matched even though
+a clean, mutually-agreeing "favors" was available and simply unused for
+this purpose. Confirmed directly, and separately confirmed real
+(non-bug): "There's"/"a"/"lot"/"of" were ALREADY landing within ~30ms of
+their own real ASR timestamps in the shipped output before this fix --
+verified by direct comparison against the reconstructed real `Word`
+list -- so if those specific words still sound off, that's ASR's own
+word-boundary precision for this passage (a different, harder problem),
+not a matching bug.
+
+Fixed: `place_words_via_asr` gained an optional `word_clean_text` param;
+`mxl_norm_line` now prefers `_normalize(word_clean_text[i])` over the raw
+MXL norm whenever a clean match exists, falling back to the MXL norm
+otherwise (unaffected when no clean text was resolved). Reuses
+`assign_words_to_lines`' own resolution rather than adding a second,
+separate fuzzy-match step -- a word is only ever resolved against the
+LRC once. New regression test (`test_dry_run.py`): an MXL word OCR'd one
+way, transcribed by ASR a different way, with a clean LRC-resolved text
+that matches the ASR exactly -- confirms it's now confidently matched
+(and confirms the OLD behavior, run without `word_clean_text`, correctly
+still misses it -- proving the fix is really doing the work).
+
+**Real re-validation, same Chicago song, same `--lrclib-id 37066985`**:
+ASR placement rate rose from 108/116 to 114/116 words (6 more words
+recovered a real confident ASR match, not just this one). The "favors"
+region directly:
+```
+: 1135 5 18  fa
+: 1141 11 18 vors
+- 1152 1178
+: 1178 5 9  I'm
+```
+fa+vors now span 71.120s-71.843s (723ms) -- matching real ASR's own
+"favors" span (71.129s-71.809s, 680ms) almost exactly, and close to
+ground truth's fa/vors timing (71.05-71.85s, 800ms: fa start Δ70ms, vors
+start Δ18ms, vors end Δ7ms). Previously this same region spanned
+71.204s-72.972s (1.77s), swallowing more than half of "I'm" -- "I'm"
+itself is now untouched, starting cleanly at beat 1178 in both runs.
+`test_dry_run.py` full suite green throughout.
+
+**Same-day follow-up: the exact-match fix above was NOT sufficient on its
+own -- WhisperX itself is not deterministic in the literal WORDS it
+transcribes, not just their timestamps.** The user re-ran the exact same
+command and got the OLD broken numbers back (`fa` len=14, `vors` len=29,
+matching the state from BEFORE this fix). Root cause: in their run, ASR
+transcribed the word as "favorites" (confirmed independently -- this is
+literally what the user's own first WhisperX excerpt in this thread
+showed, before any of these fixes existed), not "favors". `word_clean_text`
+still resolves to the correct, exact "favors" (that resolution comes from
+LRC text matching, not ASR, so it's unaffected) -- but comparing clean
+text ("favors") against ASR's own wording ("favorites") is still an exact
+non-match, so the fix from the previous entry didn't fire for this run.
+
+Fixed by extending `place_words_via_asr`'s per-line matching to also
+accept a close-but-not-identical 1:1 "replace" pairing (character-level
+ratio >= `config.MXL_LRC_FUZZY_TEXT_MIN_RATIO`, same threshold and
+technique `assign_words_to_lines` already uses for display text) --
+confirmed real ratios: "favors"~"favorites" 0.80 (clears easily),
+"favere"~"favorites" 0.53 (correctly stays below threshold, confirming
+clean-text reuse is still doing independent, necessary work -- fuzzy
+matching against the raw uncorrected OCR text alone would NOT have caught
+this specific case). New regression test covers both: the mishearing
+case now matches, and a genuinely unrelated word in the same slot is
+still correctly rejected.
+
+Re-ran the real pipeline 3 times total across this investigation;
+WhisperX transcribed this specific word as "favors" (not "favorites")
+in all 3 of my own runs, so I could not directly reproduce the user's
+exact mishearing locally -- the fix is verified via a dedicated synthetic
+test built from the user's own literal reported ASR output ("favorites",
+score=0.835) rather than a fresh real-audio repro. This is a new,
+previously-undocumented instance of ASR non-determinism in this
+pipeline: prior "Lessons learned" entries in this file already document
+Demucs and pass-1 CREPE/RMVPE non-determinism at the AUDIO/PITCH level;
+this is the first confirmed case of WhisperX itself producing a
+different literal WORD (not just a different timestamp/score) for the
+same input across runs.
 
 ## Environment notes
 
