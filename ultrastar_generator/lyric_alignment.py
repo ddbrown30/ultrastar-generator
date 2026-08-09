@@ -77,7 +77,7 @@ import numpy as np
 from . import config
 from .models import Word, Syllable
 from .note_detection import NoteEvent
-from .syllables import hyphenate
+from .syllables import hyphenate, chunk_to_count
 from .pitch import median_pitch_in_span, hz_to_ultrastar_pitch
 from .postprocess import enforce_monotonic
 
@@ -335,25 +335,6 @@ def _nearest_note_pitch(word: Word, all_notes: List[NoteEvent]) -> Optional[Tupl
     return nearest.pitch, nearest.confidence
 
 
-def _chunk_syllables(parts: List[str], n_chunks: int) -> List[str]:
-    """Merges a syllable list down to exactly n_chunks contiguous text
-    chunks (used when a word has more syllables than the audio resolved
-    distinct notes for)."""
-    n_chunks = max(1, n_chunks)
-    if n_chunks >= len(parts):
-        return parts
-    # Distribute parts across n_chunks as evenly as possible, in order.
-    chunks = []
-    base = len(parts) // n_chunks
-    extra = len(parts) % n_chunks
-    idx = 0
-    for c in range(n_chunks):
-        take = base + (1 if c < extra else 0)
-        take = max(1, take)
-        chunks.append("".join(parts[idx:idx + take]))
-        idx += take
-    return chunks
-
 
 def _syllables_for_word(word: Word, notes: List[NoteEvent], all_notes: List[NoteEvent],
                          y: np.ndarray, sr: int, stats: AlignmentStats) -> List[Syllable]:
@@ -392,7 +373,7 @@ def _syllables_for_word(word: Word, notes: List[NoteEvent], all_notes: List[Note
         text_for_note = parts
     elif len(parts) > n_notes:
         stats.words_with_syllable_merge += 1
-        text_for_note = _chunk_syllables(parts, n_notes)
+        text_for_note = chunk_to_count(parts, n_notes)
     else:
         stats.words_with_melisma += 1
         # Melisma: fewer syllables than notes. Real text goes on the

@@ -47,6 +47,15 @@ class ExistingSongVerification:
     reason: Optional[str] = None
     pitch_mismatches: List[Tuple[str, int, int]] = field(default_factory=list)       # text, existing_pc, fresh_pc
     timing_mismatches: List[Tuple[str, float, float]] = field(default_factory=list)  # text, existing_start, fresh_start
+    # Coverage: what fraction of EACH side's own word-start syllables text-
+    # matched the other side AT ALL, before the repeat-instance guard. A
+    # word that never matches (e.g. garbled/wrong text on either side)
+    # never appears in pitch_mismatches/timing_mismatches -- it just isn't
+    # scored -- so these are the only signal that catches that failure mode.
+    coverage_fresh: float = 0.0     # n_matched / len(fresh words)
+    coverage_existing: float = 0.0  # n_matched / len(existing words)
+    unmatched_fresh: List[str] = field(default_factory=list)     # fresh words that matched nothing in existing
+    unmatched_existing: List[str] = field(default_factory=list)  # existing words that matched nothing in fresh
 
 
 def _word_start_words(syllables: List[Syllable]) -> List[Tuple[str, float, int]]:
@@ -72,6 +81,7 @@ def verify_existing_song(
     min_pitch_accuracy: float = config.EXISTING_TXT_MIN_PITCH_ACCURACY,
     timing_tolerance_sec: float = config.EXISTING_TXT_TIMING_TOLERANCE_SEC,
     min_timing_agreement: float = config.EXISTING_TXT_MIN_TIMING_AGREEMENT,
+    min_coverage: float = config.EXISTING_TXT_MIN_COVERAGE,
     verbose: bool = True,
     debug_log=None,
 ) -> ExistingSongVerification:
@@ -92,6 +102,8 @@ def verify_existing_song(
     b = [w for w, _, _ in fresh_words]
     sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
     candidates = []  # (text, existing_start, fresh_start, existing_pc, fresh_pc)
+    matched_existing_idxs = set()
+    matched_fresh_idxs = set()
     for tag, a0, a1, b0, b1 in sm.get_opcodes():
         if tag != "equal":
             continue
@@ -100,8 +112,14 @@ def verify_existing_song(
             text, e_start, e_pitch = existing_words[ei]
             _, f_start, f_pitch = fresh_words[fi]
             candidates.append((text, e_start, f_start, e_pitch % 12, f_pitch % 12))
+            matched_existing_idxs.add(ei)
+            matched_fresh_idxs.add(fi)
 
     stats = ExistingSongVerification(n_matched=len(candidates))
+    stats.coverage_existing = len(candidates) / len(existing_words) if existing_words else 0.0
+    stats.coverage_fresh = len(candidates) / len(fresh_words) if fresh_words else 0.0
+    stats.unmatched_existing = [w for i, (w, _, _) in enumerate(existing_words) if i not in matched_existing_idxs]
+    stats.unmatched_fresh = [w for i, (w, _, _) in enumerate(fresh_words) if i not in matched_fresh_idxs]
 
     if len(candidates) < min_matched:
         stats.reason = (f"only {len(candidates)} word(s) matched by text (< {min_matched} required) -- "
@@ -135,19 +153,46 @@ def verify_existing_song(
     stats.timing_mismatches = [(text, e_start, f_start) for text, e_start, f_start, _, _ in guarded
                                 if abs(e_start - f_start) > timing_tolerance_sec]
 
-    if stats.pitch_class_accuracy < min_pitch_accuracy or stats.timing_within_tolerance_pct < min_timing_agreement:
+    problems = []
+    if stats.pitch_class_accuracy < min_pitch_accuracy:
+        problems.append(f"pitch-class accuracy {stats.pitch_class_accuracy:.0%} (need {min_pitch_accuracy:.0%})")
+    if stats.timing_within_tolerance_pct < min_timing_agreement:
+        problems.append(f"timing agreement {stats.timing_within_tolerance_pct:.0%} "
+                         f"(need {min_timing_agreement:.0%})")
+    # Coverage gate: a word that never text-matches at all (e.g. garbled or
+    # wrong output text) never shows up in pitch_mismatches/timing_mismatches
+    # above -- it's simply absent from `candidates` -- so pitch/timing
+    # accuracy alone can look perfect while a real chunk of the song was
+    # silently never scored. Confirmed real case: 12/116 (10%) of a real
+    # MXL+LRC output's words never matched ground truth at all and were
+    # invisible to the accuracy numbers until this gate was added.
+    if stats.coverage_fresh < min_coverage:
+        problems.append(f"fresh coverage {stats.coverage_fresh:.0%} (need {min_coverage:.0%}) -- "
+                         f"{len(stats.unmatched_fresh)} fresh word(s) never matched the existing file at all")
+    if stats.coverage_existing < min_coverage:
+        problems.append(f"existing coverage {stats.coverage_existing:.0%} (need {min_coverage:.0%}) -- "
+                         f"{len(stats.unmatched_existing)} existing word(s) never matched the fresh output at all")
+
+    if problems:
         stats.verdict = "PROBLEMS_FOUND"
-        stats.reason = (f"pitch-class accuracy {stats.pitch_class_accuracy:.0%} "
-                         f"(need {min_pitch_accuracy:.0%}), timing agreement "
-                         f"{stats.timing_within_tolerance_pct:.0%} (need {min_timing_agreement:.0%})")
+        stats.reason = "; ".join(problems)
     else:
         stats.verdict = "PASS"
 
     if verbose:
         print(f"[existing-txt] {len(candidates)} word(s) matched by text, {len(guarded)} after repeat-instance guard: "
               f"pitch-class accuracy {stats.pitch_class_accuracy:.0%}, "
-              f"timing agreement {stats.timing_within_tolerance_pct:.0%} -> {stats.verdict}")
+              f"timing agreement {stats.timing_within_tolerance_pct:.0%}, "
+              f"coverage fresh={stats.coverage_fresh:.0%}/existing={stats.coverage_existing:.0%} -> {stats.verdict}")
         if stats.verdict != "PASS":
+            if stats.unmatched_fresh:
+                shown = stats.unmatched_fresh[:15]
+                print(f"    unmatched fresh word(s): {', '.join(shown)}"
+                      + (" ..." if len(stats.unmatched_fresh) > 15 else ""))
+            if stats.unmatched_existing:
+                shown = stats.unmatched_existing[:15]
+                print(f"    unmatched existing word(s): {', '.join(shown)}"
+                      + (" ..." if len(stats.unmatched_existing) > 15 else ""))
             for text, e_pc, f_pc in stats.pitch_mismatches[:10]:
                 print(f"    pitch mismatch: {text!r} existing_pc={e_pc} fresh_pc={f_pc}")
             for text, e_start, f_start in stats.timing_mismatches[:10]:
@@ -157,6 +202,8 @@ def verify_existing_song(
         debug_log.line(f"[existing-txt] verdict={stats.verdict} "
                         f"pitch_class_accuracy={stats.pitch_class_accuracy:.2f} "
                         f"timing_agreement={stats.timing_within_tolerance_pct:.2f} "
+                        f"coverage_fresh={stats.coverage_fresh:.2f} "
+                        f"coverage_existing={stats.coverage_existing:.2f} "
                         f"n_matched={len(candidates)}")
 
     return stats

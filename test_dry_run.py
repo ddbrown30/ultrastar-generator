@@ -831,7 +831,7 @@ del _sys.modules["requests"]
 print("\n--- mxl_lrc_generator: MXL for pitch + LRC line anchors + ASR word placement ---")
 from ultrastar_generator.mxl_lrc_generator import (
     MxlWord, assign_words_to_lines, place_words_via_asr, build_syllables,
-    MxlLrcQuality, config as mxl_lrc_config,
+    MxlLrcQuality, _text_for_mxl_syllables, config as mxl_lrc_config,
 )
 from ultrastar_generator.models import Word as _Word
 
@@ -845,9 +845,40 @@ mlg_words = [
 ]
 mlg_lrc_lines = [(10.0, "hello world"), (20.0, "good bye now")]
 
-word_lines = assign_words_to_lines(mlg_words, mlg_lrc_lines)
+word_lines, word_clean_text = assign_words_to_lines(mlg_words, mlg_lrc_lines)
 assert word_lines == [0, 0, 1, 1, 1], word_lines
-print("OK: assign_words_to_lines correctly tags each word with its own LRC line index")
+assert word_clean_text == ["hello", "world", "good", "bye", "now"], word_clean_text
+print("OK: assign_words_to_lines correctly tags each word with its own LRC line index AND its own "
+      "matched clean LRC token text")
+
+# Fuzzy matching: an MXL word that's close-but-not-exact to a single LRC
+# word, anchored by correctly-matched context on both sides (a real 1:1
+# "replace" slot), is a real confirmed case -- "systern" for "system" --
+# and must get the CLEAN text, not stay stuck on OCR garbage.
+fuzzy_words = [
+    MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
+    MxlWord(text="systern", norm="systern", offset=1.0,
+            syllables=[(1.0, 0.5, 60, "sys"), (1.5, 0.5, 61, "tern")]),
+    MxlWord(text="works", norm="works", offset=2.0, syllables=[(2.0, 1.0, 60, "works")]),
+]
+fuzzy_lines = [(10.0, "the system works")]
+_, fuzzy_clean = assign_words_to_lines(fuzzy_words, fuzzy_lines)
+assert fuzzy_clean == ["the", "system", "works"], fuzzy_clean
+print("OK: an OCR-garbled MXL word in a 1:1 replace slot gets fuzzy-matched to the clean LRC text "
+      "('systern' -> 'system'), not left stuck on the MXL's own OCR garbage")
+
+# But a GENUINELY different word in the same kind of slot (not just an OCR
+# spelling variant) must NOT be fuzzy-matched -- the ratio gate has to
+# actually reject low-similarity pairs, not just be a formality.
+unrelated_words = [
+    MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
+    MxlWord(text="xyz", norm="xyz", offset=1.0, syllables=[(1.0, 1.0, 60, "xyz")]),
+    MxlWord(text="works", norm="works", offset=2.0, syllables=[(2.0, 1.0, 60, "works")]),
+]
+_, unrelated_clean = assign_words_to_lines(unrelated_words, fuzzy_lines)
+assert unrelated_clean == ["the", None, "works"], unrelated_clean
+print("OK: a genuinely unrelated word in the same kind of slot is correctly REJECTED by the similarity "
+      "ratio gate, not fuzzy-matched just because it landed in a replace slot")
 
 # ASR confidently catches "hello"/"world"/"bye" at real times close to (but not
 # exactly at) the printed line starts; "good" and "now" are missing from ASR
@@ -897,11 +928,62 @@ assert bad_starts[1] >= bad_starts[0], bad_starts
 assert bad_quality.non_monotonic_fix_count == 1, bad_quality
 print("OK: an out-of-order ASR match gets clamped to non-decreasing order, and counted for the quality gate")
 
-syllables_out = build_syllables(mlg_words, starts, ends, word_lines)
+syllables_out = build_syllables(mlg_words, starts, ends, word_lines, word_clean_text)
 assert len(syllables_out) == 5
 assert syllables_out[0].line_id == 0 and syllables_out[2].line_id == 1
 assert all(syllables_out[i].start <= syllables_out[i + 1].start for i in range(4))
 print("OK: build_syllables tags line_id from assign_words_to_lines and produces monotonic syllable starts")
+
+print("\n--- mxl_lrc_generator: _text_for_mxl_syllables substitutes clean LRC text over MXL's own OCR text ---")
+# Exact syllable-count match: clean hyphenation used directly.
+exact = _text_for_mxl_syllables("system", ["sys", "tern"])  # MXL notated 2 syllables, garbled 2nd one
+assert exact != ["sys", "tern"], exact  # must NOT be the garbled MXL text
+assert "".join(exact) == "system", exact  # reconstructs the CLEAN word, not the garbled one
+# Fewer MXL syllables than the clean word hyphenates into: merged down via chunk_to_count.
+merged = _text_for_mxl_syllables("reciprocity", ["a"])  # MXL notated only 1 syllable for this word
+assert len(merged) == 1 and merged[0] == "reciprocity", merged
+# More MXL syllables than the clean word hyphenates into: melisma continuation markers pad the rest.
+melisma = _text_for_mxl_syllables("go", ["g", "o", "o", "o"])  # MXL notated 4 notes, word is 1 syllable
+assert len(melisma) == 4, melisma
+assert melisma[0] == "go" and melisma[1:] == [mxl_lrc_config.MELISMA_CONTINUATION_TEXT] * 3, melisma
+# No clean match at all: MXL's own raw text is the only option, used as-is.
+no_match = _text_for_mxl_syllables(None, ["sys", "tern"])
+assert no_match == ["sys", "tern"], no_match
+print("OK: _text_for_mxl_syllables prefers clean LRC text reconciled to the MXL's own syllable count "
+      "(merging or melisma-padding as needed), falling back to MXL's own raw text only when no clean "
+      "match exists at all")
+
+print("\n--- mxl_lrc_generator: nearest-anchor interpolation replaces whole-line-stretch fallback ---")
+# Reproduces the real confirmed bug: an LRC line whose own window includes a
+# long trailing silence (an instrumental gap before the NEXT line) used to
+# stretch every un-ASR-matched word in it across the WHOLE window, pushing
+# them far later than their real position. One line, 4 MXL words: "one" gets
+# a real ASR match early, "two"/"three" have none (must fall back), "four"
+# gets a real ASR match near the START of the line's own real content --
+# even though the LRC line's own declared window extends much further
+# (mimicking a long trailing rest before the next line).
+anchor_words = [
+    MxlWord(text="one", norm="one", offset=0.0, syllables=[(0.0, 1.0, 60, "one")]),
+    MxlWord(text="two", norm="two", offset=1.0, syllables=[(1.0, 1.0, 60, "two")]),
+    MxlWord(text="three", norm="three", offset=2.0, syllables=[(2.0, 1.0, 60, "three")]),
+    MxlWord(text="four", norm="four", offset=3.0, syllables=[(3.0, 1.0, 60, "four")]),
+]
+# Line window is 0s-20s (a long trailing silence before the next line), but
+# the real singing (per the ASR anchors) only spans 0s-1.6s.
+anchor_lines = [(0.0, "one two three four"), (20.0, "next line")]
+anchor_asr = [
+    _Word(text="one", start=0.0, end=0.4),
+    _Word(text="four", start=1.3, end=1.6),
+]
+a_word_lines, _ = assign_words_to_lines(anchor_words, anchor_lines)
+a_starts, a_ends, a_quality = place_words_via_asr(anchor_words, a_word_lines, anchor_lines, anchor_asr)
+# "two"/"three" must land BETWEEN "one" (0.0) and "four" (1.3) -- a locally
+# sane position -- NOT stretched out toward the line's own 20s-wide window.
+assert 0.0 <= a_starts[1] <= a_starts[2] <= a_starts[3], a_starts
+assert a_starts[3] == 1.3, a_starts
+assert a_starts[1] < 5.0 and a_starts[2] < 5.0, a_starts  # nowhere close to the 20s line-window stretch
+print(f"OK: fallback words between two confident anchors interpolate from the LOCAL gap (starts={a_starts}), "
+      f"not the whole line's window including its trailing silence")
 
 print("\n--- mxl_lrc_generator: quality gate correctly rejects a wrong-recording-style result ---")
 # Mirrors the real BATB/Stars failure this session found: a candidate that
@@ -2094,6 +2176,22 @@ tiny_existing = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
 result = verify_existing_song(tiny_existing, fresh_ok, min_matched=10, verbose=False)
 assert result.verdict == "COULD_NOT_VERIFY", result
 print(f"OK: too few matched words -> COULD_NOT_VERIFY, not a false PASS ({result.reason})")
+
+# Case 5: the matched SUBSET looks perfect (same 15 words as case 1), but the
+# fresh run also has a bunch of words that never match the existing file at
+# all (e.g. garbled/wrong output text) -- real bug this coverage gate was
+# added for: pitch/timing accuracy alone can't see this, since a word that
+# never text-matches simply never becomes a candidate in the first place.
+garbled_extra = [(f"garbled{i}", 20.0 + i, 0) for i in range(10)]
+fresh_with_garbage = fresh_ok + _mk_word_syllables(garbled_extra)
+result = verify_existing_song(existing_ok, fresh_with_garbage, min_matched=10, verbose=True)
+assert result.pitch_class_accuracy == 1.0 and result.timing_within_tolerance_pct == 1.0, result
+assert result.coverage_fresh < mxl_lrc_config.EXISTING_TXT_MIN_COVERAGE, result.coverage_fresh
+assert result.verdict == "PROBLEMS_FOUND", result  # must NOT report PASS despite perfect matched-subset accuracy
+assert set(result.unmatched_fresh) == {f"garbled{i}" for i in range(10)}, result.unmatched_fresh
+print(f"OK: perfect pitch/timing on the matched subset does NOT mean PASS when coverage is low "
+      f"(coverage_fresh={result.coverage_fresh:.0%}, {len(result.unmatched_fresh)} unmatched word(s)) -- "
+      f"the real bug this gate catches (a real ~10% failure rate was previously invisible)")
 
 print("\n--- youtube_source.download_youtube_source (fake yt_dlp module, no real network) ---")
 from ultrastar_generator.youtube_source import YoutubeDownloadError

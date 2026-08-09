@@ -2436,6 +2436,111 @@ above). Quality gate: `MXL_LRC_MIN_ASR_PLACEMENT_RATE = 0.5`,
 local tempo anchor exists at all). `BPM_WRITE_MULTIPLIER = 2` (general,
 not scoped to this path).
 
+### Three real bugs found in first production use, all fixed (2026-08-09)
+
+The user ran the shipped feature for real (Chicago, `--lrclib-id
+37066985`) and found it badly broken in ways the validation above
+completely missed -- all three reproduced and root-caused with real
+data before fixing anything:
+
+1. **Lyric text always came from the MXL's own OCR'd syllable text,
+   never from LRC/ASR.** Confirmed in real output: `"MATIZON"` (OCR
+   garbage for "Matron"), `"systern"`/`"eystern"` (OCR garbage for
+   "system", twice). Fixed: `assign_words_to_lines` now also returns,
+   per word, a clean-text replacement from the matched LRC token --
+   first via an exact normalized match, and (added the same day, see
+   below) via a FUZZY match for a word in a 1:1 "replace" slot (anchored
+   by correct matches on both sides) whose character-level similarity
+   clears `config.MXL_LRC_FUZZY_TEXT_MIN_RATIO = 0.6` -- confirmed real
+   ratios: "systern"~"system" 0.769, "eystern"~"system" 0.615 (the
+   lowest real case, sets the floor), "matizon"~"matron" 0.769,
+   "recause"~"because" 0.857. Deliberately only ever a 1:1 pairing, never
+   a multi-word block -- ambiguous which-word-means-which across an
+   uneven block is exactly the repeated/uncertain-text failure class
+   this project has been burned by before. `build_syllables` reconciles
+   the clean word's own hyphenation (`syllables.hyphenate`, reusing the
+   project's existing syllabification) to the MXL's own notated syllable
+   COUNT via `syllables.chunk_to_count` (moved there from a private
+   `lyric_alignment.py` duplicate, no behavior change) or melisma-padded
+   with `config.MELISMA_CONTINUATION_TEXT`, mirroring
+   `lyric_alignment._syllables_for_word`'s existing pattern exactly. MXL
+   still supplies every syllable's pitch/timing unchanged -- only the
+   displayed text source changed. **Known remaining gap, deliberately not
+   chased further**: a word with NO anchoring match on either side (e.g.
+   the very first MXL word when the MXL itself starts partway into the
+   song, skipping a spoken intro LRC has) lands in one large, ambiguous
+   multi-token replace block and is correctly left on the MXL's own raw
+   text rather than guessing -- confirmed real case: `"MATIZON"` (first
+   MXL word, no LRC line-1-4 intro content in the MXL at all) is still
+   unfixed, correctly, for exactly this reason.
+
+2. **The fallback position/duration estimate for un-ASR-matched words
+   used the WHOLE LRC line's window, which broke badly whenever that
+   window included trailing silence.** Confirmed exact case: the LRC
+   line "Because the system works, the system called reciprocity" spans
+   37.86s-54.40s (16.5s), but the real singing ends ~48.5s -- the
+   remaining ~5.9s is a real instrumental gap before the next line. Every
+   word that didn't get its own ASR match in that line got proportionally
+   placed across the FULL 16.5s window, stretching one word out to 47s
+   and cramming everything after it into a handful of 1-beat notes right
+   behind it. Fixed: `place_words_via_asr` now interpolates a
+   non-confident word's position from its NEAREST CONFIDENT neighbors (by
+   MXL offset order, not bounded to the same line), using the local
+   real-seconds-per-quarter-note rate between them for both position and
+   duration; if only one side has an anchor, extrapolates from that
+   anchor's own nearest-neighbor pair; if no anchor exists anywhere
+   (total ASR failure), falls back to the old whole-line-proportional
+   formula so that degenerate case doesn't get worse. The result is
+   always clamped into the word's own LRC line window as a sanity
+   backstop. **Known remaining limitation**: a long melisma with no
+   following confident ASR anchor nearby (nothing new to transcribe
+   during a held note) gets a locally-estimated duration that can still
+   undershoot the real held length -- confirmed on the same
+   "reciprocity" melisma (ground truth holds it 6.75s; the fix places it
+   correctly but ends it after ~1.9s) -- real, less severe than the
+   original bug (no more multi-second word jumps), not yet addressed.
+
+3. **The verification methodology silently dropped non-matching words
+   instead of counting them as failures**, in BOTH this session's own ad
+   hoc validation scripts AND, more importantly, the shipped, production
+   `verify_existing_song.py` (used by `--existing-txt-check`). Directly
+   confirmed: 12 of 116 real output words (10.3%) never text-matched
+   ground truth at all and simply vanished from the difflib alignment
+   instead of appearing as a mismatch -- a reported "99%" was computed
+   over the 104 words that survived, not the real 116. Fixed at the
+   shared tool, not just patched around in another script:
+   `ExistingSongVerification` gained `coverage_fresh`/`coverage_existing`
+   (fraction of each side's own words that matched the other side AT
+   ALL) and `unmatched_fresh`/`unmatched_existing` (the actual word
+   lists, logged like the existing pitch/timing mismatch printouts).
+   `config.EXISTING_TXT_MIN_COVERAGE = 0.85` is now part of the
+   PASS/PROBLEMS_FOUND gate alongside pitch/timing accuracy -- a
+   perfect-looking matched subset can no longer report PASS while a real
+   chunk of the song went unscored. **Going forward, use
+   `verify_existing_song.verify_existing_song` directly** for real output
+   vs. ground-truth comparisons instead of writing another ad hoc
+   scratchpad script -- this whole project repeatedly reimplemented a
+   slightly-different, less rigorous version of exactly this function
+   from scratch across many earlier validation rounds this session.
+
+**Real re-validation after all three fixes + the fuzzy-text follow-up**,
+Chicago with `--lrclib-id 37066985` (the user's own exact real
+reproduction case), via the now-fixed `verify_existing_song` directly
+(not another scratchpad script): 109 words matched, 99% timing
+agreement, coverage fresh=94%/existing=52% (existing-side coverage is
+expected to be well under 100% -- this MXL only notates roughly the
+first half of the song's lyrics, a pre-existing, already-documented
+content limitation, not a new bug). Pitch class reads as 0% through this
+general-purpose tool specifically because `verify_existing_song` doesn't
+apply a calibration offset (by design -- it's built for same-source
+repeat-run comparisons, which never have one); manually confirmed every
+single pitch mismatch is exactly +1 semitone, the same known,
+pre-existing transposition this specific MXL file has always had,
+unrelated to any of these fixes. `musicxml_reference.py`'s pass 4 already
+handles exactly this kind of calibration for its own use case; extending
+`verify_existing_song` to do the same for cross-source comparisons was
+judged out of scope for this bug-fix round.
+
 ## Environment notes
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.

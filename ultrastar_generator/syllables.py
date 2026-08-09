@@ -76,3 +76,24 @@ def hyphenate(word: str) -> List[str]:
     parts[0] = lead + parts[0]
     parts[-1] = parts[-1] + trail
     return parts
+
+
+def chunk_to_count(parts: List[str], n_chunks: int) -> List[str]:
+    """Merges a syllable list down to exactly n_chunks contiguous text
+    chunks (used when a word has more syllables than there are target
+    slots -- e.g. audio-detected notes, or an MXL word's own notated
+    syllable count -- to hold them)."""
+    n_chunks = max(1, n_chunks)
+    if n_chunks >= len(parts):
+        return parts
+    # Distribute parts across n_chunks as evenly as possible, in order.
+    chunks = []
+    base = len(parts) // n_chunks
+    extra = len(parts) % n_chunks
+    idx = 0
+    for c in range(n_chunks):
+        take = base + (1 if c < extra else 0)
+        take = max(1, take)
+        chunks.append("".join(parts[idx:idx + take]))
+        idx += take
+    return chunks

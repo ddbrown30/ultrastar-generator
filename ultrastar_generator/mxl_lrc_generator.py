@@ -57,6 +57,7 @@ from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
 from .lrc_timing import parse_lrc
 from .models import Syllable, Word
+from .syllables import hyphenate, chunk_to_count
 
 
 def _normalize(s: str) -> str:
@@ -216,31 +217,65 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
     return LrcMatch(candidate=best, lrc_lines=lrc_lines, content_match_ratio=ratio, duration_delta=delta)
 
 
-def assign_words_to_lines(mxl_words: List[MxlWord], lrc_lines: List[Tuple[float, str]]) -> List[int]:
+def assign_words_to_lines(mxl_words: List[MxlWord],
+                           lrc_lines: List[Tuple[float, str]]) -> Tuple[List[int], List[Optional[str]]]:
     """Assigns each MXL word to an LRC line index via word-level
     whole-sequence matching (order-preserving, resistant to picking a
     wrong repeated-phrase instance the same way this project's other
     whole-sequence alignments are). Words that don't directly match any
     LRC token (OCR-garbled MXL text, minor wording differences) inherit
     the nearest PRECEDING confirmed match's line -- falling back to the
-    first confirmed line for any words before the first match."""
-    lrc_flat: List[str] = []
+    first confirmed line for any words before the first match.
+
+    ALSO returns, per word, a clean-text replacement for the DISPLAYED
+    lyric text (`None` if none was found) -- used by `build_syllables`.
+    Real, confirmed bug this fixes: the MXL's own OCR'd syllable text
+    ("MATIZON" for "Matron", "systern"/"eystern" for "system") was being
+    used verbatim in the output; MXL should only ever supply pitch and
+    relative rhythm, never displayed text, when a clean source is
+    available.
+
+    Two ways a word earns a clean-text replacement:
+      - An exact normalized match (difflib "equal" opcode) -- the common
+        case.
+      - A "replace" opcode pairing exactly ONE MXL word against exactly
+        ONE LRC word (i.e. difflib's own whole-sequence alignment already
+        decided these are the best positional fit, anchored by correctly-
+        matched words on both sides) AND their character-level similarity
+        clears `config.MXL_LRC_FUZZY_TEXT_MIN_RATIO` -- catches an MXL
+        word that's the SAME word with an OCR/spelling difference (e.g.
+        "systern" for "system") rather than genuinely missing. Only ever
+        applied to a 1:1 replace, never a multi-word block -- pairing
+        which-word-means-which-word across an uneven block is exactly the
+        kind of ambiguity this project has been burned by before with
+        repeated/uncertain text."""
+    lrc_flat: List[str] = []       # normalized, for matching
+    lrc_flat_raw: List[str] = []   # raw, for display substitution
     lrc_line_idx: List[int] = []
     for li, (_, text) in enumerate(lrc_lines):
         for tok in text.split():
             n = _normalize(tok)
             if n:
                 lrc_flat.append(n)
+                lrc_flat_raw.append(tok)
                 lrc_line_idx.append(li)
 
     mxl_norm = [w.norm for w in mxl_words]
     sm = difflib.SequenceMatcher(None, mxl_norm, lrc_flat, autojunk=False)
     word_line = {}
+    word_clean_text: dict = {}
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag != "equal":
-            continue
-        for k in range(i2 - i1):
-            word_line[i1 + k] = lrc_line_idx[j1 + k]
+        if tag == "equal":
+            for k in range(i2 - i1):
+                word_line[i1 + k] = lrc_line_idx[j1 + k]
+                word_clean_text[i1 + k] = lrc_flat_raw[j1 + k]
+        elif tag == "replace" and (i2 - i1) == 1 and (j2 - j1) == 1:
+            ratio = difflib.SequenceMatcher(None, mxl_norm[i1], lrc_flat[j1]).ratio()
+            if ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO:
+                word_line[i1] = lrc_line_idx[j1]
+                word_clean_text[i1] = lrc_flat_raw[j1]
+            # else: genuinely too different -- leave unmatched, falls
+            # through to MXL's own raw text same as before.
 
     n = len(mxl_words)
     filled: List[Optional[int]] = [None] * n
@@ -252,7 +287,9 @@ def assign_words_to_lines(mxl_words: List[MxlWord], lrc_lines: List[Tuple[float,
         else:
             filled[i] = last
     first_known = next((v for v in filled if v is not None), None)
-    return [v if v is not None else first_known for v in filled]
+    lines = [v if v is not None else first_known for v in filled]
+    clean_text = [word_clean_text.get(i) for i in range(n)]
+    return lines, clean_text
 
 
 @dataclass
@@ -275,37 +312,44 @@ def _line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float, fl
 
 def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lines: List[Tuple[float, str]],
                          asr_words: List[Word]) -> Tuple[List[float], List[float], MxlLrcQuality]:
-    """For each LRC line, matches that line's own MXL words against real
-    ASR words whose own timestamp falls near the line's real-time window
-    (order-preserving difflib, same technique used throughout this
-    project for text alignment).
+    """PASS 1: for each LRC line, matches that line's own MXL words
+    against real ASR words whose own timestamp falls near the line's
+    real-time window (order-preserving difflib, same technique used
+    throughout this project for text alignment).
 
     A matched word is only trusted if the ASR match ALSO clears
     `config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE` -- confirmed real case: a
     text match with confidence 0.003 had a genuinely wrong (0.77s off)
     timestamp, independent of anything else in this pipeline. A
-    low-confidence "match" is treated as no match at all.
+    low-confidence "match" is treated as no match at all. A trusted
+    match's START/END come directly from the ASR word's own values.
 
-    START: a trusted match uses the ASR word's own start; an untrusted/
-    unmatched word falls back to proportional placement using the MXL's
-    own relative offsets within the line's window (unchanged from before).
+    PASS 2: every remaining (non-confident) word is placed by
+    interpolating from its NEAREST CONFIDENT neighbors (by MXL offset
+    order) -- NOT by stretching proportionally across the whole line's
+    window, which was a real, confirmed bug: a line whose own (t0, t1)
+    window includes trailing silence (e.g. an instrumental gap before
+    the next line starts) stretches every non-confident word in it well
+    past where it actually belongs, using an offset-to-time RATE that's
+    diluted by real silence the words themselves never occupy. Real case
+    that exposed this: the LRC line "Because the system works, the
+    system called reciprocity" spans 16.5s, but the real singing ends
+    ~10.6s in -- every fallback word after that packed together near the
+    tail of the line's own window. Interpolating from the nearest real
+    ASR anchors (before AND after, by MXL-offset order, not bounded to
+    the same line) uses a locally-accurate rate instead. If only one
+    side has an anchor, extrapolates using that anchor's own nearest
+    neighbor pair; if no anchor exists anywhere (total ASR failure),
+    falls back to the old whole-line-proportional formula so that
+    degenerate case doesn't get worse. The result is always clamped into
+    the word's own LRC line's (t0, t1) window as a sanity backstop.
 
-    END (real duration): a trusted match uses the ASR word's own reported
-    end directly. An untrusted/unmatched word's end is ESTIMATED from its
-    own MXL note value (how many quarter notes it spans) times a locally-
-    calibrated real-seconds-per-quarter-note rate, derived from this
-    line's own (t0, t1) window and MXL offset span -- i.e. "how long
-    nearby notes are actually taking, applied to this word's own notated
-    length" rather than blindly stretching to the next word's start
-    (confirmed real bug: that produced e.g. a single word held for 3.1s
-    or 7.1s, swallowing what should have been a real pause).
-
-    Non-decreasing order on START is then enforced (clamp) -- ASR can
-    occasionally produce a slightly out-of-order local match (e.g. a
-    repeated/garbled word within one line). ENDs are then clamped to
-    never exceed the NEXT word's own start (no overlap) but are free to
-    end EARLIER, leaving a real rest -- this is the actual fix for the
-    swallowed-pause bug."""
+    Non-decreasing order on START is then enforced (clamp) -- ASR/
+    interpolation can occasionally produce a slightly out-of-order local
+    result. ENDs are then clamped to never exceed the NEXT word's own
+    start (no overlap) but are free to end EARLIER, leaving a real rest
+    -- the fix for a word swallowing a real pause (e.g. "hen." held for
+    3.1s, "The" held for 7.1s, both confirmed real bugs)."""
     line_word_idxs: dict = {}
     for i, li in enumerate(word_lines):
         line_word_idxs.setdefault(li, []).append(i)
@@ -313,8 +357,10 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
     n = len(mxl_words)
     starts: List[Optional[float]] = [None] * n
     ends: List[Optional[float]] = [None] * n
+    confident: List[bool] = [False] * n
     quality = MxlLrcQuality(n_words=n)
 
+    # --- Pass 1: confident ASR matches only. ---
     for li, idxs in line_word_idxs.items():
         idxs = sorted(idxs)
         t0, t1 = _line_window(lrc_lines, li)
@@ -330,31 +376,93 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
                 asr_w = asr_in_window[b1 + k]
                 if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
                     matched_local[a1 + k] = asr_w
-                # else: leave unmatched -- falls through to the estimated
-                # fallback placement/duration below, same as a real miss.
+                # else: leave unmatched -- falls through to pass 2.
 
-        offs = [mxl_words[i].offset for i in idxs]
-        lo, hi = min(offs), max(offs)
-        span = hi - lo
-        # Real-seconds-per-quarter-note for this line, used to estimate
-        # duration for any word that doesn't have a trusted ASR (start, end).
-        line_rate = (t1 - t0) / span if span > 0 else config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC
         for local_i, global_i in enumerate(idxs):
+            if local_i not in matched_local:
+                continue
+            asr_w = matched_local[local_i]
             w = mxl_words[global_i]
             word_qtr_dur = sum(s[1] for s in w.syllables)
-            if local_i in matched_local:
-                asr_w = matched_local[local_i]
-                starts[global_i] = asr_w.start
-                asr_dur = asr_w.end - asr_w.start
-                ends[global_i] = asr_w.start + asr_dur if asr_dur > 0 else asr_w.start + word_qtr_dur * line_rate
-                quality.n_asr_placed += 1
+            starts[global_i] = asr_w.start
+            asr_dur = asr_w.end - asr_w.start
+            ends[global_i] = (asr_w.start + asr_dur if asr_dur > 0
+                               else asr_w.start + word_qtr_dur * config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC)
+            confident[global_i] = True
+            quality.n_asr_placed += 1
+
+    # --- Pass 2: nearest-confident-anchor interpolation for everything else. ---
+    confident_idxs = [i for i in range(n) if confident[i]]
+
+    def nearest_before(i: int) -> Optional[int]:
+        best = None
+        for ci in confident_idxs:
+            if ci < i:
+                best = ci
             else:
-                off = w.offset
-                frac = (off - lo) / span if span > 0 else 0.0
-                start = t0 + frac * (t1 - t0)
-                starts[global_i] = start
-                ends[global_i] = start + word_qtr_dur * line_rate
-                quality.n_fallback += 1
+                break
+        return best
+
+    def nearest_after(i: int) -> Optional[int]:
+        for ci in confident_idxs:
+            if ci > i:
+                return ci
+        return None
+
+    for i in range(n):
+        if confident[i]:
+            continue
+        li = word_lines[i]
+        t0, t1 = _line_window(lrc_lines, li)
+        w = mxl_words[i]
+        word_qtr_dur = sum(s[1] for s in w.syllables)
+
+        pb = nearest_before(i)
+        pa = nearest_after(i)
+        rate = None
+        base_idx = None
+        if pb is not None and pa is not None:
+            off_delta = mxl_words[pa].offset - mxl_words[pb].offset
+            if off_delta > 0:
+                rate = (starts[pa] - starts[pb]) / off_delta
+            base_idx = pb
+        elif pb is not None:
+            pbb = nearest_before(pb)
+            if pbb is not None:
+                off_delta = mxl_words[pb].offset - mxl_words[pbb].offset
+                if off_delta > 0:
+                    rate = (starts[pb] - starts[pbb]) / off_delta
+            base_idx = pb
+        elif pa is not None:
+            paa = nearest_after(pa)
+            if paa is not None:
+                off_delta = mxl_words[paa].offset - mxl_words[pa].offset
+                if off_delta > 0:
+                    rate = (starts[paa] - starts[pa]) / off_delta
+            base_idx = pa
+
+        if rate is not None and base_idx is not None:
+            base = mxl_words[base_idx]
+            est_start = starts[base_idx] + (w.offset - base.offset) * rate
+        else:
+            # No usable anchor anywhere in the whole song (total ASR
+            # failure) -- fall back to the old whole-line-proportional
+            # formula rather than leaving this word unplaced.
+            idxs = sorted(line_word_idxs[li])
+            offs = [mxl_words[j].offset for j in idxs]
+            lo_off, hi_off = min(offs), max(offs)
+            span = hi_off - lo_off
+            frac = (w.offset - lo_off) / span if span > 0 else 0.0
+            est_start = t0 + frac * (t1 - t0)
+            rate = (t1 - t0) / span if span > 0 else config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC
+
+        # Sanity backstop: never escape this word's own LRC line window,
+        # even though the RATE may have been informed by an anchor in an
+        # adjacent line.
+        est_start = max(t0, min(est_start, t1))
+        starts[i] = est_start
+        ends[i] = est_start + word_qtr_dur * (rate if rate and rate > 0 else config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC)
+        quality.n_fallback += 1
 
     for i in range(1, n):
         if starts[i] < starts[i - 1]:
@@ -373,15 +481,42 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
     return starts, ends, quality
 
 
+def _text_for_mxl_syllables(clean_text: Optional[str], mxl_syllable_texts: List[str]) -> List[str]:
+    """Returns the text to display on each of an MXL word's own syllable
+    slots. If `clean_text` (the matched LRC token, see
+    `assign_words_to_lines`) is available, it's hyphenated
+    (`syllables.hyphenate`) and reconciled to the MXL's own syllable
+    COUNT -- merged down (`syllables.chunk_to_count`) if the clean word
+    hyphenates into MORE pieces than MXL notated, or padded with
+    `config.MELISMA_CONTINUATION_TEXT` if FEWER -- mirroring
+    `lyric_alignment._syllables_for_word`'s existing pattern exactly.
+    Falls back to the MXL's own raw syllable text only when no clean
+    match exists at all (better than nothing, but never preferred: the
+    MXL's own OCR can be wrong, e.g. "systern"/"eystern" for "system")."""
+    n = len(mxl_syllable_texts)
+    if clean_text is None:
+        return mxl_syllable_texts
+    parts = hyphenate(clean_text)
+    if len(parts) == n:
+        return parts
+    elif len(parts) > n:
+        return chunk_to_count(parts, n)
+    else:
+        return list(parts) + [config.MELISMA_CONTINUATION_TEXT] * (n - len(parts))
+
+
 def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_ends: List[float],
-                     word_lines: List[int]) -> List[Syllable]:
+                     word_lines: List[int], word_clean_text: List[Optional[str]]) -> List[Syllable]:
     """Splits each word's own syllables proportionally within
     [word_start, word_end) (see `place_words_via_asr` for how those are
     derived from ASR and/or MXL note values -- NOT simply "until the next
     word starts", which used to swallow real pauses between words) using
     the MXL's own relative sub-word offsets -- that part of the MXL data
     (syllable-to-syllable ratios within one word) is reliable, so there's
-    no need to guess those from ASR too. `line_id` is set from
+    no need to guess those from ASR too. The DISPLAYED text comes from
+    `word_clean_text` (the matched LRC token) via `_text_for_mxl_syllables`
+    whenever available -- MXL supplies pitch/timing only, never the
+    displayed text, when a clean source exists. `line_id` is set from
     `assign_words_to_lines` so `phrasing.build_lines` gets accurate,
     LRC-native line breaks."""
     syllables: List[Syllable] = []
@@ -397,7 +532,9 @@ def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_end
             t1 = t0
         lo = w.offset
         hi = w.offset + sum(s[1] for s in w.syllables)
-        for syl_i, (off, dur, midi, text) in enumerate(w.syllables):
+        mxl_syllable_texts = [s[3] for s in w.syllables]
+        display_texts = _text_for_mxl_syllables(word_clean_text[i], mxl_syllable_texts)
+        for syl_i, ((off, dur, midi, _orig_text), text) in enumerate(zip(w.syllables, display_texts)):
             frac0 = (off - lo) / (hi - lo) if hi > lo else 0.0
             frac1 = (off + dur - lo) / (hi - lo) if hi > lo else 1.0
             syllables.append(Syllable(
@@ -435,9 +572,9 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
         return MxlLrcResult(success=False, reason="no matching synced lyrics found on LRCLIB",
                              mxl_path=mxl_path, part_names_used=part_names)
 
-    word_lines = assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
+    word_lines, word_clean_text = assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
     word_starts, word_ends, quality = place_words_via_asr(mxl_words, word_lines, lrc_match.lrc_lines, asr_words)
-    syllables = build_syllables(mxl_words, word_starts, word_ends, word_lines)
+    syllables = build_syllables(mxl_words, word_starts, word_ends, word_lines, word_clean_text)
 
     nonmonotonic_rate = quality.non_monotonic_fix_count / quality.n_words if quality.n_words else 1.0
     if quality.asr_placement_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:

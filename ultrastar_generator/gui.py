@@ -97,6 +97,7 @@ class LrcLibSearchDialog(tk.Toplevel):
                  initial_candidates: Optional[List[LrcLibCandidate]] = None, title: str = "Select lyrics"):
         super().__init__(parent)
         self.title(title)
+        self.iconbitmap('assets/lrcicon.ico')
         self.geometry("780x500")
         self.minsize(500, 340)
         self.transient(parent)
@@ -301,6 +302,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("UltraStar Generator")
         self.geometry("820x780")
+        self.iconbitmap('assets/guiicon.ico')
         self.minsize(700, 500)
 
         self._settings = _load_settings()

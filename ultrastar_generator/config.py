@@ -650,6 +650,17 @@ EXISTING_TXT_MIN_PITCH_ACCURACY = 0.85
 EXISTING_TXT_TIMING_TOLERANCE_SEC = 0.5
 EXISTING_TXT_MIN_TIMING_AGREEMENT = 0.85
 
+# Coverage gate: what fraction of EACH side's own word-start syllables must
+# text-match the other side at all before the comparison is trusted. Added
+# after a real, confirmed blind spot (2026-08-09 MXL+LRC bug-hunt session):
+# words that fail to text-match (e.g. garbled/wrong output text) simply
+# never appear in the pitch/timing candidate list at all, so a real ~10%
+# failure rate was silently invisible to pitch_class_accuracy/
+# timing_within_tolerance_pct, which are only ever computed over whatever
+# DID match. Low coverage on EITHER side now fails the gate even if the
+# matched subset's own accuracy looks perfect.
+EXISTING_TXT_MIN_COVERAGE = 0.85
+
 
 # --- Reference lyrics (lyrics_lookup.py) ------------------------------------
 # LRCLIB (lrclib.net) is tried first -- community-sourced, has a real search
@@ -719,6 +730,18 @@ MXL_LRC_MAX_NONMONOTONIC_RATE = 0.1
 # this project's own existing "LOW SCORE" convention for flagging whisperx
 # output (transcription.py's debug logging uses the same 0.3 cutoff).
 MXL_LRC_MIN_ASR_WORD_CONFIDENCE = 0.3
+
+# assign_words_to_lines' clean-text substitution: an MXL word that lands in
+# a 1:1 "replace" slot against exactly one LRC word (in the whole-sequence
+# alignment -- i.e. difflib's own global alignment already decided these
+# two are the best positional fit, anchored by correctly-matched context on
+# both sides) is trusted as the SAME word with an OCR/spelling difference
+# if their character-level similarity clears this ratio -- not just an
+# exact string match. Real cases confirmed to need this (empirically
+# measured difflib.SequenceMatcher ratios): "systern"~"system" (0.769),
+# "eystern"~"system" (0.615, the lowest of the real cases found -- sets
+# the floor here), "matizon"~"matron" (0.769), "recause"~"because" (0.857).
+MXL_LRC_FUZZY_TEXT_MIN_RATIO = 0.6
 
 # Default real-seconds-per-quarter-note rate used to estimate a fallback
 # word's own duration from its MXL note value when NO local tempo anchor
