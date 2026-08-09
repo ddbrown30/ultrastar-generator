@@ -154,9 +154,9 @@ class LrcLibSearchDialog(tk.Toplevel):
         self.listbox.bind("<Button-1>", self._on_select)
         self.listbox.bind("<B1-Motion>", lambda _e: "break")
         self.listbox.bind("<ButtonRelease-1>", lambda _e: "break")
-        self.listbox.tag_configure("selected", background="lightblue")
         self.listbox.tag_configure("synced", foreground="green")
         self.listbox.tag_configure("even", background="whitesmoke")
+        self.listbox.tag_configure("selected", background="lightblue")
         paned.add(list_frame)
 
         preview_frame = ttk.Frame(paned)
@@ -589,9 +589,9 @@ class App(tk.Tk):
         c6 = ttk.Checkbutton(opts_frame, text="Delete work files after generating",
                               variable=self.delete_work_files)
         c6.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=2)
-        Tooltip(c6, "Deletes the Demucs separation output and any extracted audio/covers under "
-                    ".ultrastar_work once generation completes. Debug files, if enabled, are left alone. "
-                    "Leave off if you'll re-run this song again soon -- it avoids re-paying separation cost.")
+        Tooltip(c6, "Deletes the entire .ultrastar_work directory (Demucs separation output, extracted "
+                    "audio/covers, and debug files) once generation completes. Leave off if you'll re-run "
+                    "this song again soon -- it avoids re-paying separation cost.")
 
         self.advanced_toggle = ttk.Button(self, text="▶ Advanced (experimental flags)", command=self._toggle_advanced)
         self.advanced_toggle.pack(fill="x", **pad)
@@ -638,7 +638,7 @@ class App(tk.Tk):
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         self.log_text.tag_configure("error", foreground="red")
-        self.log_text.tag_configure("warning", foreground="orange")
+        self.log_text.tag_configure("warning", foreground="darkorange")
         scroll.pack(side="right", fill="y")
 
     def _toggle_advanced(self):
@@ -781,7 +781,7 @@ class App(tk.Tk):
         _save_settings(self._settings)
 
     def _browse_input(self):
-        d = filedialog.askdirectory(title="Select input folder", initialdir=self._last_dir("input_dir"))
+        d = filedialog.askdirectory(title="Select input folder", initialdir=self.input_dir.get().strip() or self._last_dir("input_dir"))
         if d:
             # tkinter's askdirectory always returns forward-slash paths on
             # Windows, even though Explorer/native dialogs display and
@@ -798,7 +798,7 @@ class App(tk.Tk):
             self._remember_dir("input_dir", d)
 
     def _browse_output(self):
-        d = filedialog.askdirectory(title="Select output folder", initialdir=self._last_dir("output_dir"))
+        d = filedialog.askdirectory(title="Select output folder", initialdir=self.input_dir.get().strip() or self._last_dir("output_dir"))
         if d:
             d = str(Path(d))  # see _browse_input's comment on why this normalization matters
             self.output_dir.set(d)

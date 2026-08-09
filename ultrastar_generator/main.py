@@ -546,6 +546,15 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             mxl_paths, artist, title, audio_duration, words,
             forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
         )
+        if mxl_lrc_result is not None and mxl_lrc_result.time_calibration is not None:
+            tc = mxl_lrc_result.time_calibration
+            if tc.offset_sec is not None:
+                drift_desc = f", drift {tc.slope:+.4f}s/LRC-s" if tc.kind == "drift" else ""
+                log(f"  LRC/audio time calibration ({tc.kind}): offset {tc.offset_sec:+.1f}s{drift_desc} "
+                    f"({tc.confidence:.0%} agreement) -- applied to LRC line timestamps before placement.")
+            else:
+                log(f"  LRC/audio time calibration: none found ({tc.skipped_reason}) -- using LRC "
+                    f"timestamps as-is.")
         if mxl_lrc_result is not None and mxl_lrc_result.success:
             syllables = mxl_lrc_result.syllables
             synced_lyrics_text = mxl_lrc_result.lrc_match.candidate.synced_lyrics

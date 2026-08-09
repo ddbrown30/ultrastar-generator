@@ -217,6 +217,66 @@ def _robust_linear_fit(
     return intercept, slope, confidence, n_inliers
 
 
+def two_tier_time_calibration(
+    candidates: List[Tuple[int, float, float]],
+    min_calibration_samples: int = config.LRC_TIMING_MIN_CALIBRATION_SAMPLES,
+    min_calibration_confidence: float = config.LRC_TIMING_MIN_CALIBRATION_CONFIDENCE,
+    min_drift_samples: int = config.LRC_TIMING_MIN_DRIFT_SAMPLES,
+    min_drift_confidence: float = config.LRC_TIMING_MIN_DRIFT_CONFIDENCE,
+    drift_inlier_tolerance_sec: float = config.LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC,
+) -> Tuple[Optional[float], float, float, Optional[str], Optional[str]]:
+    """Shared two-tier time calibration: given (key, lrc_start, delta)
+    candidates, first tries a single constant offset (mode of deltas at
+    1s resolution); if that isn't confident enough, falls back to a
+    robust (Theil-Sen) offset+slope fit tolerant of a real per-song
+    timing drift (see module docstring for why both tiers exist).
+
+    Returns (offset, slope, confidence, kind, skipped_reason) -- offset is
+    None (with skipped_reason set, kind None) if no confident calibration
+    could be established. Factored out of `apply_lrc_timing_check` so
+    `mxl_lrc_generator.py` can reuse the exact same technique to calibrate
+    away a systematic offset between LRC line timestamps and OUR OWN
+    audio (e.g. different lead-in silence) BEFORE trusting those
+    timestamps as placement anchors, rather than only diagnosing the
+    mismatch after the fact -- don't reimplement this a third time."""
+    if len(candidates) < min_calibration_samples:
+        return None, 0.0, 0.0, None, (
+            f"only {len(candidates)} matched line(s) (< {min_calibration_samples} required) -- "
+            f"not enough to trust a calibration offset"
+        )
+
+    # Tier 1: constant offset -- mode at coarse (1s) resolution, since
+    # line-level timestamps are far less precise than word-level, so a
+    # fine bucket would just split a real single cluster across several
+    # adjacent buckets.
+    BUCKET_SEC = 1.0
+    bucket_counts = Counter(round(delta / BUCKET_SEC) for _, _, delta in candidates)
+    best_bucket, n_agree = bucket_counts.most_common(1)[0]
+    offset, slope, confidence, kind = best_bucket * BUCKET_SEC, 0.0, n_agree / len(candidates), "constant"
+
+    if confidence < min_calibration_confidence:
+        # Tier 2: a real per-song drift, not just noise around one
+        # constant -- confirmed on real audio (stars, tarzan,
+        # little_mermaid), see module docstring. Stricter gate than tier
+        # 1: a 2-parameter fit can trivially match a handful of points
+        # exactly, so this needs both more samples and a higher inlier
+        # fraction before it's trusted.
+        fit = _robust_linear_fit(candidates, drift_inlier_tolerance_sec) if len(candidates) >= min_drift_samples else None
+        if fit is None or fit[2] < min_drift_confidence:
+            return None, 0.0, 0.0, None, (
+                f"no clear per-song time calibration -- constant-offset best candidate {offset:+.1f}s "
+                f"covers {confidence:.0%} of {len(candidates)} matched lines (need {min_calibration_confidence:.0%}), "
+                f"and drift fit " + (
+                    f"only reached {fit[2]:.0%} inliers (need {min_drift_confidence:.0%})" if fit
+                    else f"needs >= {min_drift_samples} matched lines"
+                )
+            )
+        offset, slope, confidence, _ = fit
+        kind = "drift"
+
+    return offset, slope, confidence, kind, None
+
+
 def apply_lrc_timing_check(
     syllables: List[Syllable],
     synced_lyrics: str,
@@ -267,46 +327,15 @@ def apply_lrc_timing_check(
         print(f"[lrc-timing] {len(lrc_lines)} synced lines, {len(our_lines)} of our own lines, "
               f"{len(candidates)} matched by text")
 
-    if len(candidates) < min_calibration_samples:
-        stats.skipped_reason = (
-            f"only {len(candidates)} matched line(s) (< {min_calibration_samples} required) -- "
-            f"not enough to trust a calibration offset"
-        )
+    offset, slope, confidence, kind, skipped_reason = two_tier_time_calibration(
+        candidates, min_calibration_samples, min_calibration_confidence,
+        min_drift_samples, min_drift_confidence, drift_inlier_tolerance_sec,
+    )
+    if offset is None:
+        stats.skipped_reason = skipped_reason
         if verbose:
             print(f"[lrc-timing] skipping: {stats.skipped_reason}")
         return stats
-
-    # Tier 1: constant offset -- mode at coarse (1s) resolution, since
-    # line-level timestamps are far less precise than word-level, so a
-    # fine bucket would just split a real single cluster across several
-    # adjacent buckets.
-    BUCKET_SEC = 1.0
-    bucket_counts = Counter(round(delta / BUCKET_SEC) for _, _, delta in candidates)
-    best_bucket, n_agree = bucket_counts.most_common(1)[0]
-    offset, slope, confidence, kind = best_bucket * BUCKET_SEC, 0.0, n_agree / len(candidates), "constant"
-
-    if confidence < min_calibration_confidence:
-        # Tier 2: a real per-song drift, not just noise around one
-        # constant -- confirmed on real audio (stars, tarzan,
-        # little_mermaid), see module docstring. Stricter gate than tier
-        # 1: a 2-parameter fit can trivially match a handful of points
-        # exactly, so this needs both more samples and a higher inlier
-        # fraction before it's trusted.
-        fit = _robust_linear_fit(candidates, drift_inlier_tolerance_sec) if len(candidates) >= min_drift_samples else None
-        if fit is None or fit[2] < min_drift_confidence:
-            stats.skipped_reason = (
-                f"no clear per-song time calibration -- constant-offset best candidate {offset:+.1f}s "
-                f"covers {confidence:.0%} of {len(candidates)} matched lines (need {min_calibration_confidence:.0%}), "
-                f"and drift fit " + (
-                    f"only reached {fit[2]:.0%} inliers (need {min_drift_confidence:.0%})" if fit
-                    else f"needs >= {min_drift_samples} matched lines"
-                )
-            )
-            if verbose:
-                print(f"[lrc-timing] skipping: {stats.skipped_reason}")
-            return stats
-        offset, slope, confidence, _ = fit
-        kind = "drift"
 
     stats.calibration_offset_sec = offset
     stats.calibration_slope = slope

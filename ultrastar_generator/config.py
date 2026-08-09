@@ -743,6 +743,17 @@ MXL_LRC_MIN_ASR_WORD_CONFIDENCE = 0.3
 # the floor here), "matizon"~"matron" (0.769), "recause"~"because" (0.857).
 MXL_LRC_FUZZY_TEXT_MIN_RATIO = 0.6
 
+# Largest MXL-word-block/LRC-word-block size `assign_words_to_lines` will
+# attempt a whole-block fuzzy match on (see its own docstring) when a
+# "replace" opcode isn't a clean 1:1 shape -- e.g. MXL's OCR merged two
+# real words into one token, or split one real (hyphenated) word into
+# two. Bounded on both sides by real matches either way, so this is never
+# an unconstrained text search; the cap just keeps the block-level ratio
+# comparison meaningful (a very long block's ratio gets less reliable as
+# a "same content" signal) and keeps `_distribute_words_to_slots`'s
+# merge/split fallbacks from producing something too coarse to be useful.
+MXL_LRC_BLOCK_MAX_WORDS = 6
+
 # Default real-seconds-per-quarter-note rate used to estimate a fallback
 # word's own duration from its MXL note value when NO local tempo anchor
 # is available at all (should be rare -- every line has its own LRC-based

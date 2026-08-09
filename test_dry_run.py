@@ -833,6 +833,7 @@ from ultrastar_generator.mxl_lrc_generator import (
     MxlWord, assign_words_to_lines, place_words_via_asr, build_syllables,
     MxlLrcQuality, _text_for_mxl_syllables, config as mxl_lrc_config,
 )
+from ultrastar_generator.lrc_timing import two_tier_time_calibration
 from ultrastar_generator.models import Word as _Word
 
 # A tiny two-line "song": line 0 "hello world", line 1 "good bye now".
@@ -880,6 +881,83 @@ assert unrelated_clean == ["the", None, "works"], unrelated_clean
 print("OK: a genuinely unrelated word in the same kind of slot is correctly REJECTED by the similarity "
       "ratio gate, not fuzzy-matched just because it landed in a replace slot")
 
+# BUG REGRESSION (real cases, "Great Big Sea - Ordinary Day", lrclib id
+# 6210269): a REPLACE block that isn't a clean 1:1 shape used to be left
+# entirely unmatched, even when both sides are anchored by real matches
+# and the whole block's content is clearly the same, just OCR-garbled or
+# word-segmented differently than the real lyric. Three real shapes, all
+# from this one song's actual MXL:
+from ultrastar_generator.mxl_lrc_generator import _distribute_words_to_slots
+
+# 1: N -- one MXL word (OCR-merged) covers TWO real LRC words ("winnes"
+# for "win now"). Only one display slot exists, so the two real words are
+# joined with a space into that one slot.
+merge_words = [
+    MxlWord(text="I", norm="i", offset=0.0, syllables=[(0.0, 1.0, 60, "I")]),
+    MxlWord(text="winnes", norm="winnes", offset=1.0, syllables=[(1.0, 1.5, 69, "winnes")]),
+    MxlWord(text="and", norm="and", offset=2.5, syllables=[(2.5, 1.0, 60, "and")]),
+]
+merge_lines = [(10.0, "I win now and")]
+_, merge_clean = assign_words_to_lines(merge_words, merge_lines)
+assert merge_clean == ["I", "win now", "and"], merge_clean
+
+# N: N (same count, individually too garbled) -- "stomty"+"in" for
+# "stop"+"trying," -- positional 1:1 once the WHOLE block is compared.
+same_count_words = [
+    MxlWord(text="won't", norm="wont", offset=0.0, syllables=[(0.0, 1.0, 60, "won't")]),
+    MxlWord(text="stomty", norm="stomty", offset=1.0,
+            syllables=[(1.0, 0.5, 67, "stom"), (1.5, 1.0, 67, "ty")]),
+    MxlWord(text="in", norm="in", offset=2.5, syllables=[(2.5, 3.0, 69, "in")]),
+    MxlWord(text="Oh", norm="oh", offset=5.5, syllables=[(5.5, 1.0, 60, "Oh")]),
+]
+same_count_lines = [(10.0, "won't stop trying, oh")]
+_, same_count_clean = assign_words_to_lines(same_count_words, same_count_lines)
+assert same_count_clean == ["won't", "stop", "trying,", "oh"], same_count_clean
+
+# N: M -- three MXL words for two real (one hyphenated) LRC words
+# ("double"+"edged"+"kide" for "double-edged"+"knife,") -- fewer real
+# words than slots, recovered by splitting the hyphenated word first
+# rather than falling straight to melisma-padding.
+split_words = [
+    MxlWord(text="a", norm="a", offset=0.0, syllables=[(0.0, 1.0, 60, "a")]),
+    MxlWord(text="double", norm="double", offset=1.0, syllables=[(1.0, 1.0, 60, "double")]),
+    MxlWord(text="edged", norm="edged", offset=2.0, syllables=[(2.0, 1.0, 60, "edged")]),
+    MxlWord(text="kide", norm="kide", offset=3.0, syllables=[(3.0, 1.0, 60, "kide")]),
+    MxlWord(text="but", norm="but", offset=4.0, syllables=[(4.0, 1.0, 60, "but")]),
+]
+split_lines = [(10.0, "a double-edged knife, but")]
+_, split_clean = assign_words_to_lines(split_words, split_lines)
+assert split_clean == ["a", "double", "edged", "knife,", "but"], split_clean
+print("OK: assign_words_to_lines recovers a MULTI-word replace block anchored by real matches on both "
+      "sides -- 1-MXL-word-merges-2-real-words, same-count-but-individually-garbled, and "
+      "fewer-real-words-than-slots-via-hyphen-split, all real 'Ordinary Day' cases")
+
+# A genuinely unrelated multi-word block (not just OCR noise) must still
+# be rejected -- the block-level ratio gate has to actually reject, not
+# just be a formality the way the 1:1 gate already is.
+unrelated_block_words = [
+    MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
+    MxlWord(text="zzz", norm="zzz", offset=1.0, syllables=[(1.0, 1.0, 60, "zzz")]),
+    MxlWord(text="qqq", norm="qqq", offset=2.0, syllables=[(2.0, 1.0, 60, "qqq")]),
+    MxlWord(text="works", norm="works", offset=3.0, syllables=[(3.0, 1.0, 60, "works")]),
+]
+unrelated_block_lines = [(10.0, "the completely unrelated text works")]
+_, unrelated_block_clean = assign_words_to_lines(unrelated_block_words, unrelated_block_lines)
+assert unrelated_block_clean[1] is None and unrelated_block_clean[2] is None, unrelated_block_clean
+print("OK: a genuinely unrelated multi-word block is correctly rejected by the block-level similarity "
+      "ratio gate too, not fuzzy-matched just because it's bounded by real anchors")
+
+# _distribute_words_to_slots directly: the merge (more real words than
+# slots) and melisma-pad (fewer real words than slots, no hyphen to
+# split) fallback shapes, isolated from the whole-block-matching path.
+assert _distribute_words_to_slots(["stop", "trying,"], 2) == ["stop", "trying,"]
+assert _distribute_words_to_slots(["win", "now"], 1) == ["win now"]
+assert _distribute_words_to_slots(["double-edged", "knife,"], 3) == ["double", "edged", "knife,"]
+assert _distribute_words_to_slots(["go"], 3) == ["go", mxl_lrc_config.MELISMA_CONTINUATION_TEXT,
+                                                  mxl_lrc_config.MELISMA_CONTINUATION_TEXT]
+print("OK: _distribute_words_to_slots handles more-words-than-slots (merge), fewer (hyphen-split, then "
+      "melisma-pad), and equal counts (direct positional) correctly in isolation")
+
 # ASR confidently catches "hello"/"world"/"bye" at real times close to (but not
 # exactly at) the printed line starts; "good" and "now" are missing from ASR
 # entirely (must fall back to proportional placement within their own line).
@@ -903,6 +981,95 @@ assert abs(ends[1] - 10.9) < 1e-9, ends[1]   # "world" keeps its own 0.3s ASR du
 print("OK: place_words_via_asr uses real ASR timestamps AND durations where confidently matched (never "
       "stretching a word across what should be a real rest), falls back to MXL-note-value/local-tempo "
       "estimated placement and duration otherwise")
+
+# BUG REGRESSION (real case: Chicago "favors" OCR'd as "favere" in the MXL,
+# but transcribed correctly by ASR) -- matching on the raw MXL norm alone
+# missed this word entirely, even though assign_words_to_lines had already
+# resolved a clean "favors" for it. place_words_via_asr must reuse that
+# clean text for its own ASR matching, not just for display.
+garbled_mxl_words = [
+    MxlWord(text="hello", norm="hello", offset=0.0, syllables=[(0.0, 1.0, 64, "hello")]),
+    MxlWord(text="favere", norm="favere", offset=1.0, syllables=[(1.0, 0.5, 64, "fa"), (1.5, 1.0, 64, "vors")]),
+]
+garbled_word_lines = [0, 0]
+garbled_clean_text = ["hello", "favors"]  # as assign_words_to_lines would have resolved it
+garbled_lrc_lines = [(10.0, "hello favors")]
+garbled_asr = [
+    _Word(text="hello", start=10.0, end=10.3),
+    _Word(text="favors", start=11.0, end=11.6),
+]
+g_starts, g_ends, g_quality = place_words_via_asr(
+    garbled_mxl_words, garbled_word_lines, garbled_lrc_lines, garbled_asr, word_clean_text=garbled_clean_text)
+assert g_starts[1] == 11.0 and g_ends[1] == 11.6, (g_starts[1], g_ends[1])
+assert g_quality.n_asr_placed == 2 and g_quality.n_fallback == 0, g_quality
+# Without the clean text (old behavior), a DOUBLY-garbled word -- MXL OCR'd
+# it as "favere" AND ASR separately mis-transcribed it as "favorites" (real
+# case: the user's own re-run) -- must NOT match, since "favere"~"favorites"
+# (ratio 0.53) falls below the fuzzy threshold even with the fuzzy-replace
+# fallback active. Confirms clean-text reuse is still doing real work of its
+# own, not just fuzzy matching alone.
+mishear_asr = [
+    _Word(text="hello", start=10.0, end=10.3),
+    _Word(text="favorites", start=11.0, end=11.6),
+]
+g2_starts, g2_ends, g2_quality = place_words_via_asr(
+    garbled_mxl_words, garbled_word_lines, garbled_lrc_lines, mishear_asr)
+assert g2_quality.n_asr_placed == 1 and g2_quality.n_fallback == 1, g2_quality
+print("OK: place_words_via_asr matches an MXL word against ASR using its already-resolved CLEAN text "
+      "(\"favere\"->\"favors\") when available, recovering a real confident ASR match that raw-OCR-norm "
+      "matching alone would miss entirely")
+
+# BUG REGRESSION (real case: the user's own re-run mis-transcribed "favors"
+# as "favorites" -- a real ASR mishearing, independent of any MXL OCR
+# issue) -- even the clean text ("favors") doesn't EXACTLY match ASR's own
+# output ("favorites") here, so the exact-match fix above isn't enough on
+# its own; a close-but-not-identical 1:1 pairing must still be trusted via
+# the same fuzzy-ratio technique assign_words_to_lines already uses for
+# display text. Reuses the same `mishear_asr` data used above to prove
+# clean-text-reuse alone isn't enough for THIS word -- fuzzy matching
+# against the clean text is what closes the gap.
+m_starts, m_ends, m_quality = place_words_via_asr(
+    garbled_mxl_words, garbled_word_lines, garbled_lrc_lines, mishear_asr, word_clean_text=garbled_clean_text)
+assert m_starts[1] == 11.0 and m_ends[1] == 11.6, (m_starts[1], m_ends[1])
+assert m_quality.n_asr_placed == 2 and m_quality.n_fallback == 0, m_quality
+# A genuinely unrelated ASR word in the same slot must still be rejected --
+# confirms this isn't just accepting any 1:1 replace pairing.
+unrelated_asr = [
+    _Word(text="hello", start=10.0, end=10.3),
+    _Word(text="banana", start=11.0, end=11.6),
+]
+u_starts, u_ends, u_quality = place_words_via_asr(
+    garbled_mxl_words, garbled_word_lines, garbled_lrc_lines, unrelated_asr, word_clean_text=garbled_clean_text)
+assert u_quality.n_asr_placed == 1 and u_quality.n_fallback == 1, u_quality
+print("OK: place_words_via_asr also trusts a close-but-not-identical 1:1 ASR pairing (\"favors\"~\"favorites\", "
+      "a real ASR mishearing) via the same fuzzy-ratio technique used for display text, while still rejecting "
+      "a genuinely unrelated word in the same slot")
+
+# BUG REGRESSION (real case: the user's own re-run, "There's a lot of
+# favors, I'm prepared..." -- the fuzzy-replace fix above only checked a
+# CLEAN 1:1 replace block, but `asr_in_window` is time-bounded, not
+# line-bounded (a deliberate +-0.5s slop so a match landing just outside
+# the LRC line's own window isn't missed) -- so a word belonging to the
+# NEXT line ("I'm") can spill into the same window and turn what should be
+# a clean 1:1 mismatch into a 1:2 replace block (['favors'] vs
+# ['favorites', 'im']), which the old `(b2 - b1) == 1` check rejected
+# outright even though the correct candidate ("favorites") was sitting
+# right there at the start of the block. Real debug-log-confirmed case:
+# this silently fell through to nearest-anchor interpolation and produced
+# a ~1.85s span for a word whose real ASR duration was 0.66s.
+spillover_lrc_lines = [(10.0, "hello favors"), (12.0, "im here")]
+spillover_asr = [
+    _Word(text="hello", start=10.0, end=10.3),
+    _Word(text="favorites", start=11.0, end=11.6),
+    _Word(text="im", start=12.0, end=12.3),
+]
+sp_starts, sp_ends, sp_quality = place_words_via_asr(
+    garbled_mxl_words, garbled_word_lines, spillover_lrc_lines, spillover_asr, word_clean_text=garbled_clean_text)
+assert sp_starts[1] == 11.0 and sp_ends[1] == 11.6, (sp_starts[1], sp_ends[1])
+assert sp_quality.n_asr_placed == 2 and sp_quality.n_fallback == 0, sp_quality
+print("OK: place_words_via_asr still recovers a fuzzy 1:1 match when a NEXT-line word spills into the same "
+      "ASR time window, turning the replace block 1:2 instead of 1:1 (real case: 'favors'~'favorites' "
+      "alongside a spilled-over \"I'm\")")
 
 # Confidence gating: a text match with LOW confidence must be treated as no
 # match at all (real case this was built for: a 0.003-confidence match had a
@@ -985,6 +1152,55 @@ assert a_starts[1] < 5.0 and a_starts[2] < 5.0, a_starts  # nowhere close to the
 print(f"OK: fallback words between two confident anchors interpolate from the LOCAL gap (starts={a_starts}), "
       f"not the whole line's window including its trailing silence")
 
+print("\n--- mxl_lrc_generator: _match_asr_to_lrc_lines + two_tier_time_calibration recover a systematic "
+      "LRC/audio offset -- BUG REGRESSION for real 'Ordinary Day' (lrclib id 6210269) case, where our own "
+      "audio has ~2.4s of extra lead-in silence vs. whichever recording LRCLIB's synced lyrics were timed "
+      "against ---")
+from ultrastar_generator.mxl_lrc_generator import _match_asr_to_lrc_lines
+
+# 6 LRC lines 2s apart (distinct single-word content so text matching is
+# unambiguous); real ASR content for each line is a CONSTANT +3.0s later
+# than the LRC line's own declared timestamp -- larger than the per-line
+# window's own +-0.5s slop plus the 2s line gap, so an UNCALIBRATED window
+# search genuinely misses every one of these real matches, not just some.
+off_lrc_lines = [(0.0, "alpha"), (2.0, "bravo"), (4.0, "charlie"), (6.0, "delta"), (8.0, "echo"), (10.0, "foxtrot")]
+off_asr = [
+    _Word(text="alpha", start=3.0, end=3.3),
+    _Word(text="bravo", start=5.0, end=5.3),
+    _Word(text="charlie", start=7.0, end=7.3),
+    _Word(text="delta", start=9.0, end=9.3),
+    _Word(text="echo", start=11.0, end=11.3),
+    _Word(text="foxtrot", start=13.0, end=13.3),
+]
+off_candidates = _match_asr_to_lrc_lines(off_asr, off_lrc_lines)
+assert len(off_candidates) == 6, off_candidates
+assert all(abs(delta - 3.0) < 1e-9 for _, _, delta in off_candidates), off_candidates
+off_offset, off_slope, off_confidence, off_kind, off_skipped = two_tier_time_calibration(off_candidates)
+assert off_offset == 3.0 and off_kind == "constant" and off_confidence == 1.0, (off_offset, off_kind, off_confidence)
+print("OK: _match_asr_to_lrc_lines recovers a per-line real-ASR-vs-LRC delta straight from ASR's own flat "
+      "word stream, and two_tier_time_calibration confidently calibrates the constant +3.0s offset from it")
+
+off_mxl_words = [
+    MxlWord(text=t, norm=t, offset=float(i), syllables=[(float(i), 1.0, 60, t)])
+    for i, t in enumerate(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"])
+]
+off_word_lines = list(range(6))
+# UNCALIBRATED: raw LRC timestamps used directly -- every real ASR match
+# falls outside its own line's +-0.5s window (declared line span is only
+# 2s, offset is 3.0s), so this must fail almost entirely.
+raw_starts, raw_ends, raw_quality = place_words_via_asr(off_mxl_words, off_word_lines, off_lrc_lines, off_asr)
+assert raw_quality.asr_placement_rate < 0.5, raw_quality
+# CALIBRATED: shift LRC timestamps by the recovered offset first (exactly
+# what generate_from_mxl_and_lrc now does) -- every word should now match
+# confidently via real ASR timing.
+cal_lrc_lines = [(t + off_offset + off_slope * t, text) for t, text in off_lrc_lines]
+cal_starts, cal_ends, cal_quality = place_words_via_asr(off_mxl_words, off_word_lines, cal_lrc_lines, off_asr)
+assert cal_quality.asr_placement_rate == 1.0, cal_quality
+assert cal_starts == [3.0, 5.0, 7.0, 9.0, 11.0, 13.0], cal_starts
+print("OK: applying the recovered offset to LRC line timestamps before matching turns an almost-total ASR "
+      "placement failure (uncalibrated, {:.0%}) into a full recovery (calibrated, {:.0%}) -- the real fix "
+      "for the 'Ordinary Day' lead-in-silence case".format(raw_quality.asr_placement_rate, cal_quality.asr_placement_rate))
+
 print("\n--- mxl_lrc_generator: quality gate correctly rejects a wrong-recording-style result ---")
 # Mirrors the real BATB/Stars failure this session found: a candidate that
 # passes duration+content filtering but whose LRC line timings don't
@@ -996,6 +1212,66 @@ high_quality = MxlLrcQuality(n_words=n_words_gate, n_asr_placed=9, n_fallback=1,
 assert high_quality.asr_placement_rate >= mxl_lrc_config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
 print("OK: MxlLrcQuality.asr_placement_rate correctly separates a low-confidence (wrong-recording-style) "
       "result from a high-confidence one, against the real shipped threshold")
+
+print("\n--- load_mxl_vocal_words: untexted continuation notes (tied hold / slurred slide) are kept, "
+      "not silently dropped -- BUG REGRESSION for real 'reciprocity' (G#->C# slide+fermata) and "
+      "'fa'/'favors' (tied hold undershooting duration) cases ---")
+import tempfile as _tempfile
+import os as _os
+import music21 as _music21
+from ultrastar_generator.mxl_lrc_generator import load_mxl_vocal_words
+
+_lmvw_part = _music21.stream.Part()
+_lmvw_part.partName = "Voice 1"
+
+# "go" -- one lyric-bearing note (begin) tied to an untexted same-pitch note
+# (a real sustain/hold -- must MERGE into one syllable, extended duration,
+# not become a second note).
+_n1 = _music21.note.Note(60, quarterLength=1.0)  # C4
+_n1.lyric = "go"
+_lmvw_part.append(_n1)
+_n2 = _music21.note.Note(60, quarterLength=1.0)  # same pitch, tied continuation
+_n2.tie = _music21.tie.Tie("stop")
+_lmvw_part.append(_n2)
+
+# "up" -- one lyric-bearing note (begin) slurred (untied) into an untexted
+# DIFFERENT-pitch note immediately after -- a real slide -- must become a
+# SECOND syllable entry (empty text), not be dropped.
+_n3 = _music21.note.Note(62, quarterLength=1.0)  # D4
+_n3.lyric = "up"
+_lmvw_part.append(_n3)
+_n4 = _music21.note.Note(58, quarterLength=1.0)  # different pitch, no tie
+_lmvw_part.append(_n4)
+
+# A rest, then an untexted note with no word in progress boundary-wise --
+# this note follows a REST (non-contiguous), so it must NOT be glued onto
+# "up"'s melisma even though no new lyric appeared in between yet.
+_lmvw_part.append(_music21.note.Rest(quarterLength=2.0))
+_n5 = _music21.note.Note(65, quarterLength=1.0)  # no lyric, non-contiguous
+_lmvw_part.append(_n5)
+
+# Next real word closes out "up"'s word.
+_n6 = _music21.note.Note(64, quarterLength=1.0)
+_n6.lyric = "down"
+_lmvw_part.append(_n6)
+
+_lmvw_score = _music21.stream.Score()
+_lmvw_score.append(_lmvw_part)
+
+with _tempfile.TemporaryDirectory() as _tmpdir:
+    _mxl_path = _os.path.join(_tmpdir, "test.musicxml")
+    _lmvw_score.write("musicxml", fp=_mxl_path)
+    lmvw_words, lmvw_parts = load_mxl_vocal_words(_mxl_path)
+
+assert [w.text for w in lmvw_words] == ["go", "up", "down"], [w.text for w in lmvw_words]
+go_word = lmvw_words[0]
+assert go_word.syllables == [(0.0, 2.0, 60, "go")], go_word.syllables
+up_word = lmvw_words[1]
+assert up_word.syllables == [(2.0, 1.0, 62, "up"), (3.0, 1.0, 58, "")], up_word.syllables
+print("OK: tied same-pitch continuation merges into one extended-duration syllable "
+      f"({go_word.syllables}); slurred different-pitch continuation becomes a real second "
+      f"syllable ({up_word.syllables}); a non-contiguous untexted note (after a rest) is "
+      "correctly left unattached")
 
 print("\n--- phrasing forces a break exactly on a line_id change (even with no silence gap) ---")
 line_syls = [
@@ -2015,9 +2291,9 @@ with _tempfile.TemporaryDirectory() as root:
     assert len(list(out_dir.iterdir())) == 1, "identical mp3/video source must only be copied ONCE"
 print("OK: identical mp3_src/video_src (mp4-as-audio case) copied exactly once, both roles reference it")
 
-print("\n--- main.delete_intermediates: scoped to separated/+extracted/, leaves debug files alone ---")
+print("\n--- main.delete_work_files: deletes the entire work_dir, debug files included (intentional) ---")
 import tempfile as _tempfile_delint
-from ultrastar_generator.main import delete_intermediates as _delete_intermediates
+from ultrastar_generator.main import delete_work_files as _delete_intermediates
 with _tempfile_delint.TemporaryDirectory() as tmp:
     work_dir = Path(tmp) / ".ultrastar_work"
     (work_dir / "separated" / "htdemucs" / "song").mkdir(parents=True)
@@ -2031,18 +2307,14 @@ with _tempfile_delint.TemporaryDirectory() as tmp:
 
     _delete_intermediates(work_dir)
 
-    assert not (work_dir / "separated").exists(), "separated/ should be deleted"
-    assert not (work_dir / "extracted").exists(), "extracted/ should be deleted"
-    assert debug_log.is_file(), "debug log must survive delete_intermediates"
-    assert pass1_debug.is_file(), "pass-1 debug file must survive delete_intermediates"
-print("OK: delete_intermediates removes separated/+extracted/ but leaves debug files under work_dir alone")
+    assert not work_dir.exists(), "the whole work_dir, including debug files, should be gone"
+print("OK: delete_work_files removes the entire work_dir, debug files included")
 
-# A work_dir with no separated/extracted subfolders at all must not raise.
+# A work_dir that doesn't exist at all must not raise.
 with _tempfile_delint.TemporaryDirectory() as tmp:
-    empty_work_dir = Path(tmp) / ".ultrastar_work"
-    empty_work_dir.mkdir()
-    _delete_intermediates(empty_work_dir)  # must not raise
-print("OK: delete_intermediates on a work_dir with nothing to delete is a silent no-op")
+    missing_work_dir = Path(tmp) / ".ultrastar_work"
+    _delete_intermediates(missing_work_dir)  # must not raise
+print("OK: delete_work_files on a work_dir that doesn't exist is a silent no-op")
 
 print("\n--- usdx_parser.parse_usdx_file: round-trips usdx_writer.render_song's own grammar ---")
 from ultrastar_generator.usdx_parser import parse_usdx_file, UsdxParseError, ParsedSong
