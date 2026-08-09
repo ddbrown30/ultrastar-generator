@@ -213,7 +213,8 @@ class LrcLibSearchDialog(tk.Toplevel):
     @staticmethod
     def _label_for(c: LrcLibCandidate) -> str:
         dur = f"{int(c.duration // 60)}:{int(c.duration % 60):02d}" if c.duration else "?:??"
-        label = f"{c.track_name} - {c.artist_name}"
+        label = f"[{c.id}] " if c.id is not None else ""
+        label += f"{c.track_name} - {c.artist_name}"
         if c.album_name:
             label += f" ({c.album_name})"
         label += f" [{dur}]"
@@ -341,6 +342,11 @@ class App(tk.Tk):
         # single-song-mode only -- batch mode always auto-picks silently.
         self.pinned_lyrics: Optional[LrcLibCandidate] = None
         self.lyrics_ambiguity_prompt = tk.BooleanVar(value=False)
+        # LRCLIB numeric id override -- lets a user who browsed lrclib.net
+        # directly and confirmed a perfect match paste the id back in,
+        # bypassing search/scoring entirely for both the MXL+LRC primary
+        # path and the standard pipeline's own reference-lyrics fetch.
+        self.lrclib_id = tk.StringVar(value="")
 
         self._running = False
         self._build_widgets()
@@ -491,6 +497,13 @@ class App(tk.Tk):
         self.pinned_lyrics_label.pack(side="left", padx=8)
         self.clear_pinned_button = ttk.Button(lyrics_frame, text="Clear", command=self._on_clear_pinned_lyrics)
         Tooltip(self.clear_pinned_button, "Revert to automatic lyrics lookup for this run.")
+        ttk.Label(lyrics_frame, text="LRCLIB ID:").pack(side="left", padx=(16, 2))
+        self.lrclib_id_entry = ttk.Entry(lyrics_frame, textvariable=self.lrclib_id, width=10)
+        self.lrclib_id_entry.pack(side="left")
+        Tooltip(self.lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself, e.g. by checking "
+                                       "a linked video, and paste the id here) -- always wins over search and "
+                                       "over the pick above, no ambiguity. Used for both MXL+LRC primary "
+                                       "generation and the standard pipeline's own lyrics fetch.")
         self.lyrics_ambiguity_check = ttk.Checkbutton(
             lyrics_frame, text="Ask when lyrics are ambiguous", variable=self.lyrics_ambiguity_prompt)
         self.lyrics_ambiguity_check.pack(side="left", padx=16)
@@ -692,6 +705,32 @@ class App(tk.Tk):
             return result_holder.get("choice")
         return callback
 
+    def _make_mxl_lrc_fallback_callback(self) -> Callable[[str], bool]:
+        """Returns a callback for PipelineOptions.mxl_lrc_fallback_callback.
+        Same thread-hop shape as `_make_ambiguity_callback` (the only safe
+        pattern for a blocking dialog from the background pipeline thread):
+        `self.after(0, ...)` schedules a `messagebox.askyesno` on the main
+        thread, the background thread blocks on a `threading.Event` until
+        it's answered. Shown by default whenever the MXL+LRC quality gate
+        fails or nothing usable was found -- no separate opt-in checkbox,
+        per the user's explicit "ask what they want to do" requirement."""
+        def callback(reason: str) -> bool:
+            result_holder = {}
+            done_event = threading.Event()
+
+            def show_dialog():
+                result_holder["continue"] = messagebox.askyesno(
+                    "MXL+LRC generation unavailable",
+                    f"{reason}\n\nContinue with standard audio-based generation?",
+                    parent=self,
+                )
+                done_event.set()
+
+            self.after(0, show_dialog)
+            done_event.wait()
+            return result_holder.get("continue", False)
+        return callback
+
     # --- folder/file pickers (remember last-used folder; default to the
     # folder the program was launched from otherwise) ---------------------
 
@@ -810,7 +849,26 @@ class App(tk.Tk):
                 if (mode != "batch" and self.lyrics_ambiguity_prompt.get() and self.pinned_lyrics is None)
                 else None
             ),
+            # LRCLIB id override -- single-song-mode only, same scoping as
+            # pinned_lyrics above (a per-song override doesn't make sense
+            # across a batch run of different songs).
+            lrclib_id=self._effective_lrclib_id() if mode != "batch" else None,
+            # MXL+LRC fallback confirmation -- single-song-mode only, shown
+            # by default (no opt-in checkbox) whenever the quality gate
+            # fails, per the user's explicit "ask what they want to do".
+            # Batch mode always auto-falls-back silently with just the log
+            # warning, same convention as the lyrics ambiguity prompt above.
+            mxl_lrc_fallback_callback=self._make_mxl_lrc_fallback_callback() if mode != "batch" else None,
         )
+
+    def _effective_lrclib_id(self) -> Optional[int]:
+        raw = self.lrclib_id.get().strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
 
     def _on_run(self):
         if self._running:

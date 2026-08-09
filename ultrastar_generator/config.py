@@ -53,6 +53,18 @@ FALLBACK_BPM = 100.0
 MIN_BPM = 60.0
 MAX_BPM = 200.0
 
+# The BPM actually WRITTEN to the .txt (and used for beat-quantization at
+# write time) is this multiple of the real detected tempo -- a common
+# real-world UltraStar convention for finer beat-grid resolution (confirmed
+# directly: a real, hand-authored reference file for "When You're Good to
+# Mama" used #BPM:300 against a real detected tempo of ~178, roughly 1.7x,
+# specifically so short/dense syllables don't need much padding to reach
+# the format's 1-beat-per-note minimum). Applied only at write time --
+# pass 1's own audio analysis (note_detection.py) always uses the real,
+# undoubled tempo, since its segmentation thresholds are tuned against real
+# beat duration, not display resolution.
+BPM_WRITE_MULTIPLIER = 2
+
 # Word-level ASR model to use with faster-whisper by default. "small.en" is
 # a good accuracy/speed tradeoff on GPU; use "medium.en" or "large-v3" for
 # better lyric accuracy at the cost of more VRAM/time.
@@ -667,6 +679,54 @@ LRCLIB_DURATION_TOLERANCE_SEC = 60.0
 REFERENCE_LYRICS_MIN_MATCH_RATIO = 0.25
 
 
+# --- MXL+LRC primary generation (mxl_lrc_generator.py) ----------------------
+# Real, ground-truth-validated (2026-08-08/09 session, Chicago - "When
+# You're Good to Mama"): MXL for pitch + LRCLIB synced-lyrics line starts as
+# real-time anchors + real ASR to place words within a line beats every
+# audio-only approach tried this session -- 100% pitch-class accuracy, 99.0%
+# timing within 500ms, 92ms mean error, with ZERO CREPE/pYIN pass-1 needed.
+# Shipped as the default generation path per the user's explicit decision.
+ENABLE_MXL_LRC_PRIMARY = True
+
+# Candidate selection stays intentionally permissive (see
+# mxl_lrc_generator.py's module docstring for why) -- the real validity gate
+# is MXL_LRC_MIN_ASR_PLACEMENT_RATE below, not these upfront filters. Two
+# real wrong-recording candidates (BATB, Les Miserables - Stars) BOTH passed
+# generous duration+content filtering this session; tightening these numbers
+# would not have caught either case.
+MXL_LRC_DURATION_TOLERANCE_SEC = 15.0
+MXL_LRC_MIN_CONTENT_MATCH_RATIO = 0.3
+
+# The decisive quality gate: does our OWN audio's real transcript actually
+# agree with the matched LRC candidate's line timings? A wrong-recording
+# candidate's line timestamps don't correspond to what's really sung at
+# those moments in OUR audio, so this collapses -- a ground-truth-free
+# signal that falls out of the placement step itself. Initial conservative
+# thresholds, calibrated against this session's one real positive case
+# (Chicago: 92% ASR-placed, 2/139 non-monotonic fixes) -- real negative-case
+# validation (BATB/Stars) is this feature's own launch verification, not
+# assumed; revisit these numbers if that validation suggests otherwise.
+MXL_LRC_MIN_ASR_PLACEMENT_RATE = 0.5
+MXL_LRC_MAX_NONMONOTONIC_RATE = 0.1
+
+# A text match alone isn't enough to trust an ASR word's timestamp -- real
+# case found this session: 'hen' text-matched correctly but whisperx's own
+# alignment confidence was 0.003 (essentially "no idea"), and its timestamp
+# was genuinely wrong (0.77s off) as a result, independent of any
+# beat-quantization issue. Below this confidence, a match is treated as if
+# it never happened (falls through to the MXL-tempo-estimated placement
+# below) rather than trusting a low-confidence position blindly. Matches
+# this project's own existing "LOW SCORE" convention for flagging whisperx
+# output (transcription.py's debug logging uses the same 0.3 cutoff).
+MXL_LRC_MIN_ASR_WORD_CONFIDENCE = 0.3
+
+# Default real-seconds-per-quarter-note rate used to estimate a fallback
+# word's own duration from its MXL note value when NO local tempo anchor
+# is available at all (should be rare -- every line has its own LRC-based
+# (t0, t1) window to derive a rate from; this is a last-resort floor).
+MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3
+
+
 @dataclass
 class PipelineOptions:
     """Every knob `run_pipeline`/`run_batch` (main.py) need, decoupled from
@@ -730,3 +790,17 @@ class PipelineOptions:
     pinned_lyrics: Optional["LrcLibCandidate"] = None
     lyrics_ambiguity_prompt: bool = False
     lyrics_disambiguation_callback: Optional[Callable[[List[Any]], Optional[Any]]] = None
+    # MXL+LRC primary generation path -- see mxl_lrc_generator.py.
+    # `lrclib_id`, if set, always wins over both search AND `pinned_lyrics`
+    # for candidate selection everywhere a candidate is needed (this new
+    # path AND the old reference-lyrics-fetch step) -- resolved once, early,
+    # in main.py via lyrics_lookup.fetch_lrclib_by_id.
+    mxl_lrc_primary: bool = ENABLE_MXL_LRC_PRIMARY
+    lrclib_id: Optional[int] = None
+    # GUI-only, never set by the CLI (which always auto-falls-back with just
+    # a warning log, same convention as every other non-interactive CLI/
+    # batch decision in this codebase). Called with the failure reason when
+    # the MXL+LRC quality gate fails or nothing usable was found; True
+    # continues with the standard audio-based fallback, False cancels the
+    # whole run.
+    mxl_lrc_fallback_callback: Optional[Callable[[str], bool]] = None

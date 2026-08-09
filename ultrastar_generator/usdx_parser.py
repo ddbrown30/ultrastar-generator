@@ -93,7 +93,18 @@ def parse_usdx_file(path: Path) -> ParsedSong:
         raise UsdxParseError(f"Invalid #GAP value: {tags['GAP']!r}")
 
     entries: List[Union[Syllable, LineBreak]] = []
-    is_first_syllable_overall = True
+    # A word's FIRST syllable is forced word-start=True whenever there's no
+    # preceding word to separate it from -- the very first syllable in the
+    # whole file, OR the first syllable right after a line break. A line
+    # break already establishes the word boundary visually/semantically, so
+    # real files routinely omit the leading space on a line's first word
+    # (confirmed on a real file: "- 48" / ": 57 2 4 Keep" with no leading
+    # space) -- relying on text.startswith(" ") alone silently merged that
+    # word onto the END of the PREVIOUS line's last word instead ("idol" +
+    # "Keep" + "ing" -> one bogus "idolkeeping" token), corrupting every
+    # downstream word-level comparison (verify_existing_song, the
+    # --existing-txt-check feature) for any file authored this way.
+    force_word_start = True
     for line in note_lines:
         m = _NOTE_RE.match(line)
         if m:
@@ -102,11 +113,10 @@ def parse_usdx_file(path: Path) -> ParsedSong:
             start = beat_to_seconds(start_beat, gap_ms, bpm)
             end = beat_to_seconds(start_beat + length_beats, gap_ms, bpm)
             # A new word's text starts with a literal space (usdx_writer's own
-            # convention, see render_song) -- except the very first syllable
-            # in the whole file, which never gets one since there's no
-            # preceding word to separate it from.
-            is_word_start = text.startswith(" ") or is_first_syllable_overall
-            is_first_syllable_overall = False
+            # convention, see render_song) -- except when nothing precedes it
+            # to separate it from (see force_word_start above).
+            is_word_start = text.startswith(" ") or force_word_start
+            force_word_start = False
             entries.append(Syllable(
                 text=text.strip(), start=start, end=end, midi_note=pitch,
                 is_word_start=is_word_start, note_type=note_type,
@@ -118,6 +128,7 @@ def parse_usdx_file(path: Path) -> ParsedSong:
             start = beat_to_seconds(int(start_beat), gap_ms, bpm)
             end = beat_to_seconds(int(end_beat), gap_ms, bpm) if end_beat is not None else None
             entries.append(LineBreak(start=start, end=end))
+            force_word_start = True
             continue
         raise UsdxParseError(f"Malformed note/break line: {line!r}")
 

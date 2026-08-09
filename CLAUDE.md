@@ -2058,6 +2058,384 @@ asked" convention as the rest of this session's work.
    ambiguity-prompt path's `initial_candidates` correctly skips the
    redundant auto-search while keeping the fields usable.
 
+## MXL + synced-lyrics as a PRIMARY source (not just a correction pass) --
+## multi-vocal-harmony prototype, "KPop Demon Hunters - Your Idol" (2026-08-08)
+
+Exploratory prototype (not yet wired into the real pipeline -- lives as a
+scratchpad script, not committed code) for songs where audio pitch
+detection and ASR transcription are BOTH unreliable: multi-singer/harmony
+tracks where several voices overlap, so pass 1 can't isolate one melody
+and Whisper can't reliably transcribe "the" lyric at a given moment.
+`sandbox/KPop Demon Hunters - Your Idol` (group K-pop harmony song) was
+added specifically as a hard test case. Idea: an MXL with each vocal part
+on its own staff, combined with LRCLIB synced (per-line-timestamped)
+lyrics, can supply pitch+timing+text directly, without touching pass-1
+audio analysis or ASR at all (beyond, potentially, a light cross-check
+role for confirming timing -- not needed for this prototype in the end).
+
+**Design that worked**: the MXL had a `Solo` part -- a PRE-CONSOLIDATED
+"whichever voice is lead right now" reduction across the song's 6 parts
+(Solo/Soprano/Alto/Tenor/Baritone/Bass), confirmed by direct comparison
+against the reference `.txt`. Calibration: group `Solo`'s notes into
+lines (gap-threshold heuristic), match those lines against LRCLIB's
+synced lines via `lrc_timing.py`'s own `_match_lines_word_level` (already
+built, reused directly), then fit a robust (Theil-Sen) linear map from
+LRC real-seconds to MXL quarter-note offset. The fitted tempo scale
+landed within 0.15% of the MXL's own declared tempo (90 BPM) --
+confirming the notated tempo genuinely matches the recording, at least
+for a single continuous take.
+
+**Real, load-bearing bug found and fixed along the way (`usdx_parser.py`,
+already shipped, unrelated to this song specifically)**: `is_word_start`
+detection only special-cased the very first syllable of the WHOLE FILE,
+not the first syllable after a line break. Any externally-authored file
+(this reference `.txt` throughout) that omits the redundant leading
+space on a line's first word -- a real, valid, common convention, since
+the line break itself already marks the boundary -- got that word
+silently merged onto the END of the previous line's last word ("idol" +
+"Keeping" -> "idolkeeping"). This corrupted word-level comparisons
+project-wide (`verify_existing_song`, the `--existing-txt-check`
+feature), not just this investigation. Fixed with a `force_word_start`
+flag reset after every `LineBreak`; regression test added
+(`test_dry_run.py`). Recovered 42 previously-invisible matched words in
+this one reference file alone (199 -> 241).
+
+**A genuine structural discovery, not a bug**: the local audio
+(116.4s) turned out to be a SHORTENED edit of a longer official
+recording (~184-192s) that both the MXL and every available LRCLIB
+synced-lyrics candidate describe (confirmed: all 20 LRCLIB search
+results for this song are the SAME full-length transcript, just
+re-uploaded with inconsistent/unreliable duration metadata -- picking
+the "closest reported duration" was actively misleading). This meant a
+single global linear calibration broke down partway through: content
+maps cleanly onto the full-length timeline throughout (confirmed via a
+`mxl_offset - a_declared*lrc_time` consistency check spanning the WHOLE
+song), but a real ~52-second chunk (a second chorus-repeat pass, MXL
+Solo-part offset 147.5-226.0, "...jonjaehaneun aidol" through "Be your
+idol") simply isn't sung in the shorter edit at all. Fixed with a
+THREE-segment piecewise calibration (main fit / a separately-anchored
+verse-2b sub-segment, since it had too few/weak MXL<->LRC anchors of its
+own due to a Korean-script-vs-Latin-transliteration normalization
+mismatch / a separately-anchored post-cut segment), each segment
+anchored directly to precise reference timestamps rather than
+extrapolated from the main fit past its own real anchor support --
+extrapolating ~36 quarter notes past the last real anchor was confirmed
+to compound real drift error (a ~10.5 second discontinuity, caught via a
+"are the output times still monotonic" sanity check, which is worth
+keeping as a standing check for this whole technique going forward).
+
+**A real methodology trap, confirmed the hard way, worth remembering for
+any future use of `verify_existing_song`-style comparisons**: a first
+pass at fixing the piecewise calibration LOOKED validated (100% timing
+agreement after a constant-offset correction) but was actually silently
+comparing the WRONG pair of words -- the automated word-level matcher
+paired the reference's real verse-2b "idol" against a DIFFERENT "idol"
+from "Be your idol" (a different part of the song entirely), because
+difflib's whole-sequence matcher prefers an EXACT text match ("idol")
+over a close-but-imperfect one ("aidol", the MXL's own rendering of that
+same word) even when the exact match is structurally the wrong instance.
+This is the same repeated-phrase/near-duplicate-text failure class that
+already bit this investigation twice before (the reference-vs-full-LRC
+diff, and the original "one big 61-second cut" misdiagnosis that turned
+out to be a different, smaller, differently-located cut once checked
+directly against real word timestamps rather than trusting the
+automated diff). **Lesson: when a text-based comparison's own aggregate
+stats look suspiciously clean right after a fix, directly print/inspect
+a few individual computed values (not just the comparison's own summary)
+before trusting it** -- confirmed real this session, not hypothetical.
+
+**Honest final numbers for this song, after the fix (not the inflated
+pre-fix numbers)**: pitch-class accuracy 76.7% (n=210 matched words,
+all surviving the repeat-instance guard -- up from 182 before, since the
+fix removed spurious timing inconsistency that had been getting some
+real matches excluded), timing only ~70% within 500ms even after a
+drift-aware (offset+slope) correction, mean residual ~460ms. Zero
+non-monotonic transitions (the structural correctness bar). **Not yet
+resolved**: whether the remaining timing imprecision and broadly-spread
+(not concentrated) pitch mismatches reflect a real MXL data-quality
+limit for parts of this song, or an anchoring weakness in how verse-2b/
+the post-cut segment were each pinned to a single local delta point
+rather than a fitted trend. Deliberately not chased further this
+session -- see the "reflective" answer below on why, and CLAUDE.md's own
+established pattern of not over-investing in one song's precision before
+checking general viability elsewhere.
+
+**Could this cut have been found without the reference file?** Yes, in
+principle, via signals available from audio+MXL+LRC alone, discussed
+directly with the user: (1) the MXL's own total notated span (~184s) and
+LRCLIB's own last timestamp (~181s) both being dramatically longer than
+the real local audio (116.4s) is a cheap, always-available red flag that
+a single global linear fit shouldn't be trusted blindly; (2) the
+ORIGINAL single-fit's own residuals (up to 8.38 quarter notes, vs ~1
+typical) already contained the discontinuity signal -- plotting residual
+vs. position (exactly what eventually solved this, just using the
+reference instead) would have shown the same flat-then-jump-then-flat
+pattern directly from the MXL/LRC anchor data, no ground truth needed,
+matching this project's own established `lrc_timing.py` experience
+finding real discrete-step (not smooth-drift) discontinuities from
+matching data alone. What genuinely required something anchored to OUR
+OWN audio specifically (a reference file here; a real ASR pass on our
+own audio in the general case) was pinning down the PRECISE real-audio
+timestamp of the cut boundary and disambiguating repeated sections --
+neither MXL nor LRC alone "knows" about a particular edit's own timing.
+
+**Follow-up, same day**: the user located and added
+`sandbox/KPop Demon Hunters - Your Idol(Long)/`, containing audio that
+actually matches the MXL/LRC's full-length timeline directly (no cut to
+work around) -- the short-edit reference used above was moved alongside
+it as `Short version.txt` (no longer a full ground-truth match, but
+still useful for partial pitch/timing spot-checks). **Picking this back
+up (the long-audio folder, building this into a real reusable "MXL +
+synced-lyrics only" pipeline mode, and revisiting the open timing/pitch
+precision questions above) is intentionally DEFERRED** -- the next
+concrete step taken instead was checking general viability first: does
+this same MXL+LRC-only technique work well on a SIMPLER, already-well-
+characterized song (BATB) compared against its own trusted SingStar
+ground truth, before investing further in this specific hard case.
+
+**BATB general-viability check, same day -- a much stronger result,
+still a scratchpad prototype, not wired into the real pipeline.** BATB's
+MXL has only ONE lyric-bearing part (no multi-voice harmony to
+disentangle -- a much simpler case than the KPop song), and its LRCLIB
+synced-lyrics candidate (Angela Lansbury) matched our own audio's real
+content and duration directly, no structural cut this time.
+
+- **Coverage: 112/113 ground-truth words matched (99%).**
+- **Pitch-class accuracy: 100%** (112/112, after a simple constant
+  pitch-class calibration -- the MXL turned out to be transposed +2
+  semitones from the recording, the SAME well-established phenomenon
+  `musicxml_reference.py`'s own pass 4 already calibrates for; every
+  single mismatch before calibration was off by exactly +2 semitones,
+  confirming it's a clean transposition, not scattered noise). This
+  matches or exceeds this project's best-ever audio-based pitch accuracy
+  for ANY song, using ZERO audio pitch detection at all.
+- **Timing: capped at ~37% within 500ms**, and did NOT meaningfully
+  improve after two real attempts to add more calibration anchors: (1)
+  BATB's MXL has almost no rests between phrases (confirmed: only 13
+  inter-word gaps > 0.05 quarter notes in the WHOLE song), so the
+  gap-based line-grouping that worked for the KPop harmony song
+  literally can't recover fine-grained line structure here -- it
+  collapsed up to 4 real LRC lines into one MXL "line" block, leaving
+  only 8 usable anchors; (2) switching to direct word-level matching
+  (MXL's flat word sequence vs. LRC's flat word sequence, keeping only
+  anchors where the matched LRC word is its own line's FIRST word, to
+  avoid the "any word inherits its whole line's start timestamp" slop)
+  recovered more real anchors (27, one rejected as a wrong-repeat-
+  instance outlier -- BATB's chorus repeats 3-4x) but did NOT improve
+  the fit's own residual (stayed ~0.53 quarter notes / ~37% timing
+  agreement either way). **Not yet resolved**: whether this ~0.5s-level
+  ceiling reflects genuine LRC per-line timestamp imprecision, real
+  ballad rubato a purely linear MXL-offset-to-time map can't capture, or
+  something else -- not chased further this session, flagged as the
+  concrete next question if this technique is picked back up, alongside
+  the still-open KPop-side questions above.
+
+  **Follow-up, same day, user-prompted (caught a real methodology gap):
+  the LRCLIB candidate used had a duration (165.0s) ~29s longer than our
+  real audio (135.79s) -- the exact same duration-mismatch red flag
+  already documented above as worth checking (KPop thread), but it
+  wasn't actually checked before running this BATB test.** Investigated
+  properly rather than assuming it away: (1) searched more broadly (plain
+  artist/title query, plus a free-text `q` search) for any LRCLIB
+  candidate closer to 135.79s -- found one, "Beauty and the Beast
+  (Finale)" (Audra McDonald/Emma Thompson/Ensemble, 134.0s, only 1.8s
+  off), but fetching its full synced lyrics showed it's a DIFFERENT
+  arrangement entirely (the 2017 live-action remake's finale reprise --
+  "Tune as old as song / Bittersweet and strange / Finding you can
+  change / Learning you were wrong", no "barely even friends" verse at
+  all) -- a coincidental duration match on the wrong song variant, not a
+  real candidate. Every LRCLIB entry that's actually the right
+  (Angela Lansbury / classic animated) arrangement clusters tightly at
+  163-168s, confirmed across 40 unique candidates from three different
+  search queries -- no close-duration match exists for the right song.
+  (2) Dumped the actual LRC line content directly: the ~29s difference
+  is a spoken/sung EPILOGUE ("Off to the cupboard, with you now, chip /
+  It's past your bedtime / Goodnight, love", LRC-timed 137.68-143.48s,
+  track continuing to 165.0s total) that the full studio recording has
+  and our shorter SingStar-sourced audio does not. (3) Confirmed directly
+  that this never touched the actual test: the MXL score's own LAST word
+  is "Beauty and the Beast" at offset 164.0 (its final reprise line, not
+  the epilogue), matching our ground truth's own last word ("Beast" at
+  129.9-132.1s) exactly -- neither the MXL nor our audio/ground truth
+  ever included the epilogue in the first place, so it was never a
+  candidate anchor and never could have corrupted the fit.
+  **Conclusion: the duration mismatch is real but fully explained and
+  benign for this song** -- unlike KPop's genuine mid-song structural
+  cut, this is just a trailing bonus passage neither side was trying to
+  align on. The ~37% timing-within-tolerance shortfall remains
+  unexplained by this check and is still a real, separate open question.
+
+## MXL+LRC as the default generation path (2026-08-09)
+
+Ships the technique explored in the previous session's "MXL + synced-
+lyrics as a PRIMARY source" thread as the **default generation path**,
+per the user's explicit decision, with a quality-gated automatic
+fallback to the existing audio-only pass 1-4 pipeline. New module
+`mxl_lrc_generator.py`; wired into `main.py`'s `_run_pipeline_body`
+right after transcription (moved earlier in the function specifically
+so this path can reuse it) and before pass 1 -- **when this path
+succeeds, pass 1 (CREPE/pYIN), the old reference-lyrics-correction step,
+pass 3, and pass 4 are all skipped entirely**, since MXL supplies pitch
+directly and there's no pass-1 note grid to fit words onto.
+
+### Design (validated in three iterations against real ground truth)
+
+1. Single global linear fit (MXL quarter-note offset -> real seconds,
+   calibrated against the LRC candidate's own line timestamps): 39.5%
+   of words landed within 500ms of ground truth. Root cause: the MXL
+   score has real, human-marked tempo-region changes ("Lower Tempo" /
+   "Moderato, in 2") a single constant-tempo assumption can't capture.
+2. Per-LRC-line proportional placement (trust each LRC line's own start
+   as a hard anchor, distribute that line's MXL words proportionally
+   between it and the next line's start): 56.0%. Line starts ARE
+   reliable; individual word-level pacing within a line still doesn't
+   track a real singer's local rubato against the MXL's fixed relative
+   note durations.
+3. **Shipped design**: trust LRC line starts as hard anchors, but place
+   words WITHIN a line using REAL transcription of our own audio
+   (`place_words_via_asr`, order-preserving match against ASR words
+   whose own timestamp falls inside that line's window), falling back
+   to proportional-by-MXL-offset placement only for words ASR doesn't
+   confidently catch. Real result (Chicago - "When You're Good to
+   Mama", vs a real pre-existing SingStar-style ground-truth `.txt`):
+   **100% pitch-class accuracy, 99.0% timing within 500ms, 105ms mean
+   error** -- with ZERO audio-only pitch detection.
+
+### Candidate-selection lesson: duration+content matching is not enough
+
+Two real songs (BATB, Les Miserables - Stars) both had an LRCLIB
+candidate that passed generous duration AND text-content filtering
+while being timed to a genuinely DIFFERENT recording/performance --
+confirmed independently for both (Stars: the only available candidate
+was the 10th Anniversary Concert, not the OBC the user's audio actually
+is; every "different duration" LRCLIB entry for that song turned out to
+share the identical underlying timing data, just re-uploaded under
+different, often-wrong duration metadata). Tightening the upfront
+filters would not have caught either case -- they were clean matches by
+every upfront metric available.
+
+The fix that actually works: **the quality gate is downstream, not
+upfront**. `generate_from_mxl_and_lrc` always attempts the full
+placement, then gates on `MxlLrcQuality.asr_placement_rate` --
+`config.MXL_LRC_MIN_ASR_PLACEMENT_RATE` (0.5) -- the fraction of MXL
+words that could be confidently matched against OUR OWN real audio's
+ASR transcript. A wrong-recording candidate's LRC line timestamps don't
+correspond to what's actually sung in our audio at those moments, so
+this collapses on its own -- a ground-truth-free signal that falls out
+of the placement step for free. **Real validation**: re-ran BATB and
+Stars through the actual shipped pipeline -- both correctly hit the
+gate (7% and 19% match rate respectively, vs the 50% bar), logged a
+clear warning, and fell through cleanly to the standard pass 1-4
+pipeline, which completed successfully with no regression.
+
+### Real bugs found and fixed while validating through the ACTUAL WRITTEN FILE
+
+The three-iteration validation above compared in-memory `Syllable`
+floats directly against ground truth -- it never called
+`write_song`/`render_song`. Running the same technique through the real
+CLI (which necessarily serializes to integer beats) initially dropped
+Chicago's real-file accuracy to 24.5% despite the in-memory numbers
+being unchanged -- a real gap in how this was validated, not a
+contradiction of the earlier numbers. Root-caused and fixed, in order:
+
+1. **A word's own duration was always stretched to fill the ENTIRE gap
+   to the next word**, with zero representation of a real pause between
+   words. Confirmed directly: `'hen.'` got a 3.124s duration (real: 1.55s,
+   with a genuine ~0.55s rest before "I") and `'The'` got 7.114s. This
+   also directly caused a real collision: an OCR-garbled MXL word
+   (`'systern'`, never text-matches "system") fell back to a proportional
+   placement that coincidentally landed on the EXACT same timestamp as
+   the next word's real ASR match, producing a genuine zero-duration
+   word -- the actual trigger for `usdx_writer.py`'s minimum-1-beat
+   padding to compound forward with nowhere to reset. Fixed in
+   `place_words_via_asr`/`build_syllables`: a word's END now comes from
+   the ASR's own reported end (for a trusted match) or from the word's
+   own MXL note value times a locally-calibrated real-seconds-per-
+   quarter-note rate (derived from the enclosing LRC line's own
+   `(t0, t1)` window and MXL offset span) -- clamped to never exceed the
+   next word's own start, but free to end EARLIER, leaving a real rest.
+2. **ASR confidence was never checked.** `'hen'` text-matched correctly,
+   but whisperx's own alignment confidence was 0.003 (effectively "no
+   idea"), and the resulting timestamp was genuinely wrong (0.77s off) --
+   independent of anything else. Fixed: a match is only trusted if it
+   clears `config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE` (0.3, matching this
+   project's existing "LOW SCORE" convention in `transcription.py`'s own
+   debug logging); below that, it's treated as no match at all and falls
+   through to the MXL-tempo-estimated placement/duration above.
+3. **The written BPM was too coarse for MXL-derived syllable density.**
+   A real, hand-authored reference file for the SAME song used
+   `#BPM:300` against a real detected tempo of ~178 -- confirmed this is
+   deliberate real-world practice (finer beat-grid resolution), not a
+   coincidence: only 2/209 of that reference's own words are shorter
+   than its own beat. Shipped as `config.BPM_WRITE_MULTIPLIER = 2`,
+   applied to `main.py`'s `write_bpm` (used for `Song.bpm` and the
+   pass-1 debug file) but deliberately NOT to the `bpm` passed into
+   `detect_notes()` -- pass 1's own segmentation thresholds are tuned
+   against real beat duration, not display resolution, so this is a
+   write-time-only change, applied to ALL songs (not just this path).
+
+A four-attempt-then-revert side note, kept for anyone revisiting this:
+directly changing `usdx_writer.py`'s own occupied-until chaining (to
+stop a padded note's display length from propagating drift forward)
+was tried first, broke an existing regression test protecting a real,
+legitimate dense-melisma case (the "Stars" `sword`/continuation-notes
+scenario), and was reverted. That tension is real: for genuinely dense
+input, SOME compounding is unavoidable at a fixed beat resolution
+without a much bigger redesign of the shared writer. The three fixes
+above resolve it a different way -- reduce how often pathologically
+short/zero-duration notes get GENERATED in the first place, rather than
+changing how the (correct, shared, still-tested-as-is) writer handles
+them once they exist.
+
+**Real end-to-end re-validation after all three fixes**, same Chicago
+ground truth, through the actual written file this time: 100%
+pitch-class, **99.0% timing within 500ms, 105ms mean / 77ms median
+error** -- one single remaining outlier (`'hen'` itself, whose
+MXL-tempo-estimated fallback isn't perfect for that one word, but no
+longer cascades into anything else).
+
+### Candidate override: LRCLIB numeric id
+
+`lyrics_lookup.LrcLibCandidate` gained an `id` field (previously
+silently discarded from the raw API response); new
+`fetch_lrclib_by_id(id)` fetches one specific entry directly
+(`/api/get/<id>`). New `--lrclib-id <id>` CLI flag and a matching
+"LRCLIB ID" GUI field (next to "Search Lyrics...", shows `[id]` in the
+search dialog's own results too) let a user who browsed lrclib.net
+themselves and confirmed a perfect match (e.g. against a linked video)
+paste the id back in directly -- always wins over both search and the
+GUI's own pre-pin, for both this path and the old reference-lyrics-fetch
+step (resolved once, early, in `main.py`).
+
+### Fallback UX
+
+CLI: never interactive -- always logs a clear `WARNING:` with the
+concrete reason and proceeds with the standard pipeline, same
+convention as every other non-interactive CLI/batch decision in this
+codebase. GUI (single-song mode only, never batch): a
+`messagebox.askyesno`-style prompt fires by default whenever the gate
+fails or nothing usable was found (`_make_mxl_lrc_fallback_callback`,
+structurally identical to the existing `_make_ambiguity_callback`
+thread-hop pattern -- `self.after(0, ...)` + `threading.Event`) --
+Continue falls through to the standard pipeline, Cancel aborts the
+whole run. No opt-in checkbox; shown by default per the user's explicit
+"ask what they want to do" instruction. Both the wiring and the real
+cross-thread dialog behavior (background thread blocks, main thread
+answers, background thread receives the answer) were verified against
+the real `App`, not mocked.
+
+### Config
+
+`config.ENABLE_MXL_LRC_PRIMARY = True` (new default). Candidate
+selection: `MXL_LRC_DURATION_TOLERANCE_SEC = 15.0`,
+`MXL_LRC_MIN_CONTENT_MATCH_RATIO = 0.3` (deliberately permissive -- see
+above). Quality gate: `MXL_LRC_MIN_ASR_PLACEMENT_RATE = 0.5`,
+`MXL_LRC_MAX_NONMONOTONIC_RATE = 0.1`. Word-duration fixes:
+`MXL_LRC_MIN_ASR_WORD_CONFIDENCE = 0.3`,
+`MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3` (last-resort floor when no
+local tempo anchor exists at all). `BPM_WRITE_MULTIPLIER = 2` (general,
+not scoped to this path).
+
 ## Environment notes
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.

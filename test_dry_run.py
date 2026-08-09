@@ -662,15 +662,20 @@ class _FakeRequestsModule:
     """Deterministic fake for the `requests` module -- lyrics_lookup.py
     does `import requests` lazily inside each fetch function, so
     installing this in sys.modules before calling is enough."""
-    def __init__(self, search_payload=None, search_status=200, ovh_payload=None, ovh_status=200):
+    def __init__(self, search_payload=None, search_status=200, ovh_payload=None, ovh_status=200,
+                 get_by_id_payload=None, get_by_id_status=200):
         self.search_payload = search_payload
         self.search_status = search_status
         self.ovh_payload = ovh_payload
         self.ovh_status = ovh_status
+        self.get_by_id_payload = get_by_id_payload  # a single dict, for /api/get/<id> -- distinct
+        self.get_by_id_status = get_by_id_status     # shape from /api/search's list response
         self.urls_requested = []
 
     def get(self, url, params=None, timeout=None):
         self.urls_requested.append(url)
+        if "lrclib.net/api/get/" in url:
+            return _FakeLRCLIBResponse(self.get_by_id_payload, self.get_by_id_status)
         if "lrclib.net" in url:
             return _FakeLRCLIBResponse(self.search_payload, self.search_status)
         return _FakeLRCLIBResponse(self.ovh_payload, self.ovh_status)
@@ -795,6 +800,120 @@ assert fallback_result is not None and fallback_result.source == "lyrics.ovh", f
 assert fallback_result.plain_lyrics == "fallback lyrics text", fallback_result
 print("OK: empty LRCLIB search result correctly fell back to lyrics.ovh")
 del _sys.modules["requests"]
+
+print("\n--- lyrics_lookup: id threads through search_lrclib, and fetch_lrclib_by_id fetches directly ---")
+from ultrastar_generator.lyrics_lookup import fetch_lrclib_by_id
+id_candidates = [
+    {"id": 111, "trackName": "Song", "artistName": "Artist", "duration": 100,
+     "instrumental": False, "plainLyrics": "words", "syncedLyrics": None},
+]
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=id_candidates)
+searched = search_lrclib("Artist", "Song")
+assert len(searched) == 1 and searched[0].id == 111, searched
+print("OK: search_lrclib now captures LRCLIB's own numeric id (previously silently discarded)")
+
+_sys.modules["requests"] = _FakeRequestsModule(get_by_id_payload={
+    "id": 37066985, "trackName": "When You're Good to Mama", "artistName": "Taye Diggs/Queen Latifah",
+    "albumName": "Chicago", "duration": 200.0, "instrumental": False,
+    "plainLyrics": "words", "syncedLyrics": "[00:01.00]line one",
+})
+by_id = fetch_lrclib_by_id(37066985)
+assert by_id is not None and by_id.id == 37066985 and by_id.track_name == "When You're Good to Mama", by_id
+assert by_id.synced_lyrics == "[00:01.00]line one", by_id
+print("OK: fetch_lrclib_by_id fetches ONE specific entry directly, bypassing search/scoring")
+
+_sys.modules["requests"] = _FakeRequestsModule(get_by_id_status=404, get_by_id_payload=None)
+missing = fetch_lrclib_by_id(999999999)
+assert missing is None, missing
+print("OK: fetch_lrclib_by_id returns None on a non-200 response (bad/missing id), never raises")
+del _sys.modules["requests"]
+
+print("\n--- mxl_lrc_generator: MXL for pitch + LRC line anchors + ASR word placement ---")
+from ultrastar_generator.mxl_lrc_generator import (
+    MxlWord, assign_words_to_lines, place_words_via_asr, build_syllables,
+    MxlLrcQuality, config as mxl_lrc_config,
+)
+from ultrastar_generator.models import Word as _Word
+
+# A tiny two-line "song": line 0 "hello world", line 1 "good bye now".
+mlg_words = [
+    MxlWord(text="hello", norm="hello", offset=0.0, syllables=[(0.0, 1.0, 64, "hello")]),
+    MxlWord(text="world", norm="world", offset=1.0, syllables=[(1.0, 1.0, 65, "world")]),
+    MxlWord(text="good", norm="good", offset=4.0, syllables=[(4.0, 1.0, 67, "good")]),
+    MxlWord(text="bye", norm="bye", offset=5.0, syllables=[(5.0, 1.0, 69, "bye")]),
+    MxlWord(text="now", norm="now", offset=6.0, syllables=[(6.0, 1.0, 71, "now")]),
+]
+mlg_lrc_lines = [(10.0, "hello world"), (20.0, "good bye now")]
+
+word_lines = assign_words_to_lines(mlg_words, mlg_lrc_lines)
+assert word_lines == [0, 0, 1, 1, 1], word_lines
+print("OK: assign_words_to_lines correctly tags each word with its own LRC line index")
+
+# ASR confidently catches "hello"/"world"/"bye" at real times close to (but not
+# exactly at) the printed line starts; "good" and "now" are missing from ASR
+# entirely (must fall back to proportional placement within their own line).
+mlg_asr = [
+    _Word(text="hello", start=10.2, end=10.5),
+    _Word(text="world", start=10.6, end=10.9),
+    _Word(text="bye", start=20.5, end=20.8),
+]
+starts, ends, quality = place_words_via_asr(mlg_words, word_lines, mlg_lrc_lines, mlg_asr)
+assert starts[0] == 10.2 and starts[1] == 10.6, starts  # ASR-placed
+assert starts[3] == 20.5, starts                         # ASR-placed ("bye")
+assert 20.0 <= starts[2] <= starts[3], starts             # "good" fell back, proportional, before "bye"
+assert starts[4] >= starts[3], starts                     # "now" fell back, still after "bye"
+assert quality.n_asr_placed == 3 and quality.n_fallback == 2, quality
+assert quality.asr_placement_rate == 3 / 5
+# ENDs for ASR-matched words use the ASR's OWN reported duration directly --
+# NOT stretched to the next word's start (the real "hen."/3.1s, "The"/7.1s
+# bug this was built to fix).
+assert abs(ends[0] - 10.5) < 1e-9, ends[0]   # "hello" keeps its own 0.3s ASR duration
+assert abs(ends[1] - 10.9) < 1e-9, ends[1]   # "world" keeps its own 0.3s ASR duration, doesn't reach "good" (20.0)
+print("OK: place_words_via_asr uses real ASR timestamps AND durations where confidently matched (never "
+      "stretching a word across what should be a real rest), falls back to MXL-note-value/local-tempo "
+      "estimated placement and duration otherwise")
+
+# Confidence gating: a text match with LOW confidence must be treated as no
+# match at all (real case this was built for: a 0.003-confidence match had a
+# genuinely wrong timestamp, independent of anything else in the pipeline).
+low_conf_asr = [
+    _Word(text="hello", start=10.2, end=10.5, confidence=0.9),
+    _Word(text="world", start=10.6, end=10.9, confidence=0.05),  # text matches, but confidence too low to trust
+]
+lc_starts, lc_ends, lc_quality = place_words_via_asr(mlg_words[:2], [0, 0], mlg_lrc_lines, low_conf_asr)
+assert lc_starts[0] == 10.2, lc_starts             # trusted (high confidence)
+assert lc_starts[1] != 10.6, lc_starts             # NOT trusted -- fell back instead of using the low-confidence match
+assert lc_quality.n_asr_placed == 1 and lc_quality.n_fallback == 1, lc_quality
+print("OK: a text match below MXL_LRC_MIN_ASR_WORD_CONFIDENCE is treated as unmatched, not trusted blindly")
+
+# Non-monotonic clamp: a deliberately out-of-order ASR match must not produce
+# a backward jump in the final output.
+bad_asr = [
+    _Word(text="hello", start=10.2, end=10.5),
+    _Word(text="world", start=9.6, end=9.9),  # earlier than "hello" -- wrong/out of order (still inside the window)
+]
+bad_starts, bad_ends, bad_quality = place_words_via_asr(mlg_words[:2], [0, 0], mlg_lrc_lines, bad_asr)
+assert bad_starts[1] >= bad_starts[0], bad_starts
+assert bad_quality.non_monotonic_fix_count == 1, bad_quality
+print("OK: an out-of-order ASR match gets clamped to non-decreasing order, and counted for the quality gate")
+
+syllables_out = build_syllables(mlg_words, starts, ends, word_lines)
+assert len(syllables_out) == 5
+assert syllables_out[0].line_id == 0 and syllables_out[2].line_id == 1
+assert all(syllables_out[i].start <= syllables_out[i + 1].start for i in range(4))
+print("OK: build_syllables tags line_id from assign_words_to_lines and produces monotonic syllable starts")
+
+print("\n--- mxl_lrc_generator: quality gate correctly rejects a wrong-recording-style result ---")
+# Mirrors the real BATB/Stars failure this session found: a candidate that
+# passes duration+content filtering but whose LRC line timings don't
+# correspond to what our own audio actually says -- ASR barely matches.
+n_words_gate = 10
+low_quality = MxlLrcQuality(n_words=n_words_gate, n_asr_placed=2, n_fallback=8, non_monotonic_fix_count=0)
+assert low_quality.asr_placement_rate < mxl_lrc_config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
+high_quality = MxlLrcQuality(n_words=n_words_gate, n_asr_placed=9, n_fallback=1, non_monotonic_fix_count=0)
+assert high_quality.asr_placement_rate >= mxl_lrc_config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
+print("OK: MxlLrcQuality.asr_placement_rate correctly separates a low-confidence (wrong-recording-style) "
+      "result from a high-confidence one, against the real shipped threshold")
 
 print("\n--- phrasing forces a break exactly on a line_id change (even with no silence gap) ---")
 line_syls = [
@@ -1881,6 +2000,34 @@ line_breaks = [e for e in parsed.entries if isinstance(e, LineBreak)]
 assert len(line_breaks) == 1 and abs(line_breaks[0].start - 2.0) < 0.06
 print("OK: parse_usdx_file round-trips render_song's own output exactly (text, pitch, word-starts, "
       "timing within one beat's quantization)")
+
+print("\n--- usdx_parser.parse_usdx_file: a line's first word with NO leading space (a real, valid "
+      "external-file convention -- the line break itself already marks the word boundary) still "
+      "gets is_word_start=True, not silently merged onto the previous line's last word ---")
+with _tempfile.TemporaryDirectory() as d:
+    real_world_path = Path(d) / "Test Artist - Real World Convention.txt"
+    # Mirrors a real confirmed case: "- 48" / ": 57 2 4 Keep" (no leading
+    # space on "Keep", even though it's a genuine new word right after the
+    # line break) -- external authoring tools commonly omit the redundant
+    # leading space here, unlike this project's own render_song (which
+    # always includes it, see usdx_writer.py).
+    real_world_path.write_text(
+        "#TITLE:Real World Convention\n#ARTIST:Test Artist\n#BPM:200\n#GAP:1000\n"
+        ": 0 4 3 idol\n"  # single-syllable word ending a line, no leading space needed on ITS side
+        "- 4\n"
+        ": 4 2 3 Keep\n"      # first syllable of the NEXT line -- no leading space
+        ": 6 2 3 ing\n"       # continuation syllable of "Keeping"
+        ": 8 2 3  you\n"      # next word, correctly has a leading space
+        "E\n",
+        encoding="utf-8",
+    )
+    parsed_rw = parse_usdx_file(real_world_path)
+    rw_syllables = [e for e in parsed_rw.entries if isinstance(e, Syllable)]
+    assert [s.text for s in rw_syllables] == ["idol", "Keep", "ing", "you"], rw_syllables
+    assert [s.is_word_start for s in rw_syllables] == [True, True, False, True], \
+        [s.is_word_start for s in rw_syllables]
+print("OK: 'Keep' (first syllable right after a line break, no leading space) correctly parses as "
+      "is_word_start=True, not merged into 'idol' from the previous line")
 
 with _tempfile.TemporaryDirectory() as d:
     garbage_path = Path(d) / "garbage.txt"

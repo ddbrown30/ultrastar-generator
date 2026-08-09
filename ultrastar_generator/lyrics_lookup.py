@@ -76,6 +76,10 @@ class LrcLibCandidate:
     plain_lyrics: str
     synced_lyrics: Optional[str]
     instrumental: bool
+    id: Optional[int] = None  # LRCLIB's own numeric id -- lets a user who
+                               # browsed lrclib.net directly and confirmed a
+                               # perfect match paste the id back in, bypassing
+                               # search/scoring entirely (see fetch_lrclib_by_id).
 
     def to_lyrics_result(self) -> "LyricsResult":
         return LyricsResult(plain_lyrics=self.plain_lyrics, synced_lyrics=self.synced_lyrics, source="lrclib")
@@ -120,9 +124,43 @@ def search_lrclib(artist: str = "", title: str = "", q: str = "") -> List[LrcLib
             plain_lyrics=c.get("plainLyrics") or "",
             synced_lyrics=c.get("syncedLyrics") or None,
             instrumental=bool(c.get("instrumental")),
+            id=c.get("id"),
         )
         for c in raw
     ]
+
+
+def fetch_lrclib_by_id(lrclib_id: int) -> Optional[LrcLibCandidate]:
+    """Fetches ONE specific LRCLIB entry directly by its numeric id
+    (`GET /api/get/<id>`), bypassing search/scoring entirely -- for a user
+    who browsed lrclib.net themselves, confirmed a specific recording is a
+    perfect match (e.g. by ear, against a linked video), and wants that
+    exact entry used with no ambiguity. Same best-effort failure convention
+    as `search_lrclib`: returns None on any failure (no `requests`, no
+    network, non-200, bad id) rather than raising."""
+    try:
+        import requests
+    except ImportError:
+        return None
+    try:
+        resp = requests.get(f"https://lrclib.net/api/get/{lrclib_id}", timeout=8)
+        if resp.status_code != 200:
+            return None
+        c = resp.json()
+    except Exception:
+        return None
+    if not c or "id" not in c:
+        return None
+    return LrcLibCandidate(
+        track_name=c.get("trackName") or "",
+        artist_name=c.get("artistName") or "",
+        album_name=c.get("albumName") or "",
+        duration=c.get("duration"),
+        plain_lyrics=c.get("plainLyrics") or "",
+        synced_lyrics=c.get("syncedLyrics") or None,
+        instrumental=bool(c.get("instrumental")),
+        id=c.get("id"),
+    )
 
 
 def _real_lrclib_candidates(candidates: List[LrcLibCandidate],

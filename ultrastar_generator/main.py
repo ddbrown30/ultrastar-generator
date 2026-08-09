@@ -42,8 +42,9 @@ from .note_detection import detect_notes
 from .alignment import align_words
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
-                             alignment_diff_summary, reference_matches_transcript)
+                             alignment_diff_summary, reference_matches_transcript, fetch_lrclib_by_id)
 from .musicxml_reference import apply_musicxml_references
+from .mxl_lrc_generator import try_mxl_lrc_primary
 from .lrc_timing import apply_lrc_timing_check
 from .video_sync import estimate_videogap
 from .usdx_writer import write_song
@@ -188,6 +189,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "for duet/ensemble arrangements where multiple parts have lyrics (e.g. a "
                          "character's own name, if the arrangement labels parts that way). Falls "
                          "back to the lyric-bearing part with the most notes if not given.")
+    p.add_argument("--mxl-lrc-primary", dest="mxl_lrc_primary", action="store_true",
+                    default=config.ENABLE_MXL_LRC_PRIMARY,
+                    help="Default ON. When a MusicXML file (--musicxml-reference or auto-detected) AND "
+                         "matching synced lyrics are both available, generate from those directly "
+                         "(MusicXML for pitch, LRCLIB line starts as real-time anchors, real "
+                         "transcription to place words within a line) instead of the standard "
+                         "audio-only pass 1-4 pipeline -- validated real end-to-end: 100% pitch-class "
+                         "accuracy, 99% timing within 500ms (see CLAUDE.md). Quality-gated: falls back "
+                         "to the standard pipeline (with a warning) whenever no MusicXML/matching "
+                         "lyrics are available or the result doesn't pass a consistency check.")
+    p.add_argument("--no-mxl-lrc-primary", dest="mxl_lrc_primary", action="store_false",
+                    help="Always use the standard audio-only pass 1-4 pipeline, even when a MusicXML "
+                         "file and matching lyrics are available.")
+    p.add_argument("--lrclib-id", dest="lrclib_id", type=int, default=None,
+                    help="A specific LRCLIB entry id (browse lrclib.net yourself to find one, e.g. by "
+                         "checking a linked video) -- always wins over search for both the MXL+LRC "
+                         "primary path and the standard pipeline's own reference-lyrics fetch, no "
+                         "ambiguity. Same idea as --existing-txt/--musicxml-reference: an explicit "
+                         "override always wins over auto-detection.")
     p.add_argument("--no-musicxml-force-calibration", dest="musicxml_force_calibration",
                     action="store_false", default=config.ENABLE_MUSICXML_FORCE_CALIBRATION,
                     help="Without a confident calibration offset (config."
@@ -436,6 +456,21 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         if candidate.is_file():
             existing_txt_path = candidate
 
+    # --- Forced/pinned LRCLIB candidate (feature: MXL+LRC primary path) --
+    # An explicit --lrclib-id (CLI) or the GUI's own pre-search pin always
+    # wins over automatic search, everywhere a candidate is needed -- both
+    # the new MXL+LRC primary path below AND, on fallback, the old
+    # reference-lyrics-fetch step. `pinned_lyrics` (a full object, already
+    # resolved) takes priority if somehow both are set.
+    forced_lrc_candidate = opts.pinned_lyrics
+    if forced_lrc_candidate is None and opts.lrclib_id is not None:
+        log(f"Fetching pinned LRCLIB entry (id={opts.lrclib_id})...")
+        forced_lrc_candidate = fetch_lrclib_by_id(opts.lrclib_id)
+        if forced_lrc_candidate is None:
+            log(f"  Could not fetch LRCLIB id {opts.lrclib_id} (not found, or no network) -- ignoring.")
+        else:
+            log(f"  Using: {forced_lrc_candidate.track_name!r} / {forced_lrc_candidate.artist_name!r}")
+
     log(f"== {artist} - {title} ==")
 
     debug_log_path = None if opts.no_debug_log else (work_dir / f"{artist} - {title} [DEBUG LOG].txt")
@@ -452,9 +487,14 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         log(f"Found cover: {resolved.cover.name}")
     if resolved.background:
         log(f"Found background: {resolved.background.name}")
+    # An explicit --musicxml-reference always wins; otherwise falls back to
+    # whatever file_discovery.find_companions auto-detected in the song's
+    # own folder (may be zero, one, or several). Used by BOTH the MXL+LRC
+    # primary path below and, on fallback, pass 4.
+    mxl_paths = [opts.musicxml_reference] if opts.musicxml_reference else [str(p) for p in resolved.musicxml]
     if resolved.musicxml and not opts.musicxml_reference:
         names = ", ".join(p.name for p in resolved.musicxml)
-        log(f"Found MusicXML reference file(s) for pass 4: {names}")
+        log(f"Found MusicXML reference file(s): {names}")
 
     # --- 2. Vocal isolation --------------------------------------------------
     if opts.skip_separation:
@@ -472,39 +512,20 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     # --- 3. Load vocal audio for pitch analysis + tempo detection -----------
     import librosa
     y, sr = librosa.load(str(vocals_path), sr=None, mono=True)
+    audio_duration = len(y) / sr
 
     bpm = opts.bpm_override or detect_bpm(y, sr)
-    log(f"BPM (as written to txt; UltraStar multiplies by 4): {bpm}")
+    # write_bpm (not bpm) is used for the actual .txt/#BPM/beat-quantization --
+    # bpm itself stays the real detected tempo for pass 1's own audio analysis,
+    # which is tuned against real beat duration, not display resolution.
+    write_bpm = bpm * config.BPM_WRITE_MULTIPLIER
+    log(f"BPM: {bpm} (detected/real tempo, used for pass-1 analysis); "
+        f"{write_bpm} written to the .txt for finer beat-grid resolution "
+        f"(UltraStar multiplies by 4 for the real note grid).")
 
-    # --- 4. PASS 1: pitch/timing from audio alone, no lyrics involved -------
-    log("Pass 1: detecting notes from audio (pitch + timing only)...")
-    notes = detect_notes(
-        y, sr, bpm=bpm,
-        isolation_source="rmvpe" if opts.pitch_source == "rmvpe" else None,
-        smooth_window_sec=opts.pitch_smooth_window,
-        pitch_jump_semitones=opts.note_split_semitones,
-        min_note_beats_fraction=opts.min_note_beat_fraction,
-        silence_threshold_db=opts.silence_threshold_db,
-        silence_absolute_floor_db=opts.silence_floor_db,
-        spike_max_duration_sec=opts.spike_max_duration,
-        spike_min_jump_semitones=opts.spike_jump_semitones,
-        use_crepe=opts.use_crepe,
-        crepe_model=opts.crepe_model,
-        verbose=not opts.quiet,
-        debug_log=debug_log,
-    )
-    if not notes:
-        return PipelineResult(success=False,
-                               error="No notes were detected -- check the audio / vocal isolation quality.")
-
-    if not opts.no_pass1_debug:
-        debug_path = write_pass1_debug_file(notes, artist, title, resolved.output_mp3_source.name, bpm,
-                                             gap_ms=int(round(notes[0].start * 1000)),
-                                             output_dir=work_dir)
-        log(f"Wrote pass-1 debug file (notes only, no lyrics): {debug_path}")
-        log("  -> load this in the UltraStar editor to check timing/pitch BEFORE lyrics are involved.")
-
-    # --- 5. Transcription (lyrics text + rough timing) -----------------------
+    # --- 4. Transcription (lyrics text + rough timing) -- moved ahead of pass 1
+    # so the MXL+LRC primary path below can use it without a second, redundant
+    # transcription call; pass 1's own note detection never depended on it.
     log(f"Transcribing with {'whisperx' if not opts.no_whisperx else 'faster-whisper'} ({opts.whisper_model})"
         f"{' [VAD near-disabled]' if opts.whisperx_no_vad else ''}...")
     words = transcribe_words(
@@ -516,109 +537,173 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                                error="No words were transcribed -- check the audio / vocal isolation quality.")
     log(f"Transcribed {len(words)} words.")
 
-    # --- 6. Reference lyrics: correct ASR text AND mark phrase/line breaks --
+    # --- 5. MXL+LRC primary generation (default path) -- MusicXML for pitch,
+    # LRCLIB synced-lyrics line starts as real-time anchors, real transcription
+    # (above) to place words within a line. Quality-gated: falls back to the
+    # standard pass 1-4 pipeline below whenever no MusicXML is available, no
+    # LRC candidate can be found/forced, or the result fails the quality gate
+    # -- see mxl_lrc_generator.py's module docstring for why the gate is
+    # trusted over trying to perfect upfront candidate selection.
+    syllables = None
     ref_lines = None
     synced_lyrics_text = None
-    if opts.fetch_lyrics:
-        if opts.pinned_lyrics is not None:
-            log(f"Using manually-selected lyrics: {opts.pinned_lyrics.track_name} - "
-                f"{opts.pinned_lyrics.artist_name} (lrclib)")
-            reference = opts.pinned_lyrics.to_lyrics_result()
-        else:
-            log("Fetching reference lyrics (LRCLIB, falling back to lyrics.ovh)...")
-            reference = fetch_reference_lyrics(
-                artist, title, duration_sec=len(y) / sr,
-                on_ambiguous=opts.lyrics_disambiguation_callback if opts.lyrics_ambiguity_prompt else None,
-            )
-        if reference:
-            candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
-            if not reference_matches_transcript(candidate_lines, words):
-                log(f"  Got a reference from {reference.source}, but its words barely overlap "
-                    f"the transcript (likely wrong song/language) -- discarding it, "
-                    f"continuing with ASR text and gap-based phrasing only.")
-            else:
-                ref_lines = candidate_lines
-                synced_lyrics_text = reference.synced_lyrics
-                log(f"  Got {len(ref_lines)} reference line(s) from {reference.source}"
-                    f"{' (synced)' if reference.synced_lyrics else ''}.")
-                corrected = align_words_to_reference(words, ref_lines)
-                diffs = alignment_diff_summary(words, corrected)
-                if diffs:
-                    log(f"  Corrected {len(diffs)} word(s) against the reference lyrics:")
-                    for d in diffs[:20]:
-                        log(f"    {d}")
-                    if len(diffs) > 20:
-                        log(f"    ... and {len(diffs) - 20} more")
-                else:
-                    log("  ASR text already matched the reference; no corrections needed.")
-                debug_log.log_reference_corrections(diffs)
-                words = corrected
-        else:
-            log("  Could not fetch reference lyrics (not found on LRCLIB or lyrics.ovh, or no "
-                "network); continuing with ASR text and gap-based phrasing only.")
-    else:
-        log("Lyric lookup disabled (--no-fetch-lyrics); using ASR text and gap-based phrasing only.")
-
-    # --- 7. PASS 3: fit words onto the pass-1 note grid (timing untouched) --
-    log("Pass 3: fitting words onto the pass-1 note grid...")
-    syllables, stats = align_words(words, notes, y, sr,
-                                    verify_words=opts.verify_words, verify_placement=opts.verify_placement,
-                                    verify_all_words=opts.verify_all_words,
-                                    verify_whisper_model=opts.verify_whisper_model,
-                                    snap_boundaries=opts.zone_boundary_snap, debug_log=debug_log,
-                                    verbose=not opts.quiet)
-    log(f"  {stats.words_with_notes}/{stats.total_words} words matched to pass-1 notes directly "
-        f"({stats.total_notes_consumed} notes consumed); "
-        f"{stats.words_with_fallback} word(s) needed a fallback note (no pass-1 note in their zone).")
-    if stats.fallback_words:
-        shown = stats.fallback_words[:15]
-        log(f"    fallback words: {', '.join(shown)}" + (" ..." if len(stats.fallback_words) > 15 else ""))
-        log(f"    (pitch source: {stats.fallback_used_neighbor} borrowed from the nearest pass-1 note, "
-            f"{stats.fallback_used_fresh_analysis} needed a fresh isolated re-analysis because no "
-            f"pass-1 notes existed at all -- the latter is the less reliable case)")
-    if stats.words_with_melisma or stats.words_with_syllable_merge:
-        log(f"    {stats.words_with_melisma} word(s) had melisma (fewer syllables than notes), "
-            f"{stats.words_with_syllable_merge} word(s) had syllables merged (more syllables than notes)")
-    if stats.lines_word_boundary_split:
-        log(f"    {stats.lines_word_boundary_split} matched reference line(s) "
-            f"({stats.words_in_word_boundary_split_lines} words) had their notes split by "
-            f"each word's own ASR start/end time")
-    if stats.verification_results:
-        n_checked = len(stats.verification_results)
-        n_replaced = sum(1 for r in stats.verification_results if r.replaced)
-        log(f"    verification: re-transcribed {n_checked} suspicious word(s) in isolation, "
-            f"replaced {n_replaced}")
-    if stats.placement_corrections:
-        log(f"    placement check: corrected {len(stats.placement_corrections)} word(s) whose FINAL "
-            f"note-assigned position didn't match what's actually sung there (see [placement] lines "
-            f"above) -- pass 3 was re-run with the fix applied")
-    if stats.placement_warnings:
-        log(f"    placement check: {len(stats.placement_warnings)} word(s) flagged -- the audio at "
-            f"their FINAL note-assigned position doesn't say the expected word (see [placement] lines "
-            f"above); these were NOT corrected automatically and are worth checking by hand")
-
-    # --- 7b. PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s).
-    # An explicit --musicxml-reference always wins; otherwise falls back to
-    # whatever file_discovery.find_companions auto-detected in the song's
-    # own folder (may be zero, one, or several -- all of them are tried).
-    mxl_paths = [opts.musicxml_reference] if opts.musicxml_reference else [str(p) for p in resolved.musicxml]
-    if mxl_paths:
-        log(f"Pass 4: cross-checking pitch against {len(mxl_paths)} MusicXML reference file(s)...")
-        syllables, mxl_stats_list = apply_musicxml_references(
-            syllables, mxl_paths, preferred_part_name=opts.musicxml_part,
-            force_calibration=opts.musicxml_force_calibration,
-            verbose=not opts.quiet, debug_log=debug_log,
+    if opts.mxl_lrc_primary and mxl_paths:
+        log("Attempting MXL+LRC primary generation (MusicXML pitch + synced-lyric line anchors + ASR word placement)...")
+        mxl_lrc_result = try_mxl_lrc_primary(
+            mxl_paths, artist, title, audio_duration, words,
+            forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
         )
-        for path, mxl_stats in zip(mxl_paths, mxl_stats_list):
-            label = Path(path).name
-            if mxl_stats.skipped_reason:
-                log(f"  {label}: skipped -- {mxl_stats.skipped_reason}")
+        if mxl_lrc_result is not None and mxl_lrc_result.success:
+            syllables = mxl_lrc_result.syllables
+            synced_lyrics_text = mxl_lrc_result.lrc_match.candidate.synced_lyrics
+            q = mxl_lrc_result.quality
+            c = mxl_lrc_result.lrc_match.candidate
+            log(f"  Success: {Path(mxl_lrc_result.mxl_path).name} (part(s): {mxl_lrc_result.part_names_used}) + "
+                f"{c.track_name!r}/{c.artist_name!r} (lrclib id={c.id}) -- "
+                f"{q.n_asr_placed}/{q.n_words} words placed via transcription, {q.n_fallback} via "
+                f"proportional fallback, {q.non_monotonic_fix_count} monotonic fix(es).")
+            log("  Skipping pass 1 (audio-only pitch detection) and pass 3/4 -- pitch comes directly "
+                "from the MusicXML.")
+        else:
+            reason = mxl_lrc_result.reason if mxl_lrc_result is not None else "no MusicXML file available"
+            log(f"  WARNING: MXL+LRC primary generation not usable ({reason}) -- falling back to "
+                f"standard audio-based generation.")
+            if opts.mxl_lrc_fallback_callback is not None:
+                if not opts.mxl_lrc_fallback_callback(reason):
+                    return PipelineResult(success=False, error=(
+                        f"Cancelled: MXL+LRC primary generation unavailable ({reason}), user declined "
+                        f"the standard-generation fallback."))
+    elif opts.mxl_lrc_primary:
+        log("No MusicXML file found for MXL+LRC primary generation; using standard audio-based generation.")
+
+    if syllables is None:
+        # --- FALLBACK: standard audio-based pass 1 -> lyrics fetch -> pass 3 -> pass 4, unchanged. ---
+
+        # --- PASS 1: pitch/timing from audio alone, no lyrics involved -------
+        log("Pass 1: detecting notes from audio (pitch + timing only)...")
+        notes = detect_notes(
+            y, sr, bpm=bpm,
+            isolation_source="rmvpe" if opts.pitch_source == "rmvpe" else None,
+            smooth_window_sec=opts.pitch_smooth_window,
+            pitch_jump_semitones=opts.note_split_semitones,
+            min_note_beats_fraction=opts.min_note_beat_fraction,
+            silence_threshold_db=opts.silence_threshold_db,
+            silence_absolute_floor_db=opts.silence_floor_db,
+            spike_max_duration_sec=opts.spike_max_duration,
+            spike_min_jump_semitones=opts.spike_jump_semitones,
+            use_crepe=opts.use_crepe,
+            crepe_model=opts.crepe_model,
+            verbose=not opts.quiet,
+            debug_log=debug_log,
+        )
+        if not notes:
+            return PipelineResult(success=False,
+                                   error="No notes were detected -- check the audio / vocal isolation quality.")
+
+        if not opts.no_pass1_debug:
+            debug_path = write_pass1_debug_file(notes, artist, title, resolved.output_mp3_source.name, write_bpm,
+                                                 gap_ms=int(round(notes[0].start * 1000)),
+                                                 output_dir=work_dir)
+            log(f"Wrote pass-1 debug file (notes only, no lyrics): {debug_path}")
+            log("  -> load this in the UltraStar editor to check timing/pitch BEFORE lyrics are involved.")
+
+        # --- Reference lyrics: correct ASR text AND mark phrase/line breaks --
+        if opts.fetch_lyrics:
+            if forced_lrc_candidate is not None:
+                log(f"Using pinned lyrics: {forced_lrc_candidate.track_name} - "
+                    f"{forced_lrc_candidate.artist_name} (lrclib)")
+                reference = forced_lrc_candidate.to_lyrics_result()
             else:
-                log(f"  {label}: parts used: {mxl_stats.part_names_used}, {mxl_stats.n_matched}/"
-                    f"{mxl_stats.n_comparable_syllables} syllables matched by lyric text, "
-                    f"calibration offset {mxl_stats.calibration_offset:+d} semitones "
-                    f"({mxl_stats.calibration_confidence:.0%} agreement), "
-                    f"{len(mxl_stats.corrections)} syllable(s) corrected")
+                log("Fetching reference lyrics (LRCLIB, falling back to lyrics.ovh)...")
+                reference = fetch_reference_lyrics(
+                    artist, title, duration_sec=audio_duration,
+                    on_ambiguous=opts.lyrics_disambiguation_callback if opts.lyrics_ambiguity_prompt else None,
+                )
+            if reference:
+                candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
+                if not reference_matches_transcript(candidate_lines, words):
+                    log(f"  Got a reference from {reference.source}, but its words barely overlap "
+                        f"the transcript (likely wrong song/language) -- discarding it, "
+                        f"continuing with ASR text and gap-based phrasing only.")
+                else:
+                    ref_lines = candidate_lines
+                    synced_lyrics_text = reference.synced_lyrics
+                    log(f"  Got {len(ref_lines)} reference line(s) from {reference.source}"
+                        f"{' (synced)' if reference.synced_lyrics else ''}.")
+                    corrected = align_words_to_reference(words, ref_lines)
+                    diffs = alignment_diff_summary(words, corrected)
+                    if diffs:
+                        log(f"  Corrected {len(diffs)} word(s) against the reference lyrics:")
+                        for d in diffs[:20]:
+                            log(f"    {d}")
+                        if len(diffs) > 20:
+                            log(f"    ... and {len(diffs) - 20} more")
+                    else:
+                        log("  ASR text already matched the reference; no corrections needed.")
+                    debug_log.log_reference_corrections(diffs)
+                    words = corrected
+            else:
+                log("  Could not fetch reference lyrics (not found on LRCLIB or lyrics.ovh, or no "
+                    "network); continuing with ASR text and gap-based phrasing only.")
+        else:
+            log("Lyric lookup disabled (--no-fetch-lyrics); using ASR text and gap-based phrasing only.")
+
+        # --- PASS 3: fit words onto the pass-1 note grid (timing untouched) --
+        log("Pass 3: fitting words onto the pass-1 note grid...")
+        syllables, stats = align_words(words, notes, y, sr,
+                                        verify_words=opts.verify_words, verify_placement=opts.verify_placement,
+                                        verify_all_words=opts.verify_all_words,
+                                        verify_whisper_model=opts.verify_whisper_model,
+                                        snap_boundaries=opts.zone_boundary_snap, debug_log=debug_log,
+                                        verbose=not opts.quiet)
+        log(f"  {stats.words_with_notes}/{stats.total_words} words matched to pass-1 notes directly "
+            f"({stats.total_notes_consumed} notes consumed); "
+            f"{stats.words_with_fallback} word(s) needed a fallback note (no pass-1 note in their zone).")
+        if stats.fallback_words:
+            shown = stats.fallback_words[:15]
+            log(f"    fallback words: {', '.join(shown)}" + (" ..." if len(stats.fallback_words) > 15 else ""))
+            log(f"    (pitch source: {stats.fallback_used_neighbor} borrowed from the nearest pass-1 note, "
+                f"{stats.fallback_used_fresh_analysis} needed a fresh isolated re-analysis because no "
+                f"pass-1 notes existed at all -- the latter is the less reliable case)")
+        if stats.words_with_melisma or stats.words_with_syllable_merge:
+            log(f"    {stats.words_with_melisma} word(s) had melisma (fewer syllables than notes), "
+                f"{stats.words_with_syllable_merge} word(s) had syllables merged (more syllables than notes)")
+        if stats.lines_word_boundary_split:
+            log(f"    {stats.lines_word_boundary_split} matched reference line(s) "
+                f"({stats.words_in_word_boundary_split_lines} words) had their notes split by "
+                f"each word's own ASR start/end time")
+        if stats.verification_results:
+            n_checked = len(stats.verification_results)
+            n_replaced = sum(1 for r in stats.verification_results if r.replaced)
+            log(f"    verification: re-transcribed {n_checked} suspicious word(s) in isolation, "
+                f"replaced {n_replaced}")
+        if stats.placement_corrections:
+            log(f"    placement check: corrected {len(stats.placement_corrections)} word(s) whose FINAL "
+                f"note-assigned position didn't match what's actually sung there (see [placement] lines "
+                f"above) -- pass 3 was re-run with the fix applied")
+        if stats.placement_warnings:
+            log(f"    placement check: {len(stats.placement_warnings)} word(s) flagged -- the audio at "
+                f"their FINAL note-assigned position doesn't say the expected word (see [placement] lines "
+                f"above); these were NOT corrected automatically and are worth checking by hand")
+
+        # --- PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s).
+        if mxl_paths:
+            log(f"Pass 4: cross-checking pitch against {len(mxl_paths)} MusicXML reference file(s)...")
+            syllables, mxl_stats_list = apply_musicxml_references(
+                syllables, mxl_paths, preferred_part_name=opts.musicxml_part,
+                force_calibration=opts.musicxml_force_calibration,
+                verbose=not opts.quiet, debug_log=debug_log,
+            )
+            for path, mxl_stats in zip(mxl_paths, mxl_stats_list):
+                label = Path(path).name
+                if mxl_stats.skipped_reason:
+                    log(f"  {label}: skipped -- {mxl_stats.skipped_reason}")
+                else:
+                    log(f"  {label}: parts used: {mxl_stats.part_names_used}, {mxl_stats.n_matched}/"
+                        f"{mxl_stats.n_comparable_syllables} syllables matched by lyric text, "
+                        f"calibration offset {mxl_stats.calibration_offset:+d} semitones "
+                        f"({mxl_stats.calibration_confidence:.0%} agreement), "
+                        f"{len(mxl_stats.corrections)} syllable(s) corrected")
 
     # --- 7c. LRC line-timing check (optional, off by default): flags lines whose
     # assigned start disagrees with LRCLIB's synced-lyrics timing. DIAGNOSTIC
@@ -713,7 +798,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             background=staged.background,
             video=staged.video,
             videogap=videogap,
-            bpm=bpm,
+            bpm=write_bpm,
             gap_ms=gap_ms,
             preview_start=preview_start,
             entries=entries,
@@ -757,6 +842,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         existing_txt_check=args.existing_txt_check, existing_txt_path=args.existing_txt_path,
         youtube_url=args.youtube_url, youtube_audio_only=args.youtube_audio_only,
         delete_intermediates=args.delete_intermediates,
+        mxl_lrc_primary=args.mxl_lrc_primary, lrclib_id=args.lrclib_id,
     )
 
 
@@ -785,6 +871,8 @@ def run(argv=None) -> int:
             incompatible.append("--youtube-url")
         if args.work_dir:
             incompatible.append("--work-dir")
+        if args.lrclib_id:
+            incompatible.append("--lrclib-id")
         if incompatible:
             print(f"--batch is not allowed together with {', '.join(incompatible)} "
                   f"(a single override doesn't make sense across multiple songs).", file=sys.stderr)
