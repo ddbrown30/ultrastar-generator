@@ -55,7 +55,7 @@ from typing import List, Optional, Tuple
 
 from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
-from .lrc_timing import parse_lrc, two_tier_time_calibration
+from .lrc_timing import parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
 
@@ -715,49 +715,6 @@ def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_end
     return syllables
 
 
-def _match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, str]]
-                             ) -> List[Tuple[int, float, float]]:
-    """Matches ASR's own flat, time-ordered word stream against the LRC
-    lines' text (one whole-sequence, order-preserving alignment -- same
-    technique used throughout this project) to find, per LRC line, the
-    EARLIEST real ASR word confidently belonging to it. Returns
-    (lrc_line_index, lrc_start, delta) candidates, delta = that word's
-    real ASR start time minus the LRC line's own declared start --
-    exactly the shape `lrc_timing.two_tier_time_calibration` expects.
-
-    This gives a real-time anchor per LRC line straight from OUR OWN
-    audio's transcription, independent of the MXL data entirely -- used
-    to calibrate away a systematic offset (e.g. extra lead-in silence in
-    our recording vs. whichever recording LRCLIB's synced lyrics were
-    timed against) BEFORE any MXL word ever gets placed, rather than only
-    diagnosing the mismatch after the fact the way `lrc_timing.py`'s
-    on-demand check does."""
-    lrc_flat: List[Tuple[int, str]] = []
-    for li, (_, text) in enumerate(lrc_lines):
-        for tok in text.split():
-            n = _normalize(tok)
-            if n:
-                lrc_flat.append((li, n))
-    lrc_norm = [n for _, n in lrc_flat]
-    asr_norm = [_normalize(w.text) for w in asr_words]
-    sm = difflib.SequenceMatcher(None, asr_norm, lrc_norm, autojunk=False)
-    first_asr_for_line: dict = {}
-    for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if tag != "equal":
-            continue
-        for k in range(a2 - a1):
-            li = lrc_flat[b1 + k][0]
-            if li not in first_asr_for_line:
-                first_asr_for_line[li] = a1 + k
-
-    candidates = []
-    for li, asr_idx in first_asr_for_line.items():
-        lrc_start = lrc_lines[li][0]
-        candidates.append((li, lrc_start, asr_words[asr_idx].start - lrc_start))
-    candidates.sort(key=lambda c: c[0])
-    return candidates
-
-
 @dataclass
 class TimeCalibration:
     offset_sec: Optional[float] = None
@@ -807,7 +764,7 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
     # just being imprecise. A null/near-zero calibration is a no-op here
     # (offset+slope of ~0 shifts nothing), so this can't regress an
     # already-well-aligned candidate.
-    time_candidates = _match_asr_to_lrc_lines(asr_words, lrc_match.lrc_lines)
+    time_candidates = match_asr_to_lrc_lines(asr_words, lrc_match.lrc_lines)
     offset, slope, confidence, kind, skipped_reason = two_tier_time_calibration(time_candidates)
     time_cal = TimeCalibration(offset_sec=offset, slope=slope, confidence=confidence,
                                 kind=kind, skipped_reason=skipped_reason)

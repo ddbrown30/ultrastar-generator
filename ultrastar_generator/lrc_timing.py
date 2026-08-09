@@ -48,7 +48,7 @@ from statistics import median
 from typing import Dict, List, Optional, Tuple
 
 from . import config
-from .models import Syllable
+from .models import Syllable, Word
 
 _LRC_TAG_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 
@@ -215,6 +215,53 @@ def _robust_linear_fit(
     n_inliers = sum(1 for r in residuals if abs(r) <= inlier_tolerance_sec)
     confidence = n_inliers / len(pts)
     return intercept, slope, confidence, n_inliers
+
+
+def match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, str]]
+                            ) -> List[Tuple[int, float, float]]:
+    """Matches ASR's own flat, time-ordered word stream against the LRC
+    lines' text (one whole-sequence, order-preserving alignment -- same
+    technique used throughout this project) to find, per LRC line, the
+    EARLIEST real ASR word confidently belonging to it. Returns
+    (lrc_line_index, lrc_start, delta) candidates, delta = that word's
+    real ASR start time minus the LRC line's own declared start --
+    exactly the shape `two_tier_time_calibration` (below) expects.
+
+    This gives a real-time anchor per LRC line straight from OUR OWN
+    audio's transcription, independent of any other reference data --
+    used to calibrate away a systematic offset (e.g. extra lead-in
+    silence in our recording vs. whichever recording LRCLIB's synced
+    lyrics were timed against) BEFORE those timestamps are trusted as
+    placement anchors, rather than only diagnosing the mismatch after the
+    fact the way `apply_lrc_timing_check` does. Originally built for
+    `mxl_lrc_generator.py`; factored out here (its data shape never
+    depended on MXL at all) once `realign.py` needed the exact same
+    ASR-vs-LRC-line calibration step -- don't reimplement this a third
+    time."""
+    lrc_flat: List[Tuple[int, str]] = []
+    for li, (_, text) in enumerate(lrc_lines):
+        for tok in text.split():
+            n = _normalize(tok)
+            if n:
+                lrc_flat.append((li, n))
+    lrc_norm = [n for _, n in lrc_flat]
+    asr_norm = [_normalize(w.text) for w in asr_words]
+    sm = difflib.SequenceMatcher(None, asr_norm, lrc_norm, autojunk=False)
+    first_asr_for_line: dict = {}
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if tag != "equal":
+            continue
+        for k in range(a2 - a1):
+            li = lrc_flat[b1 + k][0]
+            if li not in first_asr_for_line:
+                first_asr_for_line[li] = a1 + k
+
+    candidates = []
+    for li, asr_idx in first_asr_for_line.items():
+        lrc_start = lrc_lines[li][0]
+        candidates.append((li, lrc_start, asr_words[asr_idx].start - lrc_start))
+    candidates.sort(key=lambda c: c[0])
+    return candidates
 
 
 def two_tier_time_calibration(

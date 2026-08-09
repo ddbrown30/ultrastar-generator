@@ -28,6 +28,7 @@ from .batch import run_batch
 from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError, resolve_artist_title, resolve_primary_source
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
 from .main import PipelineResult, check_cuda_available, delete_work_files, run_pipeline
+from .realign import RealignPipelineOptions, run_realign_pipeline
 
 _DONE = object()  # sentinel, distinct from any real log line
 _OUTPUT_PARENT = "__OUTPUT_PARENT__"  # queue-item tag: payload is the Path to open on "Open Output Folder"
@@ -343,7 +344,7 @@ class App(tk.Tk):
         self._settings = _load_settings()
         self._launch_dir = str(Path.cwd())
 
-        self.mode = tk.StringVar(value="single")  # "single" | "batch" | "youtube"
+        self.mode = tk.StringVar(value="single")  # "single" | "batch" | "youtube" | "realign"
         self.input_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.audio_file = tk.StringVar()
@@ -351,6 +352,15 @@ class App(tk.Tk):
         self.youtube_audio_only = tk.BooleanVar(value=True)
         self.artist = tk.StringVar()
         self.title_var = tk.StringVar()
+
+        # Realign (alignment-only) mode -- see realign.py. A separate mode
+        # rather than a checkbox on the normal pipeline: it needs a
+        # fundamentally different input (an EXISTING .txt to re-time, not
+        # generate from scratch) and shares almost none of the normal
+        # pipeline's own options (pass 1-4 are skipped entirely).
+        self.existing_txt_path = tk.StringVar()
+        self.realign_use_lrc = tk.BooleanVar(value=True)
+        self.lrc_mode = tk.StringVar(value="windowed")
 
         # Curated main-surface options (see gui.py's own module docstring
         # for why only a subset of the ~30 CLI flags are exposed here).
@@ -461,13 +471,16 @@ class App(tk.Tk):
         mode_frame = ttk.LabelFrame(self, text="Mode")
         mode_frame.pack(fill="x", **pad)
         for text, value in [("Single song folder", "single"), ("Batch (parent folder)", "batch"),
-                             ("YouTube URL", "youtube")]:
+                             ("YouTube URL", "youtube"), ("Realign existing file", "realign")]:
             rb = ttk.Radiobutton(mode_frame, text=text, value=value, variable=self.mode,
                                   command=self._on_mode_change)
             rb.pack(side="left", padx=8, pady=4)
         Tooltip(mode_frame, "Single song folder: process one song folder.\n"
                              "Batch: process every immediate subfolder of a parent folder the same way.\n"
-                             "YouTube URL: download a video/audio first, then process it like a normal folder.")
+                             "YouTube URL: download a video/audio first, then process it like a normal folder.\n"
+                             "Realign existing file: alignment-only mode -- re-time an EXISTING .txt's own "
+                             "notes against its audio (GAP, note start/length only) without touching pitch "
+                             "or the note sequence itself.")
 
         io_frame = ttk.LabelFrame(self, text="Folders")
         io_frame.pack(fill="x", **pad)
@@ -483,11 +496,12 @@ class App(tk.Tk):
                               "In batch mode, this is the PARENT folder -- each of its immediate subfolders "
                               "is processed as its own song.")
 
-        ttk.Label(io_frame, text="Output folder:").grid(row=1, column=0, sticky="w", **pad)
+        self.output_dir_label = ttk.Label(io_frame, text="Output folder:")
+        self.output_dir_label.grid(row=1, column=0, sticky="w", **pad)
         self.output_dir_entry = PlaceholderEntry(io_frame, self.output_dir, self._output_dir_placeholder_text)
         self.output_dir_entry.grid(row=1, column=1, sticky="ew", **pad)
-        output_browse = ttk.Button(io_frame, text="Browse...", command=self._browse_output)
-        output_browse.grid(row=1, column=2, **pad)
+        self.output_dir_browse = ttk.Button(io_frame, text="Browse...", command=self._browse_output)
+        self.output_dir_browse.grid(row=1, column=2, **pad)
         Tooltip(self.output_dir_entry, "Where the .txt and copied companion files are written. Must differ "
                                         "from the input folder. Optional -- leave blank to use the default "
                                         "shown in grey.")
@@ -511,7 +525,15 @@ class App(tk.Tk):
                                                 "don't need the music video itself. Off: download the full "
                                                 "video (mp4) too, used as #VIDEO.")
 
-        artist_frame = ttk.LabelFrame(self, text="Artist / Title (required for YouTube; overrides filename parsing otherwise)")
+        self.existing_txt_label = ttk.Label(io_frame, text="Existing .txt file:")
+        self.existing_txt_entry = ttk.Entry(io_frame, textvariable=self.existing_txt_path)
+        self.existing_txt_browse = ttk.Button(io_frame, text="Browse...", command=self._browse_existing_txt)
+        Tooltip(self.existing_txt_entry, "The UltraStar .txt file to realign -- its notes/pitches/note "
+                                          "sequence are kept exactly as-is; only GAP and note start/length "
+                                          "are adjusted to better match the audio.")
+
+        self.artist_frame = ttk.LabelFrame(self, text="Artist / Title (required for YouTube; overrides filename parsing otherwise)")
+        artist_frame = self.artist_frame
         artist_frame.pack(fill="x", **pad)
         ttk.Label(artist_frame, text="Artist:").pack(side="left", padx=8)
         self.artist_entry = PlaceholderEntry(artist_frame, self.artist, self._artist_placeholder_text, width=25)
@@ -524,7 +546,8 @@ class App(tk.Tk):
         Tooltip(self.title_entry, "Overrides the title parsed from the filename. Required (must be typed, "
                                    "not left as the preview) for YouTube mode.")
 
-        lyrics_frame = ttk.LabelFrame(self, text="Lyrics (single-song mode only)")
+        self.lyrics_frame = ttk.LabelFrame(self, text="Lyrics (single-song mode only)")
+        lyrics_frame = self.lyrics_frame
         lyrics_frame.pack(fill="x", **pad)
         self.search_lyrics_button = ttk.Button(lyrics_frame, text="Search Lyrics...", command=self._on_search_lyrics)
         self.search_lyrics_button.pack(side="left", padx=8, pady=4)
@@ -550,7 +573,37 @@ class App(tk.Tk):
                                               "always auto-picks silently.")
         self._update_pinned_lyrics_label()
 
-        opts_frame = ttk.LabelFrame(self, text="Options")
+        self.realign_frame = ttk.LabelFrame(self, text="Realign options")
+        realign_frame = self.realign_frame
+        ttk.Label(realign_frame, text="Whisper model:").grid(row=0, column=0, sticky="w", padx=8, pady=2)
+        realign_whisper_entry = ttk.Entry(realign_frame, textvariable=self.whisper_model, width=15)
+        realign_whisper_entry.grid(row=0, column=1, sticky="w", padx=8, pady=2)
+        Tooltip(realign_whisper_entry, "ASR model size, e.g. small.en (default), medium.en, large-v3. "
+                                        "Bigger is more accurate but slower.")
+        realign_use_lrc_check = ttk.Checkbutton(realign_frame, text="Use LRC synced lyrics",
+                                                 variable=self.realign_use_lrc)
+        realign_use_lrc_check.grid(row=1, column=0, sticky="w", padx=8, pady=2)
+        Tooltip(realign_use_lrc_check, "When available, LRCLIB synced-lyrics line timestamps help place "
+                                        "words the audio transcription alone can't confidently reach. Off: "
+                                        "audio transcription only.")
+        ttk.Label(realign_frame, text="LRC mode:").grid(row=1, column=1, sticky="e", padx=(8, 2), pady=2)
+        lrc_mode_combo = ttk.Combobox(realign_frame, textvariable=self.lrc_mode, values=["windowed", "seed"],
+                                       state="readonly", width=10)
+        lrc_mode_combo.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=2)
+        Tooltip(lrc_mode_combo, "windowed (default): LRC line starts window the audio search, but ONLY when "
+                                 "LRCLIB's timing is confidently calibrated against this audio -- otherwise "
+                                 "transparently falls back to whole-song matching, same as 'seed'. seed: "
+                                 "always whole-song-transcription-primary, LRC only fills residual gaps. "
+                                 "Real comparison found 'windowed' never worse and sometimes much better "
+                                 "-- see CLAUDE.md.")
+        ttk.Label(realign_frame, text="LRCLIB ID:").grid(row=2, column=0, sticky="w", padx=8, pady=2)
+        realign_lrclib_id_entry = ttk.Entry(realign_frame, textvariable=self.lrclib_id, width=10)
+        realign_lrclib_id_entry.grid(row=2, column=1, sticky="w", padx=8, pady=2)
+        Tooltip(realign_lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself and paste "
+                                          "the id here) -- always wins over automatic search.")
+
+        self.opts_frame = ttk.LabelFrame(self, text="Options")
+        opts_frame = self.opts_frame
         opts_frame.pack(fill="x", **pad)
         c1 = ttk.Checkbutton(opts_frame, text="Fetch reference lyrics", variable=self.fetch_lyrics)
         c1.grid(row=0, column=0, sticky="w", padx=8, pady=2)
@@ -654,6 +707,7 @@ class App(tk.Tk):
         mode = self.mode.get()
         is_youtube = mode == "youtube"
         is_batch = mode == "batch"
+        is_realign = mode == "realign"
 
         self.input_label.config(text="Parent folder:" if is_batch else "Input folder:")
         if is_youtube:
@@ -663,6 +717,9 @@ class App(tk.Tk):
             self.audio_file_label.grid_remove()
             self.audio_file_entry.grid_remove()
             self.audio_file_browse.grid_remove()
+            self.existing_txt_label.grid_remove()
+            self.existing_txt_entry.grid_remove()
+            self.existing_txt_browse.grid_remove()
         else:
             self.youtube_label.grid_remove()
             self.youtube_entry.grid_remove()
@@ -675,6 +732,50 @@ class App(tk.Tk):
                 self.audio_file_label.grid(row=2, column=0, sticky="w", padx=8, pady=4)
                 self.audio_file_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
                 self.audio_file_browse.grid(row=2, column=2, padx=8, pady=4)
+            if is_realign:
+                self.existing_txt_label.grid(row=3, column=0, sticky="w", padx=8, pady=4)
+                self.existing_txt_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
+                self.existing_txt_browse.grid(row=3, column=2, padx=8, pady=4)
+            else:
+                self.existing_txt_label.grid_remove()
+                self.existing_txt_entry.grid_remove()
+                self.existing_txt_browse.grid_remove()
+
+        # Realign writes directly next to the existing file by default --
+        # the "parent folder for a fresh <Artist> - <Title> folder" meaning
+        # of Output folder doesn't apply there.
+        if is_realign:
+            self.output_dir_label.grid_remove()
+            self.output_dir_entry.grid_remove()
+            self.output_dir_browse.grid_remove()
+        else:
+            self.output_dir_label.grid(row=1, column=0, sticky="w", padx=8, pady=4)
+            self.output_dir_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+            self.output_dir_browse.grid(row=1, column=2, padx=8, pady=4)
+
+        self.artist_frame.config(
+            text="Artist / Title (overrides the existing file's own tags for LRCLIB lookup)" if is_realign
+            else "Artist / Title (required for YouTube; overrides filename parsing otherwise)")
+
+        # Realign mode skips pass 1-4 entirely, so it uses a completely
+        # different, much smaller option surface -- toggled as whole frames
+        # (not picked apart widget-by-widget the way audio_file/youtube
+        # rows are above) since almost none of the normal pipeline's own
+        # options apply. `artist_frame` is always packed, so it's a safe
+        # `after=` anchor regardless of which set is currently showing.
+        if is_realign:
+            self.lyrics_frame.pack_forget()
+            self.opts_frame.pack_forget()
+            self.advanced_toggle.pack_forget()
+            self.advanced_frame.pack_forget()
+            self.realign_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
+        else:
+            self.realign_frame.pack_forget()
+            self.lyrics_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
+            self.opts_frame.pack(fill="x", padx=8, pady=4, after=self.lyrics_frame)
+            self.advanced_toggle.pack(fill="x", padx=8, pady=4, after=self.opts_frame)
+            if self._advanced_visible:
+                self.advanced_frame.pack(fill="x", padx=8, pady=4, after=self.advanced_toggle)
 
         # Interactive LRCLIB disambiguation is single-song-mode only --
         # batch mode always auto-picks silently, never pausing for input.
@@ -812,6 +913,13 @@ class App(tk.Tk):
         if f:
             self.audio_file.set(Path(f).name)
 
+    def _browse_existing_txt(self):
+        initial = self.input_dir.get().strip() or self._last_dir("input_dir")
+        filetypes = [("UltraStar txt files", "*.txt"), ("All files", "*.*")]
+        f = filedialog.askopenfilename(title="Select existing .txt file", initialdir=initial, filetypes=filetypes)
+        if f:
+            self.existing_txt_path.set(str(Path(f)))
+
     # --- work-file cleanup / open-output-folder -------------------
 
     def _delete_work_files_now(self):
@@ -908,6 +1016,17 @@ class App(tk.Tk):
         except ValueError:
             return None
 
+    def _build_realign_opts(self) -> RealignPipelineOptions:
+        return RealignPipelineOptions(
+            audio_file=self.audio_file.get().strip() or None,
+            whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
+            artist=self.artist_entry.effective_value(),
+            title=self.title_entry.effective_value(),
+            lrclib_id=self._effective_lrclib_id(),
+            use_lrc=self.realign_use_lrc.get(),
+            lrc_mode=self.lrc_mode.get(),
+        )
+
     def _on_run(self):
         if self._running:
             return
@@ -916,7 +1035,9 @@ class App(tk.Tk):
         if not input_dir:
             messagebox.showerror("Missing folder", "An input folder is required.")
             return
-        output_dir_value = self.output_dir_entry.effective_value()  # None -> run_pipeline computes its own default
+        # None -> run_pipeline computes its own default; not used at all by
+        # realign mode, which writes directly next to the existing file.
+        output_dir_value = self.output_dir_entry.effective_value() if mode != "realign" else None
         if mode == "youtube" and not (self.artist_entry.effective_value() and self.title_entry.effective_value()):
             messagebox.showerror("Missing artist/title", "YouTube mode requires both Artist and Title to be typed in "
                                                             "(not left as the grey preview).")
@@ -924,20 +1045,31 @@ class App(tk.Tk):
         if mode == "youtube" and not self.youtube_url.get().strip():
             messagebox.showerror("Missing URL", "YouTube mode requires a URL.")
             return
+        existing_txt_path = None
+        if mode == "realign":
+            existing_txt_value = self.existing_txt_path.get().strip()
+            if not existing_txt_value:
+                messagebox.showerror("Missing file", "Realign mode requires an existing .txt file to realign.")
+                return
+            existing_txt_path = Path(existing_txt_value)
+            if not existing_txt_path.is_file():
+                messagebox.showerror("File not found", f"Existing .txt file not found:\n{existing_txt_path}")
+                return
 
-        opts = self._build_opts()
+        opts = self._build_realign_opts() if mode == "realign" else self._build_opts()
         self.log_text.delete("1.0", tk.END)
         self._set_running(True)
 
         q: "queue.Queue" = queue.Queue()
         output_dir_path = Path(output_dir_value) if output_dir_value else None
         thread = threading.Thread(
-            target=self._run_worker, args=(mode, Path(input_dir), output_dir_path, opts, q), daemon=True)
+            target=self._run_worker, args=(mode, Path(input_dir), output_dir_path, opts, q, existing_txt_path),
+            daemon=True)
         thread.start()
         self.after(100, self._drain_queue, q)
 
     def _run_worker(self, mode: str, input_dir: Path, output_dir: Optional[Path],
-                     opts: config.PipelineOptions, q: "queue.Queue"):
+                     opts, q: "queue.Queue", existing_txt_path: Optional[Path] = None):
         class _QueueWriter:
             def write(self_, s):
                 if s.strip():
@@ -948,7 +1080,15 @@ class App(tk.Tk):
 
         try:
             with contextlib.redirect_stdout(_QueueWriter()):
-                if mode == "batch":
+                if mode == "realign":
+                    result = run_realign_pipeline(input_dir, existing_txt_path, opts, log=q.put)
+                    if result.success:
+                        q.put(f"\n=== Done: {result.output_path} ===")
+                        if result.output_path is not None:
+                            q.put((_OUTPUT_PARENT, result.output_path.parent))
+                    else:
+                        q.put(f"\n=== FAILED: {result.error} ===")
+                elif mode == "batch":
                     results = run_batch(input_dir, output_dir, opts, log=q.put)
                     ok = sum(1 for _, r in results if r.success)
                     q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")

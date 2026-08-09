@@ -1,7 +1,7 @@
 # UltraStar Song Generator
 
 Generates UltraStar Deluxe `.txt` karaoke song files from a raw audio file
-(`.mp3`, `.ogg`, or `.oga`), using a **pitch/timing-first, lyrics-second**
+(`.mp3`, `.ogg`, `.oga`, or `.m4a`), using a **pitch/timing-first, lyrics-second**
 pipeline:
 
 1. Isolate the vocal track (Demucs)
@@ -331,7 +331,7 @@ gap-based phrasing.
 
 ## 4. How it maps to the UltraStar format
 
-- `#MP3` is always used for the audio file tag, even for `.ogg`/`.oga`
+- `#MP3` is always used for the audio file tag, even for `.ogg`/`.oga`/`.m4a`
   files, per the UltraStar spec (the tag name is just legacy; the game
   reads whatever format is there).
 - `#BPM` is written as the tempo *before* UltraStar's internal x4

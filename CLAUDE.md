@@ -370,6 +370,187 @@ raw OCR garbage.
 `--lrclib-id`/GUI field let a user paste a manually-confirmed LRCLIB id,
 always wins over search/auto-pick.
 
+## Alignment-only mode (`realign.py`, shipped 2026-08-09)
+
+A new, separate CLI (`python -m ultrastar_generator.realign <folder>
+--existing-txt <path>`, own `run()`/`build_arg_parser()`) that takes an
+ALREADY-WRITTEN UltraStar `.txt` plus its audio and re-times it: `#GAP`,
+note start, and note length only. Never touches pitch, never adds/
+removes/reorders a note. Assumes the input's notes are in the right
+order and its lyric TEXT is correct; makes NO other assumption about its
+timing quality (explicitly designed to survive the degenerate case of a
+flat list of equal-length placeholder notes that don't match the audio
+at all).
+
+**Design** (deliberately different from `mxl_lrc_generator.py`'s
+per-LINE-windowed ASR search, even though the anchor/interpolate shape
+is borrowed from it): a WHOLE-SONG, order-preserving text match of the
+existing file's own words against real ASR words (`match_words_to_asr`)
+— never time-windowed, since this mode can't trust the input's own
+timing enough to window a search with it. Confident matches use ASR's
+own start/end directly. LRCLIB synced lyrics, when available, seed one
+extra anchor at the first not-yet-confident word of each matched line
+(`seed_lrc_anchors`, reusing `mxl_lrc_generator.select_lrc_candidate`/
+`assign_words_to_lines` as-is via throwaway `MxlWord` wrappers around
+the existing words — those two functions only ever read `.norm`).
+Everything still unanchored is placed by `interpolate_fallback`: two
+confident neighbors → rate-interpolate using the word's OWN original
+start purely as a proportional offset (recovers real local tempo
+variation if the original timing roughly tracks the audio; degrades to
+even spacing if it doesn't); one neighbor → constant shift from it,
+not a rate extrapolated from a single point; zero anchors anywhere in
+the whole song → keep that word's ORIGINAL timing completely unchanged
+— this mode always has a safe fallback, unlike `mxl_lrc_generator`'s
+equivalent pass, which has none. Sub-word syllables are redistributed
+within a word's new span using the word's OWN original relative
+syllable timing (pitch/note count are never touched anywhere in this
+module). `match_asr_to_lrc_lines` (the ASR-vs-LRC-line calibration
+step) was promoted from `mxl_lrc_generator.py` (private) to
+`lrc_timing.py` (public) alongside `two_tier_time_calibration` — a
+second module needed the exact same, already-generic function, so it
+moved to the shared home rather than being reimplemented.
+
+**Prerequisite bug fix, `usdx_parser.py`**: word-boundary detection
+(`is_word_start`) only ever checked for a LEADING space (this project's
+own writer convention) — a real SingStar-shipped ground-truth file
+(Beauty and the Beast's `notes.txt`) uses a TRAILING space on a word's
+LAST syllable instead ("Bare"+"ly " → "Barely") and has NO leading
+spaces at all, which the old check would have silently merged into one
+bogus word per line (already flagged as a known gap in project memory,
+never fixed since nothing exercised it before this feature). Fixed by
+also checking the PREVIOUS syllable's own trailing whitespace — a
+strict superset of the old check, so this project's own leading-space-
+only output parses identically to before.
+
+**Real validation (Beauty and the Beast)**: no existing-file ground
+truth was available in the usual sense, so the SingStar `notes.txt`
+(hand-verified-accurate, see `sandbox/Beauty And The Beast - Beauty And
+The Beast/notes.txt`) was converted to a standard-convention `.txt`
+(pitch −60, `sandbox/realign_test/BATB/`) and used AS the "already
+correct" input, per the user's explicit ask to validate that realigning
+an already-good file doesn't meaningfully perturb it. Real result: 140/
+140 syllables preserved (no notes added/removed), 0 pitch mismatches,
+BPM unchanged, 108/113 words matched directly to real ASR, 1 seeded
+from an LRC line anchor, 4 interpolated, 0 kept-original. Mean start
+delta from the original +43ms, median +74ms. One real outlier: "Tune"
+(bridge section) landed 2.6s earlier than the original — WhisperX's own
+forced-alignment gave that word an implausibly early start crossing
+what should be a real musical rest, the same class of ASR word-boundary
+imprecision already documented under "Lessons learned" above, not a
+bug in this module's own logic; not chased further per this project's
+own precedent (`--verify-placement`/`--zone-boundary-snap`: individually
+well-motivated fixes for exactly this kind of case were both tried and
+found to be NET REGRESSIONS end-to-end). Confirmed BATB has no valid
+LRCLIB candidate via the dedicated MXL+LRC quality gate (see
+`project_validation_song_roster` memory), yet this mode's own (more
+permissive, since LRC is only ever a small supplementary anchor here,
+not the primary placement signal the way it is in `mxl_lrc_generator`)
+candidate search found a same-musical, different-cast "(Finale)"
+recording with a weak (54%) time calibration — it seeded exactly one
+word, which landed within 600ms of the correct position. Left as-is
+for v1 (the risk surface is inherently small: only words with no
+direct ASR match ever reach this path at all) rather than adding an
+unvalidated extra confidence gate on top.
+
+**GUI integration (same day)**: `run_realign_pipeline`/`RealignPipelineOptions`
+factored out of `realign.py`'s CLI `run()` (same shape as `main.
+run_pipeline`/`config.PipelineOptions`) so gui.py calls the exact same
+pipeline code the CLI does. New "Realign existing file" radio mode in
+gui.py, alongside single/batch/YouTube: its own "Existing .txt file"
+field (with Browse), a "Realign options" frame (Whisper model, "Use LRC
+synced lyrics" checkbox, LRC mode dropdown, LRCLIB ID -- reusing the
+Artist/Title fields and the existing threaded-run/log-draining/
+Open-Output-Folder machinery unchanged). The normal pipeline's own
+Lyrics/Options/Advanced frames (fetch-lyrics, verify-words, MusicXML,
+pitch source, etc. -- none of which apply once pass 1-4 is skipped
+entirely) are hidden as whole frames rather than picked apart
+widget-by-widget; Output folder is hidden too (realign writes directly
+next to the existing file by default, not into a fresh `<Artist> -
+<Title>` folder the way the normal pipeline does). Verified two ways:
+(1) programmatic mode-switch round-trip through all 4 modes with no Tk
+packing errors, (2) a full live run (real Demucs+WhisperX, GUI's own
+background thread + queue-drain loop, no mainloop() needed --
+`app.update()` polled in a loop instead) against the BATB test folder,
+producing the same result as the equivalent CLI invocation.
+
+**Not yet done**: no `test_dry_run.py`-adjacent real-audio smoke test
+beyond the manual BATB/Stars/Chicago runs in this file -- rerun manually
+if `realign.py`'s core matching/interpolation logic changes.
+
+### `lrc_mode="windowed"` prototype + real 3-song comparison (2026-08-09)
+
+User's hypothesis (from prior sessions' MXL+LRC work): LRC-first,
+ASR-second placement beats ASR-first, "so long as we can trust the LRC
+timing matches the audio." Built a second strategy,
+`match_words_to_asr_windowed` (mirrors `mxl_lrc_generator.
+place_words_via_asr`'s per-LINE real-time window exactly, adapted to
+match against the existing file's own already-trusted text instead of
+MXL's OCR'd text), selectable via `realign_song(lrc_mode=...)`: `"seed"`
+(shipped default, unchanged -- whole-song ASR primary, LRC only seeds
+residual gaps) vs `"windowed"` (LRC lines primary, ASR only resolves
+position within a line). `prepare_lrc` factored out of `seed_lrc_anchors`
+so both strategies share one candidate-selection/calibration call
+instead of two.
+
+**Real comparison, one ASR transcription per song reused for both modes**
+(avoids WhisperX's own non-determinism confounding the A/B — see
+"Lessons learned"), timing accuracy measured against each song's own
+trusted/reference existing file:
+
+| song | LRC calibration | seed (within 100ms) | windowed (within 100ms) |
+|---|---|---|---|
+| BATB (auto-picked, wrong-cast "(Finale)" candidate) | constant, 54% agreement | 63% | **84%** |
+| Chicago (auto-picked candidate, id 34321033) | FAILED (no offset found) | 65% | **41%** |
+| Chicago (pinned id 37066985, the one validated in [[project-mxl-lrc-ordinary-day-fixes]]'s session) | constant, 95% agreement | 67% | 66% |
+| Stars (auto-picked candidate, id 29680748) | drift, 100% agreement | 55% | 53% |
+
+Zero pitch/text/note-count differences in any run -- only timing varied.
+
+**Root cause of the Chicago regression, and the fix**: windowing an
+UNCALIBRATED LRC candidate is actively harmful -- EVERY word's match
+routes through the same untrusted signal, so an uncorrected drift (see
+`lrc_timing.py`'s own module docstring: real per-song drift, not just
+noise around a constant, is a confirmed real phenomenon) corrupts
+placement across the whole back half of the song (deltas grew smoothly
+from near-zero to -2.6s as the song progressed -- a drift signature, not
+random noise). `"seed"` mode never had this failure mode because LRC
+there only ever touches a handful of residual words ASR alone couldn't
+place, so a bad candidate's blast radius was already small by
+construction -- `"windowed"`'s blast radius is not, since it decides
+EVERY word's search window. **Fixed**: `"windowed"` now additionally
+requires `LrcPrep.calibration_offset is not None` (i.e. `two_tier_time_
+calibration` actually found a confident constant-offset OR drift fit)
+before it's used at all; otherwise it transparently falls back to
+whole-song ASR matching (identical to `"seed"`'s own fallback). Re-ran
+Chicago's auto-picked candidate after the fix: `"windowed"` now produces
+BYTE-IDENTICAL output to `"seed"` (65% within 100ms both), confirming the
+gate closes the regression without needing a pinned/forced candidate.
+BATB's win (63% -> 84%) is unaffected by the gate (its calibration
+already clears the bar at 54%).
+
+**Interpretation**: with the gate in place, `"windowed"` was never worse
+than `"seed"` in any of the 4 real test cases, and was a large win in
+exactly the case the user's hypothesis predicts (BATB: LRC timing IS
+trustworthy -- confidently calibrated, even at just 54% agreement --
+despite being from a different-cast recording of the same musical).
+Where ASR was already excellent on its own (Chicago pinned, Stars: both
+>=90% direct ASR match rate even in `"seed"` mode), windowing made
+little difference either way -- its real value shows up specifically
+when ASR's OWN forced-alignment can be confidently wrong on an
+individual word (BATB's "Tune" case from the earlier validation run)
+and a trustworthy LRC window prevents committing to that wrong answer.
+
+**Status (updated same day, user's explicit decision)**: `lrc_mode`
+default flipped from `"seed"` to `"windowed"` -- since the gate makes
+`"windowed"` an auto-select on its own (windowing when calibration is
+confident, transparently identical to `"seed"`'s own behavior
+otherwise), this needed no new mode value, just changing which string
+is the default in `realign_song`'s signature and `--lrc-mode`'s CLI
+default. `"seed"` (always whole-song-ASR-primary, even with a
+confidently-calibrated candidate available) stays available as an
+explicit opt-out / for future A-B comparisons, but isn't needed for
+normal use anymore.
+
 ## Environment
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.
@@ -393,114 +574,6 @@ always wins over search/auto-pick.
 - Adjacent-and-full-line-coverage repeated-phrase detection for
   `phrasing.py` (validated against real data, not implemented — see
   "Removed / rejected" above, user chose not to build it).
-
-### Real bug: ASR word-matching compared against the MXL's raw OCR
-### text instead of the already-resolved clean text (2026-08-09)
-
-User pushed back on the "not fully resolved" note above with real
-WhisperX output for "There's a lot of favors":
-```
-69.865 -  70.325  score=0.753  "There's"
-70.385 -  70.425  score=0.896  'a'
-70.585 -  70.885  score=0.996  'lot'
-70.945 -  71.005  score=0.532  'of'
-71.145 -  71.826  score=0.835  'favorites'
-```
-and asked directly why "favors"/"favorites"' own precise ASR timing
-wasn't used for "fa"'s start and "vors"' end.
-
-Reconstructed the REAL `Word` list from this run's own debug log (same
-data `transcribe_words` itself produces -- confirmed by reading
-`transcription.py`'s debug-dump code path directly) and replayed
-`place_words_via_asr`'s exact per-line matching for this line:
-```
-mxl_norm_line: ["there's", 'a', 'lot', 'of', 'favere']
-asr_norm:      ["there's", 'a', 'lot', 'of', 'favors', "i'm"]
-equal   ["there's", 'a', 'lot', 'of'] <-> ["there's", 'a', 'lot', 'of']
-replace ['favere']                    <-> ['favors', "i'm"]
-```
-Root cause: `place_words_via_asr` matched against `mxl_words[i].norm` --
-the MXL's own raw OCR text ("favere") -- never the already-resolved
-CLEAN text (`word_clean_text[i]` == "favors", computed by
-`assign_words_to_lines` via the LRC line, already used for DISPLAY text
-since the earlier "MATIZON"/"systern" fix) -- so a word whose MXL OCR and
-ASR transcription each garbled it differently never matched even though
-a clean, mutually-agreeing "favors" was available and simply unused for
-this purpose. Confirmed directly, and separately confirmed real
-(non-bug): "There's"/"a"/"lot"/"of" were ALREADY landing within ~30ms of
-their own real ASR timestamps in the shipped output before this fix --
-verified by direct comparison against the reconstructed real `Word`
-list -- so if those specific words still sound off, that's ASR's own
-word-boundary precision for this passage (a different, harder problem),
-not a matching bug.
-
-Fixed: `place_words_via_asr` gained an optional `word_clean_text` param;
-`mxl_norm_line` now prefers `_normalize(word_clean_text[i])` over the raw
-MXL norm whenever a clean match exists, falling back to the MXL norm
-otherwise (unaffected when no clean text was resolved). Reuses
-`assign_words_to_lines`' own resolution rather than adding a second,
-separate fuzzy-match step -- a word is only ever resolved against the
-LRC once. New regression test (`test_dry_run.py`): an MXL word OCR'd one
-way, transcribed by ASR a different way, with a clean LRC-resolved text
-that matches the ASR exactly -- confirms it's now confidently matched
-(and confirms the OLD behavior, run without `word_clean_text`, correctly
-still misses it -- proving the fix is really doing the work).
-
-**Real re-validation, same Chicago song, same `--lrclib-id 37066985`**:
-ASR placement rate rose from 108/116 to 114/116 words (6 more words
-recovered a real confident ASR match, not just this one). The "favors"
-region directly:
-```
-: 1135 5 18  fa
-: 1141 11 18 vors
-- 1152 1178
-: 1178 5 9  I'm
-```
-fa+vors now span 71.120s-71.843s (723ms) -- matching real ASR's own
-"favors" span (71.129s-71.809s, 680ms) almost exactly, and close to
-ground truth's fa/vors timing (71.05-71.85s, 800ms: fa start Δ70ms, vors
-start Δ18ms, vors end Δ7ms). Previously this same region spanned
-71.204s-72.972s (1.77s), swallowing more than half of "I'm" -- "I'm"
-itself is now untouched, starting cleanly at beat 1178 in both runs.
-`test_dry_run.py` full suite green throughout.
-
-**Same-day follow-up: the exact-match fix above was NOT sufficient on its
-own -- WhisperX itself is not deterministic in the literal WORDS it
-transcribes, not just their timestamps.** The user re-ran the exact same
-command and got the OLD broken numbers back (`fa` len=14, `vors` len=29,
-matching the state from BEFORE this fix). Root cause: in their run, ASR
-transcribed the word as "favorites" (confirmed independently -- this is
-literally what the user's own first WhisperX excerpt in this thread
-showed, before any of these fixes existed), not "favors". `word_clean_text`
-still resolves to the correct, exact "favors" (that resolution comes from
-LRC text matching, not ASR, so it's unaffected) -- but comparing clean
-text ("favors") against ASR's own wording ("favorites") is still an exact
-non-match, so the fix from the previous entry didn't fire for this run.
-
-Fixed by extending `place_words_via_asr`'s per-line matching to also
-accept a close-but-not-identical 1:1 "replace" pairing (character-level
-ratio >= `config.MXL_LRC_FUZZY_TEXT_MIN_RATIO`, same threshold and
-technique `assign_words_to_lines` already uses for display text) --
-confirmed real ratios: "favors"~"favorites" 0.80 (clears easily),
-"favere"~"favorites" 0.53 (correctly stays below threshold, confirming
-clean-text reuse is still doing independent, necessary work -- fuzzy
-matching against the raw uncorrected OCR text alone would NOT have caught
-this specific case). New regression test covers both: the mishearing
-case now matches, and a genuinely unrelated word in the same slot is
-still correctly rejected.
-
-Re-ran the real pipeline 3 times total across this investigation;
-WhisperX transcribed this specific word as "favors" (not "favorites")
-in all 3 of my own runs, so I could not directly reproduce the user's
-exact mishearing locally -- the fix is verified via a dedicated synthetic
-test built from the user's own literal reported ASR output ("favorites",
-score=0.835) rather than a fresh real-audio repro. This is a new,
-previously-undocumented instance of ASR non-determinism in this
-pipeline: prior "Lessons learned" entries in this file already document
-Demucs and pass-1 CREPE/RMVPE non-determinism at the AUDIO/PITCH level;
-this is the first confirmed case of WhisperX itself producing a
-different literal WORD (not just a different timestamp/score) for the
-same input across runs.
 
 ### Real bug: the "favorites" fuzzy fix didn't fire when a next-line word
 ### spilled into the same ASR window (2026-08-09)

@@ -1152,11 +1152,11 @@ assert a_starts[1] < 5.0 and a_starts[2] < 5.0, a_starts  # nowhere close to the
 print(f"OK: fallback words between two confident anchors interpolate from the LOCAL gap (starts={a_starts}), "
       f"not the whole line's window including its trailing silence")
 
-print("\n--- mxl_lrc_generator: _match_asr_to_lrc_lines + two_tier_time_calibration recover a systematic "
+print("\n--- lrc_timing: match_asr_to_lrc_lines + two_tier_time_calibration recover a systematic "
       "LRC/audio offset -- BUG REGRESSION for real 'Ordinary Day' (lrclib id 6210269) case, where our own "
       "audio has ~2.4s of extra lead-in silence vs. whichever recording LRCLIB's synced lyrics were timed "
       "against ---")
-from ultrastar_generator.mxl_lrc_generator import _match_asr_to_lrc_lines
+from ultrastar_generator.lrc_timing import match_asr_to_lrc_lines
 
 # 6 LRC lines 2s apart (distinct single-word content so text matching is
 # unambiguous); real ASR content for each line is a CONSTANT +3.0s later
@@ -1172,12 +1172,12 @@ off_asr = [
     _Word(text="echo", start=11.0, end=11.3),
     _Word(text="foxtrot", start=13.0, end=13.3),
 ]
-off_candidates = _match_asr_to_lrc_lines(off_asr, off_lrc_lines)
+off_candidates = match_asr_to_lrc_lines(off_asr, off_lrc_lines)
 assert len(off_candidates) == 6, off_candidates
 assert all(abs(delta - 3.0) < 1e-9 for _, _, delta in off_candidates), off_candidates
 off_offset, off_slope, off_confidence, off_kind, off_skipped = two_tier_time_calibration(off_candidates)
 assert off_offset == 3.0 and off_kind == "constant" and off_confidence == 1.0, (off_offset, off_kind, off_confidence)
-print("OK: _match_asr_to_lrc_lines recovers a per-line real-ASR-vs-LRC delta straight from ASR's own flat "
+print("OK: match_asr_to_lrc_lines recovers a per-line real-ASR-vs-LRC delta straight from ASR's own flat "
       "word stream, and two_tier_time_calibration confidently calibrates the constant +3.0s offset from it")
 
 off_mxl_words = [
@@ -2464,6 +2464,302 @@ assert set(result.unmatched_fresh) == {f"garbled{i}" for i in range(10)}, result
 print(f"OK: perfect pitch/timing on the matched subset does NOT mean PASS when coverage is low "
       f"(coverage_fresh={result.coverage_fresh:.0%}, {len(result.unmatched_fresh)} unmatched word(s)) -- "
       f"the real bug this gate catches (a real ~10% failure rate was previously invisible)")
+
+print("\n--- usdx_parser.parse_usdx_file: TRAILING-space word convention (real SingStar-shipped ground "
+      "truth files, e.g. Beauty and the Beast's notes.txt) parses word boundaries correctly -- BUG "
+      "REGRESSION for the leading-space-only heuristic silently merging a whole line into one word ---")
+with _tempfile.TemporaryDirectory() as d:
+    trailing_path = Path(d) / "Test Artist - Trailing Space.txt"
+    # Mirrors real notes.txt exactly: "Bare"+"ly " -> "Barely", "e"+"ven " -> "even",
+    # no leading spaces anywhere, word boundary is a TRAILING space on the
+    # word's own last syllable.
+    trailing_path.write_text(
+        "#TITLE:Trailing Space\n#ARTIST:Test Artist\n#BPM:240\n#GAP:0\n"
+        ": 546 6 61 Bare\n"
+        ": 553 4 63 ly \n"
+        ": 560 3 65 e\n"
+        ": 564 2 66 ven \n"
+        "E\n",
+        encoding="utf-8",
+    )
+    parsed_trailing = parse_usdx_file(trailing_path)
+    trailing_syllables = [e for e in parsed_trailing.entries if isinstance(e, Syllable)]
+    assert [s.text for s in trailing_syllables] == ["Bare", "ly", "e", "ven"], trailing_syllables
+    assert [s.is_word_start for s in trailing_syllables] == [True, False, True, False], \
+        [s.is_word_start for s in trailing_syllables]
+print("OK: trailing-space convention correctly parses 'Bare'+'ly'->'Barely' and 'e'+'ven'->'even' as two "
+      "separate words (previously the leading-space-only check would have left is_word_start=False for "
+      "everything but the very first syllable, merging the whole line into one bogus word)")
+
+print("\n--- realign: alignment-only mode -- re-times an EXISTING file's own notes against real ASR, "
+      "never touching pitch or the note sequence itself ---")
+from ultrastar_generator.realign import (
+    ExistingWord, extract_words, match_words_to_asr, interpolate_fallback, seed_lrc_anchors, realign_song,
+)
+
+print("  extract_words groups syllables into words using is_word_start, ignoring LineBreaks:")
+rg_entries = [
+    Syllable(text="Bare", start=0.0, end=0.3, midi_note=1, is_word_start=True),
+    Syllable(text="ly", start=0.3, end=0.6, midi_note=3, is_word_start=False),
+    LineBreak(start=0.6, end=1.0),
+    Syllable(text="hi", start=1.0, end=1.2, midi_note=5, is_word_start=True),
+]
+rg_words = extract_words(rg_entries)
+assert [w.text for w in rg_words] == ["Barely", "hi"], rg_words
+assert rg_words[0].entry_indices == [0, 1] and rg_words[1].entry_indices == [3], rg_words
+assert rg_words[0].orig_start == 0.0 and rg_words[0].orig_end == 0.6, rg_words[0]
+print("  OK: multi-syllable word reconstructed from consecutive same-word syllables, LineBreak skipped, "
+      "orig_start/orig_end span the whole word")
+
+print("  match_words_to_asr: exact match + fuzzy match for ASR's own mishearing, real ASR timing used directly:")
+mwa_existing = extract_words([
+    Syllable(text="hello", start=0.0, end=0.1, midi_note=0, is_word_start=True),
+    Syllable(text="favors", start=1.0, end=1.1, midi_note=0, is_word_start=True),
+    Syllable(text="world", start=2.0, end=2.1, midi_note=0, is_word_start=True),
+])
+mwa_asr = [
+    _Word(text="hello", start=10.0, end=10.3),
+    _Word(text="favorites", start=11.0, end=11.6),  # ASR mishearing, same real case as mxl_lrc_generator
+    _Word(text="world", start=12.0, end=12.3),
+]
+mwa_starts, mwa_ends, mwa_confident = match_words_to_asr(mwa_existing, mwa_asr)
+assert mwa_confident == [True, True, True], mwa_confident
+assert mwa_starts == [10.0, 11.0, 12.0], mwa_starts
+assert mwa_ends == [10.3, 11.6, 12.3], mwa_ends
+print("  OK: exact matches ('hello'/'world') AND a fuzzy ASR-mishearing match ('favors'~'favorites') all "
+      "confidently anchor to ASR's own real start/end")
+
+mwa_unrelated_asr = [_Word(text="hello", start=10.0, end=10.3), _Word(text="xyz", start=11.0, end=11.3),
+                      _Word(text="world", start=12.0, end=12.3)]
+_, _, mwa_unrelated_confident = match_words_to_asr(mwa_existing, mwa_unrelated_asr)
+assert mwa_unrelated_confident == [True, False, True], mwa_unrelated_confident
+print("  OK: a genuinely unrelated ASR word ('xyz' for 'favors') is correctly rejected, not fuzzy-matched")
+
+print("  interpolate_fallback: two-sided rate interpolation, one-sided constant shift, degenerate-original "
+      "-offset fallback, and identity fallback when no anchor exists anywhere:")
+if_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=float(i), orig_end=float(i) + 0.5)
+            for i in range(5)]
+if_starts = [0.0, None, None, None, 8.0]
+if_ends = [0.5, None, None, None, 8.5]
+if_confident = [True, False, False, False, True]
+n_interp, n_kept = interpolate_fallback(if_words, if_starts, if_ends, if_confident)
+assert n_interp == 3 and n_kept == 0, (n_interp, n_kept)
+assert if_starts == [0.0, 2.0, 4.0, 6.0, 8.0], if_starts  # rate = (8-0)/(4-0) = 2.0/orig-second
+assert [round(e - s, 6) for s, e in zip(if_starts, if_ends)] == [0.5, 1.0, 1.0, 1.0, 0.5], list(zip(if_starts, if_ends))
+print("    OK: two confident anchors -> proportional rate interpolation using ORIGINAL offsets purely as "
+      "relative position (duration scaled by the same local rate)")
+
+deg_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=0.0, orig_end=0.5)
+             for _ in range(5)]
+deg_starts = [5.0, None, None, None, 5.0]
+deg_ends = [5.5, None, None, None, 5.5]
+deg_confident = [True, False, False, False, True]
+interpolate_fallback(deg_words, deg_starts, deg_ends, deg_confident)
+assert deg_starts[1] == deg_starts[2] == deg_starts[3] == 5.0, deg_starts
+print("    OK: degenerate original offsets (e.g. a flat list of equal-length placeholder notes, no real "
+      "rhythm information to interpolate from) fall back to a constant shift instead of a divide-by-zero "
+      "or nonsense rate")
+
+one_sided_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=float(i), orig_end=float(i) + 0.5)
+                    for i in range(5)]
+one_sided_starts = [1.0, None, None, None, None]
+one_sided_ends = [1.5, None, None, None, None]
+one_sided_confident = [True, False, False, False, False]
+interpolate_fallback(one_sided_words, one_sided_starts, one_sided_ends, one_sided_confident)
+assert one_sided_starts == [1.0, 2.0, 3.0, 4.0, 5.0], one_sided_starts  # constant +1.0 shift, not extrapolated rate
+print("    OK: only ONE anchor available -> constant shift from that anchor, not a rate extrapolated from "
+      "a single data point")
+
+none_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=float(i) * 10, orig_end=float(i) * 10 + 0.5)
+              for i in range(3)]
+none_starts = [None, None, None]
+none_ends = [None, None, None]
+none_confident = [False, False, False]
+n_interp2, n_kept2 = interpolate_fallback(none_words, none_starts, none_ends, none_confident)
+assert n_kept2 == 3 and n_interp2 == 0, (n_interp2, n_kept2)
+assert none_starts == [0.0, 10.0, 20.0] and none_ends == [0.5, 10.5, 20.5], (none_starts, none_ends)
+print("    OK: NO anchor anywhere in the whole song -> original timing kept completely unchanged, never "
+      "guessed from nothing (this mode always has a safe fallback, unlike mxl_lrc_generator's equivalent)")
+
+print("  seed_lrc_anchors: LRCLIB line starts fill in an anchor for the first not-yet-confident word of "
+      "each matched line (a forced/pinned candidate skips network + candidate-selection filtering):")
+from ultrastar_generator.lyrics_lookup import LrcLibCandidate
+sla_existing = extract_words([
+    Syllable(text="alpha", start=0.0, end=1.0, midi_note=0, is_word_start=True),
+    Syllable(text="bravo", start=1.0, end=2.0, midi_note=0, is_word_start=True),
+    Syllable(text="charlie", start=2.0, end=3.0, midi_note=0, is_word_start=True),
+    Syllable(text="delta", start=3.0, end=4.0, midi_note=0, is_word_start=True),
+])
+sla_asr = [_Word(text="alpha", start=10.05, end=10.3)]  # bravo/charlie/delta never transcribed at all
+sla_starts, sla_ends, sla_confident = match_words_to_asr(sla_existing, sla_asr)
+assert sla_confident == [True, False, False, False], sla_confident
+sla_candidate = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=None,
+    plain_lyrics="alpha bravo charlie delta",
+    synced_lyrics="[00:10.00]alpha bravo\n[00:20.00]charlie delta\n",
+    instrumental=False, id=999,
+)
+sla_result = seed_lrc_anchors(sla_existing, sla_asr, sla_starts, sla_ends, sla_confident,
+                               "A", "T", 100.0, forced_candidate=sla_candidate)
+assert sla_result is not None and sla_result.n_seeded == 1, sla_result
+assert sla_confident == [True, False, True, False], sla_confident  # "charlie" seeded (first word of line 2)
+assert sla_starts[2] == 20.0, sla_starts  # this song's single ASR anchor isn't enough evidence to calibrate
+                                            # (needs >= LRC_TIMING_MIN_CALIBRATION_SAMPLES), so the line's
+                                            # own raw timestamp is used uncalibrated
+print("  OK: 'charlie' (first word of the second LRC line) gets a real-time anchor from the line's own "
+      "timestamp; 'bravo'/'delta' (not line-first) are untouched, left for interpolation")
+
+print("  seed_lrc_anchors returns None (no mutation) when no usable candidate exists -- confirmed real "
+      "case: Beauty and the Beast has NO valid LRCLIB candidate at all:")
+sla_none_starts, sla_none_ends, sla_none_confident = match_words_to_asr(sla_existing, sla_asr)
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=[])  # deterministic empty search, no real network
+sla_none_result = seed_lrc_anchors(sla_existing, sla_asr, sla_none_starts, sla_none_ends, sla_none_confident,
+                                    "A", "T", 100.0, forced_candidate=None)
+assert sla_none_result is None, sla_none_result
+assert sla_none_confident == [True, False, False, False], sla_none_confident  # unchanged
+print("  OK: no usable LRC candidate -> starts/ends/confident left completely untouched, falls through to "
+      "ASR-only interpolation")
+
+print("  match_words_to_asr_windowed (PROTOTYPE 'windowed' lrc_mode): LRC line starts window the ASR "
+      "search per-line -- a same-text ASR word far outside the line's own window is correctly ignored, "
+      "unlike whole-song matching which has no time information to reject it with:")
+from ultrastar_generator.realign import match_words_to_asr_windowed, prepare_lrc
+
+mww_existing = extract_words([
+    Syllable(text="alpha", start=0.0, end=1.0, midi_note=0, is_word_start=True),
+    Syllable(text="bravo", start=1.0, end=2.0, midi_note=0, is_word_start=True),
+    Syllable(text="charlie", start=2.0, end=3.0, midi_note=0, is_word_start=True),
+    Syllable(text="delta", start=3.0, end=4.0, midi_note=0, is_word_start=True),
+])
+mww_word_lines = [0, 0, 1, 1]
+mww_lrc_lines = [(10.0, "alpha bravo"), (20.0, "charlie delta")]
+mww_asr = [
+    _Word(text="alpha", start=100.0, end=100.3),  # decoy: right TEXT, way outside line 0's window
+    _Word(text="alpha", start=10.05, end=10.3),   # the real one, inside line 0's window
+    _Word(text="bravo", start=10.6, end=10.9),
+    _Word(text="charlie", start=20.05, end=20.3),
+]
+mww_starts, mww_ends, mww_confident = match_words_to_asr_windowed(mww_existing, mww_word_lines, mww_lrc_lines, mww_asr)
+assert mww_confident == [True, True, True, False], mww_confident
+assert mww_starts[0] == 10.05, mww_starts  # the in-window occurrence, NOT the far-away decoy at t=100
+assert mww_starts[1] == 10.6, mww_starts
+assert mww_starts[2] == 20.05, mww_starts
+print("  OK: 'alpha' correctly matched to its IN-WINDOW ASR occurrence (10.05s), ignoring the decoy "
+      "at 100s with identical text; 'delta' (no ASR word anywhere) stays unmatched for interpolate_fallback")
+
+print("  prepare_lrc: shared candidate-selection/calibration/line-assignment step used by BOTH LRC "
+      "strategies (via a forced candidate, no real network):")
+mww_prep = prepare_lrc(mww_existing, mww_asr[1:], "A", "T", 100.0, forced_candidate=sla_candidate)
+assert mww_prep is not None and mww_prep.word_lines == [0, 0, 1, 1], mww_prep
+print("  OK: prepare_lrc returns the calibrated lines + per-word line assignment both strategies build on")
+
+print("  realign_song end-to-end with lrc_mode='windowed': same forced candidate, output stays consistent "
+      "with the windowed matcher's own per-line window (not just whole-song ASR matching):")
+rsw_existing = ParsedSong(
+    title="Windowed", artist="A", bpm=60.0, gap_ms=0,
+    entries=[
+        Syllable(text="alpha", start=0.0, end=1.0, midi_note=1, is_word_start=True),
+        Syllable(text="bravo", start=1.0, end=2.0, midi_note=2, is_word_start=True),
+        Syllable(text="charlie", start=2.0, end=3.0, midi_note=3, is_word_start=True),
+        Syllable(text="delta", start=3.0, end=4.0, midi_note=4, is_word_start=True),
+    ],
+    raw_tags={"TITLE": "Windowed", "ARTIST": "A", "BPM": "60", "GAP": "0"},
+)
+rsw_log = []
+rsw_result = realign_song(rsw_existing, mww_asr, artist="A", title="T", audio_duration=100.0,
+                           use_lrc=True, lrc_mode="windowed", forced_lrc_candidate=sla_candidate, log=rsw_log.append)
+assert rsw_result.success, rsw_result.error
+rsw_syllables = [e for e in rsw_result.song.entries if isinstance(e, Syllable)]
+assert abs(rsw_syllables[0].start - 10.05) < 1e-6, rsw_syllables[0]  # picked the in-window "alpha", not the decoy
+assert [s.midi_note for s in rsw_syllables] == [1, 2, 3, 4], rsw_syllables  # pitch still never touched
+print("  OK: realign_song(lrc_mode='windowed') end-to-end also correctly rejects the far-away decoy via "
+      "the LRC line window, pitch untouched")
+
+print("  realign_song end-to-end: a file whose notes are a degenerate flat list of equal-length "
+      "placeholder notes (don't match the audio at all) gets re-timed to match real ASR, with the SAME "
+      "note count/order/pitch and BPM, only start/end (and derived GAP) changed:")
+rs_existing = ParsedSong(
+    title="Degenerate", artist="Test Artist", bpm=60.0, gap_ms=0,
+    entries=[
+        Syllable(text="one", start=0.0, end=1.0, midi_note=10, is_word_start=True, note_type=":"),
+        Syllable(text="two", start=1.0, end=2.0, midi_note=20, is_word_start=True, note_type=":"),
+        LineBreak(start=2.0, end=2.0),
+        Syllable(text="three", start=2.0, end=3.0, midi_note=30, is_word_start=True, note_type="*"),
+        Syllable(text="four", start=3.0, end=4.0, midi_note=40, is_word_start=True, note_type=":"),
+    ],
+    raw_tags={"TITLE": "Degenerate", "ARTIST": "Test Artist", "MP3": "music.ogg", "BPM": "60", "GAP": "0"},
+)
+rs_asr = [
+    _Word(text="one", start=10.0, end=10.4),
+    _Word(text="two", start=10.5, end=10.9),
+    _Word(text="three", start=11.0, end=11.4),
+    _Word(text="four", start=11.5, end=11.9),
+]
+rs_log = []
+rs_result = realign_song(rs_existing, rs_asr, use_lrc=False, log=rs_log.append)
+assert rs_result.success, rs_result.error
+rs_syllables = [e for e in rs_result.song.entries if isinstance(e, Syllable)]
+assert [s.text for s in rs_syllables] == ["one", "two", "three", "four"], rs_syllables
+assert [s.midi_note for s in rs_syllables] == [10, 20, 30, 40], rs_syllables       # pitch NEVER touched
+assert [s.note_type for s in rs_syllables] == [":", ":", "*", ":"], rs_syllables  # note type NEVER touched
+assert len(rs_result.song.entries) == len(rs_existing.entries), \
+    (len(rs_result.song.entries), len(rs_existing.entries))                        # no note added/removed
+assert rs_result.song.bpm == 60.0, rs_result.song.bpm                              # BPM never touched
+for s, expected_asr in zip(rs_syllables, rs_asr):
+    assert abs(s.start - expected_asr.start) < 1e-6, (s, expected_asr)
+    assert abs(s.end - expected_asr.end) < 1e-6, (s, expected_asr)
+assert rs_result.song.gap_ms == 10000, rs_result.song.gap_ms  # GAP re-derived from the new first syllable
+rs_break = next(e for e in rs_result.song.entries if isinstance(e, LineBreak))
+assert abs(rs_break.start - 10.9) < 1e-6, rs_break.start  # re-anchored to "two"'s new end
+assert abs(rs_break.end - 11.0) < 1e-6, rs_break.end      # re-anchored to "three"'s new start
+assert rs_result.song.mp3 == "music.ogg"  # untouched metadata carried through verbatim
+assert rs_result.quality.n_asr_matched == 4 and rs_result.quality.n_kept_original == 0, rs_result.quality
+rs_orig_syllables_after = [e for e in rs_existing.entries if isinstance(e, Syllable)]
+assert [s.start for s in rs_orig_syllables_after] == [0.0, 1.0, 2.0, 3.0], rs_orig_syllables_after
+print("  OK: the CALLER's own ParsedSong (rs_existing) is never mutated -- its syllables still show their "
+      "original 0-4s placeholder timing after the call, so realign_song can safely be called twice on the "
+      "same parsed object (e.g. to compare two lrc_mode strategies against each other)")
+print("  OK: every note landed exactly on its real ASR timestamp (0-4s placeholder timing completely "
+      "replaced by real ~10-12s audio timing), pitch/note-type/note-count/BPM untouched, GAP and the "
+      "LineBreak's position both correctly re-derived from the new syllable timing")
+
+print("  realign_song: a low anchor rate (lyrics/audio likely mismatched) still returns a usable result "
+      "(never crashes/aborts -- the original file is always a safe fallback) but logs a clear warning:")
+rs_bad_existing = ParsedSong(
+    title="Mismatch", artist="Test Artist", bpm=120.0, gap_ms=0,
+    entries=[Syllable(text=f"w{i}", start=float(i), end=float(i) + 0.5, midi_note=0, is_word_start=True)
+             for i in range(10)],
+    raw_tags={"TITLE": "Mismatch", "ARTIST": "Test Artist", "BPM": "120", "GAP": "0"},
+)
+rs_bad_asr = [_Word(text="completely", start=50.0, end=50.3), _Word(text="unrelated", start=51.0, end=51.3)]
+rs_bad_log = []
+rs_bad_result = realign_song(rs_bad_existing, rs_bad_asr, use_lrc=False, log=rs_bad_log.append)
+assert rs_bad_result.success, rs_bad_result.error
+assert rs_bad_result.quality.n_asr_matched == 0, rs_bad_result.quality
+assert any("WARNING" in line and "may not match" in line for line in rs_bad_log), rs_bad_log
+print("  OK: 0% real anchor rate still produces a valid (unchanged-timing) output rather than crashing, "
+      "with a clear warning logged for the user to review")
+
+print("  realign: the existing file being realigned is ALWAYS treated as read-only -- never overwritten, "
+      "not even if an explicit --output path resolves to the same file:")
+from ultrastar_generator.realign import resolve_realign_output_path, check_output_not_existing_file
+
+ro_existing_path = Path("C:/Songs/Some Artist - Some Song.txt")
+ro_default_out = resolve_realign_output_path(ro_existing_path, None)
+assert ro_default_out.name == "Some Artist - Some Song [REALIGNED].txt", ro_default_out
+assert check_output_not_existing_file(ro_default_out, ro_existing_path) is None, \
+    "the default output path must never collide with the existing file"
+print("  OK: the default output path is a separate '[REALIGNED]' file, never the existing file itself")
+
+ro_same_out = resolve_realign_output_path(ro_existing_path, str(ro_existing_path))
+ro_error = check_output_not_existing_file(ro_same_out, ro_existing_path)
+assert ro_error is not None and "read-only" in ro_error, ro_error
+print("  OK: an explicit --output that resolves to the SAME path as the existing file is REFUSED "
+      "(no override exists for this on purpose)")
+
+ro_different_out = resolve_realign_output_path(ro_existing_path, "C:/Songs/somewhere/else.txt")
+assert check_output_not_existing_file(ro_different_out, ro_existing_path) is None
+print("  OK: an explicit --output pointing somewhere genuinely different is allowed")
 
 print("\n--- youtube_source.download_youtube_source (fake yt_dlp module, no real network) ---")
 from ultrastar_generator.youtube_source import YoutubeDownloadError

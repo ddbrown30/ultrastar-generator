@@ -78,7 +78,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--audio-file", default=None,
                     help="Which file (bare filename, within the input folder) to use as the audio/video "
                          "source -- required only if the folder contains more than one real audio file "
-                         "(mp3/ogg/oga), which this tool otherwise refuses to guess between.")
+                         "(mp3/ogg/oga/m4a), which this tool otherwise refuses to guess between.")
     p.add_argument("--youtube-url", default=None,
                     help="Download this video instead of using local files -- lands directly in the "
                          "input folder, then processed exactly like any other song folder. REQUIRES "

@@ -11,7 +11,7 @@ NOTE_RAP = "R"
 NOTE_RAP_GOLDEN = "G"
 
 # --- Audio / file conventions ---------------------------------------------
-AUDIO_EXTS = (".mp3", ".ogg", ".oga")
+AUDIO_EXTS = (".mp3", ".ogg", ".oga", ".m4a")
 # All companion-#VIDEO-eligible extensions (file_discovery.find_companions).
 VIDEO_EXTS = (".avi", ".mp4", ".mpg", ".mpeg")
 # Video containers UltraStar Deluxe can use directly as #MP3 (confirmed by

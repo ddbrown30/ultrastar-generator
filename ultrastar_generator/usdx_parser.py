@@ -105,6 +105,7 @@ def parse_usdx_file(path: Path) -> ParsedSong:
     # downstream word-level comparison (verify_existing_song, the
     # --existing-txt-check feature) for any file authored this way.
     force_word_start = True
+    prev_raw_text = None
     for line in note_lines:
         m = _NOTE_RE.match(line)
         if m:
@@ -112,11 +113,25 @@ def parse_usdx_file(path: Path) -> ParsedSong:
             start_beat, length_beats, pitch = int(start_beat), int(length_beats), int(pitch)
             start = beat_to_seconds(start_beat, gap_ms, bpm)
             end = beat_to_seconds(start_beat + length_beats, gap_ms, bpm)
-            # A new word's text starts with a literal space (usdx_writer's own
-            # convention, see render_song) -- except when nothing precedes it
-            # to separate it from (see force_word_start above).
-            is_word_start = text.startswith(" ") or force_word_start
+            # A new word's boundary is marked by whitespace -- but WHICH side
+            # varies by source. This project's own writer (usdx_writer.py)
+            # puts a LEADING space on a new word's text; real SingStar-shipped
+            # ground-truth files instead put a TRAILING space at the end of a
+            # word's LAST syllable and no leading space at all (confirmed:
+            # "Bare" + "ly " forms "Barely", "e" + "ven " forms "even" --
+            # trusting text.startswith(" ") alone here would treat every
+            # syllable after the first in a line as a CONTINUATION, silently
+            # merging a whole line into one bogus word). Checking both this
+            # syllable's own leading space AND the previous syllable's
+            # trailing space handles both conventions -- and is a strict
+            # superset of the old leading-space-only check, so this project's
+            # own output (leading-space only) parses identically to before.
+            is_word_start = (
+                force_word_start or text.startswith(" ")
+                or (prev_raw_text is not None and prev_raw_text.endswith(" "))
+            )
             force_word_start = False
+            prev_raw_text = text
             entries.append(Syllable(
                 text=text.strip(), start=start, end=end, midi_note=pitch,
                 is_word_start=is_word_start, note_type=note_type,

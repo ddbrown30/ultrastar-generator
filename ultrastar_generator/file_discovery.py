@@ -1,7 +1,7 @@
 """Finds companion files (video, cover, background) next to an audio file.
 
 Rules implemented (per the user's spec):
-  * Audio files are named "<Artist> - <Title>.<ext>" (mp3/ogg/oga).
+  * Audio files are named "<Artist> - <Title>.<ext>" (mp3/ogg/oga/m4a).
   * If an .avi/.mp4 exists with the SAME base name -> #VIDEO.
   * If exactly one .jpg/.jpeg exists with the same base name -> used for
     both #COVER and #BACKGROUND.
