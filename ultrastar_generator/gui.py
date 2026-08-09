@@ -380,6 +380,7 @@ class App(tk.Tk):
         self.existing_txt_path = tk.StringVar()
         self.realign_use_lrc = tk.BooleanVar(value=True)
         self.lrc_mode = tk.StringVar(value="windowed")
+        self.realign_delete_work_files = tk.BooleanVar(value=False)
 
         # Curated main-surface options (see gui.py's own module docstring
         # for why only a subset of the ~30 CLI flags are exposed here).
@@ -608,22 +609,35 @@ class App(tk.Tk):
                                               "always auto-picks silently.")
         self._update_pinned_lyrics_label()
 
-        self.realign_frame = ttk.LabelFrame(self, text="Realign options")
-        realign_frame = self.realign_frame
-        ttk.Label(realign_frame, text="Whisper model:").grid(row=0, column=0, sticky="w", padx=8, pady=2)
-        realign_whisper_entry = ttk.Entry(realign_frame, textvariable=self.whisper_model, width=15)
+        # Mirrors the normal pipeline's own Lyrics/Options split immediately
+        # below (same LabelFrame styling/naming convention) rather than one
+        # combined "Realign options" frame -- LRCLIB candidate selection
+        # (Lyrics) is conceptually separate from behavioral toggles
+        # (Options), same distinction the normal pipeline already draws.
+        self.realign_lyrics_frame = ttk.LabelFrame(self, text="Lyrics (single-song mode only)")
+        realign_lyrics_frame = self.realign_lyrics_frame
+        ttk.Label(realign_lyrics_frame, text="LRCLIB ID:").pack(side="left", padx=8, pady=4)
+        self.realign_lrclib_id_entry = ttk.Entry(realign_lyrics_frame, textvariable=self.lrclib_id, width=10)
+        self.realign_lrclib_id_entry.pack(side="left", padx=4, pady=4)
+        Tooltip(self.realign_lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself and "
+                                               "paste the id here) -- always wins over automatic search.")
+
+        self.realign_options_frame = ttk.LabelFrame(self, text="Options")
+        realign_options_frame = self.realign_options_frame
+        ttk.Label(realign_options_frame, text="Whisper model:").grid(row=0, column=0, sticky="w", padx=8, pady=2)
+        realign_whisper_entry = ttk.Entry(realign_options_frame, textvariable=self.whisper_model, width=15)
         realign_whisper_entry.grid(row=0, column=1, sticky="w", padx=8, pady=2)
         Tooltip(realign_whisper_entry, "ASR model size, e.g. small.en (default), medium.en, large-v3. "
                                         "Bigger is more accurate but slower.")
-        realign_use_lrc_check = ttk.Checkbutton(realign_frame, text="Use LRC synced lyrics",
+        realign_use_lrc_check = ttk.Checkbutton(realign_options_frame, text="Use LRC synced lyrics",
                                                  variable=self.realign_use_lrc)
         realign_use_lrc_check.grid(row=1, column=0, sticky="w", padx=8, pady=2)
         Tooltip(realign_use_lrc_check, "When available, LRCLIB synced-lyrics line timestamps help place "
                                         "words the audio transcription alone can't confidently reach. Off: "
                                         "audio transcription only.")
-        ttk.Label(realign_frame, text="LRC mode:").grid(row=1, column=1, sticky="e", padx=(8, 2), pady=2)
-        lrc_mode_combo = ttk.Combobox(realign_frame, textvariable=self.lrc_mode, values=["windowed", "seed"],
-                                       state="readonly", width=10)
+        ttk.Label(realign_options_frame, text="LRC mode:").grid(row=1, column=1, sticky="e", padx=(8, 2), pady=2)
+        lrc_mode_combo = ttk.Combobox(realign_options_frame, textvariable=self.lrc_mode,
+                                       values=["windowed", "seed"], state="readonly", width=10)
         lrc_mode_combo.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=2)
         Tooltip(lrc_mode_combo, "windowed (default): LRC line starts window the audio search, but ONLY when "
                                  "LRCLIB's timing is confidently calibrated against this audio -- otherwise "
@@ -631,11 +645,14 @@ class App(tk.Tk):
                                  "always whole-song-transcription-primary, LRC only fills residual gaps. "
                                  "Real comparison found 'windowed' never worse and sometimes much better "
                                  "-- see CLAUDE.md.")
-        ttk.Label(realign_frame, text="LRCLIB ID:").grid(row=2, column=0, sticky="w", padx=8, pady=2)
-        self.realign_lrclib_id_entry = ttk.Entry(realign_frame, textvariable=self.lrclib_id, width=10)
-        self.realign_lrclib_id_entry.grid(row=2, column=1, sticky="w", padx=8, pady=2)
-        Tooltip(self.realign_lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself and "
-                                               "paste the id here) -- always wins over automatic search.")
+        realign_delete_work_files_check = ttk.Checkbutton(
+            realign_options_frame, text="Delete work files after realigning",
+            variable=self.realign_delete_work_files)
+        realign_delete_work_files_check.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        Tooltip(realign_delete_work_files_check, "Deletes the entire .ultrastar_work directory (cached "
+                                                   "Demucs separation, debug files) once realigning completes. "
+                                                   "Leave off if you'll re-run this song again soon -- it "
+                                                   "avoids re-paying separation cost.")
 
         self.opts_frame = ttk.LabelFrame(self, text="Options")
         opts_frame = self.opts_frame
@@ -822,9 +839,11 @@ class App(tk.Tk):
             self.opts_frame.pack_forget()
             self.advanced_toggle.pack_forget()
             self.advanced_frame.pack_forget()
-            self.realign_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
+            self.realign_lyrics_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
+            self.realign_options_frame.pack(fill="x", padx=8, pady=4, after=self.realign_lyrics_frame)
         else:
-            self.realign_frame.pack_forget()
+            self.realign_lyrics_frame.pack_forget()
+            self.realign_options_frame.pack_forget()
             self.lyrics_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
             self.opts_frame.pack(fill="x", padx=8, pady=4, after=self.lyrics_frame)
             self.advanced_toggle.pack(fill="x", padx=8, pady=4, after=self.opts_frame)
@@ -1096,6 +1115,7 @@ class App(tk.Tk):
             lrclib_id=None if is_batch else self._effective_lrclib_id(),
             use_lrc=self.realign_use_lrc.get(),
             lrc_mode=self.lrc_mode.get(),
+            delete_work_files=self.realign_delete_work_files.get(),
         )
 
     def _on_run(self):

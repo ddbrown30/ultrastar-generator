@@ -816,6 +816,11 @@ def build_arg_parser():
                          "never worse than 'seed' and a clear win when calibration was confident. 'seed': "
                          "always whole-song-ASR-primary, even with a confidently-calibrated candidate -- "
                          "kept for A-B comparison, not needed for normal use.")
+    p.add_argument("--delete-work-files", action="store_true",
+                    help="Delete the large, fully-regeneratable work files under "
+                         "<input-folder>/.ultrastar_work after realigning. Default: OFF (keeps them so "
+                         "re-runs reuse the cached separation) -- same convention as the main pipeline's "
+                         "own --delete-work-files.")
     return p
 
 
@@ -839,6 +844,7 @@ class RealignPipelineOptions:
     use_lrc: bool = True
     lrc_mode: str = "windowed"
     output_path: Optional[str] = None
+    delete_work_files: bool = False
 
 
 @dataclass
@@ -850,6 +856,26 @@ class RealignPipelineResult:
 
 def run_realign_pipeline(input_dir: Path, existing_txt_path: Optional[Path], opts: RealignPipelineOptions,
                           *, log: Callable[[str], None] = print) -> RealignPipelineResult:
+    """Thin wrapper around `_run_realign_pipeline_body` so `opts.
+    delete_work_files` is honored via `finally`, regardless of which of
+    the body's several early-return failure paths was taken -- work_dir
+    may be partially populated (e.g. separation already ran) even on a
+    failed run. Mirrors `main.run_pipeline`'s own wrapper exactly (see
+    its docstring); work_dir's own location is recomputed here rather
+    than threaded back out of the body, since it's a pure function of
+    (input_dir, opts.work_dir) that can never diverge from what the body
+    itself used."""
+    try:
+        return _run_realign_pipeline_body(input_dir, existing_txt_path, opts, log=log)
+    finally:
+        if opts.delete_work_files:
+            from .main import delete_work_files as _delete_work_files
+            wd = Path(opts.work_dir).resolve() if opts.work_dir else (Path(input_dir) / ".ultrastar_work")
+            _delete_work_files(wd)
+
+
+def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path], opts: RealignPipelineOptions,
+                                *, log: Callable[[str], None] = print) -> RealignPipelineResult:
     """Runs the full realign CLI/GUI flow for one song: resolves the audio,
     isolates vocals, transcribes, realigns, and writes the output file.
     Never raises on an "expected" failure (bad existing file, ambiguous
@@ -986,6 +1012,7 @@ def _opts_from_args(args) -> RealignPipelineOptions:
         no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
         artist=args.artist, title=args.title, lrclib_id=args.lrclib_id,
         use_lrc=args.use_lrc, lrc_mode=args.lrc_mode, output_path=args.output_path,
+        delete_work_files=args.delete_work_files,
     )
 
 

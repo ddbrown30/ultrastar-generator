@@ -7,12 +7,26 @@ place, rather than duplicating the subprocess invocation a second time.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 from . import config
+
+# Suppresses the console window Windows otherwise pops up for a real
+# console-subsystem child process (ffmpeg/ffprobe) when the PARENT has no
+# console of its own (e.g. the GUI, launched via pythonw.exe -- see
+# run_gui.bat) -- confirmed real user-visible symptom ("console windows
+# popping up during the pipeline run"). A no-op (flag 0) on non-Windows,
+# where `subprocess.CREATE_NO_WINDOW` doesn't exist and this concept
+# doesn't apply. Harmless when a console DOES already exist (CLI run from
+# a terminal): the child already shares that console either way, and all
+# output is captured via capture_output=True regardless of window
+# visibility, so nothing is lost by suppressing a window that wasn't
+# going to newly appear in that case anyway.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def has_audio_stream(path: Path) -> bool:
@@ -29,7 +43,7 @@ def has_audio_stream(path: Path) -> bool:
         "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and proc.stdout.strip() != ""
@@ -68,7 +82,7 @@ def extract_audio_track(src: Path, dst: Path, *, as_mp3: bool = False, sr: Optio
             "-vn", "-ac", "1", "-ar", str(sr or 16000), "-f", "wav", str(dst),
         ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, timeout=600, creationflags=_NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0

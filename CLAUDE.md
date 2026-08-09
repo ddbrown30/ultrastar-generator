@@ -477,6 +477,32 @@ producing the same result as the equivalent CLI invocation.
 beyond the manual BATB/Stars/Chicago runs in this file -- rerun manually
 if `realign.py`'s core matching/interpolation logic changes.
 
+### GUI form split into Lyrics/Options + `--delete-work-files` (2026-08-09)
+
+Realign's GUI form restructured to match the normal pipeline's own
+Lyrics/Options split (user's explicit request), rather than one combined
+"Realign options" frame: `self.realign_lyrics_frame` (LRCLIB ID only, for
+now -- no Search/pin/ambiguity-prompt support in realign.py yet) +
+`self.realign_options_frame` (Whisper model, Use LRC synced lyrics, LRC
+mode, and a new "Delete work files after realigning" checkbox). Both
+toggle together as a pair in `_on_mode_change` exactly where the single
+`realign_frame` used to.
+
+`--delete-work-files` support added to `realign.py` itself for this (it
+didn't exist there at all before): `RealignPipelineOptions.
+delete_work_files`, and `run_realign_pipeline` split into a thin wrapper
++ `_run_realign_pipeline_body`, mirroring `main.run_pipeline`'s own
+wrapper/`finally` shape exactly (deletion happens regardless of which
+early-return failure path the body took). `run_realign_batch` gets this
+for free -- it already calls the wrapper per subfolder. CLI gained a
+matching `--delete-work-files` flag.
+
+Real-validated end-to-end: ran with `--skip-separation --vocals-path
+<a DIFFERENT folder's cached vocals> --delete-work-files` against a
+throwaway folder -- output file written correctly, that folder's OWN
+`.ultrastar_work` was deleted afterward, and the separately-referenced
+cache folder (BATB) was confirmed untouched.
+
 ### Batch support + Mode/Batch UI restructure (2026-08-09)
 
 Added batch mode to `realign.py`: `find_existing_txt_in_folder` auto-
@@ -647,6 +673,23 @@ normal use anymore.
   pulls in pyannote/torch; expect noisy-but-harmless startup warnings.
 - Demucs stems cached in `sandbox/.ultrastar_work/` — safe to delete
   between runs; separation is skipped if `vocals.wav` already exists.
+- **No console-window flashing** (2026-08-09, user-reported): every
+  `subprocess.run` call that spawns a real console-subsystem executable
+  (ffprobe/ffmpeg in `media_extract.py`, Demucs in `separation.py` --
+  the only 3 call sites in the repo) passes
+  `creationflags=subprocess.CREATE_NO_WINDOW` (a module-level `_NO_WINDOW`
+  constant per file, `0` on non-Windows where the flag doesn't exist) --
+  otherwise Windows pops a new console window per call whenever the
+  parent process has none of its own (the GUI, launched via `pythonw.exe`
+  per `run_gui.bat`). Harmless when a console DOES already exist (CLI run
+  from a terminal) since output is captured via `capture_output=True`
+  regardless of window visibility either way. Real-validated: `ffprobe`
+  (`has_audio_stream`) still correctly detects a real audio file's stream
+  with the flag applied. yt-dlp (YouTube mode) is invoked as a Python
+  library call, not a subprocess, so it isn't affected by or in need of
+  this fix; any console flash it produces internally (unlikely, but not
+  independently checked) would be third-party behavior outside this
+  project's control.
 
 ## Open / deferred (not yet built, needs direction before starting)
 

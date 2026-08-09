@@ -7,12 +7,18 @@ people already have it installed (`pip install demucs`).
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from . import config
+
+# See media_extract.py's own comment on this exact constant -- suppresses
+# the console window Windows otherwise pops up for a subprocess when the
+# parent has none of its own (the GUI, launched via pythonw.exe).
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 class SeparationError(RuntimeError):
@@ -55,7 +61,7 @@ def isolate_vocals(
         str(audio_path),
     ]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         raise SeparationError(
             f"Demucs failed (exit {proc.returncode}).\n"
