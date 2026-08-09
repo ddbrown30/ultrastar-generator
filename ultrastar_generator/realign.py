@@ -693,6 +693,51 @@ def _song_from_existing(existing: ParsedSong, entries: List[object], gap_ms: int
     )
 
 
+class AmbiguousExistingTxtError(ValueError):
+    """Raised by `find_existing_txt_in_folder` when the folder doesn't
+    have exactly one obvious existing .txt to realign -- fails closed,
+    same convention as `file_discovery.AmbiguousInputError` (never
+    silently guesses which file the user meant)."""
+
+
+def find_existing_txt_in_folder(folder: Path) -> Path:
+    """Auto-detects the single existing UltraStar .txt to realign within
+    a folder -- used when no explicit --existing-txt is given (required
+    for batch mode, where a single explicit path can't apply across
+    multiple subfolders; optional convenience in single-song mode too).
+
+    Excludes this module's OWN "[REALIGNED]" output naming convention --
+    otherwise re-running on a folder that already has a previous run's
+    output would either see two candidates (falsely "ambiguous") or,
+    worse, pick the REALIGNED file itself as this run's new INPUT,
+    compounding drift across repeated runs instead of always realigning
+    the same original file.
+
+    When more than one real candidate remains, tries ONE further
+    disambiguation before giving up: a file named exactly "<folder
+    name>.txt" (case-insensitive) -- the common convention this project's
+    own output/companion files already follow elsewhere (e.g. `#COVER`/
+    `#BACKGROUND` matching by basename in file_discovery.py). Only trusted
+    when it narrows the field to EXACTLY one match; still fails closed
+    (never guesses) otherwise."""
+    folder = Path(folder)
+    candidates = sorted(p for p in folder.glob("*.txt") if "[REALIGNED]" not in p.stem)
+    if not candidates:
+        raise AmbiguousExistingTxtError(f"No .txt file found in {folder} to realign.")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    expected_name = f"{folder.name}.txt".lower()
+    name_matches = [p for p in candidates if p.name.lower() == expected_name]
+    if len(name_matches) == 1:
+        return name_matches[0]
+
+    names = ", ".join(p.name for p in candidates)
+    raise AmbiguousExistingTxtError(
+        f"Multiple .txt files found in {folder} ({names}), and none (or more than one) match the "
+        f"folder's own name ({folder.name}.txt) -- pass --existing-txt explicitly to disambiguate.")
+
+
 def resolve_realign_output_path(existing_txt_path: Path, output_path_override: Optional[str]) -> Path:
     """Where a realigned .txt gets written -- an explicit override if given,
     else a NEW file alongside the existing one, never the existing file
@@ -727,9 +772,19 @@ def build_arg_parser():
                     "touched, changed, added, or removed)."
     )
     p.add_argument("input", help="Path to the song's folder (containing the audio, or a video that "
-                                  "stands in for it -- same folder-resolution rules as the main pipeline).")
-    p.add_argument("--existing-txt", dest="existing_txt_path", required=True,
-                    help="Path to the existing UltraStar .txt to realign.")
+                                  "stands in for it -- same folder-resolution rules as the main pipeline). "
+                                  "With --batch, this is a PARENT folder whose immediate subdirectories are "
+                                  "each realigned the same way.")
+    p.add_argument("--batch", action="store_true",
+                    help="Treat the positional argument as a PARENT folder: run realignment on each of its "
+                         "immediate subdirectories (not the parent itself), auto-detecting each subfolder's "
+                         "own existing .txt (see --existing-txt). One song failing does not abort the rest. "
+                         "Not allowed together with --existing-txt/--audio-file/--work-dir/--artist/--title/"
+                         "--lrclib-id (none of which make sense as a single override across multiple songs).")
+    p.add_argument("--existing-txt", dest="existing_txt_path", default=None,
+                    help="Path to the existing UltraStar .txt to realign. Optional in single-song mode -- "
+                         "auto-detects the single .txt file in the input folder if omitted. Not allowed "
+                         "with --batch (each subfolder is always auto-detected).")
     p.add_argument("--output", dest="output_path", default=None,
                     help="Where to write the realigned .txt (default: alongside the existing file, "
                          "named '<name> [REALIGNED].txt'). The existing file (--existing-txt) is always "
@@ -793,7 +848,7 @@ class RealignPipelineResult:
     error: Optional[str] = None
 
 
-def run_realign_pipeline(input_dir: Path, existing_txt_path: Path, opts: RealignPipelineOptions,
+def run_realign_pipeline(input_dir: Path, existing_txt_path: Optional[Path], opts: RealignPipelineOptions,
                           *, log: Callable[[str], None] = print) -> RealignPipelineResult:
     """Runs the full realign CLI/GUI flow for one song: resolves the audio,
     isolates vocals, transcribes, realigns, and writes the output file.
@@ -801,14 +856,26 @@ def run_realign_pipeline(input_dir: Path, existing_txt_path: Path, opts: Realign
     folder, no words transcribed, etc.) -- those come back as
     `RealignPipelineResult(success=False, error=...)`, same convention as
     `main.run_pipeline`, so the CLI wrapper and gui.py can both handle
-    failure uniformly."""
+    failure uniformly.
+
+    `existing_txt_path=None` auto-detects the single .txt in `input_dir`
+    (see `find_existing_txt_in_folder`) -- required for `run_realign_batch`
+    (a single explicit path can't apply across multiple subfolders), and
+    a convenience in single-song mode too."""
     from .song_input import resolve_song_folder
     from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError
     from .separation import isolate_vocals, SeparationError
     from .transcription import transcribe_words
 
     input_dir = Path(input_dir)
-    existing_txt_path = Path(existing_txt_path)
+    if existing_txt_path is None:
+        try:
+            existing_txt_path = find_existing_txt_in_folder(input_dir)
+        except AmbiguousExistingTxtError as e:
+            return RealignPipelineResult(success=False, error=str(e))
+        log(f"Auto-detected existing file: {existing_txt_path}")
+    else:
+        existing_txt_path = Path(existing_txt_path)
     work_dir = Path(opts.work_dir).resolve() if opts.work_dir else (input_dir / ".ultrastar_work")
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -871,6 +938,47 @@ def run_realign_pipeline(input_dir: Path, existing_txt_path: Path, opts: Realign
     return RealignPipelineResult(success=True, output_path=output_path)
 
 
+def run_realign_batch(parent_dir: Path, opts: RealignPipelineOptions,
+                       *, log: Callable[[str], None] = print) -> List[Tuple[str, RealignPipelineResult]]:
+    """Runs `run_realign_pipeline` once per immediate subdirectory of
+    `parent_dir` (mirrors `batch.run_batch`'s shape exactly), auto-
+    detecting each subfolder's own existing .txt to realign (see
+    `find_existing_txt_in_folder`) -- a single explicit path can't apply
+    across multiple subfolders, so `opts.output_path`/a single existing-
+    txt override are never meaningful here; the caller is expected to
+    leave those None (see gui.py/`run`'s own incompatibility checks).
+    Unlike `run_batch`, there's no output-folder mirroring to set up --
+    each result is always written next to ITS OWN subfolder's existing
+    file, so no `output_parent_dir` parameter exists here at all.
+
+    Any exception from a single song -- even one `run_realign_pipeline`
+    itself didn't already catch -- is caught HERE, logged, and recorded
+    as a failed result; one bad song must never abort the rest of the
+    batch, same reasoning as `run_batch`."""
+    parent_dir = Path(parent_dir)
+    subdirs = sorted(p for p in parent_dir.iterdir() if p.is_dir())
+    results: List[Tuple[str, RealignPipelineResult]] = []
+
+    for i, sub in enumerate(subdirs, 1):
+        log(f"== Batch {i}/{len(subdirs)}: {sub.name} ==")
+        try:
+            result = run_realign_pipeline(sub, None, opts, log=log)
+        except Exception as e:
+            log(f"  FAILED (unexpected error): {e}")
+            result = RealignPipelineResult(success=False, error=str(e))
+        if not result.success:
+            log(f"  FAILED: {result.error}")
+        results.append((sub.name, result))
+
+    n_ok = sum(1 for _, r in results if r.success)
+    log(f"\nBatch complete: {n_ok}/{len(results)} song(s) succeeded.")
+    for name, result in results:
+        status = "OK" if result.success else f"FAILED ({result.error})"
+        log(f"  {name}: {status}")
+
+    return results
+
+
 def _opts_from_args(args) -> RealignPipelineOptions:
     return RealignPipelineOptions(
         audio_file=args.audio_file, work_dir=args.work_dir, whisper_model=args.whisper_model,
@@ -890,6 +998,23 @@ def run(argv=None) -> int:
 
     args = build_arg_parser().parse_args(argv)
 
+    if args.batch:
+        incompatible = []
+        if args.existing_txt_path:
+            incompatible.append("--existing-txt")
+        if args.audio_file:
+            incompatible.append("--audio-file")
+        if args.work_dir:
+            incompatible.append("--work-dir")
+        if args.artist or args.title:
+            incompatible.append("--artist/--title")
+        if args.lrclib_id:
+            incompatible.append("--lrclib-id")
+        if incompatible:
+            print(f"--batch is not allowed together with {', '.join(incompatible)} "
+                  f"(a single override doesn't make sense across multiple songs).", file=sys.stderr)
+            return 1
+
     from .main import check_cuda_available
     cuda_error = check_cuda_available()
     if cuda_error:
@@ -897,9 +1022,13 @@ def run(argv=None) -> int:
         return 1
 
     input_dir = Path(args.input).resolve()
-    existing_txt_path = Path(args.existing_txt_path).resolve()
     opts = _opts_from_args(args)
 
+    if args.batch:
+        results = run_realign_batch(input_dir, opts)
+        return 0 if all(r.success for _, r in results) else 2
+
+    existing_txt_path = Path(args.existing_txt_path).resolve() if args.existing_txt_path else None
     result = run_realign_pipeline(input_dir, existing_txt_path, opts)
     if not result.success:
         print(result.error, file=sys.stderr)

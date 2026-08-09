@@ -875,6 +875,8 @@ def run(argv=None) -> int:
             incompatible.append("--work-dir")
         if args.lrclib_id:
             incompatible.append("--lrclib-id")
+        if args.audio_file:
+            incompatible.append("--audio-file")
         if incompatible:
             print(f"--batch is not allowed together with {', '.join(incompatible)} "
                   f"(a single override doesn't make sense across multiple songs).", file=sys.stderr)

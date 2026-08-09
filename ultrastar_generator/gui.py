@@ -28,7 +28,7 @@ from .batch import run_batch
 from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError, resolve_artist_title, resolve_primary_source
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
 from .main import PipelineResult, check_cuda_available, delete_work_files, run_pipeline
-from .realign import RealignPipelineOptions, run_realign_pipeline
+from .realign import RealignPipelineOptions, run_realign_batch, run_realign_pipeline
 
 _DONE = object()  # sentinel, distinct from any real log line
 _OUTPUT_PARENT = "__OUTPUT_PARENT__"  # queue-item tag: payload is the Path to open on "Open Output Folder"
@@ -332,6 +332,19 @@ class PlaceholderEntry(ttk.Entry):
         """The real user-entered value, or None if only the preview is showing."""
         return None if self.is_placeholder else (self._var.get().strip() or None)
 
+    def set_real_value(self, value: str) -> None:
+        """Sets a REAL value programmatically (e.g. from a Browse dialog,
+        which never focuses the entry itself so <FocusIn> never fires) --
+        unlike setting the underlying StringVar directly, this correctly
+        clears `is_placeholder` too. A raw `.set()` left it stale, so
+        `effective_value()` kept returning None even though the var now
+        held a real value -- confirmed a real, pre-existing bug for
+        `_browse_output` before this method existed; use this instead of
+        `.set()` on the var for any future browse-style handler too."""
+        self.is_placeholder = False
+        self.configure(foreground="black")
+        self._var.set(value)
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -344,7 +357,13 @@ class App(tk.Tk):
         self._settings = _load_settings()
         self._launch_dir = str(Path.cwd())
 
-        self.mode = tk.StringVar(value="single")  # "single" | "batch" | "youtube" | "realign"
+        self.mode = tk.StringVar(value="generate")  # "generate" | "youtube" | "realign"
+        # Batch is a MODIFIER, orthogonal to mode -- usable with "generate" and
+        # "realign" (each processes every immediate subfolder of the input
+        # folder instead of the input folder itself), meaningless for
+        # "youtube" (a single URL can't populate N subfolders), where it's
+        # disabled outright rather than just ignored.
+        self.batch_mode = tk.BooleanVar(value=False)
         self.input_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.audio_file = tk.StringVar()
@@ -458,6 +477,14 @@ class App(tk.Tk):
         # folder actually lives.
         return ".\\Output\\"
 
+    def _existing_txt_placeholder_text(self) -> str:
+        # A static hint, not a resolved real value (unlike artist/title's
+        # own placeholder) -- the actual file is only found by touching
+        # the filesystem (find_existing_txt_in_folder), which can fail
+        # (ambiguous/missing), so it isn't predicted here on every
+        # keystroke; the real outcome is reported in the run log instead.
+        return "(auto-detected from input folder)"
+
     def _refresh_artist_title_placeholders(self):
         self.artist_entry.refresh_placeholder()
         self.title_entry.refresh_placeholder()
@@ -470,17 +497,22 @@ class App(tk.Tk):
 
         mode_frame = ttk.LabelFrame(self, text="Mode")
         mode_frame.pack(fill="x", **pad)
-        for text, value in [("Single song folder", "single"), ("Batch (parent folder)", "batch"),
-                             ("YouTube URL", "youtube"), ("Realign existing file", "realign")]:
+        for text, value in [("Generate song file", "generate"), ("YouTube URL", "youtube"),
+                             ("Realign existing file", "realign")]:
             rb = ttk.Radiobutton(mode_frame, text=text, value=value, variable=self.mode,
                                   command=self._on_mode_change)
             rb.pack(side="left", padx=8, pady=4)
-        Tooltip(mode_frame, "Single song folder: process one song folder.\n"
-                             "Batch: process every immediate subfolder of a parent folder the same way.\n"
+        self.batch_check = ttk.Checkbutton(mode_frame, text="Batch (parent folder)", variable=self.batch_mode,
+                                            command=self._on_mode_change)
+        self.batch_check.pack(side="left", padx=(24, 8), pady=4)
+        Tooltip(mode_frame, "Generate song file: process one song folder from scratch.\n"
                              "YouTube URL: download a video/audio first, then process it like a normal folder.\n"
                              "Realign existing file: alignment-only mode -- re-time an EXISTING .txt's own "
                              "notes against its audio (GAP, note start/length only) without touching pitch "
-                             "or the note sequence itself.")
+                             "or the note sequence itself.\n"
+                             "Batch: process every immediate subfolder of the input folder the same way, "
+                             "instead of the input folder itself. Usable with Generate or Realign -- not "
+                             "with YouTube (a single URL can't populate multiple subfolders).")
 
         io_frame = ttk.LabelFrame(self, text="Folders")
         io_frame.pack(fill="x", **pad)
@@ -526,11 +558,14 @@ class App(tk.Tk):
                                                 "video (mp4) too, used as #VIDEO.")
 
         self.existing_txt_label = ttk.Label(io_frame, text="Existing .txt file:")
-        self.existing_txt_entry = ttk.Entry(io_frame, textvariable=self.existing_txt_path)
+        self.existing_txt_entry = PlaceholderEntry(io_frame, self.existing_txt_path,
+                                                     self._existing_txt_placeholder_text)
         self.existing_txt_browse = ttk.Button(io_frame, text="Browse...", command=self._browse_existing_txt)
         Tooltip(self.existing_txt_entry, "The UltraStar .txt file to realign -- its notes/pitches/note "
                                           "sequence are kept exactly as-is; only GAP and note start/length "
-                                          "are adjusted to better match the audio.")
+                                          "are adjusted to better match the audio. Optional -- leave blank "
+                                          "to auto-detect the single .txt file in the input folder (if more "
+                                          "than one exists, tries '<folder name>.txt' before giving up).")
 
         self.artist_frame = ttk.LabelFrame(self, text="Artist / Title (required for YouTube; overrides filename parsing otherwise)")
         artist_frame = self.artist_frame
@@ -597,10 +632,10 @@ class App(tk.Tk):
                                  "Real comparison found 'windowed' never worse and sometimes much better "
                                  "-- see CLAUDE.md.")
         ttk.Label(realign_frame, text="LRCLIB ID:").grid(row=2, column=0, sticky="w", padx=8, pady=2)
-        realign_lrclib_id_entry = ttk.Entry(realign_frame, textvariable=self.lrclib_id, width=10)
-        realign_lrclib_id_entry.grid(row=2, column=1, sticky="w", padx=8, pady=2)
-        Tooltip(realign_lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself and paste "
-                                          "the id here) -- always wins over automatic search.")
+        self.realign_lrclib_id_entry = ttk.Entry(realign_frame, textvariable=self.lrclib_id, width=10)
+        self.realign_lrclib_id_entry.grid(row=2, column=1, sticky="w", padx=8, pady=2)
+        Tooltip(self.realign_lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself and "
+                                               "paste the id here) -- always wins over automatic search.")
 
         self.opts_frame = ttk.LabelFrame(self, text="Options")
         opts_frame = self.opts_frame
@@ -706,8 +741,12 @@ class App(tk.Tk):
     def _on_mode_change(self):
         mode = self.mode.get()
         is_youtube = mode == "youtube"
-        is_batch = mode == "batch"
         is_realign = mode == "realign"
+        # Batch is a checkbox, orthogonal to mode -- but meaningless for
+        # YouTube (a single URL can't populate multiple subfolders), so
+        # it's disabled AND ignored there regardless of its own raw state.
+        self.batch_check.config(state=tk.DISABLED if is_youtube else tk.NORMAL)
+        is_batch = self.batch_mode.get() and not is_youtube
 
         self.input_label.config(text="Parent folder:" if is_batch else "Input folder:")
         if is_youtube:
@@ -724,18 +763,28 @@ class App(tk.Tk):
             self.youtube_label.grid_remove()
             self.youtube_entry.grid_remove()
             self.youtube_audio_only_check.grid_remove()
-            if is_batch:
-                self.audio_file_label.grid_remove()
-                self.audio_file_entry.grid_remove()
-                self.audio_file_browse.grid_remove()
-            else:
-                self.audio_file_label.grid(row=2, column=0, sticky="w", padx=8, pady=4)
-                self.audio_file_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
-                self.audio_file_browse.grid(row=2, column=2, padx=8, pady=4)
+            # Audio file is meaningful for BOTH generate and realign, but a
+            # single bare filename can't apply across multiple batch
+            # subfolders -- DISABLED (greyed out, stays visible) rather than
+            # hidden when batch is on, so it's clear the field still exists,
+            # just isn't usable in this combination.
+            self.audio_file_label.grid(row=2, column=0, sticky="w", padx=8, pady=4)
+            self.audio_file_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+            self.audio_file_browse.grid(row=2, column=2, padx=8, pady=4)
+            audio_file_state = tk.DISABLED if is_batch else tk.NORMAL
+            self.audio_file_entry.config(state=audio_file_state)
+            self.audio_file_browse.config(state=audio_file_state)
             if is_realign:
                 self.existing_txt_label.grid(row=3, column=0, sticky="w", padx=8, pady=4)
                 self.existing_txt_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
                 self.existing_txt_browse.grid(row=3, column=2, padx=8, pady=4)
+                # Same reasoning as audio file above: a single explicit
+                # existing-file path can't apply across multiple batch
+                # subfolders (each is auto-detected instead) -- disabled,
+                # not hidden.
+                existing_txt_state = tk.DISABLED if is_batch else tk.NORMAL
+                self.existing_txt_entry.config(state=existing_txt_state)
+                self.existing_txt_browse.config(state=existing_txt_state)
             else:
                 self.existing_txt_label.grid_remove()
                 self.existing_txt_entry.grid_remove()
@@ -743,7 +792,7 @@ class App(tk.Tk):
 
         # Realign writes directly next to the existing file by default --
         # the "parent folder for a fresh <Artist> - <Title> folder" meaning
-        # of Output folder doesn't apply there.
+        # of Output folder doesn't apply there (batch or not).
         if is_realign:
             self.output_dir_label.grid_remove()
             self.output_dir_entry.grid_remove()
@@ -756,6 +805,11 @@ class App(tk.Tk):
         self.artist_frame.config(
             text="Artist / Title (overrides the existing file's own tags for LRCLIB lookup)" if is_realign
             else "Artist / Title (required for YouTube; overrides filename parsing otherwise)")
+        # A single artist/title override doesn't make sense across multiple
+        # batch subfolders either -- disabled, not hidden, same as above.
+        artist_title_state = tk.DISABLED if is_batch else tk.NORMAL
+        self.artist_entry.config(state=artist_title_state)
+        self.title_entry.config(state=artist_title_state)
 
         # Realign mode skips pass 1-4 entirely, so it uses a completely
         # different, much smaller option surface -- toggled as whole frames
@@ -777,11 +831,14 @@ class App(tk.Tk):
             if self._advanced_visible:
                 self.advanced_frame.pack(fill="x", padx=8, pady=4, after=self.advanced_toggle)
 
-        # Interactive LRCLIB disambiguation is single-song-mode only --
-        # batch mode always auto-picks silently, never pausing for input.
+        # A single pinned/searched-for lyrics candidate or LRCLIB id override
+        # doesn't make sense across multiple batch subfolders either --
+        # interactive disambiguation is single-song-mode only regardless.
         lyrics_controls_state = tk.DISABLED if is_batch else tk.NORMAL
         self.search_lyrics_button.config(state=lyrics_controls_state)
         self.lyrics_ambiguity_check.config(state=lyrics_controls_state)
+        self.lrclib_id_entry.config(state=lyrics_controls_state)
+        self.realign_lrclib_id_entry.config(state=artist_title_state)
 
     # --- LRCLIB lyrics search / disambiguation -----------------------------
 
@@ -902,7 +959,7 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="Select output folder", initialdir=self.input_dir.get().strip() or self._last_dir("output_dir"))
         if d:
             d = str(Path(d))  # see _browse_input's comment on why this normalization matters
-            self.output_dir.set(d)
+            self.output_dir_entry.set_real_value(d)
             self._remember_dir("output_dir", d)
 
     def _browse_audio_file(self):
@@ -918,7 +975,7 @@ class App(tk.Tk):
         filetypes = [("UltraStar txt files", "*.txt"), ("All files", "*.*")]
         f = filedialog.askopenfilename(title="Select existing .txt file", initialdir=initial, filetypes=filetypes)
         if f:
-            self.existing_txt_path.set(str(Path(f)))
+            self.existing_txt_entry.set_real_value(str(Path(f)))
 
     # --- work-file cleanup / open-output-folder -------------------
 
@@ -962,12 +1019,23 @@ class App(tk.Tk):
 
     # --- actions ---------------------------------------------------------
 
+    def _is_batch(self) -> bool:
+        # Batch is meaningless for YouTube (a single URL can't populate
+        # multiple subfolders) -- ignored there regardless of the
+        # checkbox's own raw state, same as _on_mode_change disabling it.
+        return self.batch_mode.get() and self.mode.get() != "youtube"
+
     def _build_opts(self) -> config.PipelineOptions:
         mode = self.mode.get()
+        is_batch = self._is_batch()
         return config.PipelineOptions(
-            artist=self.artist_entry.effective_value(),
-            title=self.title_entry.effective_value(),
-            audio_file=self.audio_file.get().strip() or None,
+            # A single artist/title/audio-file override doesn't make sense
+            # across multiple batch subfolders -- forced None here to match
+            # the fields being DISABLED (not hidden) in _on_mode_change,
+            # regardless of whatever stale text is still sitting in them.
+            artist=None if is_batch else self.artist_entry.effective_value(),
+            title=None if is_batch else self.title_entry.effective_value(),
+            audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             fetch_lyrics=self.fetch_lyrics.get(),
             verify_words=self.verify_words.get(),
             verify_placement=self.verify_placement.get(),
@@ -982,29 +1050,29 @@ class App(tk.Tk):
             youtube_url=(self.youtube_url.get().strip() or None) if mode == "youtube" else None,
             youtube_audio_only=self.youtube_audio_only.get(),
             delete_work_files=self.delete_work_files.get(),
-            batch=(mode == "batch"),
+            batch=is_batch,
             # Interactive LRCLIB disambiguation -- single-song-mode only
             # (see _on_mode_change, which also disables the controls
             # themselves in batch mode). A manual pre-run pick always wins
             # outright; the ambiguity-prompt callback is only wired up as
             # a fallback when nothing was pre-picked.
-            pinned_lyrics=self.pinned_lyrics if mode != "batch" else None,
-            lyrics_ambiguity_prompt=self.lyrics_ambiguity_prompt.get() if mode != "batch" else False,
+            pinned_lyrics=self.pinned_lyrics if not is_batch else None,
+            lyrics_ambiguity_prompt=self.lyrics_ambiguity_prompt.get() if not is_batch else False,
             lyrics_disambiguation_callback=(
                 self._make_ambiguity_callback()
-                if (mode != "batch" and self.lyrics_ambiguity_prompt.get() and self.pinned_lyrics is None)
+                if (not is_batch and self.lyrics_ambiguity_prompt.get() and self.pinned_lyrics is None)
                 else None
             ),
             # LRCLIB id override -- single-song-mode only, same scoping as
             # pinned_lyrics above (a per-song override doesn't make sense
             # across a batch run of different songs).
-            lrclib_id=self._effective_lrclib_id() if mode != "batch" else None,
+            lrclib_id=self._effective_lrclib_id() if not is_batch else None,
             # MXL+LRC fallback confirmation -- single-song-mode only, shown
             # by default (no opt-in checkbox) whenever the quality gate
             # fails, per the user's explicit "ask what they want to do".
             # Batch mode always auto-falls-back silently with just the log
             # warning, same convention as the lyrics ambiguity prompt above.
-            mxl_lrc_fallback_callback=self._make_mxl_lrc_fallback_callback() if mode != "batch" else None,
+            mxl_lrc_fallback_callback=self._make_mxl_lrc_fallback_callback() if not is_batch else None,
         )
 
     def _effective_lrclib_id(self) -> Optional[int]:
@@ -1017,12 +1085,15 @@ class App(tk.Tk):
             return None
 
     def _build_realign_opts(self) -> RealignPipelineOptions:
+        is_batch = self._is_batch()
         return RealignPipelineOptions(
-            audio_file=self.audio_file.get().strip() or None,
+            # Same "doesn't make sense across multiple batch subfolders"
+            # reasoning as _build_opts above.
+            audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
-            artist=self.artist_entry.effective_value(),
-            title=self.title_entry.effective_value(),
-            lrclib_id=self._effective_lrclib_id(),
+            artist=None if is_batch else self.artist_entry.effective_value(),
+            title=None if is_batch else self.title_entry.effective_value(),
+            lrclib_id=None if is_batch else self._effective_lrclib_id(),
             use_lrc=self.realign_use_lrc.get(),
             lrc_mode=self.lrc_mode.get(),
         )
@@ -1031,6 +1102,7 @@ class App(tk.Tk):
         if self._running:
             return
         mode = self.mode.get()
+        is_batch = self._is_batch()
         input_dir = self.input_dir.get().strip()
         if not input_dir:
             messagebox.showerror("Missing folder", "An input folder is required.")
@@ -1045,16 +1117,21 @@ class App(tk.Tk):
         if mode == "youtube" and not self.youtube_url.get().strip():
             messagebox.showerror("Missing URL", "YouTube mode requires a URL.")
             return
+        # In batch mode, each subfolder auto-detects its own existing .txt
+        # (see find_existing_txt_in_folder) -- a single explicit path can't
+        # apply across multiple subfolders, so it's neither required nor read.
+        # A real typed value is used as-is; left blank (or still showing the
+        # placeholder), run_realign_pipeline auto-detects the single .txt in
+        # the input folder itself (find_existing_txt_in_folder) -- same as
+        # batch mode's own per-subfolder auto-detection, just for one folder.
         existing_txt_path = None
-        if mode == "realign":
-            existing_txt_value = self.existing_txt_path.get().strip()
-            if not existing_txt_value:
-                messagebox.showerror("Missing file", "Realign mode requires an existing .txt file to realign.")
-                return
-            existing_txt_path = Path(existing_txt_value)
-            if not existing_txt_path.is_file():
-                messagebox.showerror("File not found", f"Existing .txt file not found:\n{existing_txt_path}")
-                return
+        if mode == "realign" and not is_batch:
+            existing_txt_value = self.existing_txt_entry.effective_value()
+            if existing_txt_value:
+                existing_txt_path = Path(existing_txt_value)
+                if not existing_txt_path.is_file():
+                    messagebox.showerror("File not found", f"Existing .txt file not found:\n{existing_txt_path}")
+                    return
 
         opts = self._build_realign_opts() if mode == "realign" else self._build_opts()
         self.log_text.delete("1.0", tk.END)
@@ -1063,12 +1140,13 @@ class App(tk.Tk):
         q: "queue.Queue" = queue.Queue()
         output_dir_path = Path(output_dir_value) if output_dir_value else None
         thread = threading.Thread(
-            target=self._run_worker, args=(mode, Path(input_dir), output_dir_path, opts, q, existing_txt_path),
+            target=self._run_worker,
+            args=(mode, is_batch, Path(input_dir), output_dir_path, opts, q, existing_txt_path),
             daemon=True)
         thread.start()
         self.after(100, self._drain_queue, q)
 
-    def _run_worker(self, mode: str, input_dir: Path, output_dir: Optional[Path],
+    def _run_worker(self, mode: str, is_batch: bool, input_dir: Path, output_dir: Optional[Path],
                      opts, q: "queue.Queue", existing_txt_path: Optional[Path] = None):
         class _QueueWriter:
             def write(self_, s):
@@ -1081,14 +1159,24 @@ class App(tk.Tk):
         try:
             with contextlib.redirect_stdout(_QueueWriter()):
                 if mode == "realign":
-                    result = run_realign_pipeline(input_dir, existing_txt_path, opts, log=q.put)
-                    if result.success:
-                        q.put(f"\n=== Done: {result.output_path} ===")
-                        if result.output_path is not None:
-                            q.put((_OUTPUT_PARENT, result.output_path.parent))
+                    if is_batch:
+                        results = run_realign_batch(input_dir, opts, log=q.put)
+                        ok = sum(1 for _, r in results if r.success)
+                        q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")
+                        # Each result is written next to its OWN subfolder's
+                        # existing file (no output-folder mirroring the way
+                        # the normal pipeline's batch has) -- the parent
+                        # folder itself is the only sensible single target.
+                        q.put((_OUTPUT_PARENT, input_dir))
                     else:
-                        q.put(f"\n=== FAILED: {result.error} ===")
-                elif mode == "batch":
+                        result = run_realign_pipeline(input_dir, existing_txt_path, opts, log=q.put)
+                        if result.success:
+                            q.put(f"\n=== Done: {result.output_path} ===")
+                            if result.output_path is not None:
+                                q.put((_OUTPUT_PARENT, result.output_path.parent))
+                        else:
+                            q.put(f"\n=== FAILED: {result.error} ===")
+                elif is_batch:
                     results = run_batch(input_dir, output_dir, opts, log=q.put)
                     ok = sum(1 for _, r in results if r.success)
                     q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")

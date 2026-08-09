@@ -477,6 +477,95 @@ producing the same result as the equivalent CLI invocation.
 beyond the manual BATB/Stars/Chicago runs in this file -- rerun manually
 if `realign.py`'s core matching/interpolation logic changes.
 
+### Batch support + Mode/Batch UI restructure (2026-08-09)
+
+Added batch mode to `realign.py`: `find_existing_txt_in_folder` auto-
+detects the single .txt to realign within a folder (fails closed --
+`AmbiguousExistingTxtError` -- on zero or multiple candidates; excludes
+this module's own `"[REALIGNED]"` naming convention so re-running batch
+on an already-realigned folder doesn't see two candidates, or worse pick
+the REALIGNED file as the next run's INPUT and compound drift).
+`run_realign_pipeline`'s `existing_txt_path` is now `Optional` (auto-
+detects when `None`); new `run_realign_batch` mirrors `batch.run_batch`'s
+shape but needs no `output_parent_dir` at all, since every result is
+always written next to ITS OWN subfolder's existing file (no mirroring
+concept the way the normal pipeline's batch has). CLI gained `--batch`
+with the same incompatibility-checking convention as `main.py`'s
+(`--existing-txt`/`--audio-file`/`--work-dir`/`--artist`/`--title`/
+`--lrclib-id` all rejected together with `--batch` -- none make sense as
+a single override across multiple songs). Also fixed the same latent gap
+in `main.py`'s own `--batch` validation, which was missing `--audio-file`
+from that list. Real end-to-end validation: batch-ran all 3 of
+`sandbox/realign_test/{BATB,Chicago,Stars}` in one CLI invocation --
+correctly auto-detected each subfolder's own file (BATB's folder already
+had a leftover `[REALIGNED].txt` from earlier testing, correctly
+excluded), 3/3 succeeded, zero writes to any original input file
+(confirmed via mtime).
+
+**GUI restructure (user's explicit request)**: "Single song folder" mode
+renamed to "Generate song file"; Batch changed from a 4th mutually-
+exclusive radio option to a `Checkbutton` orthogonal to mode (usable with
+both "Generate song file" and "Realign existing file", disabled --
+`state=DISABLED`, and its own checked state ignored regardless -- for
+"YouTube URL", since a single URL can't populate multiple subfolders).
+`self.mode` narrowed to `"generate"|"youtube"|"realign"`; a new
+`_is_batch()` helper (`self.batch_mode.get() and mode != "youtube"`) is
+the single source of truth both `_on_mode_change` (UI) and `_build_opts`/
+`_build_realign_opts` (options) consult, so they can never disagree about
+whether batch is actually active.
+
+**Explicit new requirement**: toggling Batch must DISABLE the audio-file
+field and its related elements (label/entry/browse button), not hide
+them via `grid_remove()` the old batch-as-a-mode code did -- same
+treatment now extended, for consistency and to close a real pre-existing
+gap, to Artist/Title (a single override across multiple batch songs was
+ALREADY silently applied identically to every subfolder before this
+session, an existing bug -- the GUI calls `run_batch` directly, bypassing
+`main.run()`'s own CLI-level incompatibility checks entirely) and the
+LRCLIB ID field (both the normal-pipeline and realign-mode copies).
+Existing .txt (realign mode) gets the same disable-not-hide treatment.
+Fields keep whatever text the user already typed while disabled --
+confirmed the underlying `StringVar` value survives a
+disable-then-re-enable cycle intact, only OPTS BUILDING ignores it
+(forces `None`) while batch is checked.
+
+Verified via a live (real Tk root, `update_idletasks()`, no mainloop)
+mode x batch matrix covering all 3 modes -- correct enable/disable state
+and correct forced-`None` opts in every cell, plus the YouTube-disables-
+the-checkbox-and-ignores-its-state case specifically.
+
+**Auto-detect extended to single-song mode too (same day, user request)**:
+`find_existing_txt_in_folder` (originally batch-only) now also backs
+single-song mode -- CLI `--existing-txt` is optional (already was);
+gui.py's "Existing .txt file" field became a `PlaceholderEntry`
+("(auto-detected from input folder)"), and `_on_run` no longer requires
+it. Also extended the auto-detect logic itself: when a folder has
+MULTIPLE real `.txt` candidates (common in single-song mode, where a
+folder often has other stray `.txt` files a pure batch subfolder
+wouldn't), try exactly one further disambiguation -- a file named
+`"<folder name>.txt"` (case-insensitive, same basename-matching
+convention `file_discovery.py` already uses for cover/background) -- and
+only trust it if it narrows the field to EXACTLY one match; still fails
+closed (`AmbiguousExistingTxtError`) otherwise, never guessing further.
+
+**Found and fixed a real, pre-existing, unrelated GUI bug while wiring
+the new field**: `PlaceholderEntry.effective_value()` incorrectly kept
+returning `None` after a Browse-dialog selection, because `_browse_output`
+set the underlying `StringVar` directly, which never clears
+`is_placeholder` (only `<FocusIn>` does, and a Browse button click never
+focuses the entry itself) -- confirmed via a direct repro BEFORE writing
+any fix, not assumed. This silently discarded a user's picked output
+folder in real usage any time they used Browse without first clicking
+into the field. Fixed at the root: new `PlaceholderEntry.set_real_value()`
+clears `is_placeholder` correctly; `_browse_output` and the new
+`_browse_existing_txt` both updated to use it instead of `.set()` on the
+var directly.
+
+Real validation: single-song CLI mode with no `--existing-txt` at all
+against `sandbox/realign_test/BATB` (which has both the original file AND
+a leftover `[REALIGNED].txt` from earlier testing) correctly auto-detected
+and used the ORIGINAL file only.
+
 ### `lrc_mode="windowed"` prototype + real 3-song comparison (2026-08-09)
 
 User's hypothesis (from prior sessions' MXL+LRC work): LRC-first,

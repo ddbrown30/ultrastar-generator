@@ -2761,6 +2761,71 @@ ro_different_out = resolve_realign_output_path(ro_existing_path, "C:/Songs/somew
 assert check_output_not_existing_file(ro_different_out, ro_existing_path) is None
 print("  OK: an explicit --output pointing somewhere genuinely different is allowed")
 
+print("  realign: find_existing_txt_in_folder auto-detects the single .txt to realign in a folder "
+      "(needed for --batch, where a single explicit --existing-txt can't apply across multiple "
+      "subfolders) -- fails closed (never guesses) when zero or multiple real candidates exist:")
+from ultrastar_generator.realign import find_existing_txt_in_folder, AmbiguousExistingTxtError
+
+with _tempfile.TemporaryDirectory() as d:
+    single_dir = Path(d)
+    (single_dir / "Some Artist - Some Song.txt").write_text("x", encoding="utf-8")
+    found = find_existing_txt_in_folder(single_dir)
+    assert found.name == "Some Artist - Some Song.txt", found
+print("  OK: exactly one .txt in the folder -> found directly")
+
+with _tempfile.TemporaryDirectory() as d:
+    reran_dir = Path(d)
+    (reran_dir / "Some Artist - Some Song.txt").write_text("x", encoding="utf-8")
+    (reran_dir / "Some Artist - Some Song [REALIGNED].txt").write_text("y", encoding="utf-8")
+    found2 = find_existing_txt_in_folder(reran_dir)
+    assert found2.name == "Some Artist - Some Song.txt", found2
+print("  OK: a folder that already has a PREVIOUS run's own '[REALIGNED]' output still correctly "
+      "picks the ORIGINAL file -- not falsely 'ambiguous', and never the REALIGNED file itself "
+      "(which would compound drift across repeated batch runs)")
+
+with _tempfile.TemporaryDirectory() as d:
+    empty_dir = Path(d)
+    try:
+        find_existing_txt_in_folder(empty_dir)
+        assert False, "should have raised AmbiguousExistingTxtError"
+    except AmbiguousExistingTxtError:
+        pass
+print("  OK: no .txt file at all -> AmbiguousExistingTxtError, never silently skipped")
+
+with _tempfile.TemporaryDirectory() as d:
+    multi_dir = Path(d)
+    (multi_dir / "one.txt").write_text("x", encoding="utf-8")
+    (multi_dir / "two.txt").write_text("y", encoding="utf-8")
+    try:
+        find_existing_txt_in_folder(multi_dir)
+        assert False, "should have raised AmbiguousExistingTxtError"
+    except AmbiguousExistingTxtError:
+        pass
+print("  OK: two genuinely different .txt files -> AmbiguousExistingTxtError, never guesses which one")
+
+with _tempfile.TemporaryDirectory() as d:
+    named_dir = Path(d) / "Some Artist - Some Song"
+    named_dir.mkdir()
+    (named_dir / "Some Artist - Some Song.txt").write_text("x", encoding="utf-8")
+    (named_dir / "notes_backup.txt").write_text("y", encoding="utf-8")
+    found3 = find_existing_txt_in_folder(named_dir)
+    assert found3.name == "Some Artist - Some Song.txt", found3
+print("  OK: multiple .txt files, but exactly one matches '<folder name>.txt' -> that one is used, "
+      "not treated as ambiguous")
+
+with _tempfile.TemporaryDirectory() as d:
+    unrelated_dir = Path(d) / "Some Artist - Some Song"
+    unrelated_dir.mkdir()
+    (unrelated_dir / "one.txt").write_text("x", encoding="utf-8")
+    (unrelated_dir / "two.txt").write_text("y", encoding="utf-8")
+    try:
+        find_existing_txt_in_folder(unrelated_dir)
+        assert False, "should have raised AmbiguousExistingTxtError"
+    except AmbiguousExistingTxtError:
+        pass
+print("  OK: multiple .txt files, NONE matching the folder's own name -> still AmbiguousExistingTxtError "
+      "(the folder-name match is a narrow disambiguation, not a fallback 'guess something' rule)")
+
 print("\n--- youtube_source.download_youtube_source (fake yt_dlp module, no real network) ---")
 from ultrastar_generator.youtube_source import YoutubeDownloadError
 
