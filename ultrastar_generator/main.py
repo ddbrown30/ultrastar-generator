@@ -110,11 +110,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                                         "multiple runs of the same song even when writing output elsewhere). Not allowed "
                                         "together with --batch, since a shared override would collide every song's cache "
                                         "into one directory.")
-    p.add_argument("--delete-intermediates", action="store_true",
-                    help="Delete the large, fully-regeneratable intermediate files under "
-                         "<input-folder>/.ultrastar_work (Demucs separation output, mp4/avi-extracted "
-                         "audio/covers) once generation completes -- debug files, if enabled, are left "
-                         "alone. Default: OFF (keeps them so re-runs reuse the cached separation).")
+    p.add_argument("--delete-work-files", action="store_true",
+                    help="Delete the large, fully-regeneratable work files under "
+                         "<input-folder>/.ultrastar_work "
+                         "Default: OFF (keeps them so re-runs reuse the cached separation).")
     p.add_argument("--whisper-model", default=config.DEFAULT_WHISPER_MODEL,
                     help=f"whisper model name for the main transcription pass (default: {config.DEFAULT_WHISPER_MODEL}). "
                          "This is what drives word timing accuracy feeding pass 3's note-zone assignment -- a bigger "
@@ -324,18 +323,12 @@ def check_cuda_available() -> Optional[str]:
     return None
 
 
-def delete_intermediates(work_dir: Path) -> None:
-    """Deletes the large, fully-regeneratable audio artifacts under
-    work_dir -- Demucs separation output (separated/) and mp4/avi-extracted
-    audio/cover files (extracted/). Deliberately NOT the whole work_dir:
-    debug files (see run_pipeline's own debug_log_path/write_pass1_debug_file
-    calls) also live directly under work_dir and must survive this."""
+def delete_work_files(work_dir: Path) -> None:
+    """Deletes the .ultrastar_work directory"""
     import shutil
     work_dir = Path(work_dir)
-    for sub in ("separated", "extracted"):
-        d = work_dir / sub
-        if d.is_dir():
-            shutil.rmtree(d, ignore_errors=True)
+    if work_dir.is_dir():
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.PipelineOptions,
@@ -350,7 +343,7 @@ def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.Pipel
     passes something that feeds a queue/log widget instead.
 
     Thin wrapper around `_run_pipeline_body` so that `opts.
-    delete_intermediates` can be honored via `finally`, regardless of
+    delete_work_files` can be honored via `finally`, regardless of
     which of `_run_pipeline_body`'s several early-return failure paths
     was taken -- work_dir may be partially populated (e.g. separation
     already ran) even on a failed run. work_dir's own location is
@@ -361,9 +354,9 @@ def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.Pipel
     try:
         return _run_pipeline_body(input_dir, output_dir, opts, log=log)
     finally:
-        if opts.delete_intermediates:
+        if opts.delete_work_files:
             wd = Path(opts.work_dir).resolve() if opts.work_dir else (Path(input_dir) / ".ultrastar_work")
-            delete_intermediates(wd)
+            delete_work_files(wd)
 
 
 def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config.PipelineOptions,
@@ -807,10 +800,10 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         log(f"Wrote {out_path}")
 
     if not opts.skip_separation:
-        if opts.delete_intermediates:
-            log(f"(Intermediate files in {work_dir} will be deleted now that generation is complete.)")
+        if opts.delete_work_files:
+            log(f"(Work files in {work_dir} will be deleted now that generation is complete.)")
         else:
-            log(f"(Intermediate files kept in {work_dir}; delete it to reclaim disk space.)")
+            log(f"(Work files kept in {work_dir}; delete it to reclaim disk space.)")
 
     debug_log.close()
     return PipelineResult(success=True, output_txt_path=out_path, regenerated=regenerated)
@@ -841,7 +834,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         no_debug_log=args.no_debug_log, quiet=args.quiet,
         existing_txt_check=args.existing_txt_check, existing_txt_path=args.existing_txt_path,
         youtube_url=args.youtube_url, youtube_audio_only=args.youtube_audio_only,
-        delete_intermediates=args.delete_intermediates,
+        delete_work_files=args.delete_work_files,
         mxl_lrc_primary=args.mxl_lrc_primary, lrclib_id=args.lrclib_id,
     )
 

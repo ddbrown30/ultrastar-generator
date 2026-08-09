@@ -801,7 +801,7 @@ class PipelineOptions:
     youtube_url: Optional[str] = None
     youtube_audio_only: bool = True
     batch: bool = False
-    delete_intermediates: bool = False
+    delete_work_files: bool = False
     # Interactive LRCLIB disambiguation -- GUI only, never set by the CLI.
     # `pinned_lyrics` (actually a lyrics_lookup.LrcLibCandidate; kept as a
     # forward-reference string here to avoid a circular import, since

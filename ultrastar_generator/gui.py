@@ -27,7 +27,7 @@ from . import config
 from .batch import run_batch
 from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError, resolve_artist_title, resolve_primary_source
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
-from .main import PipelineResult, check_cuda_available, delete_intermediates, run_pipeline
+from .main import PipelineResult, check_cuda_available, delete_work_files, run_pipeline
 
 _DONE = object()  # sentinel, distinct from any real log line
 _OUTPUT_PARENT = "__OUTPUT_PARENT__"  # queue-item tag: payload is the Path to open on "Open Output Folder"
@@ -98,9 +98,8 @@ class LrcLibSearchDialog(tk.Toplevel):
         super().__init__(parent)
         self.title(title)
         self.iconbitmap('assets/lrcicon.ico')
-        self.geometry("780x500")
+        self.geometry("900x500")
         self.minsize(500, 340)
-        self.transient(parent)
         self.candidates: List[LrcLibCandidate] = []
         self.result: Optional[LrcLibCandidate] = None
 
@@ -134,17 +133,31 @@ class LrcLibSearchDialog(tk.Toplevel):
         for entry in (artist_entry, title_entry, query_entry):
             entry.bind("<Return>", lambda _e: self._do_search())
 
-        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill="both", expand=True, padx=8, pady=4)
 
         list_frame = ttk.Frame(paned)
-        self.listbox = tk.Listbox(list_frame, exportselection=False)
+        self.listbox = tk.Text(
+            list_frame,
+            width=1,
+            wrap="none",
+            cursor="arrow",
+            state="disabled",
+            highlightthickness=0,
+            padx=4,
+            pady=4,
+        )
         self.listbox.pack(side="left", fill="both", expand=True)
         list_scroll = ttk.Scrollbar(list_frame, command=self.listbox.yview)
         list_scroll.pack(side="right", fill="y")
         self.listbox.configure(yscrollcommand=list_scroll.set)
-        self.listbox.bind("<<ListboxSelect>>", self._on_select)
-        paned.add(list_frame, weight=1)
+        self.listbox.bind("<Button-1>", self._on_select)
+        self.listbox.bind("<B1-Motion>", lambda _e: "break")
+        self.listbox.bind("<ButtonRelease-1>", lambda _e: "break")
+        self.listbox.tag_configure("selected", background="lightblue")
+        self.listbox.tag_configure("synced", foreground="green")
+        self.listbox.tag_configure("even", background="whitesmoke")
+        paned.add(list_frame)
 
         preview_frame = ttk.Frame(paned)
         self.preview = tk.Text(preview_frame, wrap="word", state="disabled")
@@ -152,12 +165,11 @@ class LrcLibSearchDialog(tk.Toplevel):
         self.preview.configure(yscrollcommand=preview_scroll.set)
         self.preview.pack(side="left", fill="both", expand=True)
         preview_scroll.pack(side="right", fill="y")
-        paned.add(preview_frame, weight=2)
+        paned.add(preview_frame)
 
-        # Draggable sash defaults to roughly a 1:2 split (list:preview) --
         # PanedWindow only knows real widget sizes after a layout pass, so
         # this is deferred; the user can freely drag it afterward regardless.
-        self.after(10, lambda: paned.sashpos(0, 240))
+        self.after_idle(lambda: paned.sash_place(0, 350, 0))
 
         button_frame = ttk.Frame(self)
         button_frame.pack(fill="x", padx=8, pady=(0, 8))
@@ -183,15 +195,16 @@ class LrcLibSearchDialog(tk.Toplevel):
         query = self.search_query.get().strip()
         artist = self.search_artist.get().strip()
         title = self.search_title.get().strip()
-        if not query and not artist and not title:
+        if not query and not title:
             messagebox.showerror("Missing search terms",
-                                  "Enter a search query, or an artist/title, to search for.", parent=self)
+                                  "Enter a search query, or a title and optional artist, to search for.", parent=self)
             return
         try:
             results = search_lrclib(q=query) if query else search_lrclib(artist, title)
         except Exception as e:
             messagebox.showerror("Search failed", str(e), parent=self)
             return
+        results = [c for c in results if not c.instrumental]
         self._set_candidates(results)
         if not results:
             what = repr(query) if query else f"{artist!r} / {title!r}"
@@ -199,15 +212,26 @@ class LrcLibSearchDialog(tk.Toplevel):
 
     def _set_candidates(self, candidates: List[LrcLibCandidate]):
         self.candidates = candidates
-        self.listbox.delete(0, tk.END)
+        self.listbox.configure(state="normal")
+        self.listbox.delete("1.0", tk.END)
+        even = ""
         for c in candidates:
-            self.listbox.insert(tk.END, self._label_for(c))
+            self.listbox.insert(tk.END, f"[{c.id}][{int(c.duration // 60)}:{int(c.duration % 60):02d}]", even)
+            if c.synced_lyrics:
+                self.listbox.insert(tk.END, "[Synced]", ("synced", even))
+            self.listbox.insert(tk.END,
+                f"\n{c.track_name}\n"
+                f"{c.artist_name}{f' ({c.album_name})' if c.album_name else ''}\n",
+                even
+            )
+            even = "even" if not even else ""
+        self.listbox.configure(state="disabled")
         self.preview.configure(state="normal")
         self.preview.delete("1.0", tk.END)
         self.preview.configure(state="disabled")
         self.use_button.config(state=tk.DISABLED)
         if candidates:
-            self.listbox.selection_set(0)
+            self.selected_index = 0
             self._show_preview(0)
             self.use_button.config(state=tk.NORMAL)
 
@@ -219,21 +243,32 @@ class LrcLibSearchDialog(tk.Toplevel):
         if c.album_name:
             label += f" ({c.album_name})"
         label += f" [{dur}]"
-        if c.instrumental:
-            label += " [Instrumental]"
         return label
 
-    def _on_select(self, _event=None):
-        sel = self.listbox.curselection()
-        if sel:
-            self._show_preview(sel[0])
-            self.use_button.config(state=tk.NORMAL)
+    def _on_select(self, event):
+        line = int(self.listbox.index(f"@{event.x},{event.y}").split(".")[0])
+        index = (line - 1) // 3
+
+        if not 0 <= index < len(self.candidates):
+            return
+
+        self.selected_index = index
+
+        self.listbox.configure(state="normal")
+        self.listbox.tag_remove("selected", "1.0", "end")
+
+        start_line = index * 3 + 1
+        end_line = start_line + 3
+
+        self.listbox.tag_add("selected", f"{start_line}.0", f"{end_line}.0")
+        self.listbox.configure(state="disabled")
+
+        self._show_preview(index)
+        self.use_button.config(state=tk.NORMAL)
 
     def _show_preview(self, idx: int):
         c = self.candidates[idx]
-        text = c.plain_lyrics or "(no lyrics text for this candidate)"
-        if c.synced_lyrics:
-            text = "[synced lyrics also available for this candidate]\n\n" + text
+        text = c.synced_lyrics or c.plain_lyrics or "(no lyrics text for this candidate)"
         self.preview.configure(state="normal")
         self.preview.delete("1.0", tk.END)
         self.preview.insert("1.0", text)
@@ -334,7 +369,7 @@ class App(tk.Tk):
         self.quiet = tk.BooleanVar(value=False)
         self._advanced_visible = False
 
-        self.delete_intermediates = tk.BooleanVar(value=False)
+        self.delete_work_files = tk.BooleanVar(value=False)
         self._last_output_parent: Optional[Path] = None  # set after a successful run, for "Open Output Folder"
 
         # Interactive LRCLIB disambiguation. pinned_lyrics is a manual
@@ -551,8 +586,8 @@ class App(tk.Tk):
         Tooltip(pitch_combo, "rmvpe (default): RMVPE's own isolation-mode pitch/voicing, fastest and "
                               "most accurate on average. ensemble: pYIN + CREPE cross-check instead.")
 
-        c6 = ttk.Checkbutton(opts_frame, text="Delete intermediate files after generating",
-                              variable=self.delete_intermediates)
+        c6 = ttk.Checkbutton(opts_frame, text="Delete work files after generating",
+                              variable=self.delete_work_files)
         c6.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=2)
         Tooltip(c6, "Deletes the Demucs separation output and any extracted audio/covers under "
                     ".ultrastar_work once generation completes. Debug files, if enabled, are left alone. "
@@ -589,10 +624,10 @@ class App(tk.Tk):
         open_output_btn.pack(side="right", padx=4)
         Tooltip(open_output_btn, "Opens the output folder in File Explorer -- the folder that CONTAINS the "
                                   "per-song output (e.g. .../Output/, not .../Output/<Artist> - <Title>/).")
-        delete_now_btn = ttk.Button(self.run_frame, text="Delete Intermediate Files Now",
-                                     command=self._delete_intermediates_now)
+        delete_now_btn = ttk.Button(self.run_frame, text="Delete Work Files Now",
+                                     command=self._delete_work_files_now)
         delete_now_btn.pack(side="right", padx=4)
-        Tooltip(delete_now_btn, "Deletes the Demucs separation output and any extracted audio/covers for "
+        Tooltip(delete_now_btn, "Deletes the work folder for "
                                  "the current input folder immediately, without generating anything. Asks "
                                  "for confirmation first.")
 
@@ -602,6 +637,8 @@ class App(tk.Tk):
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.pack(side="left", fill="both", expand=True)
+        self.log_text.tag_configure("error", foreground="red")
+        self.log_text.tag_configure("warning", foreground="orange")
         scroll.pack(side="right", fill="y")
 
     def _toggle_advanced(self):
@@ -775,25 +812,24 @@ class App(tk.Tk):
         if f:
             self.audio_file.set(Path(f).name)
 
-    # --- intermediate-file cleanup / open-output-folder -------------------
+    # --- work-file cleanup / open-output-folder -------------------
 
-    def _delete_intermediates_now(self):
+    def _delete_work_files_now(self):
         input_dir = self.input_dir.get().strip()
         if not input_dir:
             messagebox.showerror("Missing folder", "Set the input folder first.")
             return
         work_dir = Path(input_dir) / ".ultrastar_work"
         if not work_dir.is_dir():
-            messagebox.showinfo("Nothing to delete", f"No intermediate files found at:\n{work_dir}")
+            messagebox.showinfo("Nothing to delete", f"No work folder found at:\n{work_dir}")
             return
         if not messagebox.askyesno(
-                "Delete intermediate files?",
-                f"This will permanently delete the Demucs separation output and any extracted "
-                f"audio/covers under:\n\n{work_dir}\n\n"
-                f"(Debug files, if any, are left alone.) Continue?"):
+                "Delete work files?",
+                f"This will permanently delete the work directory:\n\n{work_dir}\n\n"
+                f"Continue?"):
             return
-        delete_intermediates(work_dir)
-        messagebox.showinfo("Done", f"Intermediate files deleted from:\n{work_dir}")
+        delete_work_files(work_dir)
+        messagebox.showinfo("Done", f"{work_dir} deleted")
 
     def _open_output_folder(self):
         # Prefer the last real completed run's own path (exact, unambiguous).
@@ -837,7 +873,7 @@ class App(tk.Tk):
             quiet=self.quiet.get(),
             youtube_url=(self.youtube_url.get().strip() or None) if mode == "youtube" else None,
             youtube_audio_only=self.youtube_audio_only.get(),
-            delete_intermediates=self.delete_intermediates.get(),
+            delete_work_files=self.delete_work_files.get(),
             batch=(mode == "batch"),
             # Interactive LRCLIB disambiguation -- single-song-mode only
             # (see _on_mode_change, which also disables the controls
@@ -945,7 +981,12 @@ class App(tk.Tk):
                     continue
                 line = str(item)
                 at_bottom = self.log_text.yview()[1] >= 0.99
-                self.log_text.insert(tk.END, line if line.endswith("\n") else line + "\n")
+                text_tag = ""
+                if "warning" in line.lower():
+                    text_tag = "warning"
+                if "error" in line.lower() or "failed" in line.lower():
+                    text_tag = "error"
+                self.log_text.insert(tk.END, line if line.endswith("\n") else line + "\n", text_tag)
                 if at_bottom:
                     self.log_text.see(tk.END)
         except queue.Empty:
