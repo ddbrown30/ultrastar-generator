@@ -1355,15 +1355,145 @@ shape). `main.py`'s two retry sites are still NOT unit tested (same
 reasoning as the rewindow section above -- this is orchestration around
 real transcription calls) but ARE now real-audio validated end to end.
 
-**Still open**: Magic Dance's per-passage fix (`longest_unconfident_run`)
-has NOT yet been re-validated end-to-end the way Gold's has (Gold got 4
-real runs; Magic Dance only got the ORIGINAL small.en run that exposed
-the gap, before the per-passage trigger existed) -- re-run it to confirm
-the fix actually recovers the "Slap that baby..." passage's timing in a
-real written output, not just via the synthetic test. CLI-only for now
-(no GUI checkbox) -- same "ship CLI-only, add GUI once validated"
-pattern used for `--strategy validate` initially. The standard fallback
-path's no-reference-available gap (noted above) is unchanged.
+**Resolved same day**: Magic Dance's per-passage fix has now been
+re-validated end-to-end with default options (`medium.en`, not the
+small.en used to originally expose the gap) -- 150/180 words matched
+directly, 26 more recovered via `force_align_gaps`, only 4 interpolated,
+0 kept-original. CLI-only for now (no GUI checkbox) -- same "ship
+CLI-only, add GUI once validated" pattern used for `--strategy
+validate` initially. The standard fallback path's no-reference-available
+gap (noted above) is unchanged.
+
+## UltraStarKaraokeMaker-inspired improvements: force-align gaps, note
+## over-segmentation investigation, and melisma-tail merging (2026-08-10)
+
+Compared our own output on "Trixie Mattel - Gold" against a real run of
+UltraStarKaraokeMaker (github.com/walterfr/UltraStarKaraokeMaker, MIT-
+style OSS) on the same song. Three concrete things came out of this:
+
+### 1. Force-align known gaps -- shipped, see the section above
+`transcription.force_align_words_in_window` (real wav2vec2 CTC forced
+alignment of KNOWN text into a bounded audio window) directly adapted
+from USKMaker's own `realign_gap_windows`. Wired into both `realign.py`
+(`_force_align_unconfident_runs`) and `main.py`'s standard fallback path
+(`lyrics_lookup.recover_dropped_reference_words`). Default ON in both
+(`config.FORCE_ALIGN_GAPS`), `--no-force-align-gaps` opts out.
+
+### 2. Note over-segmentation ("extra notes") investigation -- explored,
+### NOT shipped, reverted to default
+User's own real-ear comparison flagged that our output has far more
+notes than USKMaker's for the same song, hypothesized as coming from
+our pitch-first architecture (pass-1 detects pitch from audio ALONE, no
+lyrics knowledge, vs. USKMaker's forced-alignment-first + per-syllable
+pitch extraction afterward). Confirmed with real numbers: untexted `~`
+continuation-note rate varies wildly by song under our OWN pipeline
+(Gold 33%, Stars 32%, Magic Dance 0%, Ordinary Day 8%) -- not a uniform
+defect. Cross-checked against Stars' real sheet-music OMR ground truth:
+our rate (32%) is ~7x the REAL notated melisma rate (4.4%), and pass-1's
+own RAW note count (258) is already ~2.8x the real note count (91)
+*before* any lyrics are even involved -- confirms genuine pass-1
+over-segmentation, not "this song is just melismatic."
+
+Tried widening `NOTE_MERGE_SEMITONES` (1 -> 2) as the fix. Structural
+analysis of what actually gets merged (28 groups, same-audio controlled
+sweep) found ~64% are clearly transient/vibrato artifacts (a dominant
+sustained note bracketed by much-shorter same-or-near-pitch fragments,
+several with the exact same pitch on BOTH sides of a brief dip --
+onset/release tracking noise, not real melody), but ~15-20% are
+genuinely ambiguous 2-note comparable-duration steps that could be real
+stepwise melodic movement -- and `NOTE_MERGE_SEMITONES` was *already*
+lowered from 2 to 1 once before, specifically because a looser threshold
+was confirmed to chain-merge real melodic movement into flattened notes
+(see the constant's own docstring in config.py). A real controlled
+same-audio-no-separation comparison avoided the confound from an EARLIER
+attempt at this same comparison, which accidentally compared two
+different GENERATION PATHS (MXL+LRC vs pass-1) rather than the merge
+threshold, because Stars has its own `.mxl` file and MXL+LRC-primary
+(the default when an MXL is present) skips pass-1 entirely --
+`[PASS1 DEBUG].txt`'s own timestamp not matching the run in question is
+the tell for this; don't assume a full-pipeline run exercised pass-1
+just because pass-1-specific flags were on.
+
+Real controlled validation (both non-MXL forced via `--no-mxl-lrc-
+primary`, run against real ground truth): **BATB vs its own hand-
+verified SingStar ground truth showed 100% pitch-class accuracy at
+`merge=2`** (103 matched words, 97% timing agreement) -- no pitch cost
+found on the one comparison with genuinely trustworthy ground truth.
+Stars vs its own MXL score showed only 60% agreement, but that
+comparison is inherently weaker (an MXL score and a real performance can
+legitimately diverge in key/arrangement independent of detector
+accuracy) and there was no `merge=1` baseline via the same method to
+compare against.
+
+**Decision: NOT shipped.** `NOTE_MERGE_SEMITONES` reverted to `1`
+(default) after the investigation. Despite BATB's clean 100% result, the
+~15-20% ambiguous-case rate combined with this constant's own prior,
+specific, confirmed real-bug history (see its own docstring) was judged
+not worth the risk without either better ground truth or actual
+listening validation. Both `--no-mxl-lrc-primary` real outputs from
+this investigation are left on disk for the user to listen to directly:
+`sandbox/Les Misérables - Stars/Output_nomxl_merge2/` and `sandbox/
+Beauty And The Beast - Beauty And The Beast/Output_nomxl_merge2/`.
+
+### 3. Melisma-tail merge -- shipped, default ON
+Separate, much narrower, real-user-reported fix: a melisma-continuation
+note (`~`) that's beat-adjacent (no gap) to the PRECEDING note at the
+*exact* same pitch is redundant on the beat grid and just makes the
+chart busier to read/sing -- e.g. "ly" (a real word syllable) followed
+immediately by a same-pitch `~` should be ONE longer note, not two.
+Real example that motivated this ("Barely even friends"):
+```
+: 263 1 3 ly          : 263 4 3 ly
+: 264 3 3 ~      ->   (merged away)
+```
+`usdx_writer._merge_connected_melisma_tails` runs at the INTEGER BEAT
+level (on exactly what will be written, post-quantization -- not on the
+pre-quantization float-second timing, since quantization itself can
+change what counts as "adjacent"), folding a `~` into whichever note
+precedes it (a real word syllable OR another `~`) and extending that
+note's own length -- chains, so several connected same-pitch `~` notes
+in a row all collapse into one. Never merges across a LineBreak.
+Deliberately NOT applied to `realign.py` (default `False` at the
+`render_song`/`write_song` function level itself, only `main.py`
+explicitly opts in via `opts.merge_connected_melisma`) -- realign has
+its own stricter "never add/remove/reorder a note" contract that
+deleting a note would violate. Default ON in `main.py`
+(`config.MERGE_CONNECTED_MELISMA_TAILS`), `--no-merge-connected-melisma`
+opts out. Verified against real output: zero remaining same-pitch
+beat-adjacent `~` violations across all 3 gen-test outputs below.
+
+### Final 6-song real validation (2026-08-10), all default options
+Gen tests (BATB, Chicago, Gold) and realign tests (Chicago, Americans,
+Magic Dance) run with every new default (`force_align_gaps`,
+`retry_low_quality_asr`, `merge_connected_melisma` all ON,
+`NOTE_MERGE_SEMITONES` reverted to `1`) together for the first time:
+
+- **BATB gen**: MXL+LRC primary correctly rejected again (8%->9% ASR
+  placement rate even after the large-v3 retry -- the same known
+  wrong-cast "(Finale)" candidate issue, not a new bug), fell back to
+  standard generation. `force_align_gaps` recovered 20 words there.
+  100% pitch-class accuracy against real ground truth (105 matched
+  words), 97.1% timing agreement.
+- **Chicago gen**: MXL+LRC primary succeeded cleanly on the first try --
+  113/116 words placed via transcription, 0 monotonic fixes.
+- **Gold gen**: exactly reproduced the already-validated force-align-
+  gaps + large-v3-retry behavior (10 words recovered directly, retry
+  improves reference match 91%->95% on the residual gap).
+- **Chicago realign**: 208/210 words matched directly to ASR (99%), 2
+  more recovered via `force_align_gaps`.
+- **Americans realign**: correctly rejected the wrong-edition LRC
+  candidate again (31 vs 40 "afraid" occurrences, same repeat-structure
+  check as before) -- the per-passage trigger (39-word unconfident run)
+  fired the large-v3 retry, which brought anchor rate from 62% to 100%
+  (`force_align_gaps` alone had already recovered 29 words; the retry's
+  own force-align pass recovered 129 more).
+- **Magic Dance realign**: 150/180 matched directly, 26 recovered via
+  `force_align_gaps`, only 4 interpolated, 0 kept-original -- see the
+  "resolved same day" note above.
+
+Zero regressions, `test_dry_run.py` green throughout. This is the first
+time all of this session's mechanisms have been real-validated running
+together rather than in isolation.
 
 ## Environment
 

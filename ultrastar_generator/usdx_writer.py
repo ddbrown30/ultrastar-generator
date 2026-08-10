@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
+from . import config
 from .models import Song, Syllable, LineBreak
 from .tempo import seconds_to_beat, seconds_to_beat_length
 
@@ -70,7 +71,31 @@ def _quantize_entries(entries: List[object], bpm: float, gap_ms: int) -> List[tu
     return out
 
 
-def render_song(song: Song) -> str:
+def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
+    """See config.MERGE_CONNECTED_MELISMA_TAILS's docstring. Folds a 'syl'
+    entry into the immediately preceding 'syl' entry when they're beat-
+    adjacent (no gap), same pitch, and THIS entry's own text is the
+    melisma-continuation placeholder -- extending the previous entry's
+    length and dropping this one. A single left-to-right pass, updating
+    the last kept entry in place, correctly chains multiple consecutive
+    same-pitch continuation notes into one (each new candidate is checked
+    against whatever the previous one already collapsed into). Never
+    merges across a LineBreak ('break') entry, and never touches the
+    very first entry."""
+    out: List[tuple] = []
+    for item in quantized:
+        if (item[0] == "syl" and out and out[-1][0] == "syl"
+                and item[4].strip() == config.MELISMA_CONTINUATION_TEXT
+                and item[3] == out[-1][3]  # same pitch (midi_note)
+                and item[1] == out[-1][1] + out[-1][2]):  # beat-adjacent: start == prev start+length
+            prev = out[-1]
+            out[-1] = (prev[0], prev[1], prev[2] + item[2], prev[3], prev[4], prev[5], prev[6])
+        else:
+            out.append(item)
+    return out
+
+
+def render_song(song: Song, merge_connected_melisma: bool = False) -> str:
     lines: List[str] = []
 
     def tag(name: str, value) -> None:
@@ -103,6 +128,8 @@ def render_song(song: Song) -> str:
         tag("PREVIEWSTART", round(song.preview_start, 2))
 
     quantized = _quantize_entries(song.entries, song.bpm, song.gap_ms)
+    if merge_connected_melisma:
+        quantized = _merge_connected_melisma_tails(quantized)
 
     first_syllable_seen = False
     for item in quantized:
@@ -123,6 +150,6 @@ def render_song(song: Song) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_song(song: Song, output_path: Path) -> None:
+def write_song(song: Song, output_path: Path, merge_connected_melisma: bool = False) -> None:
     output_path = Path(output_path)
-    output_path.write_text(render_song(song), encoding="utf-8")
+    output_path.write_text(render_song(song, merge_connected_melisma=merge_connected_melisma), encoding="utf-8")

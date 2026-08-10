@@ -38,6 +38,7 @@ import difflib
 import re
 import urllib.parse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from . import config
@@ -331,6 +332,88 @@ def largest_unmatched_reference_run(ref_lines: List[str], words: List[Word]) -> 
         return 0
     matcher = difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False)
     return max((b1 - b0 for tag, a0, a1, b0, b1 in matcher.get_opcodes() if tag == "insert"), default=0)
+
+
+def recover_dropped_reference_words(ref_lines: List[str], words: List[Word], vocals_path: Path,
+                                     *, debug_log=None) -> Tuple[List[Word], int]:
+    """PROTOTYPE, see config.FORCE_ALIGN_GAPS's docstring. For each
+    contiguous run of reference words with NO corresponding ASR word at
+    all (a difflib 'insert' opcode -- the SAME one `largest_unmatched_
+    reference_run` measures the size of), forces that KNOWN reference
+    text onto the audio window between the nearest ASR-matched
+    neighbors, via a real wav2vec2 CTC forced alignment
+    (`transcription.force_align_words_in_window`) -- doesn't need ASR to
+    have transcribed anything in the gap at all, since it isn't
+    searching a transcript, it's measuring where the GIVEN text fits.
+
+    A successful recovery is spliced into the returned word list as a
+    new `Word` with real measured timing and text taken directly from
+    the reference -- a later `align_words_to_reference` call will then
+    match it as an ordinary "equal" opcode (the text matches exactly),
+    assigning the correct `line_id` the normal way rather than needing
+    special-casing here.
+
+    Returns (new_words, n_recovered) -- `words` itself is never mutated;
+    `new_words` is `words` unchanged if there was nothing to recover, or
+    nothing could be. Lazily loads the audio/align model at most once,
+    and only if there's an actual gap to try."""
+    if not ref_lines or not words:
+        return words, 0
+
+    ref_norm, ref_orig, ref_line_ids = _tokenize_lines(ref_lines)
+    asr_norm = [_normalize(w.text) for w in words]
+    if not ref_norm or not asr_norm:
+        return words, 0
+
+    matcher = difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    if not any(tag == "insert" for tag, *_ in opcodes):
+        return words, 0
+
+    from .transcription import force_align_words_in_window
+    import whisperx
+    from . import model_cache
+
+    audio = None
+    align_model = metadata = None
+    audio_duration = 0.0
+
+    out: List[Word] = []
+    n_recovered = 0
+    for tag, a0, a1, b0, b1 in opcodes:
+        if tag != "insert":
+            out.extend(words[a0:a1])
+            continue
+
+        if audio is None:
+            audio = whisperx.load_audio(str(vocals_path))
+            align_model, metadata = model_cache.get_whisperx_align_model()
+            audio_duration = len(audio) / 16000.0
+
+        win_start = words[a0 - 1].end if a0 > 0 else 0.0
+        win_end = words[a1].start if a1 < len(words) else audio_duration
+        win_start = max(0.0, min(win_start, audio_duration))
+        win_end = max(0.0, min(win_end, audio_duration))
+
+        gap_text = ref_orig[b0:b1]
+        gap_line_ids = ref_line_ids[b0:b1]
+        aligned = force_align_words_in_window(gap_text, win_start, win_end, align_model, metadata, audio)
+        if aligned is None:
+            if debug_log is not None:
+                debug_log.line(f"  force-align (reference gap): [{win_start:8.3f}-{win_end:8.3f}] "
+                                f"({len(gap_text)} word(s) {' '.join(gap_text)!r}) -- no usable result, "
+                                f"stays dropped")
+            continue
+
+        for text, line_id, (ws, we, score) in zip(gap_text, gap_line_ids, aligned):
+            out.append(Word(text=text, start=ws, end=we, confidence=score, line_id=line_id))
+            n_recovered += 1
+        if debug_log is not None:
+            debug_log.line(f"  force-align (reference gap): [{win_start:8.3f}-{win_end:8.3f}] "
+                            f"({len(gap_text)} word(s) {' '.join(gap_text)!r}) -- recovered via forced "
+                            f"alignment")
+
+    return out, n_recovered
 
 
 def reference_matches_transcript(ref_lines: List[str], words: List[Word],

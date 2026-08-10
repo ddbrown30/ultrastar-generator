@@ -575,6 +575,77 @@ assert "\n: 0 " in txt
 print(txt)
 print("OK: writer output structurally correct")
 
+print("\n--- usdx_writer._merge_connected_melisma_tails (2026-08-10): a beat-adjacent, same-pitch '~' "
+      "melisma-continuation note gets folded into the note before it instead of staying a separate note "
+      "-- real user-reported example ('Barely even friends') ---")
+from ultrastar_generator.usdx_writer import _merge_connected_melisma_tails, render_song as _render_merge
+
+mcm_input = [
+    ("syl", 261, 1, 1, "Bare", True, ":"),
+    ("syl", 263, 1, 3, "ly", False, ":"),
+    ("syl", 264, 3, 3, "~", False, ":"),        # same pitch (3) as "ly", adjacent -> merges into "ly"
+    ("syl", 268, 1, 5, " even", True, ":"),
+    ("syl", 269, 1, 6, "~", False, ":"),        # different pitch than "even" (6 vs 5) -- stays separate...
+    ("syl", 270, 1, 6, "~", False, ":"),        # ...but THIS one is same pitch as the previous '~' (6==6),
+                                                 # adjacent -> the two '~' notes merge into one
+    ("syl", 272, 2, 8, " friends", True, ":"),
+    ("syl", 274, 3, 8, "~", False, ":"),        # same pitch (8) as "friends", adjacent -> merges into "friends"
+]
+mcm_out = _merge_connected_melisma_tails(mcm_input)
+assert mcm_out == [
+    ("syl", 261, 1, 1, "Bare", True, ":"),
+    ("syl", 263, 4, 3, "ly", False, ":"),       # 1+3=4
+    ("syl", 268, 1, 5, " even", True, ":"),
+    ("syl", 269, 2, 6, "~", False, ":"),        # 1+1=2, still untexted
+    ("syl", 272, 5, 8, " friends", True, ":"),  # 2+3=5
+], mcm_out
+print("OK:", mcm_out)
+
+mcm_gap_input = [
+    ("syl", 0, 2, 4, "held", True, ":"),
+    ("syl", 3, 2, 4, "~", False, ":"),   # same pitch, but NOT adjacent (0+2=2 != 3) -- a real gap/pause -> no merge
+]
+assert _merge_connected_melisma_tails(mcm_gap_input) == mcm_gap_input, _merge_connected_melisma_tails(mcm_gap_input)
+print("OK: a same-pitch '~' separated by even a 1-beat gap is left alone (not a genuine continuation)")
+
+mcm_pitch_input = [
+    ("syl", 0, 2, 4, "held", True, ":"),
+    ("syl", 2, 2, 5, "~", False, ":"),   # adjacent, but DIFFERENT pitch -> no merge
+]
+assert _merge_connected_melisma_tails(mcm_pitch_input) == mcm_pitch_input
+print("OK: an adjacent but different-pitch '~' is left alone (a real pitch change, not noise)")
+
+mcm_linebreak_input = [
+    ("syl", 0, 2, 4, "held", True, ":"),
+    ("break", 2, 2),
+    ("syl", 2, 2, 4, "~", False, ":"),   # same pitch, "adjacent" only by ignoring the LineBreak -- must NOT merge
+]
+assert _merge_connected_melisma_tails(mcm_linebreak_input) == mcm_linebreak_input
+print("OK: a '~' right after a LineBreak never merges backward across it, even at the same pitch")
+
+# End-to-end option wiring: render_song(merge_connected_melisma=True/False) actually changes the output.
+mcm_song = Song(
+    # bpm=240 -> beat = 1/(240*4/60) = 0.0625s exactly; all timestamps below are
+    # exact multiples of that, so quantization can't introduce a rounding-tie gap
+    # (an earlier version of this test picked bpm/timestamps that landed exactly
+    # on a beat's midpoint, which Python's banker's rounding resolved differently
+    # for the two adjacent notes and spuriously introduced a 1-beat gap between
+    # them -- not a bug in the merge logic itself, just an unlucky test input).
+    title="T", artist="A", mp3="a.mp3", bpm=240.0, gap_ms=0,
+    entries=[
+        Syllable("Bare", 0.0, 0.25, 1, is_word_start=True),
+        Syllable("ly", 0.25, 0.50, 3, is_word_start=False),
+        Syllable("~", 0.50, 1.50, 3, is_word_start=False),
+    ],
+)
+mcm_txt_on = _render_merge(mcm_song, merge_connected_melisma=True)
+mcm_txt_off = _render_merge(mcm_song, merge_connected_melisma=False)
+assert "~" not in mcm_txt_on, mcm_txt_on
+assert "~" in mcm_txt_off, mcm_txt_off
+assert mcm_txt_on != mcm_txt_off
+print("OK: render_song(merge_connected_melisma=True) actually removes the redundant '~'; "
+      "=False (the function's own default) leaves it untouched")
+
 print("\nALL DRY-RUN CHECKS PASSED")
 
 print("\n--- pitch_to_note_name conversions ---")
@@ -712,6 +783,132 @@ tl_norm, tl_orig, tl_line_ids = _tokenize_lines(["Do-do-do-do-do", "well-known f
 assert tl_orig == ["Do", "do", "do", "do", "do", "well", "known", "fact"], tl_orig
 assert tl_line_ids == [0, 0, 0, 0, 0, 1, 1, 1], tl_line_ids
 print("OK:", tl_orig)
+
+print("\n--- transcription.force_align_words_in_window (PROTOTYPE, 2026-08-10, adapted from "
+      "UltraStarKaraokeMaker's realign_gap_windows): forces KNOWN text onto an audio window via a real "
+      "wav2vec2 CTC call -- validates the result before ever trusting it (word count, timestamps present, "
+      "within window, monotonic), never applies a partial/ambiguous result ---")
+import sys as _sys_fa
+import types as _types_fa
+
+
+class _FakeWhisperXAlignModule:
+    def __init__(self):
+        self.align_fn = None
+
+    def align(self, segments, align_model, metadata, audio, device=None, return_char_alignments=False):
+        return self.align_fn(segments[0])
+
+
+_fake_whisperx_fa = _FakeWhisperXAlignModule()
+_sys_fa.modules["whisperx"] = _fake_whisperx_fa
+from ultrastar_generator.transcription import force_align_words_in_window
+
+# (a) clean success: 3 words, all measured, monotonic, inside the window.
+_fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
+    {"word": "Do", "start": 10.0, "end": 10.2, "score": 0.7},
+    {"word": "do", "start": 10.2, "end": 10.4, "score": 0.6},
+    {"word": "do", "start": 10.4, "end": 10.6, "score": 0.65},
+]}]}
+fa_result = force_align_words_in_window(["Do", "do", "do"], 10.0, 11.0, None, None, None)
+assert fa_result is not None and len(fa_result) == 3, fa_result
+assert fa_result[0][:2] == (10.0, 10.2) and fa_result[2][:2] == (10.4, 10.6), fa_result
+print("OK: clean forced-alignment result accepted, per-word (start, end, score) returned in order")
+
+# (b) word-count mismatch (e.g. whisperx expanded/collapsed a token) -> rejected, None.
+_fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
+    {"word": "Do", "start": 10.0, "end": 10.2, "score": 0.7},
+]}]}
+assert force_align_words_in_window(["Do", "do", "do"], 10.0, 11.0, None, None, None) is None
+print("OK: word-count mismatch (asked for 3, got 1) -> rejected rather than guessing a mapping")
+
+# (c) a word placed outside the window (beyond slop) -> rejected, None.
+_fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
+    {"word": "Do", "start": 10.0, "end": 10.2, "score": 0.7},
+    {"word": "do", "start": 10.2, "end": 10.4, "score": 0.6},
+    {"word": "do", "start": 20.0, "end": 20.2, "score": 0.6},  # way past window_end=11.0 + slop
+]}]}
+assert force_align_words_in_window(["Do", "do", "do"], 10.0, 11.0, None, None, None) is None
+print("OK: a word landing well outside the window -> rejected")
+
+# (d) non-monotonic output (a later word starting before an earlier one) -> rejected, None.
+_fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
+    {"word": "Do", "start": 10.4, "end": 10.6, "score": 0.7},
+    {"word": "do", "start": 10.0, "end": 10.2, "score": 0.6},  # earlier than the word before it
+]}]}
+assert force_align_words_in_window(["Do", "do"], 10.0, 11.0, None, None, None) is None
+print("OK: non-monotonic word order -> rejected")
+
+# (e) missing timestamp on one word -> rejected, None.
+_fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
+    {"word": "Do", "start": None, "end": None, "score": 0.0},
+]}]}
+assert force_align_words_in_window(["Do"], 10.0, 11.0, None, None, None) is None
+print("OK: a word with no measured timestamp -> rejected")
+
+# (f) window too short for the given word count -> rejected WITHOUT even calling whisperx.align.
+def _fa_boom(seg):
+    raise AssertionError("whisperx.align must not be called when the window is too short to bother")
+_fake_whisperx_fa.align_fn = _fa_boom
+assert force_align_words_in_window(["one", "two", "three", "four", "five"], 10.0, 10.05, None, None, None) is None
+print("OK: a window too short for the word count -> rejected before ever calling whisperx.align")
+
+# (g) whisperx.align itself raising -> caught, None, never crashes the pipeline.
+def _fa_raises(seg):
+    raise RuntimeError("simulated alignment backtrack failure")
+_fake_whisperx_fa.align_fn = _fa_raises
+assert force_align_words_in_window(["Do"], 10.0, 11.0, None, None, None) is None
+print("OK: whisperx.align() raising is caught, not propagated")
+
+del _sys_fa.modules["whisperx"]
+
+print("\n--- lyrics_lookup.recover_dropped_reference_words (PROTOTYPE, 2026-08-10): splices force-aligned "
+      "words into a copy of the ASR word list at each reference 'insert' gap -- real case (Trixie Mattel - "
+      "Gold): recovers a whole 'Do-do-do-do-do' passage ASR produced zero words for ---")
+from ultrastar_generator.lyrics_lookup import recover_dropped_reference_words
+import ultrastar_generator.transcription as transcription_mod_fa
+import ultrastar_generator.model_cache as model_cache_mod_fa
+
+rdr_ref_lines = ["Will you grow from those cold blood wrongs", "Do-do-do-do-do", "They start to play"]
+rdr_words = [
+    Word(text="Will", start=0.0, end=0.3), Word(text="you", start=0.3, end=0.5),
+    Word(text="grow", start=0.5, end=0.8), Word(text="from", start=0.8, end=1.0),
+    Word(text="those", start=1.0, end=1.3), Word(text="cold", start=1.3, end=1.5),
+    Word(text="blood", start=1.5, end=1.8), Word(text="wrongs", start=1.8, end=2.0),
+    # <-- "Do-do-do-do-do" (5 words after hyphen-splitting) completely missing here -->
+    Word(text="They", start=5.0, end=5.3), Word(text="start", start=5.3, end=5.6),
+    Word(text="to", start=5.6, end=5.7), Word(text="play", start=5.7, end=6.0),
+]
+_orig_force_align_fa = transcription_mod_fa.force_align_words_in_window
+_orig_align_model_fa = model_cache_mod_fa.get_whisperx_align_model
+transcription_mod_fa.force_align_words_in_window = lambda words_text, w0, w1, *a, **kw: [
+    (w0 + i * 0.4, w0 + i * 0.4 + 0.3, 0.5) for i in range(len(words_text))
+]
+model_cache_mod_fa.get_whisperx_align_model = lambda *a, **kw: (None, None)
+_sys_fa.modules["whisperx"] = _types_fa.SimpleNamespace(load_audio=lambda path: [0] * 160000)  # 10s @ 16kHz
+rdr_new_words, rdr_n = recover_dropped_reference_words(rdr_ref_lines, rdr_words, Path("dummy.wav"))
+assert rdr_n == 5, rdr_n
+assert len(rdr_new_words) == len(rdr_words) + 5, len(rdr_new_words)
+rdr_recovered = [w for w in rdr_new_words if w.text in ("Do", "do")]
+assert len(rdr_recovered) == 5 and [w.text for w in rdr_recovered] == ["Do", "do", "do", "do", "do"], \
+    [w.text for w in rdr_recovered]
+# recovered words must land strictly between "wrongs" (ends 2.0) and "They" (starts 5.0) -- the real gap window
+assert all(2.0 <= w.start < 5.0 for w in rdr_recovered), [(w.start, w.end) for w in rdr_recovered]
+assert [w.text for w in rdr_words] == ["Will", "you", "grow", "from", "those", "cold", "blood", "wrongs",
+                                        "They", "start", "to", "play"], \
+    "the original words list must never be mutated"
+print(f"  OK: {rdr_n} words recovered ('Do-do-do-do-do' split into 5), spliced into the gap between "
+      f"'wrongs' and 'They' with real (fake, in this test) timing; original word list left untouched")
+
+# force_align_words_in_window returning None (couldn't recover) -> gap stays dropped, words unchanged.
+transcription_mod_fa.force_align_words_in_window = lambda *a, **kw: None
+rdr_noop_words, rdr_noop_n = recover_dropped_reference_words(rdr_ref_lines, rdr_words, Path("dummy.wav"))
+assert rdr_noop_n == 0 and len(rdr_noop_words) == len(rdr_words), (rdr_noop_n, len(rdr_noop_words))
+print("  OK: an unrecoverable gap (no usable alignment result) is left dropped, not force-inserted")
+
+transcription_mod_fa.force_align_words_in_window = _orig_force_align_fa
+model_cache_mod_fa.get_whisperx_align_model = _orig_align_model_fa
+del _sys_fa.modules["whisperx"]
 
 print("\n--- lyrics_lookup._fetch_from_lrclib: picks the best candidate by duration closeness, "
       "excludes instrumental/lyric-less candidates, breaks ties toward a synced-lyrics candidate ---")
@@ -2744,6 +2941,56 @@ rlg2_n = rematch_local_gaps(rlg2_words, rlg2_asr, rlg2_starts, rlg2_ends, rlg2_c
 assert rlg2_n == 0 and rlg2_confident == [False, True], (rlg2_n, rlg2_confident)
 print("  OK: a word genuinely absent from the ASR window is left unmatched (for interpolate_fallback), "
       "not force-matched to something implausible")
+
+print("  _force_align_unconfident_runs (PROTOTYPE, 2026-08-10, adapted from UltraStarKaraokeMaker): forces "
+      "the EXISTING file's own text for a still-unconfident run onto the audio window between its nearest "
+      "confident neighbors -- unlike rematch_local_gaps, doesn't need ASR to have transcribed anything there "
+      "at all, so it can recover a run rematch_local_gaps genuinely can't (real case: 'mystery' above):")
+from ultrastar_generator.realign import _force_align_unconfident_runs
+import ultrastar_generator.transcription as transcription_mod_rg
+import ultrastar_generator.model_cache as model_cache_mod_rg
+
+fa_words = extract_words([
+    Syllable(text="Do-", start=0.0, end=0.5, midi_note=0, is_word_start=True),
+    Syllable(text="mystery", start=1.0, end=1.5, midi_note=0, is_word_start=True),
+    Syllable(text="hello", start=2.0, end=2.5, midi_note=0, is_word_start=True),
+])
+fa_starts = [None, None, 10.0]
+fa_ends = [None, None, 10.5]
+fa_confident = [False, False, True]
+_orig_fawiw = transcription_mod_rg.force_align_words_in_window
+_orig_align_model_rg = model_cache_mod_rg.get_whisperx_align_model
+transcription_mod_rg.force_align_words_in_window = lambda words_text, w0, w1, *a, **kw: [
+    (w0 + i * 0.3, w0 + i * 0.3 + 0.25, 0.55) for i in range(len(words_text))
+]
+model_cache_mod_rg.get_whisperx_align_model = lambda *a, **kw: (None, None)
+_sys_fa.modules["whisperx"] = _types_fa.SimpleNamespace(load_audio=lambda path: [0] * 160000)  # 10s @ 16kHz
+fa_n = _force_align_unconfident_runs(fa_words, fa_starts, fa_ends, fa_confident, Path("dummy.wav"))
+assert fa_n == 2, fa_n
+assert fa_confident == [True, True, True], fa_confident
+assert fa_starts[0] == 0.0 and fa_starts[1] == 0.3, fa_starts  # window = [0.0 (song start), 10.0)
+print("  OK: a run with NO neighboring confident word before it (song start) still gets a real window "
+      "([0.0, next confident word's start)) and both words are recovered")
+
+# force_align_words_in_window returning None (window unusable) -> run stays unconfident for interpolation.
+transcription_mod_rg.force_align_words_in_window = lambda *a, **kw: None
+fa_confident2 = [False, False, True]
+fa_n2 = _force_align_unconfident_runs(fa_words, list(fa_starts), list(fa_ends), fa_confident2, Path("dummy.wav"))
+assert fa_n2 == 0 and fa_confident2 == [False, False, True], (fa_n2, fa_confident2)
+print("  OK: an unrecoverable run (no usable alignment result) is left unconfident, not force-marked anyway")
+
+# a fully-confident word list never even tries to load audio (early return, no whisperx call at all).
+def _fa_rg_boom(*a, **kw):
+    raise AssertionError("force_align_words_in_window must not be called when nothing is unconfident")
+transcription_mod_rg.force_align_words_in_window = _fa_rg_boom
+fa_none_n = _force_align_unconfident_runs(fa_words, [0.0, 1.0, 10.0], [0.5, 1.5, 10.5], [True, True, True],
+                                           Path("dummy.wav"))
+assert fa_none_n == 0
+print("  OK: no unconfident words at all -> returns immediately, never touches the audio/align model")
+
+transcription_mod_rg.force_align_words_in_window = _orig_fawiw
+model_cache_mod_rg.get_whisperx_align_model = _orig_align_model_rg
+del _sys_fa.modules["whisperx"]
 
 print("  seed_lrc_anchors: LRCLIB line starts fill in an anchor for the first not-yet-confident word of "
       "each matched line (a forced/pinned candidate skips network + candidate-selection filtering):")

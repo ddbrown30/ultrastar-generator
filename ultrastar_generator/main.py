@@ -43,7 +43,7 @@ from .alignment import align_words
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
                              alignment_diff_summary, reference_match_ratio, largest_unmatched_reference_run,
-                             fetch_lrclib_by_id)
+                             recover_dropped_reference_words, fetch_lrclib_by_id)
 from .musicxml_reference import apply_musicxml_references
 from .mxl_lrc_generator import try_mxl_lrc_primary
 from .lrc_timing import apply_lrc_timing_check
@@ -175,6 +175,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                           f"fine). No-op if --whisper-model is already '{config.RETRY_ASR_MODEL}'; only kept if "
                           f"it actually scores better than the original. See CLAUDE.md.").replace("%", "%%"))
     p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
+    p.add_argument("--force-align-gaps", dest="force_align_gaps", action="store_true",
+                    default=config.FORCE_ALIGN_GAPS,
+                    help="PROTOTYPE, default: ON. Standard fallback path only: for any run of reference "
+                         "lyrics words ASR produced NO word for at all, forces that known text onto the "
+                         "audio window between the nearest ASR-matched neighbors via a real wav2vec2 CTC "
+                         "forced alignment -- doesn't need ASR to have transcribed anything in the gap. "
+                         "Adapted from UltraStarKaraokeMaker. See CLAUDE.md.")
+    p.add_argument("--no-force-align-gaps", dest="force_align_gaps", action="store_false")
+    p.add_argument("--merge-connected-melisma", dest="merge_connected_melisma", action="store_true",
+                    default=config.MERGE_CONNECTED_MELISMA_TAILS,
+                    help="Default: ON. Final write-time cleanup: a melisma-continuation note ('~') that's "
+                         "beat-adjacent (no gap) to the preceding note at the EXACT same pitch is merged "
+                         "into it (extending its length, dropping the '~') instead of being written as a "
+                         "separate note -- chains, so several connected same-pitch '~' notes in a row all "
+                         "collapse into one. See CLAUDE.md.")
+    p.add_argument("--no-merge-connected-melisma", dest="merge_connected_melisma", action="store_false")
     p.add_argument("--verify-words", dest="verify_words", action="store_true",
                     default=config.ENABLE_WORD_VERIFICATION,
                     help="Re-transcribe a tight, isolated audio crop around every word's own ASR "
@@ -729,6 +745,20 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 )
             if reference:
                 candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
+                # PROTOTYPE force-align known gaps, see config.FORCE_ALIGN_GAPS's
+                # docstring. Gated on the SAME wrong-song floor as everything else
+                # in this block (reference_match_ratio computed on the ORIGINAL
+                # ASR words, before any recovery) -- running this against a
+                # wrong-song/wrong-language reference would force garbage text
+                # onto our own audio, not recover anything real.
+                if (opts.force_align_gaps
+                        and reference_match_ratio(candidate_lines, words) >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
+                    words, n_recovered = recover_dropped_reference_words(candidate_lines, words, vocals_path,
+                                                                          debug_log=debug_log)
+                    if n_recovered:
+                        dlog(f"  Force-alignment of known gaps: recovered {n_recovered} word(s) from the "
+                             f"reference lyrics that ASR produced no word for at all, via a real wav2vec2 "
+                             f"CTC forced alignment.")
                 match_ratio = reference_match_ratio(candidate_lines, words)
                 unmatched_run = largest_unmatched_reference_run(candidate_lines, words)
                 # PROTOTYPE ASR-quality retry, see config.RETRY_LOW_QUALITY_ASR's
@@ -760,6 +790,17 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                              f"but ASR quality looks weak) -- retrying before accepting this transcription.")
                     retry_words = _retry_transcribe(vocals_path, opts, debug_log, log)
                     if retry_words:
+                        # Apply the SAME gap-recovery to the retry's own transcription before comparing --
+                        # otherwise accepting the retry (its raw ratio can look better on the WHOLE song)
+                        # silently throws away whatever the first pass's gap-recovery already found, and
+                        # there's no guarantee the bigger model independently recovers the same passage.
+                        if (opts.force_align_gaps and reference_match_ratio(candidate_lines, retry_words)
+                                >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
+                            retry_words, retry_n_recovered = recover_dropped_reference_words(
+                                candidate_lines, retry_words, vocals_path, debug_log=debug_log)
+                            if retry_n_recovered:
+                                dlog(f"  Force-alignment of known gaps (retry transcription): recovered "
+                                     f"{retry_n_recovered} more word(s).")
                         retry_ratio = reference_match_ratio(candidate_lines, retry_words)
                         retry_unmatched_run = largest_unmatched_reference_run(candidate_lines, retry_words)
                         # Accept if it's better on WHICHEVER signal actually triggered the retry -- comparing
@@ -963,7 +1004,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             preview_start=preview_start,
             entries=entries,
         )
-        write_song(song, out_path)
+        write_song(song, out_path, merge_connected_melisma=opts.merge_connected_melisma)
         log(f"Wrote {out_path}")
 
     if not opts.skip_separation:
@@ -989,6 +1030,8 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
         rewindow_long_segments=args.rewindow_long_segments,
         retry_low_quality_asr=args.retry_low_quality_asr,
+        force_align_gaps=args.force_align_gaps,
+        merge_connected_melisma=args.merge_connected_melisma,
         verify_words=args.verify_words,
         verify_placement=args.verify_placement, verify_all_words=args.verify_all_words,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,

@@ -123,11 +123,12 @@ class RealignQuality:
     n_asr_matched: int = 0
     n_lrc_seeded: int = 0
     n_local_rematched: int = 0
+    n_force_aligned: int = 0  # see config.FORCE_ALIGN_GAPS
     n_interpolated: int = 0
     n_kept_original: int = 0
     # Longest CONSECUTIVE run of words with no real anchor (asr/lrc/local-
-    # rematch) at all -- see config.RETRY_ASR_MIN_UNCONFIDENT_RUN. A
-    # per-PASSAGE signal, independent of anchor_rate: real case (David
+    # rematch/force-align) at all -- see config.RETRY_ASR_MIN_UNCONFIDENT_RUN.
+    # A per-PASSAGE signal, independent of anchor_rate: real case (David
     # Bowie - Magic Dance, small.en) had a song-wide anchor rate of 58%
     # (well above the retry bar) while one hallucinated decoder segment
     # still dragged a real, contiguous passage ~12-14s off in the final
@@ -137,8 +138,8 @@ class RealignQuality:
 
     @property
     def anchor_rate(self) -> float:
-        return ((self.n_asr_matched + self.n_lrc_seeded + self.n_local_rematched) / self.n_words
-                 if self.n_words else 0.0)
+        return ((self.n_asr_matched + self.n_lrc_seeded + self.n_local_rematched + self.n_force_aligned)
+                 / self.n_words if self.n_words else 0.0)
 
 
 def _longest_false_run(confident: List[bool]) -> int:
@@ -149,6 +150,80 @@ def _longest_false_run(confident: List[bool]) -> int:
         cur = 0 if c else cur + 1
         best = max(best, cur)
     return best
+
+
+def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Optional[float]],
+                                   ends: List[Optional[float]], confident: List[bool],
+                                   vocals_path: Path, *, debug_log: Optional[DebugLog] = None
+                                   ) -> int:
+    """PROTOTYPE, see config.FORCE_ALIGN_GAPS's docstring. For each
+    contiguous run of `confident[i] == False`, forces the EXISTING file's
+    OWN text for that run onto the audio window between the nearest
+    CONFIDENT neighbors (or 0.0/audio-end at the edges), via
+    `transcription.force_align_words_in_window` -- a real, measured
+    wav2vec2 CTC forced alignment, not a guess. Unlike `rematch_local_gaps`
+    (searches ASR's own already-decoded words in the window -- useless if
+    the decoder produced none there), this doesn't depend on ASR having
+    transcribed anything at all in the gap.
+
+    Mutates `starts`/`ends`/`confident` in place for any run that
+    succeeds; leaves a run untouched (falls through to
+    `interpolate_fallback` as before) if the window's too short or the
+    alignment result doesn't validate. Returns how many words were
+    recovered this way. Lazily loads the audio/align model at most once,
+    and only if there's actually an unconfident run to try -- a clean
+    file with no gaps never pays this cost."""
+    if not any(not c for c in confident):
+        return 0
+    from .transcription import force_align_words_in_window
+    import whisperx
+    from . import model_cache
+
+    audio = None
+    align_model = metadata = None
+    audio_duration = 0.0
+    promoted = 0
+
+    n = len(words)
+    idx = 0
+    while idx < n:
+        if confident[idx]:
+            idx += 1
+            continue
+        run_start = idx
+        while idx < n and not confident[idx]:
+            idx += 1
+        run = list(range(run_start, idx))
+
+        if audio is None:
+            audio = whisperx.load_audio(str(vocals_path))
+            align_model, metadata = model_cache.get_whisperx_align_model()
+            audio_duration = len(audio) / 16000.0
+
+        win_start = ends[run_start - 1] if run_start > 0 and ends[run_start - 1] is not None else 0.0
+        win_end = starts[idx] if idx < n and starts[idx] is not None else audio_duration
+        win_start = max(0.0, min(win_start, audio_duration))
+        win_end = max(0.0, min(win_end, audio_duration))
+
+        words_text = [words[k].text.strip() for k in run]
+        aligned = force_align_words_in_window(words_text, win_start, win_end, align_model, metadata, audio)
+        if aligned is None:
+            if debug_log is not None:
+                debug_log.line(f"  force-align: gap [{win_start:8.3f}-{win_end:8.3f}] "
+                                f"({len(run)} word(s) {' '.join(words_text)!r}) -- no usable result, "
+                                f"left for interpolation")
+            continue
+
+        for k, (ws, we, score) in zip(run, aligned):
+            starts[k] = ws
+            ends[k] = we
+            confident[k] = True
+            promoted += 1
+        if debug_log is not None:
+            debug_log.line(f"  force-align: gap [{win_start:8.3f}-{win_end:8.3f}] "
+                            f"({len(run)} word(s) {' '.join(words_text)!r}) -- recovered via forced alignment")
+
+    return promoted
 
 
 def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
@@ -775,10 +850,11 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                   use_lrc: bool = True, lrc_mode: str = "windowed",
                   forced_lrc_candidate: Optional[LrcLibCandidate] = None,
                   use_local_rematch: bool = False,
+                  force_align_gaps: bool = False, vocals_path: Optional[Path] = None,
                   log: Callable[[str], None] = print,
                   debug_log: Optional[DebugLog] = None) -> RealignResult:
-    """Core, audio-loading-free realignment step: given an already-parsed
-    existing song and already-transcribed ASR words, returns a new `Song`
+    """Core realignment step: given an already-parsed existing song and
+    already-transcribed ASR words, returns a new `Song`
     with the SAME notes (never added/removed/reordered, pitch untouched)
     but corrected start/end times. See module docstring for the overall
     approach.
@@ -839,7 +915,18 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     pass did. Left off by default and NOT wired into the CLI/GUI pending
     a way to distinguish "the original file is genuinely wrong here" from
     "ASR is just sparse/ambiguous here, trust the original" -- don't flip
-    this on without addressing that."""
+    this on without addressing that.
+
+    `force_align_gaps` (default ON, see config.FORCE_ALIGN_GAPS): after
+    local-rematch, forces the existing file's OWN text for any STILL-
+    unconfident run onto the audio window between its nearest confident
+    neighbors via a real wav2vec2 CTC forced alignment (`transcription.
+    force_align_words_in_window`) -- unlike local-rematch, this doesn't
+    need ASR to have transcribed anything in the gap at all, since it
+    isn't searching a transcript, it's measuring where the GIVEN text
+    fits. Requires `vocals_path` (the loaded audio + align model are
+    only paid for if there's an actual gap to try). Adapted from
+    UltraStarKaraokeMaker's own `realign_gap_windows` -- see CLAUDE.md."""
     # A deep copy, not just a new list -- the Syllable/LineBreak objects
     # themselves get mutated in place below (start/end reassigned), and
     # `existing` is a caller-owned ParsedSong that must come back out
@@ -927,6 +1014,16 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
             if confident[i] and not source[i]:
                 source[i] = "local_rematch"
 
+    if force_align_gaps and vocals_path is not None:
+        quality.n_force_aligned = _force_align_unconfident_runs(words, starts, ends, confident, vocals_path,
+                                                                  debug_log=debug_log)
+        if quality.n_force_aligned:
+            log(f"  Force-alignment of known gaps: recovered {quality.n_force_aligned} word(s) via a real "
+                f"wav2vec2 CTC forced alignment of the existing file's own text.")
+        for i in range(len(words)):
+            if confident[i] and not source[i]:
+                source[i] = "force_align"
+
     quality.longest_unconfident_run = _longest_false_run(confident)
 
     had_any_anchor = any(confident)
@@ -937,7 +1034,8 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
 
     log(f"  {quality.n_asr_matched}/{quality.n_words} word(s) matched directly to real ASR transcription, "
         f"{quality.n_lrc_seeded} from LRC line anchors, {quality.n_local_rematched} from the local-rematch "
-        f"second pass, {quality.n_interpolated} interpolated between anchors, {quality.n_kept_original} kept "
+        f"second pass, {quality.n_force_aligned} from forced alignment of known gaps, "
+        f"{quality.n_interpolated} interpolated between anchors, {quality.n_kept_original} kept "
         f"at their original timing (no anchor found nearby).")
     if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:
         log(f"  WARNING: only {quality.anchor_rate:.0%} of words got a real anchor from the audio -- "
@@ -949,13 +1047,15 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
             return realign_song(
                 existing, asr_words, artist=artist, title=title, audio_duration=audio_duration,
                 use_lrc=use_lrc, lrc_mode="seed", forced_lrc_candidate=forced_lrc_candidate,
-                use_local_rematch=use_local_rematch, log=log, debug_log=debug_log,
+                use_local_rematch=use_local_rematch, force_align_gaps=force_align_gaps,
+                vocals_path=vocals_path, log=log, debug_log=debug_log,
             )
 
     if debug_log is not None:
         debug_log.section("REALIGN SUMMARY (strategy=replace)")
         debug_log.line(f"  {quality.n_asr_matched}/{quality.n_words} matched directly to ASR, "
                         f"{quality.n_lrc_seeded} from LRC anchors, {quality.n_local_rematched} from local-rematch, "
+                        f"{quality.n_force_aligned} from forced alignment of known gaps, "
                         f"{quality.n_interpolated} interpolated, {quality.n_kept_original} kept original.")
         if lrc_prep is not None:
             c = lrc_prep.lrc_match.candidate
@@ -1403,6 +1503,15 @@ def build_arg_parser():
                           f"actually scores better. Only applies to --strategy replace. See CLAUDE.md."
                           ).replace("%", "%%"))
     p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
+    p.add_argument("--force-align-gaps", dest="force_align_gaps", action="store_true",
+                    default=config.FORCE_ALIGN_GAPS,
+                    help="PROTOTYPE, default: ON. For any run of words still without a real anchor after "
+                         "ASR/LRC/local-rematch, forces the existing file's own text onto the audio window "
+                         "between its nearest confident neighbors via a real wav2vec2 CTC forced alignment "
+                         "-- doesn't need ASR to have transcribed anything in the gap at all, unlike "
+                         "local-rematch. Adapted from UltraStarKaraokeMaker. Only applies to --strategy "
+                         "replace. See CLAUDE.md.")
+    p.add_argument("--no-force-align-gaps", dest="force_align_gaps", action="store_false")
     p.add_argument("--strategy", choices=["replace", "validate"], default="replace",
                     help="PROTOTYPE, not GUI-exposed yet (default: replace). 'replace': a word confidently "
                          "matched to ASR has its timing REPLACED with ASR's own value (shipped behavior). "
@@ -1438,6 +1547,7 @@ class RealignPipelineOptions:
     no_debug_log: bool = False
     rewindow_long_segments: bool = True
     retry_low_quality_asr: bool = config.RETRY_LOW_QUALITY_ASR
+    force_align_gaps: bool = config.FORCE_ALIGN_GAPS
     # "replace" (default, shipped): realign_song, a matched word's timing
     # is REPLACED with ASR's own value. "validate" (PROTOTYPE -- real-
     # validated but only helps when the file is already mostly accurate,
@@ -1526,7 +1636,8 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
 
     retry_result = realign_song(
         existing, retry_asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
-        use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate, log=log,
+        use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate,
+        force_align_gaps=opts.force_align_gaps, vocals_path=vocals_path, log=log,
         debug_log=debug_log,
     )
     if retry_result.success and retry_result.quality is not None:
@@ -1658,7 +1769,8 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     else:
         result = realign_song(
             existing, asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
-            use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate, log=log,
+            use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate,
+            force_align_gaps=opts.force_align_gaps, vocals_path=vocals_path, log=log,
             debug_log=debug_log,
         )
         result = _retry_asr_if_low_quality(
@@ -1728,7 +1840,8 @@ def _opts_from_args(args) -> RealignPipelineOptions:
         use_lrc=args.use_lrc, lrc_mode=args.lrc_mode, output_path=args.output_path,
         delete_work_files=args.delete_work_files, no_debug_log=args.no_debug_log,
         rewindow_long_segments=args.rewindow_long_segments,
-        retry_low_quality_asr=args.retry_low_quality_asr, strategy=args.strategy,
+        retry_low_quality_asr=args.retry_low_quality_asr,
+        force_align_gaps=args.force_align_gaps, strategy=args.strategy,
     )
 
 

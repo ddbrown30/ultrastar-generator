@@ -18,7 +18,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 from . import config
 from . import model_cache
@@ -138,6 +138,77 @@ def _rewindow_long_segments(segments: list, align_model, metadata, audio, device
         return fixed
     finally:
         align_logger.setLevel(prev_level)
+
+
+def force_align_words_in_window(words_text: List[str], window_start: float, window_end: float,
+                                 align_model, metadata, audio, device: str = "cuda"
+                                 ) -> Optional[List[Tuple[float, float, float]]]:
+    """Forces KNOWN `words_text` onto the audio inside [window_start,
+    window_end] via a real wav2vec2 CTC forced alignment (whisperx.
+    align()) -- unlike a normal ASR pass, this doesn't need the decoder to
+    have "heard" these words at all; it directly measures where the GIVEN
+    text best fits within the window. This is what recovers content a
+    free transcription pass can drop outright (a decoder segment that
+    silently omits real sung words -- see config.REWINDOW_ENABLED's
+    docstring for the same underlying failure mode), rather than hoping a
+    bigger model happens to transcribe it (config.RETRY_ASR_MODEL, which
+    real-world testing found doesn't reliably recover a specific dropped
+    passage even when it does help other parts of a song) or re-searching
+    an ASR transcript that may never have had these words in it at all
+    (rejected in `realign.py`'s own `rematch_local_gaps` history for
+    exactly this reason).
+
+    Approach and validation directly adapted from UltraStarKaraokeMaker's
+    own `realign_gap_windows` (github.com/walterfr/UltraStarKaraokeMaker,
+    python-sidecar/pipeline/align.py, MIT-style OSS) -- real case that
+    motivated bringing this over: their output on "Trixie Mattel - Gold"
+    correctly recovered a "Do-do-do-do-do" backing-vocal passage our own
+    pipeline dropped outright, via exactly this mechanism (their own
+    song_data.json tags the recovered words `"source": "realign"`).
+
+    Returns None (caller should keep whatever fallback -- interpolation
+    -- it already had) if: the window is too short to plausibly hold
+    this many words; whisperx.align() raises (a genuinely bad window
+    shouldn't crash the pipeline); the returned word count doesn't match
+    `words_text` (ambiguous mapping -- e.g. a word split into multiple
+    tokens); any word is missing a timestamp; or any word falls outside
+    the window (with `config.FORCE_ALIGN_WINDOW_SLOP_SEC` slop) or out of
+    order relative to the previous word -- never applies a partial/
+    ambiguous result."""
+    import whisperx
+
+    if not words_text:
+        return None
+    min_window = (config.FORCE_ALIGN_MIN_WINDOW_BASE_SEC
+                  + config.FORCE_ALIGN_MIN_WINDOW_SEC_PER_WORD * len(words_text))
+    if window_end - window_start < min_window:
+        return None
+
+    segment = {"start": window_start, "end": window_end, "text": " ".join(words_text)}
+    try:
+        result = whisperx.align([segment], align_model, metadata, audio, device=device,
+                                 return_char_alignments=False)
+    except Exception:
+        return None
+
+    raw_out = [w for seg in result.get("segments", []) for w in seg.get("words", [])]
+    if len(raw_out) != len(words_text):
+        return None
+
+    out: List[Tuple[float, float, float]] = []
+    last_start = window_start - 1e-3
+    for w in raw_out:
+        ws, we = w.get("start"), w.get("end")
+        if ws is None or we is None:
+            return None
+        ws, we = float(ws), float(we)
+        if (ws < window_start - config.FORCE_ALIGN_WINDOW_SLOP_SEC
+                or we > window_end + config.FORCE_ALIGN_WINDOW_SLOP_SEC
+                or ws < last_start):
+            return None
+        last_start = ws
+        out.append((ws, max(we, ws + 0.02), float(w.get("score", 0.0))))
+    return out
 
 
 def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None,

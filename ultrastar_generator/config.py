@@ -205,6 +205,25 @@ MELISMA_CONTINUATION_TEXT = "~"
 # overlaps in the final assembled note/lyric sequence.
 MIN_NOTE_GAP_SEC = 0.01
 
+# Final-step cleanup (2026-08-10): a melisma-continuation note ("~") that's
+# beat-adjacent (no gap) to the PRECEDING note AND at the exact same pitch
+# is redundant on the beat grid -- UltraStar doesn't need a separate note
+# to hold a pitch that hasn't changed and hasn't even paused; it just makes
+# the chart busier to read/sing without adding real information. Real case
+# (user-reported, "Barely even friends"): a word's own note followed
+# immediately by a same-pitch "~" (an onset/release tracking artifact --
+# see NOTE_MERGE_SEMITONES's own docstring for the same underlying pass-1
+# phenomenon) got written as two separate notes instead of one longer one.
+# Merges the "~" into whichever note precedes it (word syllable OR another
+# "~"), extending that note's own length and dropping the "~" entirely --
+# chains, so several connected same-pitch "~" notes in a row all collapse
+# into one. Runs at the INTEGER BEAT level in usdx_writer.py, on exactly
+# what will be written, not on the pre-quantization float-second timing --
+# quantization itself can change what counts as "adjacent". Generation
+# pipeline only (main.py) -- NOT applied to realign.py, which has its own
+# stricter "never add/remove/reorder a note" contract this would violate.
+MERGE_CONNECTED_MELISMA_TAILS = True
+
 # CREPE (torchcrepe) runs alongside pYIN as a second, independent pitch
 # estimate per frame -- CREPE is a learned model and is generally more
 # robust than pYIN's DSP-based approach when there's accompaniment bleed
@@ -922,6 +941,35 @@ RETRY_ASR_MIN_REFERENCE_MATCH_RATIO = 0.6
 RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN = 5
 RETRY_ASR_MIN_UNCONFIDENT_RUN = 5
 
+# --- Force-align known-text gaps (PROTOTYPE, 2026-08-10) --------------------
+# Adapted from UltraStarKaraokeMaker (github.com/walterfr/UltraStarKaraokeMaker,
+# python-sidecar/pipeline/align.py's `realign_gap_windows`) after comparing
+# its real output on "Trixie Mattel - Gold" against ours -- it correctly
+# recovered a "Do-do-do-do-do" backing-vocal passage our own pipeline
+# dropped outright, via a real wav2vec2 CTC forced alignment of the KNOWN
+# missing text restricted to the audio window between the nearest measured
+# neighbors. Structurally different from (and more reliable than) two
+# things already in this codebase: `RETRY_ASR_MODEL` (retries the WHOLE
+# song with a bigger model, probabilistic -- confirmed on a real Gold run
+# that the retry can be accepted for improving the aggregate while NOT
+# actually fixing the specific passage that triggered it) and realign.py's
+# own `rematch_local_gaps` (re-searches ASR's OWN already-decoded words in
+# a window -- useless if the decoder produced zero words there at all,
+# which is exactly this failure mode). Forced alignment doesn't care
+# whether the decoder ever produced these words; it directly measures
+# where the GIVEN text best fits.
+# See `transcription.force_align_words_in_window` for the primitive
+# (validation logic ported directly from USKMaker's own function) --
+# used by `realign.py` (on gaps in an existing file's own text) and
+# `lyrics_lookup.py` (on reference-lyrics text ASR completely dropped).
+# `MIN_WINDOW_BASE_SEC`/`MIN_WINDOW_SEC_PER_WORD` and `WINDOW_SLOP_SEC`
+# are carried over from USKMaker's own values as a starting point, not
+# independently re-derived.
+FORCE_ALIGN_GAPS = True
+FORCE_ALIGN_MIN_WINDOW_BASE_SEC = 0.10
+FORCE_ALIGN_MIN_WINDOW_SEC_PER_WORD = 0.08
+FORCE_ALIGN_WINDOW_SLOP_SEC = 0.5
+
 
 @dataclass
 class PipelineOptions:
@@ -949,6 +997,8 @@ class PipelineOptions:
     whisperx_no_vad: bool = ENABLE_WHISPERX_NO_VAD
     rewindow_long_segments: bool = REWINDOW_ENABLED
     retry_low_quality_asr: bool = RETRY_LOW_QUALITY_ASR
+    force_align_gaps: bool = FORCE_ALIGN_GAPS
+    merge_connected_melisma: bool = MERGE_CONNECTED_MELISMA_TAILS
     verify_words: bool = ENABLE_WORD_VERIFICATION
     verify_placement: bool = ENABLE_PLACEMENT_VERIFICATION
     verify_all_words: bool = VERIFY_ALL_WORDS
