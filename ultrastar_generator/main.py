@@ -151,6 +151,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Use whisperx's own default pyannote VAD instead of the near-disabled "
                          "workaround -- re-enables the confirmed sustained-note timestamp bug; "
                          "kept only for comparison/debugging.")
+    p.add_argument("--rewindow-long-segments", dest="rewindow_long_segments", action="store_true",
+                    default=config.REWINDOW_ENABLED,
+                    help="Default: ON (real-validated across 12 real songs/runs, 6 genuine fixes, 0 "
+                         "regressions -- see CLAUDE.md). For any whisper decoder segment >= config."
+                         "REWINDOW_MIN_SEGMENT_DURATION_SEC long, sweeps smaller candidate windows and "
+                         "keeps whichever gives the best forced-alignment score -- fixes a real case where "
+                         "the decoder silently drops content, leaving a short remaining phrase aligned "
+                         "against a much-too-large window.")
+    p.add_argument("--no-rewindow-long-segments", dest="rewindow_long_segments", action="store_false")
     p.add_argument("--verify-words", dest="verify_words", action="store_true",
                     default=config.ENABLE_WORD_VERIFICATION,
                     help="Re-transcribe a tight, isolated audio crop around every word's own ASR "
@@ -524,6 +533,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     words = transcribe_words(
         vocals_path, opts.whisper_model, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
         whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
+        rewindow_long_segments=opts.rewindow_long_segments,
     )
     if not words:
         return PipelineResult(success=False,
@@ -829,6 +839,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         skip_separation=args.skip_separation, vocals_path=args.vocals_path,
         fetch_lyrics=args.fetch_lyrics, no_video_sync=args.no_video_sync,
         no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
+        rewindow_long_segments=args.rewindow_long_segments,
         verify_words=args.verify_words,
         verify_placement=args.verify_placement, verify_all_words=args.verify_all_words,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,

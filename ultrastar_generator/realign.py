@@ -51,11 +51,13 @@ from __future__ import annotations
 import copy
 import difflib
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 from . import config
+from .debug_log import DebugLog
 from .models import LineBreak, Song, Syllable, Word
 from .usdx_parser import ParsedSong, UsdxParseError, parse_usdx_file
 from .usdx_writer import write_song
@@ -120,12 +122,14 @@ class RealignQuality:
     n_words: int = 0
     n_asr_matched: int = 0
     n_lrc_seeded: int = 0
+    n_local_rematched: int = 0
     n_interpolated: int = 0
     n_kept_original: int = 0
 
     @property
     def anchor_rate(self) -> float:
-        return (self.n_asr_matched + self.n_lrc_seeded) / self.n_words if self.n_words else 0.0
+        return ((self.n_asr_matched + self.n_lrc_seeded + self.n_local_rematched) / self.n_words
+                 if self.n_words else 0.0)
 
 
 def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
@@ -205,9 +209,108 @@ class LrcPrep:
     calibration_confidence: float
 
 
+def _reconstruct_our_lines(entries: List[Union[Syllable, LineBreak]]) -> List[str]:
+    """Rebuilds the existing file's own display lines (delimited by its own
+    LineBreak markers) -- used to compare repeat STRUCTURE against an LRC
+    candidate's own lines (see `check_repeat_structure`), the same "-"
+    boundaries phrasing.build_lines writes for a freshly-generated song."""
+    lines: List[str] = []
+    cur: List[str] = []
+    for e in entries:
+        if isinstance(e, LineBreak):
+            if cur:
+                lines.append("".join(cur))
+            cur = []
+            continue
+        prefix = " " if e.is_word_start and cur else ""
+        cur.append(prefix + e.text)
+    if cur:
+        lines.append("".join(cur))
+    return lines
+
+
+def _normalize_line(text: str) -> str:
+    return " ".join(n for n in (_normalize(tok) for tok in text.split()) if n)
+
+
+def check_repeat_structure(our_lines: List[str], lrc_line_texts: List[str],
+                            min_repeat: int = 3, min_word_len: int = 4) -> Optional[str]:
+    """Rejects an LRC candidate whose REPEAT STRUCTURE doesn't match ours --
+    real confirmed case (David Bowie - "I'm Afraid of Americans", see
+    CLAUDE.md): our own file's most-repeated line ("I'm afraid of
+    Americans") appears 31 times total across its repeated-word family, but
+    the auto-picked LRCLIB candidate (a different edition/box-set mix of
+    the same song) has 40 -- 9 EXTRA chorus repeats, a real structural
+    arrangement difference between recordings, not just per-line timing
+    noise. Global time CALIBRATION alone can't reliably catch this: a
+    genuinely different-but-similar-length edition can still clear the
+    confidence bar by chance on the non-repeated portions of the song
+    (confirmed: this exact candidate calibrated at 48%, in the same range
+    as OTHER real candidates' validated-good calibrations, e.g. Ordinary
+    Day's 46% -- the confidence NUMBER alone can't tell these apart).
+
+    First finds OUR OWN most-repeated normalized LINE (skipped entirely if
+    nothing repeats at least `min_repeat` times -- most songs have no such
+    line, and this check has nothing to say about them). A repeated
+    CHORUS is rarely one single exact-duplicate line, though -- real
+    confirmed case: "I'm afraid of Americans"/"...of the world"/"...I
+    can't help it"/"...I can't" are four DIFFERENT lines, so comparing
+    only the single most-repeated exact line (10x in our file, 12x in the
+    candidate -- within tolerance on its own) completely misses the real
+    mismatch, since the true repeat count is split across all four
+    variants. Instead, this counts WORD occurrences (not exact-line
+    matches) for the most-repeated line's own content words (short/filler
+    words under `min_word_len` chars excluded, since a common word like
+    "of"/"the" repeating a lot doesn't indicate a repeated CHORUS the way
+    a shared distinctive word across every variant does) across the WHOLE
+    song on each side, and uses whichever qualifying word has the HIGHEST
+    count in our own file as the comparison signal -- confirmed this
+    picks "afraid" (appears in all four variants, 31 vs 40 in the real
+    case, a 29% difference) over a less complete signal like "Americans"
+    (present in only one variant).
+
+    A real edition/arrangement difference tends to differ by MORE than a
+    small fraction of the true repeat count (tolerance +-15%, minimum
+    +-1, absorbs ordinary per-song noise like an intro/outro repeat some
+    editions add or drop) -- confirmed this tolerance passes Ordinary
+    Day's genuinely-matching candidate (its own most-repeated line count:
+    4 vs 4) while rejecting Americans' (31 vs 40).
+
+    Returns a human-readable rejection reason, or None if the candidate's
+    repeat structure is consistent enough to trust (including whenever
+    there's no repeated line in our own file to check at all)."""
+    our_normalized_lines = [_normalize_line(t) for t in our_lines]
+    line_counts = Counter(nl for nl in our_normalized_lines if nl)
+    if not line_counts:
+        return None
+    most_line, line_n = line_counts.most_common(1)[0]
+    if line_n < min_repeat:
+        return None
+
+    our_word_counts = Counter(_normalize(tok) for line in our_lines for tok in line.split())
+    lrc_word_counts = Counter(_normalize(tok) for line in lrc_line_texts for tok in line.split())
+    candidate_words = {w for w in most_line.split() if len(w) >= min_word_len}
+    if not candidate_words:
+        return None
+    fingerprint_word, our_n = max(
+        ((w, our_word_counts.get(w, 0)) for w in candidate_words), key=lambda t: t[1])
+    if our_n < min_repeat:
+        return None
+    lrc_n = lrc_word_counts.get(fingerprint_word, 0)
+    tolerance = max(1, round(0.15 * our_n))
+    if abs(our_n - lrc_n) > tolerance:
+        return (f"our most-repeated line ({most_line!r}, {line_n}x) has a distinctive word "
+                f"({fingerprint_word!r}) appearing {our_n}x total in the existing file but {lrc_n}x in "
+                f"the LRC candidate's own lyrics (tolerance +/-{tolerance}) -- likely a different "
+                f"edition/arrangement with a different repeat structure, not just timing noise")
+    return None
+
+
 def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
                  artist: str, title: str, audio_duration: float,
-                 forced_candidate: Optional[LrcLibCandidate] = None) -> Optional[LrcPrep]:
+                 forced_candidate: Optional[LrcLibCandidate] = None,
+                 our_lines: Optional[List[str]] = None,
+                 log: Optional[Callable[[str], None]] = None) -> Optional[LrcPrep]:
     """Selects an LRC candidate, calibrates its line timestamps against
     OUR audio's real ASR transcription, and assigns each existing word to
     a line -- shared setup for both `seed_lrc_anchors` (LRC seeds ONE
@@ -223,13 +326,30 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
     mxl_lrc_generator.py -- they only ever read `MxlWord.norm`, so
     existing words are wrapped in real `MxlWord` instances with harmless
     placeholder `offset`/`syllables` rather than duplicating that
-    candidate-selection/line-assignment logic a third time."""
+    candidate-selection/line-assignment logic a third time.
+
+    `our_lines` (the existing file's own display lines, see
+    `_reconstruct_our_lines`) -- when given -- additionally rejects a
+    candidate whose REPEAT STRUCTURE doesn't match ours (see
+    `check_repeat_structure`; real confirmed case: David Bowie - "I'm
+    Afraid of Americans", CLAUDE.md). Optional and skipped (no rejection)
+    when not given, since not every caller has the original entries handy
+    (e.g. `seed_lrc_anchors`'s own standalone/test-only call path)."""
     fake_words = [MxlWord(text=w.text, norm=w.norm, offset=float(i), syllables=[])
                   for i, w in enumerate(existing_words)]
 
     lrc_match = select_lrc_candidate(artist, title, fake_words, audio_duration, forced=forced_candidate)
     if lrc_match is None:
         return None
+
+    if our_lines is not None:
+        lrc_line_texts = [text for _t, text in lrc_match.lrc_lines]
+        rejection = check_repeat_structure(our_lines, lrc_line_texts)
+        if rejection is not None:
+            if log is not None:
+                log(f"  Warning: LRC candidate {lrc_match.candidate.track_name!r}/{lrc_match.candidate.artist_name!r} "
+                    f"rejected: {rejection}")
+            return None
 
     # Calibrate away a systematic offset between LRC's own line timestamps
     # and OUR audio's real timing (e.g. different lead-in silence) BEFORE
@@ -251,7 +371,9 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
 def seed_lrc_anchors(existing_words: List[ExistingWord], asr_words: List[Word],
                       starts: List[Optional[float]], ends: List[Optional[float]], confident: List[bool],
                       artist: str, title: str, audio_duration: float,
-                      forced_candidate: Optional[LrcLibCandidate] = None) -> Optional[LrcSeedResult]:
+                      forced_candidate: Optional[LrcLibCandidate] = None,
+                      our_lines: Optional[List[str]] = None,
+                      log: Optional[Callable[[str], None]] = None) -> Optional[LrcSeedResult]:
     """"seed" strategy: fills in a real-time anchor, from LRCLIB's
     synced-lyrics LINE starts, for the first not-yet-confident word of
     each line the candidate's lyrics can be matched to -- mutates
@@ -264,7 +386,8 @@ def seed_lrc_anchors(existing_words: List[ExistingWord], asr_words: List[Word],
     strategy (LRC lines are primary, ASR only resolves position within a
     line) -- kept as a separate code path pending real end-to-end
     comparison of the two (see CLAUDE.md)."""
-    prep = prepare_lrc(existing_words, asr_words, artist, title, audio_duration, forced_candidate)
+    prep = prepare_lrc(existing_words, asr_words, artist, title, audio_duration, forced_candidate,
+                        our_lines=our_lines, log=log)
     if prep is None:
         return None
     return seed_from_prep(existing_words, prep, starts, ends, confident)
@@ -372,6 +495,76 @@ def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: 
     return starts, ends, confident
 
 
+def rematch_local_gaps(existing_words: List[ExistingWord], asr_words: List[Word],
+                        starts: List[Optional[float]], ends: List[Optional[float]],
+                        confident: List[bool],
+                        slack_sec: float = config.REALIGN_LOCAL_REMATCH_SLACK_SEC) -> int:
+    """SECOND PASS (see config.REALIGN_LOCAL_REMATCH_SLACK_SEC for the real
+    case this fixes): for every still-CONTIGUOUS-unmatched run of existing
+    words, retry the match locally against only the ASR words that fall
+    between the nearest confident anchors surrounding that run -- a much
+    smaller, less ambiguous search than `match_words_to_asr`'s whole-song
+    pass, so a repeated phrase elsewhere in the song can no longer steal the
+    match. Mutates `starts`/`ends`/`confident` in place for any word this
+    recovers; a run that still finds nothing (e.g. genuinely not sung, or
+    ASR really never picked it up) is left exactly as it was for
+    `interpolate_fallback` to handle same as before. Returns the count of
+    newly-matched words."""
+    n = len(existing_words)
+    n_matched = 0
+    i = 0
+    while i < n:
+        if confident[i]:
+            i += 1
+            continue
+        lo = i
+        while i < n and not confident[i]:
+            i += 1
+        hi = i  # run is [lo, hi), both boundaries (lo-1, hi) confident or absent
+
+        t0 = ends[lo - 1] if lo > 0 else None
+        t1 = starts[hi] if hi < n else None
+        if t0 is None and t1 is None:
+            continue  # no confident anchor anywhere in the song -- nothing to bound the search with
+        if t0 is None:
+            t0 = t1 - 30.0
+        if t1 is None:
+            t1 = t0 + 30.0
+
+        asr_in_window = [w for w in asr_words if t0 - slack_sec <= w.start <= t1 + slack_sec]
+        if not asr_in_window:
+            continue
+
+        block_norm = [existing_words[k].norm for k in range(lo, hi)]
+        asr_norm = [_normalize(w.text) for w in asr_in_window]
+        sm = difflib.SequenceMatcher(None, block_norm, asr_norm, autojunk=False)
+        matched_local: dict = {}
+        for tag, a1, a2, b1, b2 in sm.get_opcodes():
+            if tag == "equal":
+                for k in range(a2 - a1):
+                    asr_w = asr_in_window[b1 + k]
+                    if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
+                        matched_local[a1 + k] = asr_w
+            elif tag == "replace" and (a2 - a1) == 1:
+                best_ratio, best_asr_w = 0.0, None
+                for bk in range(b1, b2):
+                    ratio = difflib.SequenceMatcher(None, block_norm[a1], asr_norm[bk]).ratio()
+                    if ratio > best_ratio:
+                        best_ratio, best_asr_w = ratio, asr_in_window[bk]
+                if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
+                    if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
+                        matched_local[a1] = best_asr_w
+
+        for local_i, asr_w in matched_local.items():
+            global_i = lo + local_i
+            starts[global_i] = asr_w.start
+            ends[global_i] = asr_w.end
+            confident[global_i] = True
+            n_matched += 1
+
+    return n_matched
+
+
 def interpolate_fallback(existing_words: List[ExistingWord],
                           starts: List[Optional[float]], ends: List[Optional[float]],
                           confident: List[bool]) -> Tuple[int, int]:
@@ -461,12 +654,32 @@ def interpolate_fallback(existing_words: List[ExistingWord],
         ends[i] = est_end
         n_interpolated += 1
 
-    # Non-decreasing starts, and an end never overlapping the next word's
-    # own (already-finalized) start -- same clamp shape as
-    # mxl_lrc_generator.place_words_via_asr's final safety net.
+    # Non-decreasing starts -- but a CONFIDENT word's own real match is a
+    # FIXED POINT, never moved by a neighboring fallback word's estimate.
+    # Real bug found (David Bowie - "I'm Afraid of Americans", a song with
+    # many near-identical repeated short lines): one fallback word's
+    # over-extrapolated estimate exceeded FOURTEEN subsequent, genuinely
+    # confident ASR matches -- the old forward-only clamp (which treated
+    # every index identically regardless of `confident`) dragged all
+    # fourteen of them up to that single wrong value instead of trusting
+    # them, destroying real information, not just filling a gap. Only
+    # fallback words are adjusted in either direction here: pass 1 pushes
+    # a fallback word forward past a larger PRECEDING value; pass 2 (in
+    # reverse) pulls a fallback word back if it exceeds the next
+    # CONFIDENT word's own value. Confident words themselves are never
+    # rewritten by either pass.
     for i in range(1, n):
+        if confident[i]:
+            continue
         if starts[i] < starts[i - 1]:
             starts[i] = starts[i - 1]
+    next_confident_start = None
+    for i in range(n - 1, -1, -1):
+        if confident[i]:
+            next_confident_start = starts[i]
+            continue
+        if next_confident_start is not None and starts[i] > next_confident_start:
+            starts[i] = next_confident_start
     for i in range(n):
         if i + 1 < n and ends[i] > starts[i + 1]:
             ends[i] = starts[i + 1]
@@ -542,7 +755,9 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                   audio_duration: Optional[float] = None,
                   use_lrc: bool = True, lrc_mode: str = "windowed",
                   forced_lrc_candidate: Optional[LrcLibCandidate] = None,
-                  log: Callable[[str], None] = print) -> RealignResult:
+                  use_local_rematch: bool = False,
+                  log: Callable[[str], None] = print,
+                  debug_log: Optional[DebugLog] = None) -> RealignResult:
     """Core, audio-loading-free realignment step: given an already-parsed
     existing song and already-transcribed ASR words, returns a new `Song`
     with the SAME notes (never added/removed/reordered, pitch untouched)
@@ -573,7 +788,27 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
         each matched line. Kept as an explicit opt-out / for A-B testing
         against "windowed" -- not needed for normal use now that
         "windowed" already degrades to equivalent behavior on its own
-        whenever LRC can't be trusted."""
+        whenever LRC can't be trusted.
+
+    `use_local_rematch` (OFF by default, PROTOTYPE, see config.
+    REALIGN_LOCAL_REMATCH_SLACK_SEC): when True, runs `rematch_local_gaps`
+    for any word still unmatched after the above, retrying the match
+    against only the ASR words bounded between its nearest confident
+    neighbors. Real, well-motivated case (David Bowie "I'm Afraid Of
+    Americans" -- see CLAUDE.md): recovers a genuinely-unmatched run
+    whose text was stolen by a repeat elsewhere in the song. BUT a real,
+    controlled (same-transcription) A/B across the 4-song validation set
+    found it's a NET REGRESSION on 3 of 4 songs (BATB -24pp within 100ms
+    being the worst) -- when the existing file's own local timing is
+    already trustworthy (true for all 4 validation songs, which is WHY
+    they're used as references) and ASR itself is sparse/ambiguous in a
+    region, `interpolate_fallback`'s own original-timing-proportional
+    guess is regularly BETTER than a forced local ASR rematch, which can
+    just as easily lock onto the wrong nearby repeat as the whole-song
+    pass did. Left off by default and NOT wired into the CLI/GUI pending
+    a way to distinguish "the original file is genuinely wrong here" from
+    "ASR is just sparse/ambiguous here, trust the original" -- don't flip
+    this on without addressing that."""
     # A deep copy, not just a new list -- the Syllable/LineBreak objects
     # themselves get mutated in place below (start/end reassigned), and
     # `existing` is a caller-owned ParsedSong that must come back out
@@ -589,28 +824,37 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
 
     lrc_prep = None
     if use_lrc and audio_duration is not None:
+        our_lines = _reconstruct_our_lines(entries)
         lrc_prep = prepare_lrc(words, asr_words, artist or existing.artist, title or existing.title,
-                                audio_duration, forced_candidate=forced_lrc_candidate)
+                                audio_duration, forced_candidate=forced_lrc_candidate,
+                                our_lines=our_lines, log=log)
 
-    # "windowed" additionally requires a CONFIDENT time calibration before it's
-    # trusted -- real comparison (see CLAUDE.md, BATB/Stars/Chicago) found
-    # windowing raw, UNCALIBRATED LRC lines is actively harmful: every word's
-    # match is gated through the same untrusted signal, so an uncorrected
-    # drift corrupts the whole song (confirmed real case: Chicago's
-    # auto-picked candidate had no confident calibration and windowed mode's
-    # within-100ms accuracy dropped from 65% to 41% as a result). "seed" mode
-    # doesn't need this same gate -- LRC there only ever seeds a handful of
-    # residual words ASR couldn't reach, so a bad candidate's blast radius is
-    # already small by construction; windowed's is not, since it decides
-    # EVERY word's search window.
+    # BOTH strategies require a CONFIDENT time calibration before an LRC
+    # candidate is trusted at all -- real comparison (see CLAUDE.md, BATB/
+    # Stars/Chicago) already found windowing raw, UNCALIBRATED LRC lines
+    # actively harmful for "windowed" (every word's match routes through the
+    # same untrusted signal). A SECOND real case (David Bowie - "Heroes")
+    # showed "seed" is NOT safe either, despite it only ever seeding a
+    # handful of words directly: the LRC candidate found was a Kolacny
+    # Brothers CHORAL COVER (confirmed via calibration_confidence=0.0, a
+    # real "zero agreement" case, not just "not enough samples") -- ONE bad
+    # seed anchor landed later in time than several of its own already-
+    # correctly-ASR-matched NEIGHBORS, and `interpolate_fallback`'s
+    # monotonic clamp (forward-push only, no notion of "this anchor might
+    # itself be wrong") then dragged every one of those correct neighbors
+    # forward to match the bad anchor -- corrupting real, independently-
+    # confirmed-correct ASR matches, not just filling a genuine gap. Once
+    # confirmed, this obsoleted the earlier "seed's blast radius is small
+    # by construction" reasoning: a single bad anchor's blast radius is
+    # actually unbounded once the monotonic clamp propagates it forward,
+    # regardless of strategy. Both strategies now use the exact same gate.
     lrc_seed = None
-    use_windowed = (lrc_mode == "windowed" and lrc_prep is not None
-                     and lrc_prep.calibration_offset is not None)
-    if lrc_mode == "windowed" and lrc_prep is not None and not use_windowed:
+    lrc_confident = lrc_prep is not None and lrc_prep.calibration_offset is not None
+    if lrc_mode == "windowed" and lrc_prep is not None and not lrc_confident:
         log(f"  LRC candidate found but no confident time calibration -- 'windowed' mode isn't safe to use "
             f"here (would window the ENTIRE match against an uncalibrated signal), falling back to "
             f"whole-song ASR matching instead.")
-    if use_windowed:
+    if lrc_mode == "windowed" and lrc_confident:
         starts, ends, confident = match_words_to_asr_windowed(words, lrc_prep.word_lines, lrc_prep.lrc_lines,
                                                                 asr_words)
         quality = RealignQuality(n_words=len(words), n_asr_matched=sum(confident))
@@ -622,7 +866,7 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
         starts, ends, confident = match_words_to_asr(words, asr_words)
         quality = RealignQuality(n_words=len(words), n_asr_matched=sum(confident))
         if use_lrc and audio_duration is not None:
-            if lrc_prep is not None:
+            if lrc_prep is not None and lrc_confident:
                 lrc_seed = seed_from_prep(words, lrc_prep, starts, ends, confident)
                 if lrc_seed is not None:
                     quality.n_lrc_seeded = lrc_seed.n_seeded
@@ -632,17 +876,273 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                         + (f", time calibration ({lrc_seed.calibration_kind}) offset "
                            f"{lrc_seed.calibration_offset:+.1f}s ({lrc_seed.calibration_confidence:.0%} agreement)"
                            if lrc_seed.calibration_offset is not None else ", no time calibration found"))
+            elif lrc_prep is not None:
+                log(f"  LRC candidate found ({lrc_prep.lrc_match.candidate.track_name!r}/"
+                    f"{lrc_prep.lrc_match.candidate.artist_name!r}) but no confident time calibration -- "
+                    f"NOT trusted as a seed anchor either (a wrong-recording candidate's uncalibrated line "
+                    f"timestamp can corrupt correctly-matched neighbors via the monotonic clamp -- confirmed "
+                    f"real case, see CLAUDE.md), falling back to ASR-only interpolation.")
             else:
                 log("  No usable LRCLIB synced-lyrics candidate for this song -- ASR matching only.")
 
+    source = ["asr" if c else "" for c in confident]
+
+    if use_local_rematch:
+        quality.n_local_rematched = rematch_local_gaps(words, asr_words, starts, ends, confident)
+        if quality.n_local_rematched:
+            log(f"  Local-rematch second pass: recovered {quality.n_local_rematched} word(s) that the whole-song "
+                f"match missed, by retrying just the ASR words bounded between their nearest confident neighbors.")
+        for i in range(len(words)):
+            if confident[i] and not source[i]:
+                source[i] = "local_rematch"
+
+    had_any_anchor = any(confident)
     quality.n_interpolated, quality.n_kept_original = interpolate_fallback(words, starts, ends, confident)
+    for i in range(len(words)):
+        if not source[i]:
+            source[i] = "interpolated" if had_any_anchor else "kept_original"
 
     log(f"  {quality.n_asr_matched}/{quality.n_words} word(s) matched directly to real ASR transcription, "
-        f"{quality.n_lrc_seeded} from LRC line anchors, {quality.n_interpolated} interpolated between "
-        f"anchors, {quality.n_kept_original} kept at their original timing (no anchor found nearby).")
+        f"{quality.n_lrc_seeded} from LRC line anchors, {quality.n_local_rematched} from the local-rematch "
+        f"second pass, {quality.n_interpolated} interpolated between anchors, {quality.n_kept_original} kept "
+        f"at their original timing (no anchor found nearby).")
     if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:
         log(f"  WARNING: only {quality.anchor_rate:.0%} of words got a real anchor from the audio -- "
             f"this file's lyrics may not match this audio at all. Review the output carefully.")
+
+    if debug_log is not None:
+        debug_log.section("REALIGN SUMMARY (strategy=replace)")
+        debug_log.line(f"  {quality.n_asr_matched}/{quality.n_words} matched directly to ASR, "
+                        f"{quality.n_lrc_seeded} from LRC anchors, {quality.n_local_rematched} from local-rematch, "
+                        f"{quality.n_interpolated} interpolated, {quality.n_kept_original} kept original.")
+        if lrc_prep is not None:
+            c = lrc_prep.lrc_match.candidate
+            debug_log.line(f"  LRC candidate: {c.track_name!r}/{c.artist_name!r} (id={c.id}), "
+                            f"calibration={lrc_prep.calibration_kind} offset={lrc_prep.calibration_offset} "
+                            f"confidence={lrc_prep.calibration_confidence}")
+        debug_log.section("PER-WORD TRACE (text, orig_start->orig_end, source, final_start->final_end)")
+        for i, w in enumerate(words):
+            debug_log.line(f"  {i:4d} {w.text:20s} orig={w.orig_start:9.3f}-{w.orig_end:9.3f}  "
+                            f"[{source[i]:14s}]  final={starts[i]:9.3f}-{ends[i]:9.3f}  "
+                            f"delta={starts[i] - w.orig_start:+8.3f}")
+        debug_log.section(f"RAW ASR TRANSCRIPT ({len(asr_words)} word(s), real timestamps + confidence -- "
+                           f"WhisperX/faster-whisper is NOT deterministic run-to-run, so this is the only record "
+                           f"of what THIS specific run's ASR actually heard)")
+        for aw in asr_words:
+            debug_log.line(f"  {aw.start:9.3f}-{aw.end:9.3f}  conf={aw.confidence:.3f}  {aw.text!r}")
+
+    new_start_by_idx: dict = {}
+    new_end_by_idx: dict = {}
+    for i, w in enumerate(words):
+        for idx, s, e in _redistribute_syllables(entries, w, starts[i], ends[i]):
+            new_start_by_idx[idx] = s
+            new_end_by_idx[idx] = e
+
+    for idx, e in enumerate(entries):
+        if isinstance(e, Syllable):
+            e.start = new_start_by_idx[idx]
+            e.end = new_end_by_idx[idx]
+
+    _reposition_line_breaks(entries, new_start_by_idx, new_end_by_idx)
+
+    first_syllable = next((e for e in entries if isinstance(e, Syllable)), None)
+    gap_ms = int(round(first_syllable.start * 1000)) if first_syllable else existing.gap_ms
+
+    song = _song_from_existing(existing, entries, gap_ms)
+    return RealignResult(success=True, song=song, quality=quality, lrc_seed=lrc_seed)
+
+
+# --- "validate" strategy (PROTOTYPE, see CLAUDE.md) -------------------------
+#
+# `realign_song` above always REPLACES a matched word's timing with ASR's
+# own value, even when the existing file was already correct there. This
+# alternative strategy instead VALIDATES first: a note whose original
+# position (after a single global GAP/drift correction -- see
+# `compute_gap_calibration`, user's own framing: "sometimes the song file
+# is nearly perfect but the GAP is wrong so everything is offset") is
+# independently confirmed by a confident ASR match is left COMPLETELY
+# UNTOUCHED, position and length both -- never overwritten by ASR's own,
+# less precise, value. Only words that don't validate get repositioned, the
+# same way `realign_song`'s fallback words already do (reusing
+# `interpolate_fallback` unchanged -- a validated word is exactly as
+# trustworthy an anchor as a directly-ASR-matched one, so no new
+# interpolation logic is needed). NOT YET wired into the CLI/GUI as a real
+# selectable strategy -- prototype only, pending real-audio comparison
+# against `realign_song`'s existing "replace" behavior.
+
+
+@dataclass
+class GapCalibration:
+    offset: Optional[float]
+    slope: float
+    confidence: float
+    kind: Optional[str]           # "constant", "drift", or None if uncalibrated
+    skipped_reason: Optional[str]
+    asr_starts: List[Optional[float]]   # whole-song match_words_to_asr's own raw results,
+    asr_ends: List[Optional[float]]     # reused directly by validate_words_against_asr
+    asr_confident: List[bool]           # so it's never recomputed a second time
+
+
+def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[Word]) -> GapCalibration:
+    """FIRST PASS: checks whether the whole file can be explained by a
+    single constant real-time offset (or slow linear drift) from its OWN
+    original timing -- i.e. #GAP (or a slow drift) is the only real
+    problem, and the file's own relative note timing/rhythm is already
+    correct.
+
+    Reuses `match_words_to_asr` (the same whole-song, order-preserving,
+    repeat-safe ASR matching used elsewhere in this module) to find
+    confident (original_start, real_asr_start) pairs, then feeds them into
+    `two_tier_time_calibration` (the SAME robust, repeat-safe two-tier fit
+    already validated for LRC line calibration -- don't reimplement a
+    third time) using each word's own original start (seconds) as the "x"
+    axis, exactly mirroring how LRC line timestamps are used there."""
+    starts, ends, confident = match_words_to_asr(existing_words, asr_words)
+    candidates = [(i, w.orig_start, starts[i] - w.orig_start)
+                  for i, w in enumerate(existing_words) if confident[i]]
+    offset, slope, confidence, kind, skipped_reason = two_tier_time_calibration(candidates)
+    return GapCalibration(offset=offset, slope=slope, confidence=confidence, kind=kind,
+                           skipped_reason=skipped_reason, asr_starts=starts, asr_ends=ends,
+                           asr_confident=confident)
+
+
+def validate_words_against_asr(existing_words: List[ExistingWord], gap: GapCalibration,
+                                tolerance_sec: float = config.REALIGN_VALIDATE_TOLERANCE_SEC
+                                ) -> Tuple[List[Optional[float]], List[Optional[float]], List[bool]]:
+    """For each word: computes its expected start after applying the global
+    GAP correction found above (a no-op shift of 0 if no confident
+    calibration was found -- validates against the ORIGINAL timing
+    directly in that case). If a confident whole-song ASR match ALSO
+    exists for this word and its own real START lands within
+    `tolerance_sec` of that expected position, the word's ORIGINAL timing
+    (shifted only by the single global correction) is trusted EXACTLY --
+    neither its position nor its length is touched beyond that one
+    uniform shift.
+
+    Only checks START proximity, never END: ASR is known-unreliable at
+    detecting the end of a sustained/held note (see CLAUDE.md's "Lessons
+    learned" -- "Don't trust individual ASR word timestamps for
+    fine-grained boundaries"), so a word's own already-correct LENGTH is
+    trusted from the input file rather than second-guessed by ASR's own,
+    less reliable, end timestamp.
+
+    Words that don't validate are left None/False for `interpolate_fallback`
+    to resolve using validated neighbors (and, optionally, LRC anchors) as
+    anchors."""
+    n = len(existing_words)
+    starts: List[Optional[float]] = [None] * n
+    ends: List[Optional[float]] = [None] * n
+    validated: List[bool] = [False] * n
+    offset = gap.offset if gap.offset is not None else 0.0
+    for i, w in enumerate(existing_words):
+        expected_start = w.orig_start + offset + gap.slope * w.orig_start
+        if gap.asr_confident[i] and abs(gap.asr_starts[i] - expected_start) <= tolerance_sec:
+            orig_dur = w.orig_end - w.orig_start
+            starts[i] = expected_start
+            ends[i] = expected_start + orig_dur
+            validated[i] = True
+    return starts, ends, validated
+
+
+@dataclass
+class ValidateQuality:
+    n_words: int = 0
+    n_validated: int = 0
+    n_lrc_seeded: int = 0
+    n_interpolated: int = 0
+    n_kept_original: int = 0
+
+    @property
+    def anchor_rate(self) -> float:
+        return (self.n_validated + self.n_lrc_seeded) / self.n_words if self.n_words else 0.0
+
+
+def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
+                           artist: Optional[str] = None, title: Optional[str] = None,
+                           audio_duration: Optional[float] = None,
+                           use_lrc: bool = True, forced_lrc_candidate: Optional[LrcLibCandidate] = None,
+                           validate_tolerance_sec: float = config.REALIGN_VALIDATE_TOLERANCE_SEC,
+                           log: Callable[[str], None] = print,
+                           debug_log: Optional[DebugLog] = None) -> RealignResult:
+    """PROTOTYPE strategy -- see the module comment above `GapCalibration`.
+    Same overall shape/contract as `realign_song` (never raises, returns
+    `RealignResult`, never touches pitch/note count/order), but each word
+    is either VALIDATED (kept exactly as-is beyond a single global GAP
+    correction) or repositioned via `interpolate_fallback` using validated
+    (+ optional LRC) anchors -- never simply overwritten with ASR's own
+    value the way `realign_song` does."""
+    entries = copy.deepcopy(existing.entries)
+    words = extract_words(entries)
+    if not words:
+        return RealignResult(success=False, error="Existing file has no words to realign.")
+
+    quality = ValidateQuality(n_words=len(words))
+
+    gap = compute_gap_calibration(words, asr_words)
+    if gap.offset is not None:
+        drift_desc = f", drift {gap.slope:+.4f}s/s" if gap.kind == "drift" else ""
+        log(f"  GAP check ({gap.kind}): offset {gap.offset:+.2f}s{drift_desc} "
+            f"({gap.confidence:.0%} agreement) -- applying as a single correction before validating "
+            f"individual words.")
+    else:
+        log(f"  GAP check: no confident single offset found ({gap.skipped_reason}) -- validating "
+            f"word-by-word against the file's own original timing directly.")
+
+    starts, ends, validated = validate_words_against_asr(words, gap, tolerance_sec=validate_tolerance_sec)
+    quality.n_validated = sum(validated)
+    source = ["validated" if v else "" for v in validated]
+
+    lrc_seed = None
+    if use_lrc and audio_duration is not None:
+        our_lines = _reconstruct_our_lines(entries)
+        prep = prepare_lrc(words, asr_words, artist or existing.artist, title or existing.title,
+                            audio_duration, forced_candidate=forced_lrc_candidate,
+                            our_lines=our_lines, log=log)
+        if prep is not None and prep.calibration_offset is not None:
+            lrc_seed = seed_from_prep(words, prep, starts, ends, validated)
+            quality.n_lrc_seeded = lrc_seed.n_seeded
+            log(f"  LRC anchors: {lrc_seed.lrc_match.candidate.track_name!r}/"
+                f"{lrc_seed.lrc_match.candidate.artist_name!r} -- seeded {lrc_seed.n_seeded} "
+                f"additional line-start anchor(s) for words that didn't validate.")
+        elif prep is not None:
+            log("  LRC candidate found but not confidently calibrated -- not used as an anchor source.")
+        else:
+            log("  No usable LRCLIB synced-lyrics candidate for this song.")
+        for i in range(len(words)):
+            if validated[i] and not source[i]:
+                source[i] = "lrc"
+
+    had_any_anchor = any(validated)
+    quality.n_interpolated, quality.n_kept_original = interpolate_fallback(words, starts, ends, validated)
+    for i in range(len(words)):
+        if not source[i]:
+            source[i] = "interpolated" if had_any_anchor else "kept_original"
+
+    log(f"  {quality.n_validated}/{quality.n_words} word(s) validated as ALREADY CORRECT (kept exactly "
+        f"as-is -- position and length untouched beyond the single global GAP correction), "
+        f"{quality.n_lrc_seeded} from LRC anchors, {quality.n_interpolated} repositioned by "
+        f"interpolation, {quality.n_kept_original} kept at their original timing (no anchor nearby).")
+    if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:
+        log(f"  WARNING: only {quality.anchor_rate:.0%} of words validated or got an LRC anchor -- "
+            f"this file's lyrics may not match this audio at all. Review the output carefully.")
+
+    if debug_log is not None:
+        debug_log.section("REALIGN SUMMARY (strategy=validate)")
+        debug_log.line(f"  GAP: offset={gap.offset} slope={gap.slope} confidence={gap.confidence} "
+                        f"kind={gap.kind} skipped_reason={gap.skipped_reason}")
+        debug_log.line(f"  {quality.n_validated}/{quality.n_words} validated (kept as-is), "
+                        f"{quality.n_lrc_seeded} from LRC anchors, {quality.n_interpolated} interpolated, "
+                        f"{quality.n_kept_original} kept original.")
+        debug_log.section("PER-WORD TRACE (text, orig_start->orig_end, source, final_start->final_end)")
+        for i, w in enumerate(words):
+            debug_log.line(f"  {i:4d} {w.text:20s} orig={w.orig_start:9.3f}-{w.orig_end:9.3f}  "
+                            f"[{source[i]:14s}]  final={starts[i]:9.3f}-{ends[i]:9.3f}  "
+                            f"delta={starts[i] - w.orig_start:+8.3f}")
+        debug_log.section(f"RAW ASR TRANSCRIPT ({len(asr_words)} word(s), real timestamps + confidence -- "
+                           f"WhisperX/faster-whisper is NOT deterministic run-to-run, so this is the only record "
+                           f"of what THIS specific run's ASR actually heard)")
+        for aw in asr_words:
+            debug_log.line(f"  {aw.start:9.3f}-{aw.end:9.3f}  conf={aw.confidence:.3f}  {aw.text!r}")
 
     new_start_by_idx: dict = {}
     new_end_by_idx: dict = {}
@@ -821,6 +1321,27 @@ def build_arg_parser():
                          "<input-folder>/.ultrastar_work after realigning. Default: OFF (keeps them so "
                          "re-runs reuse the cached separation) -- same convention as the main pipeline's "
                          "own --delete-work-files.")
+    p.add_argument("--no-debug-log", action="store_true",
+                    help="Skip writing '<Artist> - <Title> [DEBUG LOG].txt' (per-word match/interpolation "
+                         "trace) to the work dir. Default: ON, same convention as the main pipeline's own "
+                         "debug log.")
+    p.add_argument("--rewindow-long-segments", dest="rewindow_long_segments", action="store_true",
+                    default=True,
+                    help="Default: ON for realign mode (real-validated across 8 real songs, 4 genuine fixes, "
+                         "0 regressions -- see CLAUDE.md). For any whisper decoder segment >= "
+                         "config.REWINDOW_MIN_SEGMENT_DURATION_SEC long, sweeps smaller candidate windows "
+                         "and keeps whichever gives the best forced-alignment score -- fixes a real case "
+                         "where the decoder silently drops content, leaving a short remaining phrase "
+                         "aligned against a much-too-large window.")
+    p.add_argument("--no-rewindow-long-segments", dest="rewindow_long_segments", action="store_false")
+    p.add_argument("--strategy", choices=["replace", "validate"], default="replace",
+                    help="PROTOTYPE, not GUI-exposed yet (default: replace). 'replace': a word confidently "
+                         "matched to ASR has its timing REPLACED with ASR's own value (shipped behavior). "
+                         "'validate': first checks whether the whole file is explained by a single global "
+                         "GAP/drift correction, then a word whose (GAP-corrected) original position is "
+                         "independently CONFIRMED by ASR is left completely untouched -- position and "
+                         "length both -- instead of being overwritten; only words that don't validate are "
+                         "repositioned. See CLAUDE.md.")
     return p
 
 
@@ -845,6 +1366,17 @@ class RealignPipelineOptions:
     lrc_mode: str = "windowed"
     output_path: Optional[str] = None
     delete_work_files: bool = False
+    no_debug_log: bool = False
+    rewindow_long_segments: bool = True
+    # "replace" (default, shipped): realign_song, a matched word's timing
+    # is REPLACED with ASR's own value. "validate" (PROTOTYPE -- real-
+    # validated but only helps when the file is already mostly accurate,
+    # see CLAUDE.md -- kept off by default, selectable via CLI --strategy
+    # or the GUI's Strategy dropdown): realign_song_validate -- a word
+    # whose original position (after a single global GAP/drift correction)
+    # is independently confirmed by ASR is left completely untouched
+    # instead.
+    strategy: str = "replace"
 
 
 @dataclass
@@ -910,6 +1442,13 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     except UsdxParseError as e:
         return RealignPipelineResult(success=False, error=f"Could not parse {existing_txt_path}: {e}")
 
+    artist = opts.artist or existing.artist
+    title = opts.title or existing.title
+    debug_log_path = None if opts.no_debug_log else (work_dir / f"{artist} - {title} [DEBUG LOG].txt")
+    debug_log = DebugLog(debug_log_path)
+    if debug_log_path is not None:
+        log(f"Writing debug log to: {debug_log_path}")
+
     try:
         resolved = resolve_song_folder(input_dir, work_dir, audio_file_override=opts.audio_file)
     except (AmbiguousInputError, NoAudioSourceFoundError) as e:
@@ -935,6 +1474,7 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     asr_words = transcribe_words(
         vocals_path, opts.whisper_model, prefer_whisperx=not opts.no_whisperx,
         whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
+        debug_log=debug_log, rewindow_long_segments=opts.rewindow_long_segments,
     )
     if not asr_words:
         return RealignPipelineResult(
@@ -948,10 +1488,18 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
             log(f"Could not fetch LRCLIB id {opts.lrclib_id} -- ignoring.")
 
     log("Realigning...")
-    result = realign_song(
-        existing, asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
-        use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate, log=log,
-    )
+    if opts.strategy == "validate":
+        result = realign_song_validate(
+            existing, asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
+            use_lrc=opts.use_lrc, forced_lrc_candidate=forced_candidate, log=log,
+            debug_log=debug_log,
+        )
+    else:
+        result = realign_song(
+            existing, asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
+            use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate, log=log,
+            debug_log=debug_log,
+        )
     if not result.success:
         return RealignPipelineResult(success=False, error=result.error)
 
@@ -961,6 +1509,7 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
         return RealignPipelineResult(success=False, error=guard_error)
     write_song(result.song, output_path)
     log(f"Wrote {output_path}")
+    debug_log.close()
     return RealignPipelineResult(success=True, output_path=output_path)
 
 
@@ -1012,7 +1561,8 @@ def _opts_from_args(args) -> RealignPipelineOptions:
         no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
         artist=args.artist, title=args.title, lrclib_id=args.lrclib_id,
         use_lrc=args.use_lrc, lrc_mode=args.lrc_mode, output_path=args.output_path,
-        delete_work_files=args.delete_work_files,
+        delete_work_files=args.delete_work_files, no_debug_log=args.no_debug_log,
+        rewindow_long_segments=args.rewindow_long_segments, strategy=args.strategy,
     )
 
 

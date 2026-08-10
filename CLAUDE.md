@@ -477,6 +477,185 @@ producing the same result as the equivalent CLI invocation.
 beyond the manual BATB/Stars/Chicago runs in this file -- rerun manually
 if `realign.py`'s core matching/interpolation logic changes.
 
+### Real bug: `lrc_mode="seed"` also needed the calibration gate, not just
+### `"windowed"` (David Bowie - "Heroes", 2026-08-09)
+
+User reported a real, reproducible failure: in the shipped file, "Just
+for one day" (beats 4185-4279) is correct; in the realigned output, that
+passage landed in the middle of a big silent stretch. Root-caused by
+replaying the real run's own data (not guessed): the auto-picked LRCLIB
+candidate for this song was **"Heroes" by "Kolacny Brothers"** -- a
+CHORAL COVER, not Bowie's own recording (same wrong-recording failure
+class as BATB's "(Finale)" cast recording and Chicago's auto-picked
+candidate, see the `lrc_mode="windowed"` section above) -- confirmed via
+`calibration_confidence=0.0`, a real "zero agreement" case, not merely
+"not enough samples." Because this candidate's calibration failed,
+`"windowed"` mode correctly declined it and fell back to `"seed"` -- but
+`"seed"`'s own LRC-anchor-seeding step (`seed_from_prep`) had NO
+calibration gate at all, on the (now-disproven) theory that seeding only
+a handful of words keeps its "blast radius" small by construction. It
+seeded word "Then" at 176.98s from the uncalibrated candidate's raw line
+timestamp -- a time LATER than several of ITS OWN neighbors' already-
+independently-correct ASR matches (170-172s) AND later than "Just for
+one day"'s own correct ASR matches (175.0-176.2s). `interpolate_fallback`'s
+monotonic clamp (forward-push only, no notion that an earlier anchor
+might itself be wrong) then dragged ALL of those already-correct
+neighbors forward to 176.98s to preserve ordering -- corrupting real,
+independently-confirmed-correct matches, not just filling a genuine gap.
+This is why the blast-radius theory was wrong: a single bad anchor's
+effective blast radius is unbounded once the monotonic clamp propagates
+it forward to the next real anchor, regardless of how few words were
+directly seeded.
+
+**Fixed**: both `"windowed"` and `"seed"` now use the exact same gate
+(`lrc_prep.calibration_offset is not None`) before trusting an LRC
+candidate for ANYTHING, seeding included -- an uncalibrated candidate now
+falls all the way back to pure ASR + `interpolate_fallback`, same as "no
+candidate found" would. Real-validated: re-ran David Bowie - Heroes,
+`n_lrc_seeded` dropped from 5 to 0, "Just for one day" now lands within
+0.2-0.5s of the original (previously off by 1-6.7s across that whole
+passage, with word "Then" off by +6.7s). Regression-checked BATB
+afterward (unaffected -- its own candidate's calibration still clears
+the bar at 54% confidence, same as before this fix). New synthetic
+regression test added (`test_dry_run.py`) reproducing the exact failure
+shape (a seeded anchor landing later than already-confident neighbors)
+without needing real audio.
+
+### Real bug #2: `interpolate_fallback`'s monotonic clamp could overwrite
+### an already-CONFIDENT match too, not just fallback ones (David Bowie -
+### "I'm Afraid of Americans", 2026-08-09)
+
+Second real user report, same day: a passage repeating "I'm afraid of
+Americans" / "I'm afraid of the world" / "I'm afraid I can't help it" /
+"I'm afraid I can't" (this song's chorus repeats this whole 4-line block
+roughly a dozen times, "afraid" alone appears 31 times) ended up in the
+output as 16 consecutive words each exactly 1 beat long, essentially
+frozen at one instant -- but with CORRECT pitches, confirming the note
+data itself was untouched and this was a pure timing bug.
+
+Root-caused via the real run's own data (`match_words_to_asr_windowed`'s
+raw per-word matches, captured BEFORE `interpolate_fallback` ran): this
+song's picked LRCLIB candidate is genuinely David Bowie's own real
+recording (unlike Heroes' wrong-artist case) and its calibration cleared
+the confidence gate (48%, `kind="constant"`) -- so `"windowed"` mode was
+used, correctly per the fix above. But the per-LINE window computation
+for FOUR consecutive LRC lines in this repeated block searched the WRONG
+occurrence of a repeated phrase: their real matches landed ~12s EARLIER
+than they should have (confirmed: raw matched ASR timestamps for these
+lines were nearly identical to a DIFFERENT, earlier real occurrence of
+the same repeated text -- a real repeated-phrase disambiguation failure
+the GLOBAL calibration confidence check can't see, since it only
+measures overall agreement, not per-line reliability in one specific
+repetitive stretch). This alone would have been a real but bounded
+~12s-early error for that block -- what made it catastrophic was a
+SEPARATE bug: the fallback word immediately before this mis-matched
+block computed a NEGATIVE interpolation rate (because its two "confident"
+anchors were themselves chronologically inverted -- the later-in-
+sequence anchor's real match, from the mis-aimed window, was chrono-
+logically EARLIER than the earlier anchor's), triggering
+`interpolate_fallback`'s degenerate fallback formula (a constant shift
+from the earlier anchor ALONE, ignoring the later one entirely), which
+overshot PAST all 14 of the following genuinely-confident matches. The
+OLD monotonic clamp (forward-push, no notion of `confident` at all) then
+flattened every one of those 14 correct matches up to that one wrong,
+overshot value -- destroying real, independently-correct information,
+not just filling a gap.
+
+**Fixed**: `interpolate_fallback`'s trailing monotonic-fixup is now
+confident-aware -- a confident word's own value is a FIXED POINT, never
+rewritten by either direction of the clamp; only fallback words are
+adjusted (pass 1, forward: push a fallback word up past a larger
+preceding value; pass 2, backward: pull a fallback word back down if it
+exceeds the next confident word's own value). Real-validated: re-running
+with the fix, the 14-word flatten is gone -- each word now gets its own
+distinct (still ~12s early, since the underlying mis-aimed window isn't
+fixed) value instead of one shared wrong point. New synthetic regression
+test added reproducing the exact negative-rate-inversion shape without
+needing real audio.
+
+**Open question the underlying mis-aimed-window problem exposes**: ran
+`"seed"` mode (whole-song ASR matching, immune to per-line windowing
+since it doesn't depend on LRC line correspondence for most of the song)
+on this SAME song for comparison -- it placed this entire passage within
+tens of milliseconds of the original throughout, dramatically better
+than `"windowed"` even after the clamp fix (which still leaves the whole
+block ~12s early, just no longer flattened to one point). This is a
+SECOND real case (after Heroes) where `"windowed"` has a real, distinct
+failure mode `"seed"` doesn't share -- here, a highly-repetitive song
+defeats per-line LRC correspondence even with a correctly-calibrated,
+correctly-attributed candidate, which the global calibration-confidence
+gate cannot detect (it only measures aggregate agreement, not per-line
+reliability within one repetitive stretch). Combined with Heroes
+(wrong-recording candidate), `"windowed"` now has two independent
+confirmed real failure classes beyond what the original 3-song
+comparison (BATB/Stars/Chicago) exercised, while `"seed"` has been
+robust or better in every real case tried so far. **Not yet acted on** --
+surfaced to the user as an open question (whether `"windowed"` should
+remain the default) rather than unilaterally flipping it again without
+their input, since this is a real tradeoff (windowed's upside on BATB
+was real and validated) with limited data on each side.
+
+**Resolution (same day)**: extended the comparison to Stars/Chicago/
+Ordinary Day with both fixes active. Ordinary Day -- ALSO a repeat-heavy
+song (a 4x-repeated chorus) -- turned out to be the mirror image of
+Americans: there `"seed"` mode is the one that catastrophically fails (a
+44-SECOND misalignment on the repeated chorus, 46% within 100ms, mean
+error 5.4s) while `"windowed"` handles it cleanly (71%, mean error
+0.15s) -- `"seed"`'s own whole-song matching has the exact same class of
+repeated-phrase vulnerability as `"windowed"`'s per-line matching, just
+triggered differently (no real-time window to bound the search, so a
+long enough repeated stretch can make the whole-sequence diff jump back
+to an earlier occurrence). Net across 5 real songs: `"windowed"` wins
+clearly on 2 (BATB, Ordinary Day), ties on 2 (Chicago, Stars), loses on
+1 (Americans) -- **`"windowed"` stays the default**, this was not a close
+call once Ordinary Day was added to the comparison.
+
+Investigated Americans further per the user's own suspicion ("the LRC
+data is for the album version but I have the audio from the music
+video") -- confirmed directly: our file's own `afraid` count is 31; the
+auto-picked LRCLIB candidate's (id 34342583, from the *Brilliant
+Adventure* box set) is 40 -- a real, structural arrangement difference
+(9 extra chorus repeats), not just timing noise. Candidate DURATION
+alone doesn't catch this (267.0s our audio vs 270.0s declared -- well
+within the existing 15s selection tolerance, coincidentally close
+despite the real structural difference). Led directly to the repeat-
+structure check below.
+
+### Repeat-structure consistency check for LRC candidates (2026-08-09)
+
+New `check_repeat_structure` (in `realign.py`) rejects an LRC candidate
+whose repeat structure doesn't match ours, wired into `prepare_lrc` via
+an optional `our_lines` (the existing file's own lines, reconstructed by
+new `_reconstruct_our_lines` from its `-` LineBreak markers) + `log`
+param -- both optional so existing callers/tests that don't have the
+original entries handy (e.g. `seed_lrc_anchors`'s standalone/test path)
+are unaffected.
+
+**Design note, found the hard way**: the first version compared only the
+SINGLE most-repeated exact-duplicate LINE (10x ours vs 12x the
+candidate's, within tolerance -- would NOT have caught the real bug).
+A real chorus is often split across several near-duplicate variants
+("I'm afraid of Americans"/"...of the world"/"...I can't help it"/"...I
+can't"), each individually landing within tolerance on its own even
+though the true repeat count is split across all four. Fixed by
+comparing WORD occurrences instead: find the most-repeated line's own
+content words (filtering out short/filler words under 4 chars, since a
+common word repeating a lot doesn't indicate a repeated CHORUS the way a
+shared distinctive word across every variant does), pick whichever
+qualifying word has the highest count in OUR OWN file (confirmed this
+selects "afraid" -- present in all four variants -- over a less-complete
+signal like "Americans", present in only one), and compare that word's
+total count on both sides. Tolerance +-15%/minimum +-1 (absorbs ordinary
+per-song noise like an intro/outro repeat some editions add or drop).
+
+Real-validated against all 5 songs already in the comparison set:
+correctly rejects Americans (31 vs 40, un-blocked "windowed" falls back
+to whole-song ASR matching, which independently is known to place this
+whole passage well) while leaving BATB/Chicago/Stars/Ordinary Day's own
+already-validated candidates completely unaffected (all pass the check).
+Confirmed end-to-end through the real written output, not just the
+isolated check function.
+
 ### GUI form split into Lyrics/Options + `--delete-work-files` (2026-08-09)
 
 Realign's GUI form restructured to match the normal pipeline's own
@@ -665,6 +844,371 @@ default. `"seed"` (always whole-song-ASR-primary, even with a
 confidently-calibrated candidate available) stays available as an
 explicit opt-out / for future A-B comparisons, but isn't needed for
 normal use anymore.
+
+### `"validate"` strategy prototype + local-rematch second pass -- real
+### comparison, local-rematch REJECTED as a net regression (2026-08-09)
+
+**"validate" strategy** (`realign_song_validate`, `--strategy validate`):
+trusts a word's own (GAP-corrected) original position over ASR's own
+value whenever ASR confirms it's close, rather than always replacing with
+ASR's own less-precise timing. Built and real-validated (100% exact
+recovery on "I'm Afraid Of Americans", which happened to have a near-
+perfect original file needing only a GAP fix). **User's explicit
+correction after seeing this result**: `"validate"` is not a generally
+useful strategy -- it only shines when the input file is ALREADY
+accurate, which defeats the purpose for the actual problem (files whose
+lyrics/timing genuinely don't match the audio well). Kept in the codebase
+as a prototype (`--strategy validate`, not GUI-exposed) but not pursued
+further as the general solution.
+
+**Real bug motivating the next investigation**: user reported "Johnny
+wants a brain, Johnny wants to suck on a coke" (Americans) landing
+compressed/wrong in a real failing run, even under the shipped `"replace"`
+strategy -- the section immediately before and after recovers fine, only
+this one block (with several nearby "Johnny wants X" near-repeats, plus
+an ASR-unfriendly "Ah-ah-ah" ad-lib line right before it) goes wrong.
+Root cause (confirmed via real, same-transcription diagnostics): a
+repeated phrase ELSEWHERE in the song can steal `match_words_to_asr`'s
+whole-song text match, leaving the real local occurrence completely
+unmatched -- it then falls straight to `interpolate_fallback`'s
+proportional guess, which has no way to know a real silence/pause exists
+inside that gap, and compresses the words together.
+
+**Fix attempt: `rematch_local_gaps`** (new function, `config.
+REALIGN_LOCAL_REMATCH_SLACK_SEC`) -- a second pass that retries any
+still-unmatched run of words against ONLY the ASR words whose own
+timestamp falls between that run's nearest confident neighbors (+/- 1s
+slack), instead of the whole song -- much less ambiguous, so a repeat
+elsewhere can no longer steal the match. Synthetic regression test added
+(`test_dry_run.py`) confirming it recovers a same-text-decoy scenario
+correctly.
+
+**Real, CONTROLLED (single transcription, A/B in one process -- avoids
+WhisperX's own non-determinism confounding the comparison) validation
+against all 4 reference songs found this is a NET REGRESSION**:
+
+| song | within 100ms, WITHOUT local-rematch | WITH local-rematch | delta |
+|---|---|---|---|
+| BATB | 80.5% | 56.6% | **-23.9pp** |
+| Chicago | 66.7% | 66.7% | 0 (0 words touched) |
+| Stars | 63.1% | 64.1% | +1.0pp |
+| OrdinaryDay | 70.5% | 68.7% | -1.8pp |
+
+**Why it fails to generalize** (same shape as `--verify-placement`/
+`--zone-boundary-snap` in the main pipeline's own "Removed / rejected"
+history -- a well-motivated mechanism that doesn't survive real data):
+the 4 reference songs are all cases where the EXISTING file's own local
+timing is already trustworthy (that's why they're used as references) --
+so when ASR is sparse/ambiguous in some region,
+`interpolate_fallback`'s original-timing-proportional guess is regularly
+BETTER than forcing a local ASR rematch, which can just as easily lock
+onto the wrong nearby repeat within its own (still non-zero-width)
+window as the whole-song pass did. It only actually helps in the
+opposite case -- the original file's local timing is ALSO wrong there
+(true for the Americans case that motivated it) -- and there's no cheap
+signal available to tell those two situations apart before deciding
+whether to trust a local rematch over interpolation.
+
+**Decision: shipped OFF by default** (`realign_song(use_local_rematch=
+False)`, not wired into CLI/GUI). Code and its synthetic test kept in
+place since the underlying mechanism is real value for the case it was
+built for -- just needs a way to gate it (e.g. distinguishing "original
+file wrong here" from "ASR just sparse here") before it's safe to enable
+generally. Don't flip this on without addressing that gating question.
+
+**Separately found, NOT fixed (needs its own investigation)**: Americans'
+own outro ("God is an American" x8, tight ~6s spacing) shows the whole-
+song matcher's repeat-occurrence-count mismatch drifting the matched
+position by increasing multiples of the repeat period (+6s, then +18s,
+then stabilizing at +30s) as the song progresses -- a different failure
+shape than the "Johnny" case (there, ALL words in the region go
+unmatched; here, they get CONFIDENTLY matched, just to the wrong
+occurrence, so neither `interpolate_fallback` nor `rematch_local_gaps`
+can help -- the whole-song text-only match has no time information to
+break the tie with). Pre-existing, not introduced by local-rematch (
+confirmed via the same controlled single-transcription A/B). Left as a
+known open issue.
+
+### realign debug log (2026-08-09)
+
+User noticed realign never wrote a debug file (unlike the main
+pipeline's `[DEBUG LOG].txt`), which would have made this session's
+whole-song-vs-local-rematch investigation trivial instead of needing
+several throwaway scratchpad scripts. Fixed: `realign_song` now accepts
+an optional `debug_log: DebugLog` (same class the main pipeline uses),
+writing a per-word trace (text, orig start/end, WHICH mechanism placed
+it -- asr/lrc/local_rematch/interpolated/kept_original -- final
+start/end, delta) plus the existing summary stats.
+`_run_realign_pipeline_body` wires this up the same way `main.py` does:
+`<Artist> - <Title> [DEBUG LOG].txt` under the work dir, ON by default,
+`--no-debug-log`/`RealignPipelineOptions.no_debug_log` to skip -- no GUI
+checkbox, matching the main pipeline's own convention.
+
+**Follow-up same day**: also added a "RAW ASR TRANSCRIPT" section (every
+`Word` actually fed into matching, with confidence) and wired
+`transcribe_words(..., debug_log=debug_log)` through from realign (it
+existed in `transcription.py` already but was never actually connected
+from realign's call site -- a real, silent gap). This is what made the
+hallucination root-cause below findable at all: a user-pasted "per-word
+trace" section was initially mistaken for raw ASR data, leading nowhere,
+until the actual raw-ASR section was added and read -- see
+[[feedback-verify-data-labels-before-concluding]] (auto-memory). Also
+added a "RAW WHISPER DECODER SEGMENTS" section (the decoder's OWN
+segment-level output, BEFORE wav2vec2 forced alignment) -- this is what
+let the hallucination be pinned to the DECODER stage specifically, not
+the alignment stage (see below). `realign_song_validate` now also
+accepts `debug_log` (parity with `realign_song`), same 3 sections.
+
+### `"validate"` strategy properly wired up (GUI + parity), still OFF by
+### default (2026-08-09)
+
+User: "properly implement the validate flow we did earlier. Leave it off
+by default for now, just so we can work on improving the other methods."
+`realign_song_validate` was previously reachable only via `--strategy
+validate` on the CLI, explicitly "not GUI-exposed yet". Added a
+"Strategy" combobox (`replace`/`validate`) to the GUI's realign Options
+frame (same frame as Whisper model/Use LRC/LRC mode/delete-work-files),
+wired through `_build_realign_opts` -> `RealignPipelineOptions.strategy`
+-> `_run_realign_pipeline_body`'s existing branch. Default stays
+`"replace"` in both the GUI (`self.realign_strategy = tk.StringVar(value=
+"replace")`) and the CLI (`--strategy` default unchanged) -- this is
+purely making an already-real-validated option properly selectable, not
+changing what runs by default. Verified via a GUI smoke test (mode-switch
+matrix + Strategy round-trip through `_build_realign_opts`) and a real
+end-to-end run confirming all 3 debug-log sections (summary/per-word
+trace/raw ASR) appear correctly under `strategy=validate` too.
+
+### Real bug root-caused to WhisperX DECODER hallucination, not our own
+### matching logic (David Bowie - "I'm Afraid Of Americans", 2026-08-09)
+
+User reported (again) that "Johnny wants a brain, Johnny wants to suck on
+a coke" lands badly wrong via the GUI's realign mode, real audio position
+confirmed by ear as ~81-84s (matching the EXISTING FILE's own original
+timing almost exactly). Initial hypothesis (repeated-phrase text stealing
+the whole-song match, same class as the "I'm afraid" collapse) did NOT
+reproduce across 2 of my own fresh runs -- both landed this passage
+correctly. **User caught a real mistake**: the debug data I was
+diagnosing from (their earlier pasted lines) was the PER-WORD TRACE
+section, not raw ASR -- I hadn't built the raw-ASR dump yet at that
+point, so I was drawing conclusions from the wrong data entirely (see
+[[feedback-verify-data-labels-before-concluding]]).
+
+With the new RAW ASR TRANSCRIPT + RAW WHISPER DECODER SEGMENTS sections
+in place, user re-ran via the GUI (fresh work dir) and the real failing
+run's data showed the true mechanism: the DECODER's own segment
+`66.856 - 85.975` (a single ~19s chunk) transcribed as just `"Johnny
+wants a brain, Johnny wants to suck on the conch."` -- it completely
+DROPPED the real intervening content ("Johnny's in America... Ah-ah-ah,
+ah-ah, ah-ah-ah", a scat/ad-lib line) and also misheard "coke" as
+"conch". Since the decoder declared this whole 19s span as ONE segment
+containing only those few words, wav2vec2's forced alignment had no
+choice but to spread them across the full window, landing "Johnny wants
+a brain" ~6-7s too early. **Confirmed via `match_words_to_asr`'s own
+raw output that this is a real, literal exact-text match** (not a fuzzy
+mismatch or occurrence-ambiguity bug) -- the words genuinely are in the
+transcript, just with catastrophically wrong decoder-level segment
+timing. This is a THIRD distinct failure class this session (see
+[[project-realign-alignment-mode]]): outright decoder hallucination/
+content-drop within an oversized segment, not a matching-algorithm issue
+at all.
+
+**Tested the obvious lever: reverting to WhisperX's own default VAD**
+(`whisperx_no_vad=False`, i.e. `vad_onset=0.500/vad_offset=0.363` instead
+of the existing `WHISPERX_NO_VAD_OPTIONS` near-zero override) -- **this
+is NOT a fix, it's a regression**. Decoder segments got even BIGGER (one
+26.6s segment swallowed an entire verse, `Chicago`-style, plus visible
+text reordering -- "Johnny's in America" ended up transcribed AFTER
+"Johnny wants to think of a joke" despite being sung first), and the
+whole back half of the song's word-matching collapsed (`n_asr_matched`
+cratered, deltas of +62s appearing from that point on). This directly
+confirms the existing near-zero-VAD default (chosen for a DIFFERENT real
+case, see `WHISPERX_NO_VAD_OPTIONS`'s own docstring: fixed a 5.88s->0.15s
+error on "Stars") should stay -- don't revert it. Also confirmed
+`condition_on_previous_text` is already `False` in whisperx's own
+defaults (checked `whisperx/asr.py` directly), so that's not an available
+lever either. `hallucination_silence_threshold` (whisperx default `None`)
+is specifically for SILENCE-triggered hallucination, not applicable here
+(this segment has real singing throughout, just misrecognized).
+
+**Status: unresolved, no fix attempted yet.** No cheap, low-risk
+WhisperX-level knob found. A downstream defense (e.g. distrusting ASR
+words whose parent decoder segment is anomalously long/word-sparse -- a
+direct fingerprint of this exact failure, unlike per-word confidence
+alone which wasn't reliably low enough to catch it) would need new
+plumbing (`Word` doesn't currently carry which decoder segment it came
+from) and, per this session's own repeated lesson (`rematch_local_gaps`
+above), needs real controlled validation before shipping -- not attempted
+without the user's go-ahead given two "well-motivated mechanism didn't
+generalize" results already this session.
+
+### Long-segment re-windowing for whisperx forced alignment (PROTOTYPE,
+### OFF by default, 2026-08-09/10)
+
+Follow-up to the decoder-hallucination finding above -- user did their own
+manual experiments (short clips align correctly where the full segment
+doesn't) and proposed testing candidate windows for a long decoder
+segment and picking whichever forced-alignment gives the best score.
+
+**Real case (David Bowie - Magic Dance, via GUI, `large-v3`)**: decoder
+segment `104.352-124.501` (20.1s) transcribed as just `"In 9 hours and 23
+minutes, you'll be mine."` (8 words) -- the real "Jump Magic Jump!..."
+content that's actually sung in there got dropped, same failure class as
+the Americans case above. Forcing the 8 words against the whole 20.1s
+window crammed them into 105.192-108.274 (score 0.564) -- nowhere near
+the user's by-ear-confirmed real position, ~114-118s.
+
+**Investigation (iterative, see full detail in session transcript)**:
+1. First tried the user's exact proposal -- 4 fixed 8s windows tiling the
+   segment (104-112/108-116/112-120/116-124). No clear winner (0.56-0.59
+   band); every window crammed the phrase into its own first ~1-3s
+   regardless of position -- a real, load-bearing finding: WIDTH doesn't
+   matter, and a window even CENTERED on the true position (113-119)
+   scored WORSE (0.513) than the eventual answer, because it wasn't
+   exactly aligned to where the correct placement wants to start.
+2. Widened to 12-20s at various offsets -- offset=106 emerged as best
+   (mean 0.636), but this was later found to be a FALSE local optimum:
+   the 2s-step sweep (96-112) happened to stop 2 seconds short of the
+   true peak.
+3. User confirmed by listening: true position is ~114s, not 106s.
+   Re-tested at MATCHED widths, offset=114 head-to-head vs offset=106:
+   114 won at every width (10s: 0.751 vs 0.649). A fine 1s-step sweep
+   (110-118) confirmed a SHARP, isolated peak exactly at 114 (0.751,
+   dropping to 0.55-0.58 just 1-2s either side) -- not noise, and not
+   beaten by anything else in the whole 96-124 range tested. **This
+   validated the core approach**: fine-grained, wide-enough offset search
+   + pick-best-score DOES find the true answer; the earlier "106" false
+   positive was a search-coverage gap, not a fundamental flaw in using
+   CTC score to compare candidates.
+
+**Shipped as a prototype** (`transcription.py`): `_rewindow_long_segments`
+(+ `_find_best_window`, `_mean_word_score`) -- for any whisper decoder
+segment >= `config.REWINDOW_MIN_SEGMENT_DURATION_SEC` (10.0s), sweeps
+fixed-10s-width candidate windows at 1s steps (`REWINDOW_CANDIDATE_
+WIDTH_SEC`/`REWINDOW_STEP_SEC`) across the segment's own declared span,
+re-running `whisperx.align()` per candidate (real, unmodified whisperx
+code, just called repeatedly with different `(start, end)` on the SAME
+segment text) and keeping whichever wins by mean word score -- but ONLY
+if it beats the baseline (whole-segment) score by at least
+`REWINDOW_MIN_SCORE_IMPROVEMENT` (0.10, a first estimate from this one
+real case, not yet broadly validated). Only ever corrects segment
+BOUNDARIES before the normal `whisperx.align(result["segments"], ...)`
+call -- everything downstream (Word construction, realign's own matching)
+is untouched, so this composes for free. Wired through `transcribe_words
+(..., rewindow_long_segments=...)` -> `RealignPipelineOptions.
+rewindow_long_segments` / `--rewindow-long-segments` -- **OFF by default,
+user's explicit request to keep it opt-in** while validated on more real
+cases. Not wired into the main (non-realign) pipeline yet.
+
+**Real validation, 2026-08-10**:
+- Magic Dance (`large-v3`, real GUI-produced audio): fired exactly on the
+  target segment, `104.352-124.501 -> 113.352-123.352`, score 0.564 ->
+  0.710. Final written output places the line at 114.213-117.580s,
+  matching the user's confirmed position. Clean, validated fix.
+- Americans (fresh transcription, small.en default): the "Johnny wants a
+  brain...coke" segment WAS flagged (18.6s) and a marginal improvement was
+  found (0.584 -> 0.680, +0.096) but fell just short of the +0.10 bar, so
+  baseline was correctly kept -- and baseline was ALREADY fine in this
+  particular run (74.28-82.88s, the known-good pattern), so this was the
+  right call, not a missed fix. Didn't get an unlucky-enough transcription
+  in this attempt to re-exercise the ORIGINAL dropped-content failure.
+- `test_dry_run.py` stays green throughout (no synthetic tests added --
+  this calls real whisperx CTC internals, not mockable the way the rest
+  of realign.py's matching logic is; validation is real-audio-only, per
+  the CLAUDE.md convention that real validation is required regardless).
+
+**Broader real validation (2026-08-10, same day, user's request: "try to
+reproduce Americans a couple times [fresh Demucs each time], try BATB
+(maybe helps Tune), pick 1-2 other songs")** -- 6 total real runs:
+
+| Song | Fired? | Result |
+|---|---|---|
+| Magic Dance | Yes | 0.564->0.710, fixed to the confirmed 114-118s position |
+| Americans (fresh Demucs #1) | No | baseline already fine (0.758) this run |
+| Americans (fresh Demucs #2) | **Yes** | 0.593->0.723 -- reproduced the ORIGINAL bug fresh and fixed it, landing within 0.06s of the trusted existing file's own timing |
+| BATB | No | baseline already fine (0.801); "Tune" lands correctly (86.44s vs original 86.38s) -- confirms the earlier catastrophic "Tune at 32s" case was the unrelated `validate`-strategy LRC-seed bug (see above), not a decoder-segment issue this mechanism would ever touch |
+| Chicago | **Yes** | 0.564->0.674, landed within 0.15s of trusted timing |
+| Stars | No | every segment already scored 0.72-0.87, no improvement found anywhere |
+
+**Zero regressions across all 6** -- every fire was independently verified
+as a genuine improvement (checked against each song's own trusted
+original timing, not just the raw score delta), and every non-fire
+correctly left an already-good baseline alone. ASR non-determinism is
+still real and visible (Americans needed 2 fresh Demucs+transcribe
+attempts to reproduce the original failure at all) but doesn't undermine
+the mechanism's safety -- it only ever acts when it finds a clear,
+verified-in-practice improvement.
+
+**2 more songs tested same day (Ordinary Day, Heroes)** -- also zero
+regressions: Ordinary Day fired once (0.652->0.801, fixed an ASR-garbled
+opening line -- "four balls of rugby" mis-hearing -- to within 0.2s of
+trusted timing); Heroes never fired, including on a segment with the
+SAME oversized shape as the Magic Dance bug ("Just for one day I will be
+king", 29.5s/8 words, baseline score only 0.598) where the sweep
+correctly found NOTHING better -- checked the actual placement, it was
+already correct (a sustained/held note dragging confidence down without
+actually being misaligned). Good evidence the mechanism doesn't
+over-fire on merely-low-confidence-but-correct segments.
+
+**Total: 8 real songs, 4 genuine verified fixes (Magic Dance, Americans,
+Chicago, Ordinary Day), 4 correct no-ops (Americans attempt 1, BATB,
+Stars, Heroes), zero regressions.**
+
+**Decision (user, 2026-08-10): flipped to DEFAULT-ON for realign mode.**
+`RealignPipelineOptions.rewindow_long_segments` now defaults `True`
+(hardcoded, decoupled from `config.REWINDOW_ENABLED` which stays the
+main-pipeline's own separate switch); CLI flag inverted to `--no-
+rewindow-long-segments` opt-out (mirrors `--whisperx-vad`'s pattern).
+GUI needed no change -- it doesn't set this field explicitly, so it
+picks up the new default automatically.
+
+**Wired into the main (non-realign) generation pipeline the same day**,
+STILL OFF by default there (`config.REWINDOW_ENABLED = False`,
+`PipelineOptions.rewindow_long_segments`, `--rewindow-long-segments`/
+`--no-rewindow-long-segments` in `main.py`) -- user's explicit ask to
+start a validation series there before considering flipping it too,
+same reasoning as everywhere else in this project (a different code
+path needs its own real validation, isolation-mode/one-pipeline results
+don't reliably predict another).
+
+**Generation-pipeline validation, 4 real full pass 1-4 runs so far
+(2026-08-10)**, all completed cleanly through note-fitting/verification/
+output with no crashes or anomalies:
+- Magic Dance (`large-v3`): decoder happened to keep the "Jump Magic
+  Jump!...you'll be mine!" text together this run (not truncated the
+  way the original bug run was) -- correctly no-op.
+- BATB (`small.en`): matched its own realign-mode result exactly (same
+  ASR under the hood) -- no fires needed, all baselines already good.
+- Americans (`small.en`): fired, IDENTICAL numbers to the earlier
+  realign-mode fix (0.593->0.723, same segment bounds) -- the WRITTEN
+  output's fallback-word list confirms "coke." now lands at 83.86s (the
+  corrected position), not the original ~76-79s bug. Full pass 1-4 +
+  verification completed normally on top of the corrected timing.
+- Ordinary Day (`small.en`): fired, identical to realign mode again
+  (0.652->0.801 for the "four balls of rugby"-garbled opening line) --
+  the WRITTEN output's `#GAP:16951` (16.95s) directly confirms the
+  corrected position made it all the way through to the final note
+  timing, not just the intermediate ASR word list.
+
+Notable: Americans and Ordinary Day's generation-pipeline fires matched
+their earlier realign-mode fires' scores EXACTLY (down to 3 decimals) on
+reused cached vocals -- WhisperX's documented non-determinism doesn't
+always manifest run-to-run on IDENTICAL audio input; it's real (confirmed
+elsewhere this session with fresh Demucs runs) but not guaranteed to
+differ every time.
+
+**Decision (user, 2026-08-10): flipped to DEFAULT-ON EVERYWHERE.**
+`config.REWINDOW_ENABLED = True` (the single shared master switch --
+`transcription.transcribe_words`'s own default AND `config.
+PipelineOptions.rewindow_long_segments` both read it, so this one flip
+covers the main generation pipeline; realign mode already had its own
+hardcoded `True` default set earlier the same day). `--no-rewindow-
+long-segments` (both `main.py` and `realign.py` CLIs) opts back out if
+ever needed. Final tally before this decision: 12 real runs across 8
+songs (Magic Dance, Americans, BATB, Chicago, Stars, Ordinary Day,
+Heroes across realign mode; Magic Dance/BATB/Americans/Ordinary Day
+again through the full generation pipeline), 6 genuine verified fixes
+(carried through to the actual written output, not just an intermediate
+score), 0 regressions anywhere.
 
 ## Environment
 

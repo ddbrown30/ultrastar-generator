@@ -22,8 +22,81 @@ from . import model_cache
 from .models import Word
 
 
+def _mean_word_score(words: list) -> float:
+    scores = [w.get("score") for w in words if w.get("score") is not None]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _find_best_window(segment: dict, align_model, metadata, audio, device: str,
+                       debug_log=None) -> tuple:
+    """See config.REWINDOW_ENABLED's docstring for the real case this fixes
+    and its validation history. Sweeps fixed-width candidate windows across `segment`'s own
+    declared [start, end] span, re-running wav2vec2 CTC alignment of the
+    SAME text against each, and keeps whichever gives the best mean word
+    score -- provided it clears the baseline (whole-segment) score by
+    `config.REWINDOW_MIN_SCORE_IMPROVEMENT`. Returns (start, end, improved)
+    -- `improved=False` means the caller should keep the segment's own
+    original bounds untouched."""
+    import whisperx
+
+    t1, t2 = segment["start"], segment["end"]
+
+    baseline = whisperx.align([segment], align_model, metadata, audio, device=device)
+    baseline_score = _mean_word_score(baseline["word_segments"])
+
+    width = config.REWINDOW_CANDIDATE_WIDTH_SEC
+    step = config.REWINDOW_STEP_SEC
+    best_score = baseline_score
+    best_window = None
+
+    offset = t1
+    while offset < t2:
+        w0, w1 = offset, min(offset + width, t2)
+        cand_seg = dict(segment, start=w0, end=w1)
+        cand = whisperx.align([cand_seg], align_model, metadata, audio, device=device)
+        cand_score = _mean_word_score(cand["word_segments"])
+        if debug_log is not None:
+            debug_log.line(f"    candidate [{w0:8.3f},{w1:8.3f}]  mean_score={cand_score:.3f}")
+        if cand_score > best_score:
+            best_score = cand_score
+            best_window = (w0, w1)
+        offset += step
+
+    if best_window is not None and best_score >= baseline_score + config.REWINDOW_MIN_SCORE_IMPROVEMENT:
+        if debug_log is not None:
+            debug_log.line(f"  RE-WINDOWED [{t1:.3f}-{t2:.3f}] {segment['text']!r}: baseline score "
+                            f"{baseline_score:.3f} -> {best_window[0]:.3f}-{best_window[1]:.3f} "
+                            f"score {best_score:.3f}")
+        return best_window[0], best_window[1], True
+
+    if debug_log is not None:
+        debug_log.line(f"  kept baseline [{t1:.3f}-{t2:.3f}] {segment['text']!r}: baseline score "
+                        f"{baseline_score:.3f}, best candidate {best_score:.3f} didn't clear the "
+                        f"+{config.REWINDOW_MIN_SCORE_IMPROVEMENT} improvement bar")
+    return t1, t2, False
+
+
+def _rewindow_long_segments(segments: list, align_model, metadata, audio, device: str,
+                             debug_log=None) -> list:
+    """Returns a NEW segment list with corrected (start, end) for any
+    segment at least `config.REWINDOW_MIN_SEGMENT_DURATION_SEC` long --
+    everything else (text, downstream whisperx.align()/Word construction)
+    is untouched; this only fixes segment BOUNDARIES before they're used,
+    so it composes with the normal pipeline for free."""
+    fixed = []
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        if duration < config.REWINDOW_MIN_SEGMENT_DURATION_SEC:
+            fixed.append(seg)
+            continue
+        new_start, new_end, improved = _find_best_window(seg, align_model, metadata, audio, device,
+                                                           debug_log=debug_log)
+        fixed.append(dict(seg, start=new_start, end=new_end) if improved else seg)
+    return fixed
+
+
 def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None,
-                               vad_options: dict = None) -> List[Word]:
+                               vad_options: dict = None, rewindow_long_segments: bool = False) -> List[Word]:
     import whisperx
 
     audio = whisperx.load_audio(str(vocals_path))
@@ -31,8 +104,23 @@ def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None
     model = model_cache.get_whisperx_asr_model(model_name, vad_options=vad_options)
     result = model.transcribe(audio, language="en", batch_size=16)
 
+    if debug_log is not None:
+        debug_log.section("RAW WHISPER DECODER SEGMENTS (before forced alignment -- shows what VAD chunked "
+                           "and what the DECODER itself transcribed for each chunk, before wav2vec2 CTC "
+                           "places individual word timestamps within it)")
+        for seg in result["segments"]:
+            debug_log.line(f"  {seg.get('start'):8.3f} - {seg.get('end'):8.3f}  {seg.get('text', '')!r}")
+
     align_model, metadata = model_cache.get_whisperx_align_model()
-    aligned = whisperx.align(result["segments"], align_model, metadata, audio, device="cuda")
+
+    segments = result["segments"]
+    if rewindow_long_segments:
+        if debug_log is not None:
+            debug_log.section("LONG-SEGMENT RE-WINDOWING (see config.REWINDOW_ENABLED)")
+        segments = _rewindow_long_segments(segments, align_model, metadata, audio, device="cuda",
+                                            debug_log=debug_log)
+
+    aligned = whisperx.align(segments, align_model, metadata, audio, device="cuda")
 
     if debug_log is not None:
         debug_log.section("RAW WHISPERX OUTPUT (direct from whisperx.align(), before any filtering)")
@@ -122,6 +210,7 @@ def transcribe_words(
     debug_log=None,
     vad_filter: bool = True,
     whisperx_vad_options: dict = None,
+    rewindow_long_segments: bool = config.REWINDOW_ENABLED,
 ) -> List[Word]:
     """Returns a flat, time-ordered list of Word objects for the whole track.
 
@@ -136,12 +225,15 @@ def transcribe_words(
     faster-whisper path. `whisperx_vad_options` only applies to the
     whisperx path -- see config.WHISPERX_NO_VAD_OPTIONS's docstring for
     why this fixed a real, confirmed timing bug (word timestamps up to
-    ~6s wrong around sustained/held notes).
+    ~6s wrong around sustained/held notes). `rewindow_long_segments`
+    (whisperx path only, ON by default) -- see config.REWINDOW_ENABLED's
+    docstring for the real case this fixes and its validation history.
     """
     if prefer_whisperx:
         try:
             return _transcribe_with_whisperx(vocals_path, model_name, debug_log=debug_log,
-                                              vad_options=whisperx_vad_options)
+                                              vad_options=whisperx_vad_options,
+                                              rewindow_long_segments=rewindow_long_segments)
         except ImportError:
             print(
                 "whisperx not installed -- falling back to faster-whisper's own "

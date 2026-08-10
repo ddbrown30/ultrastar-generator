@@ -2581,6 +2581,75 @@ assert none_starts == [0.0, 10.0, 20.0] and none_ends == [0.5, 10.5, 20.5], (non
 print("    OK: NO anchor anywhere in the whole song -> original timing kept completely unchanged, never "
       "guessed from nothing (this mode always has a safe fallback, unlike mxl_lrc_generator's equivalent)")
 
+print("  BUG REGRESSION (real case: David Bowie - I'm Afraid of Americans, a song with many near-"
+      "identical repeated short lines): a fallback word's own interpolated estimate must NEVER drag "
+      "an already-CONFIDENT neighbor's own real match forward -- confirmed real case: a mis-aimed LRC "
+      "line window (windowed matching picked the wrong occurrence of a repeated line) put a CONFIDENT "
+      "anchor chronologically EARLIER than the confident anchor before it (a real inversion between two "
+      "'confident' matches), which sends interpolate_fallback's own rate formula negative -- its "
+      "degenerate fallback (shift from the earlier anchor alone, ignoring the later one entirely) then "
+      "overshot PAST several subsequent genuinely-confident matches, and the old forward-only clamp "
+      "flattened every one of them to that one wrong value:")
+cb_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=float(i), orig_end=float(i) + 0.5)
+            for i in range(5)]
+# w0 confident at real t=10.0. w2/w3/w4 confident at real t=5.0/5.3/5.6 --
+# EARLIER than w0, despite coming AFTER it in the word sequence (the real
+# inversion a mis-aimed line window produces). w1 (fallback, between w0 and
+# w2) computes a negative rate from this and overshoots to 11.0 -- worse
+# than either anchor.
+cb_starts = [10.0, None, 5.0, 5.3, 5.6]
+cb_ends = [10.5, None, 5.2, 5.5, 5.8]
+cb_confident = [True, False, True, True, True]
+n_interp, n_kept = interpolate_fallback(cb_words, cb_starts, cb_ends, cb_confident)
+assert cb_starts[2:5] == [5.0, 5.3, 5.6], cb_starts  # untouched -- these are CONFIDENT, never overwritten
+assert cb_starts[1] == 5.0, cb_starts  # the overshot fallback estimate (11.0) is pulled back to the next confident value
+print("  OK: confident words w2/w3/w4 keep their own real values exactly, completely unaffected by w1's "
+      "overshot estimate (11.0 -> pulled back to 5.0); a real word0-vs-w1 inversion (10.0 then 5.0) can "
+      "still remain -- one of the two confident ANCHORS is itself wrong here, which this pass can't "
+      "resolve -- but it no longer drags w2/w3/w4 down with it")
+
+print("  BUG REGRESSION (real case: David Bowie - I'm Afraid Of Americans, 'Johnny wants a brain, Johnny "
+      "wants to suck on a coke' -- a repeated phrase elsewhere in the song stole the whole-song match, "
+      "leaving this real run unmatched and landing compressed/wrong via blind interpolation): "
+      "rematch_local_gaps retries an unmatched run using ONLY the ASR words bounded between its nearest "
+      "confident neighbors, so a same-text decoy far outside that window can't be picked instead:")
+from ultrastar_generator.realign import rematch_local_gaps
+rlg_words = extract_words([
+    Syllable(text="hello", start=0.0, end=0.5, midi_note=0, is_word_start=True),
+    Syllable(text="echo", start=1.0, end=1.5, midi_note=0, is_word_start=True),
+    Syllable(text="echo", start=2.0, end=2.5, midi_note=0, is_word_start=True),
+    Syllable(text="world", start=3.0, end=3.5, midi_note=0, is_word_start=True),
+])
+rlg_asr = [
+    _Word(text="echo", start=100.0, end=100.3),   # decoy: same text, way outside the [10.5, 20.0] window
+    _Word(text="hello", start=10.0, end=10.5),
+    _Word(text="echo", start=12.0, end=12.3),      # real first 'echo', inside the window
+    _Word(text="echo", start=15.0, end=15.3),      # real second 'echo', inside the window
+    _Word(text="world", start=20.0, end=20.5),
+]
+rlg_starts = [10.0, None, None, 20.0]
+rlg_ends = [10.5, None, None, 20.5]
+rlg_confident = [True, False, False, True]
+rlg_n = rematch_local_gaps(rlg_words, rlg_asr, rlg_starts, rlg_ends, rlg_confident)
+assert rlg_n == 2, rlg_n
+assert rlg_confident == [True, True, True, True], rlg_confident
+assert rlg_starts == [10.0, 12.0, 15.0, 20.0], rlg_starts
+print("  OK: both 'echo' occurrences recovered from their real, IN-WINDOW ASR timestamps (12.0/15.0) -- "
+      "the far-away same-text decoy at t=100 was never a candidate")
+
+rlg2_words = extract_words([
+    Syllable(text="mystery", start=1.0, end=1.5, midi_note=0, is_word_start=True),
+    Syllable(text="hello", start=2.0, end=2.5, midi_note=0, is_word_start=True),
+])
+rlg2_asr = [_Word(text="hello", start=10.0, end=10.5)]  # 'mystery' genuinely never transcribed at all
+rlg2_starts = [None, 10.0]
+rlg2_ends = [None, 10.5]
+rlg2_confident = [False, True]
+rlg2_n = rematch_local_gaps(rlg2_words, rlg2_asr, rlg2_starts, rlg2_ends, rlg2_confident)
+assert rlg2_n == 0 and rlg2_confident == [False, True], (rlg2_n, rlg2_confident)
+print("  OK: a word genuinely absent from the ASR window is left unmatched (for interpolate_fallback), "
+      "not force-matched to something implausible")
+
 print("  seed_lrc_anchors: LRCLIB line starts fill in an anchor for the first not-yet-confident word of "
       "each matched line (a forced/pinned candidate skips network + candidate-selection filtering):")
 from ultrastar_generator.lyrics_lookup import LrcLibCandidate
@@ -2653,6 +2722,60 @@ mww_prep = prepare_lrc(mww_existing, mww_asr[1:], "A", "T", 100.0, forced_candid
 assert mww_prep is not None and mww_prep.word_lines == [0, 0, 1, 1], mww_prep
 print("  OK: prepare_lrc returns the calibrated lines + per-word line assignment both strategies build on")
 
+print("  check_repeat_structure: rejects an LRC candidate whose REPEAT STRUCTURE doesn't match ours -- "
+      "BUG REGRESSION (real case: David Bowie - I'm Afraid of Americans, an LRC candidate from a "
+      "different edition/box-set mix with 9 extra chorus repeats): the real signal can't be a single "
+      "exact-repeated LINE, since a real chorus is often split across several near-duplicate variants "
+      "(e.g. 'I'm afraid of Americans'/'...of the world'/'...I can't help it'), each individually "
+      "landing within tolerance on its own -- the shared distinctive WORD across all of them is needed:")
+from ultrastar_generator.realign import _reconstruct_our_lines, check_repeat_structure
+
+crs_entries = []
+for _ in range(3):
+    crs_entries.append(Syllable(text="chorus", start=0.0, end=0.1, midi_note=0, is_word_start=True))
+    crs_entries.append(Syllable(text="one", start=0.1, end=0.2, midi_note=0, is_word_start=True))
+    crs_entries.append(LineBreak(start=0.2, end=0.3))
+for _ in range(3):
+    crs_entries.append(Syllable(text="chorus", start=0.0, end=0.1, midi_note=0, is_word_start=True))
+    crs_entries.append(Syllable(text="two", start=0.1, end=0.2, midi_note=0, is_word_start=True))
+    crs_entries.append(LineBreak(start=0.2, end=0.3))
+crs_our_lines = _reconstruct_our_lines(crs_entries)
+assert crs_our_lines == ["chorus one"] * 3 + ["chorus two"] * 3, crs_our_lines
+
+crs_lrc_matching = ["chorus one"] * 3 + ["chorus two"] * 3
+assert check_repeat_structure(crs_our_lines, crs_lrc_matching) is None
+print("  OK: matching repeat structure ('chorus' appears 6x total on both sides, split the same way "
+      "across both variants) -> not rejected")
+
+crs_lrc_mismatched = ["chorus one"] * 4 + ["chorus two"] * 4  # 8x vs our 6x -- structurally different
+crs_rejection = check_repeat_structure(crs_our_lines, crs_lrc_mismatched)
+assert crs_rejection is not None and "chorus" in crs_rejection, crs_rejection
+print("  OK: mismatched repeat structure ('chorus' 6x vs 8x, split across TWO near-duplicate line "
+      "variants each individually within tolerance on its own) -> correctly rejected via the shared "
+      "distinctive word, not just the single most-repeated exact line")
+
+assert check_repeat_structure(["alpha", "bravo", "charlie"], ["anything", "goes", "here"]) is None
+print("  OK: no repeated line in our own file at all -> nothing to check, never rejects")
+
+print("  prepare_lrc: a repeat-structure-mismatched candidate is rejected outright (via our_lines/log), "
+      "even though it would otherwise be perfectly usable (forced candidate, so selection/duration/"
+      "content filters don't apply):")
+crs_prep_words = extract_words(crs_entries)
+crs_lrc_text = "\n".join(f"[00:{i:02d}.00]chorus one" for i in range(4)) + "\n" + \
+               "\n".join(f"[00:{i + 10:02d}.00]chorus two" for i in range(4))
+crs_forced = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=None,
+    plain_lyrics="chorus one chorus two", synced_lyrics=crs_lrc_text,
+    instrumental=False, id=555,
+)
+crs_prep_log = []
+crs_prep_result = prepare_lrc(crs_prep_words, [], "A", "T", 100.0, forced_candidate=crs_forced,
+                               our_lines=crs_our_lines, log=crs_prep_log.append)
+assert crs_prep_result is None, crs_prep_result
+assert any("rejected" in line for line in crs_prep_log), crs_prep_log
+print("  OK: prepare_lrc itself rejects the candidate (returns None, same as 'no candidate found') and "
+      "logs the specific reason when our_lines/log are provided")
+
 print("  realign_song end-to-end with lrc_mode='windowed': same forced candidate, output stays consistent "
       "with the windowed matcher's own per-line window (not just whole-song ASR matching):")
 rsw_existing = ParsedSong(
@@ -2674,6 +2797,47 @@ assert abs(rsw_syllables[0].start - 10.05) < 1e-6, rsw_syllables[0]  # picked th
 assert [s.midi_note for s in rsw_syllables] == [1, 2, 3, 4], rsw_syllables  # pitch still never touched
 print("  OK: realign_song(lrc_mode='windowed') end-to-end also correctly rejects the far-away decoy via "
       "the LRC line window, pitch untouched")
+
+print("  BUG REGRESSION (real case: David Bowie - Heroes): lrc_mode='seed' must ALSO refuse to seed "
+      "anchors from an LRC candidate whose time calibration failed -- a wrong-recording candidate's "
+      "uncalibrated line timestamp seeded as an anchor can land LATER than several already-correctly-"
+      "ASR-matched neighbors, and interpolate_fallback's forward-only monotonic clamp then drags those "
+      "correct neighbors forward to match the bad anchor, corrupting real matches, not just filling a "
+      "genuine gap. Confirmed real case: an LRCLIB candidate for 'Heroes' by a completely different "
+      "artist (a choral cover, calibration_confidence=0.0) seeded 'Then' at a time LATER than 'Just for "
+      "one day', which was already correctly ASR-matched -- corrupting that whole passage:")
+bg_existing = extract_words([
+    Syllable(text="alpha", start=0.0, end=1.0, midi_note=0, is_word_start=True),
+    Syllable(text="bravo", start=1.0, end=2.0, midi_note=0, is_word_start=True),
+    Syllable(text="charlie", start=2.0, end=3.0, midi_note=0, is_word_start=True),
+    Syllable(text="delta", start=3.0, end=4.0, midi_note=0, is_word_start=True),
+])
+# Only 1 real ASR match to the LRC's own line text -- not enough samples for
+# two_tier_time_calibration to trust ANY offset (same as the real Bowie case:
+# calibration_confidence=0.0, not just "borderline").
+bg_asr = [_Word(text="alpha", start=10.05, end=10.3)]
+bg_starts, bg_ends, bg_confident = match_words_to_asr(bg_existing, bg_asr)
+assert bg_confident == [True, False, False, False], bg_confident
+
+bg_existing_song = ParsedSong(
+    title="T", artist="A", bpm=60.0, gap_ms=0,
+    entries=[
+        Syllable(text="alpha", start=0.0, end=1.0, midi_note=1, is_word_start=True),
+        Syllable(text="bravo", start=1.0, end=2.0, midi_note=2, is_word_start=True),
+        Syllable(text="charlie", start=2.0, end=3.0, midi_note=3, is_word_start=True),
+        Syllable(text="delta", start=3.0, end=4.0, midi_note=4, is_word_start=True),
+    ],
+    raw_tags={"TITLE": "T", "ARTIST": "A", "BPM": "60", "GAP": "0"},
+)
+bg_log = []
+bg_result = realign_song(bg_existing_song, bg_asr, artist="A", title="T", audio_duration=100.0,
+                          use_lrc=True, lrc_mode="seed", forced_lrc_candidate=sla_candidate, log=bg_log.append)
+assert bg_result.success, bg_result.error
+assert bg_result.quality.n_lrc_seeded == 0, bg_result.quality
+assert any("NOT trusted as a seed anchor" in line for line in bg_log), bg_log
+print("  OK: lrc_mode='seed' also declines to seed from an uncalibrated candidate (0 seeded, not 1) -- "
+      "'charlie' (first word of line 2) is left for interpolate_fallback instead of a raw, untrusted "
+      "line timestamp")
 
 print("  realign_song end-to-end: a file whose notes are a degenerate flat list of equal-length "
       "placeholder notes (don't match the audio at all) gets re-timed to match real ASR, with the SAME "
@@ -2760,6 +2924,120 @@ print("  OK: an explicit --output that resolves to the SAME path as the existing
 ro_different_out = resolve_realign_output_path(ro_existing_path, "C:/Songs/somewhere/else.txt")
 assert check_output_not_existing_file(ro_different_out, ro_existing_path) is None
 print("  OK: an explicit --output pointing somewhere genuinely different is allowed")
+
+print("\n--- realign: 'validate' strategy (PROTOTYPE) -- a word CONFIRMED by ASR near its own "
+      "(GAP-corrected) original position is left completely untouched instead of being replaced "
+      "with ASR's own value ---")
+from ultrastar_generator.realign import (
+    compute_gap_calibration, validate_words_against_asr, realign_song_validate, GapCalibration,
+)
+
+print("  compute_gap_calibration: 'sometimes the song file is nearly perfect but the GAP is wrong so "
+      "everything is offset' -- a UNIFORM +5.0s shift across every word is detected as a single "
+      "constant offset, not treated as N independent per-word corrections:")
+gc_words = extract_words([
+    Syllable(text="alpha", start=10.0, end=10.5, midi_note=0, is_word_start=True),
+    Syllable(text="bravo", start=11.0, end=11.5, midi_note=0, is_word_start=True),
+    Syllable(text="charlie", start=12.0, end=12.5, midi_note=0, is_word_start=True),
+    Syllable(text="delta", start=13.0, end=13.5, midi_note=0, is_word_start=True),
+    Syllable(text="echo", start=14.0, end=14.5, midi_note=0, is_word_start=True),
+])
+gc_asr = [_Word(text="alpha", start=15.0, end=15.5), _Word(text="bravo", start=16.0, end=16.5),
+          _Word(text="charlie", start=17.0, end=17.5), _Word(text="delta", start=18.0, end=18.5),
+          _Word(text="echo", start=19.0, end=19.5)]
+gc = compute_gap_calibration(gc_words, gc_asr)
+assert gc.offset is not None and abs(gc.offset - 5.0) < 1e-6 and gc.kind == "constant", gc
+assert gc.confidence == 1.0, gc.confidence
+print("  OK: a uniform +5.0s shift across all 5 words is recovered as one confident constant GAP "
+      "offset, using the SAME robust two-tier calibration already validated for LRC line timing")
+
+print("  validate_words_against_asr: a word whose (GAP-corrected) original position is confirmed by "
+      "ASR is kept EXACTLY as original -- position AND length -- not replaced by ASR's own (slightly "
+      "different) timestamp; a word ASR disagrees with is left unvalidated:")
+gc_words2 = extract_words([
+    Syllable(text="alpha", start=10.0, end=10.5, midi_note=0, is_word_start=True),
+    Syllable(text="bravo", start=11.0, end=11.5, midi_note=0, is_word_start=True),
+])
+# A pre-built GapCalibration (bypassing compute_gap_calibration's own
+# >=5-sample minimum, tested separately above) with a known +5.0s offset --
+# alpha's ASR match (15.0) is within tolerance of its expected (10.0+5.0=
+# 15.0); bravo's ASR match is deliberately way off (30.0, not 16.0) and
+# must NOT validate.
+gc2 = GapCalibration(offset=5.0, slope=0.0, confidence=1.0, kind="constant", skipped_reason=None,
+                      asr_starts=[15.0, 30.0], asr_ends=[15.6, 30.6], asr_confident=[True, True])
+vw_starts, vw_ends, vw_validated = validate_words_against_asr(gc_words2, gc2)
+assert vw_validated == [True, False], vw_validated
+assert vw_starts[0] == 15.0 and vw_ends[0] == 15.5, (vw_starts[0], vw_ends[0])  # ORIGINAL 0.5s length kept,
+                                                                                  # NOT ASR's own 0.6s span
+print("  OK: 'alpha' validated with its OWN original 0.5s length (10.0-10.5, shifted to 15.0-15.5), "
+      "NOT overwritten by ASR's own slightly-different 15.0-15.6 span; 'bravo' (ASR disagrees) is "
+      "correctly left unvalidated")
+
+print("  realign_song_validate end-to-end: an already-correct file whose ONLY problem is a wrong GAP -- "
+      "every word's own relative timing/length is preserved EXACTLY, just uniformly shifted, and pitch/"
+      "note-count/BPM are untouched (same invariants as realign_song). Needs >= 5 agreeing words for "
+      "two_tier_time_calibration's own minimum-sample gate to trust a single offset at all:")
+rv_existing = ParsedSong(
+    title="GapOnly", artist="Test Artist", bpm=120.0, gap_ms=0,
+    entries=[
+        Syllable(text="one", start=10.0, end=10.4, midi_note=5, is_word_start=True, note_type=":"),
+        Syllable(text="two", start=11.0, end=11.9, midi_note=7, is_word_start=True, note_type="*"),
+        LineBreak(start=11.9, end=12.0),
+        Syllable(text="three", start=12.0, end=12.3, midi_note=9, is_word_start=True, note_type=":"),
+        Syllable(text="four", start=13.0, end=13.2, midi_note=2, is_word_start=True, note_type=":"),
+        Syllable(text="five", start=14.0, end=14.6, midi_note=4, is_word_start=True, note_type=":"),
+    ],
+    raw_tags={"TITLE": "GapOnly", "ARTIST": "Test Artist", "BPM": "120", "GAP": "0"},
+)
+rv_asr = [_Word(text="one", start=18.0, end=18.4), _Word(text="two", start=19.0, end=19.7),
+          _Word(text="three", start=20.0, end=20.2), _Word(text="four", start=21.0, end=21.3),
+          _Word(text="five", start=22.0, end=22.9)]
+rv_log = []
+rv_result = realign_song_validate(rv_existing, rv_asr, use_lrc=False, log=rv_log.append)
+assert rv_result.success, rv_result.error
+rv_syllables = [e for e in rv_result.song.entries if isinstance(e, Syllable)]
+# GAP offset should be exactly +8.0s (18-10, 19-11, 20-12, 21-13, 22-14 all agree).
+assert [round(s.start, 6) for s in rv_syllables] == [18.0, 19.0, 20.0, 21.0, 22.0], rv_syllables
+# Original LENGTHS preserved exactly -- NOT replaced by ASR's own (slightly different) spans.
+assert [round(s.end - s.start, 6) for s in rv_syllables] == [0.4, 0.9, 0.3, 0.2, 0.6], rv_syllables
+assert [s.midi_note for s in rv_syllables] == [5, 7, 9, 2, 4], rv_syllables
+assert [s.note_type for s in rv_syllables] == [":", "*", ":", ":", ":"], rv_syllables
+assert len(rv_result.song.entries) == len(rv_existing.entries)
+assert rv_result.song.bpm == 120.0
+assert rv_result.quality.n_validated == 5, rv_result.quality
+print("  OK: all 5 words validated and shifted by exactly the same +8.0s GAP correction, each keeping "
+      "its OWN original length rather than ASR's own slightly different span -- pitch/note-type/"
+      "note-count/BPM untouched")
+
+print("  realign_song_validate: a mostly-correct file with ONE genuinely wrong word -- the wrong word "
+      "is repositioned via interpolation while its correctly-matching neighbors (>= 5 of them, so the "
+      "GAP calibration itself is well-established) stay validated (untouched) around it:")
+rvm_existing = ParsedSong(
+    title="Mostly", artist="A", bpm=120.0, gap_ms=0,
+    entries=[
+        Syllable(text="one", start=0.0, end=0.4, midi_note=1, is_word_start=True),
+        Syllable(text="two", start=1.0, end=1.4, midi_note=2, is_word_start=True),
+        Syllable(text="three", start=2.0, end=2.4, midi_note=3, is_word_start=True),   # this one is WRONG
+        Syllable(text="four", start=3.0, end=3.4, midi_note=4, is_word_start=True),
+        Syllable(text="five", start=4.0, end=4.4, midi_note=5, is_word_start=True),
+        Syllable(text="six", start=5.0, end=5.4, midi_note=6, is_word_start=True),
+    ],
+    raw_tags={"TITLE": "Mostly", "ARTIST": "A", "BPM": "120", "GAP": "0"},
+)
+# one/two/four/five/six all agree on a clean +10.0s offset; "three"'s real
+# ASR match is a wild outlier (50.0) that must NOT be trusted as validating it.
+rvm_asr = [_Word(text="one", start=10.0, end=10.4), _Word(text="two", start=11.0, end=11.4),
+           _Word(text="three", start=50.0, end=50.4), _Word(text="four", start=13.0, end=13.4),
+           _Word(text="five", start=14.0, end=14.4), _Word(text="six", start=15.0, end=15.4)]
+rvm_result = realign_song_validate(rvm_existing, rvm_asr, use_lrc=False, log=lambda s: None)
+assert rvm_result.success, rvm_result.error
+rvm_syllables = [e for e in rvm_result.song.entries if isinstance(e, Syllable)]
+assert rvm_syllables[1].start == 11.0 and rvm_syllables[3].start == 13.0, rvm_syllables  # validated, untouched
+assert 11.0 < rvm_syllables[2].start < 13.0, rvm_syllables[2]  # repositioned BETWEEN its validated neighbors,
+                                                                  # not left at the wild ASR outlier (50.0)
+assert rvm_result.quality.n_validated == 5 and rvm_result.quality.n_interpolated == 1, rvm_result.quality
+print("  OK: 'two'/'four' (and the other agreeing words) validated and untouched; 'three' (wild ASR "
+      "outlier) correctly rejected and interpolated between its validated neighbors instead")
 
 print("  realign: find_existing_txt_in_folder auto-detects the single .txt to realign in a folder "
       "(needed for --batch, where a single explicit --existing-txt can't apply across multiple "

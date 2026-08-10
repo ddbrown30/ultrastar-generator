@@ -761,6 +761,79 @@ MXL_LRC_BLOCK_MAX_WORDS = 6
 MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3
 
 
+# --- realign.py "validate" strategy (PROTOTYPE, 2026-08-09) ----------------
+# A word's own ORIGINAL start (after the single global GAP/drift correction
+# computed by compute_gap_calibration) is trusted EXACTLY -- position AND
+# length left completely untouched -- if a confident whole-song ASR match
+# for that word lands within this many seconds of that expected position.
+# Only START proximity is checked, never END (see validate_words_against_asr's
+# own docstring for why -- ASR is known-unreliable at the end of a
+# sustained/held note). NOT yet empirically validated against real ground
+# truth beyond informal spot-checks -- picked by analogy to this project's
+# other word-level timing-agreement tolerances (e.g. EXISTING_TXT_TIMING_
+# TOLERANCE_SEC=0.5, MXL_LRC's own ASR-match acceptance), not measured.
+REALIGN_VALIDATE_TOLERANCE_SEC = 0.3
+
+# --- realign.py local-rematch second pass (2026-08-09) ---------------------
+# `match_words_to_asr`'s whole-song text match can leave a contiguous run of
+# existing words unmatched even though the audio really does contain them --
+# confirmed real case (David Bowie "I'm Afraid Of Americans": "Johnny wants a
+# brain, Johnny wants to suck on a coke" landed compressed into the wrong
+# span because none of those words got a whole-song match that run). Root
+# cause: the whole-song matcher has no time information at all, so when a
+# short phrase repeats several times nearby (as it does here -- "Johnny
+# wants" x4), it's easy for a DIFFERENT, non-adjacent repeat to steal the
+# text match, leaving the real local occurrence unmatched. Rather than
+# falling straight through to proportional interpolation (which has no way
+# to know a real silence/pause exists inside the gap), a second, LOCAL pass
+# retries the match for any still-unmatched run using ONLY the ASR words
+# whose own timestamp falls between the nearest confident anchors before and
+# after that run (+/- this slack) -- much less ambiguous than a whole-song
+# search since it's bounded to roughly where the run actually has to be.
+# Only ever fills in words that were otherwise going to be interpolated --
+# can't make an already-good match worse.
+REALIGN_LOCAL_REMATCH_SLACK_SEC = 1.0
+
+# --- transcription.py long-segment re-windowing (PROTOTYPE, 2026-08-09) ----
+# Real bug (David Bowie - Magic Dance): a whisper DECODER segment can
+# declare a much longer span than its own text plausibly needs (real case:
+# 20.1s for an 8-word line, "In 9 hours and 23 minutes, you'll be mine.")
+# -- a symptom of the decoder silently DROPPING real intervening content
+# (the "Jump Magic Jump!..." section actually sung in there). Forcing
+# wav2vec2 to align the short remaining text against the WHOLE oversized
+# window produces a confidently-wrong placement: real case, crammed into
+# the first ~3s of the window (mean word score 0.56), nowhere near the
+# true ~114-118s position (user confirmed by ear).
+#
+# Real, validated fix: for any segment at least this long, sweep smaller
+# fixed-width candidate windows across its own declared span (step below)
+# and keep whichever gives the best mean word score, PROVIDED it beats the
+# baseline (whole-segment) score by at least the margin below -- otherwise
+# keep the baseline alignment untouched. Real validation: a FINE (1s step)
+# sweep found a sharp, correct peak (mean score 0.751) at the user's
+# confirmed position that a coarser first attempt (2s step) skipped right
+# over, and that peak beat every other candidate -- including a
+# plausible-looking false local optimum (0.649) -- by a wide, unambiguous
+# margin (the false peak only beat the baseline by ~0.08-0.09, well under
+# the margin below, which is why a threshold this size should reject it).
+# `REWINDOW_MIN_SCORE_IMPROVEMENT` is a first estimate from this ONE real
+# case (roughly half the true peak's 0.19 margin over baseline) -- not
+# yet validated across multiple songs.
+#
+# ON by default everywhere (2026-08-10) -- real-validated across 12 total
+# runs (8 realign-mode songs, 4 full generation-pipeline songs), zero
+# regressions, 6 genuine verified fixes carried through to the actual
+# written output (not just the intermediate ASR score). See CLAUDE.md's
+# "Long-segment re-windowing" section for the full validation history.
+# `--no-rewindow-long-segments` (CLI, both realign.py and main.py) opts
+# back out if ever needed.
+REWINDOW_ENABLED = True
+REWINDOW_MIN_SEGMENT_DURATION_SEC = 10.0
+REWINDOW_CANDIDATE_WIDTH_SEC = 10.0
+REWINDOW_STEP_SEC = 1.0
+REWINDOW_MIN_SCORE_IMPROVEMENT = 0.10
+
+
 @dataclass
 class PipelineOptions:
     """Every knob `run_pipeline`/`run_batch` (main.py) need, decoupled from
@@ -785,6 +858,7 @@ class PipelineOptions:
     no_video_sync: bool = False
     no_whisperx: bool = False
     whisperx_no_vad: bool = ENABLE_WHISPERX_NO_VAD
+    rewindow_long_segments: bool = REWINDOW_ENABLED
     verify_words: bool = ENABLE_WORD_VERIFICATION
     verify_placement: bool = ENABLE_PLACEMENT_VERIFICATION
     verify_all_words: bool = VERIFY_ALL_WORDS

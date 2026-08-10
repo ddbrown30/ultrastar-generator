@@ -380,6 +380,7 @@ class App(tk.Tk):
         self.existing_txt_path = tk.StringVar()
         self.realign_use_lrc = tk.BooleanVar(value=True)
         self.lrc_mode = tk.StringVar(value="windowed")
+        self.realign_strategy = tk.StringVar(value="replace")
         self.realign_delete_work_files = tk.BooleanVar(value=False)
 
         # Curated main-surface options (see gui.py's own module docstring
@@ -645,10 +646,20 @@ class App(tk.Tk):
                                  "always whole-song-transcription-primary, LRC only fills residual gaps. "
                                  "Real comparison found 'windowed' never worse and sometimes much better "
                                  "-- see CLAUDE.md.")
+        ttk.Label(realign_options_frame, text="Strategy:").grid(row=2, column=0, sticky="w", padx=8, pady=2)
+        realign_strategy_combo = ttk.Combobox(realign_options_frame, textvariable=self.realign_strategy,
+                                               values=["replace", "validate"], state="readonly", width=10)
+        realign_strategy_combo.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=2)
+        Tooltip(realign_strategy_combo, "replace (default): a word confidently matched to the audio has its "
+                                          "timing REPLACED with the transcription's own value. validate "
+                                          "(PROTOTYPE): a word whose existing position roughly agrees with the "
+                                          "audio (after one global GAP correction) is left completely untouched "
+                                          "instead. Only helps when the file is ALREADY mostly accurate -- not "
+                                          "a general fix for files that don't match the audio. See CLAUDE.md.")
         realign_delete_work_files_check = ttk.Checkbutton(
             realign_options_frame, text="Delete work files after realigning",
             variable=self.realign_delete_work_files)
-        realign_delete_work_files_check.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        realign_delete_work_files_check.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=2)
         Tooltip(realign_delete_work_files_check, "Deletes the entire .ultrastar_work directory (cached "
                                                    "Demucs separation, debug files) once realigning completes. "
                                                    "Leave off if you'll re-run this song again soon -- it "
@@ -1115,6 +1126,7 @@ class App(tk.Tk):
             lrclib_id=None if is_batch else self._effective_lrclib_id(),
             use_lrc=self.realign_use_lrc.get(),
             lrc_mode=self.lrc_mode.get(),
+            strategy=self.realign_strategy.get(),
             delete_work_files=self.realign_delete_work_files.get(),
         )
 
