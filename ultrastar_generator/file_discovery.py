@@ -234,21 +234,86 @@ def parse_artist_title(audio_path: Path) -> tuple[str, str]:
 
 
 def resolve_artist_title(audio_path: Path, input_dir: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Tries the audio file's own name first (parse_artist_title's usual
-    contract); if that fails -- e.g. a ripped/downloaded file keeping a
-    generic name like "music.ogg" while the FOLDER it's in is still named
-    "<Artist> - <Title>" (a real, confirmed case: this project's own
-    "Beauty And The Beast - Beauty And The Beast" SingStar-rip test song)
-    -- falls back to the input folder's own name. Uses the folder's raw
-    `.name` (not `.stem`, which would wrongly treat a dot inside a folder
-    name as a file extension to strip, since folders don't have real
-    extensions). Returns (None, None) if neither works -- never raises,
-    unlike `parse_artist_title` itself."""
-    try:
-        return parse_artist_title(audio_path)
-    except ValueError:
-        pass
+    """Input is folder-based (see module docstring), so the INPUT FOLDER's
+    own name is the sole, authoritative "<Artist> - <Title>" source -- a
+    file inside can be named anything at all (a ripped/downloaded file
+    keeping a generic name like "music.ogg", multiple companion files with
+    unrelated names, etc; real confirmed case: this project's own
+    "Beauty And The Beast - Beauty And The Beast" SingStar-rip test song).
+    `audio_path` is accepted but intentionally unused -- kept so call
+    sites don't need special-casing depending on which source they have
+    handy. Uses the folder's raw `.name` (not `.stem`, which would
+    wrongly treat a dot inside a folder name as a file extension to
+    strip, since folders don't have real extensions). Returns (None,
+    None) if the folder name doesn't parse -- never raises, unlike
+    `parse_artist_title` itself."""
+    del audio_path
     try:
         return _split_artist_title(Path(input_dir).name)
     except ValueError:
         return None, None
+
+
+_MINOR_WORDS = {
+    "a", "an", "the",
+    "and", "but", "or", "nor", "for", "so", "yet",
+    "as", "at", "by", "in", "into", "of", "off", "on", "onto", "out", "over",
+    "per", "to", "up", "via", "with", "from",
+}
+
+
+def _word_case_shape(word: str) -> str:
+    """Classifies a word's letters-only casing so `headline_case` knows
+    whether it's safe to touch: "simple" (all-lowercase, or exactly one
+    leading capital + the rest lowercase -- including single-letter
+    words, which are inherently ambiguous either way) can be safely
+    re-cased; "upper" (2+ letters, ALL of them uppercase -- an acronym or
+    stylized name, e.g. "AND") and "mixed" (any other pattern, e.g.
+    "KPop", "McDonald") must be left completely alone since we can't
+    safely guess whether that capitalization is intentional; "none" (no
+    letters at all, e.g. "&") is never touched either."""
+    letters = [c for c in word if c.isalpha()]
+    if not letters:
+        return "none"
+    if all(c.isupper() for c in letters):
+        return "upper" if len(letters) > 1 else "simple"
+    if letters[0].isupper() and all(c.islower() for c in letters[1:]):
+        return "simple"
+    if all(c.islower() for c in letters):
+        return "simple"
+    return "mixed"
+
+
+def _capitalize_first_letter(word: str) -> str:
+    for i, c in enumerate(word):
+        if c.isalpha():
+            return word[:i] + c.upper() + word[i + 1:]
+    return word
+
+
+def headline_case(text: str) -> str:
+    """Title-cases `text` for display in output folder/file names (e.g.
+    "Beauty And The Beast" -> "Beauty and the Beast") -- minor words
+    (articles/conjunctions/short prepositions, see `_MINOR_WORDS`) are
+    lowercased unless they're the first or last word. Deliberately NOT
+    aggressive: only words in an unambiguous "simple" case shape (see
+    `_word_case_shape`) are ever touched -- an ALL CAPS word (e.g. "AND")
+    or one with unusual internal capitalization (e.g. "KPop") is left
+    completely untouched, since forcing it into "and"/"Kpop" would
+    destroy what's very likely intentional stylization. Splits on
+    whitespace only; any punctuation attached to a word (e.g. "Beast,",
+    "Don't") stays attached and untouched."""
+    words = text.split(" ")
+    n = len(words)
+    out = []
+    for i, word in enumerate(words):
+        if _word_case_shape(word) != "simple":
+            out.append(word)
+            continue
+        lowered = word.lower()
+        letters_only = "".join(c for c in lowered if c.isalpha())
+        if i != 0 and i != n - 1 and letters_only in _MINOR_WORDS:
+            out.append(lowered)
+        else:
+            out.append(_capitalize_first_letter(lowered))
+    return " ".join(out)

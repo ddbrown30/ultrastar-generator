@@ -42,6 +42,7 @@ from typing import Callable, List, Optional, Tuple
 
 from . import config
 from .models import Word
+from .syllables import hyphenate
 
 # Lines that are pure section/annotation markers (e.g. "[Chorus]",
 # "[Verse 2]") or a source's occasional trailing credit line, not actual
@@ -282,6 +283,56 @@ def fetch_reference_lyrics(
     return _fetch_from_lyrics_ovh(artist, title)
 
 
+def reference_match_ratio(ref_lines: List[str], words: List[Word]) -> float:
+    """The raw vocabulary-overlap ratio underlying `reference_matches_transcript`
+    -- factored out so a caller that needs the actual NUMBER, not just a
+    pass/fail against `REFERENCE_LYRICS_MIN_MATCH_RATIO`'s deliberately
+    lenient "is this even the right song" bar, can reuse the exact same
+    computation. Used by main.py's ASR-quality retry check (see
+    `config.RETRY_ASR_MIN_REFERENCE_MATCH_RATIO`), which asks a stricter
+    question -- "did ASR transcribe it well" -- against a reference that's
+    already cleared the lower bar."""
+    if not ref_lines or not words:
+        return 0.0
+    ref_norm, _, _ = _tokenize_lines(ref_lines)
+    asr_norm = [_normalize(w.text) for w in words if _normalize(w.text)]
+    if not ref_norm or not asr_norm:
+        return 0.0
+    return difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False).ratio()
+
+
+def largest_unmatched_reference_run(ref_lines: List[str], words: List[Word]) -> int:
+    """Size (in reference words) of the LARGEST contiguous run of reference
+    words with NO corresponding ASR word at all -- a difflib 'insert'
+    opcode in the SAME whole-sequence alignment `align_words_to_reference`
+    itself uses. `align_words_to_reference` already recognizes this exact
+    case (see its own 'tag == "insert"' comment: "reference has word(s)
+    ASR completely missed... simply not represented") but has nothing to
+    DO with an insert block -- there's no ASR word to attach a corrected
+    text/timing to, so it's silently dropped from the final output with no
+    signal anywhere.
+
+    This is a materially different failure than a low match ratio spread
+    thinly across many individually-mistranscribed words (what
+    `reference_match_ratio` measures): it's ASR dropping a whole real
+    passage outright (real case: "Trixie Mattel - Gold", the reference's
+    "Doo doo doo doo doo. They start to play." is transcribed correctly at
+    one repeat of this chorus later in the song but produces ZERO ASR
+    words at an earlier, otherwise-identical repeat -- an aggregate ratio
+    over the whole 326-word transcript stayed well above the retry bar
+    even though this one passage was completely missing end to end). A
+    long insert run is a precise, sharp fingerprint for exactly that,
+    independent of how well the REST of the song transcribed."""
+    if not ref_lines or not words:
+        return 0
+    ref_norm, _, _ = _tokenize_lines(ref_lines)
+    asr_norm = [_normalize(w.text) for w in words]
+    if not ref_norm or not asr_norm:
+        return 0
+    matcher = difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False)
+    return max((b1 - b0 for tag, a0, a1, b0, b1 in matcher.get_opcodes() if tag == "insert"), default=0)
+
+
 def reference_matches_transcript(ref_lines: List[str], words: List[Word],
                                   min_ratio: float = config.REFERENCE_LYRICS_MIN_MATCH_RATIO) -> bool:
     """Sanity-checks a fetched reference against the ASR transcript's OWN
@@ -294,14 +345,7 @@ def reference_matches_transcript(ref_lines: List[str], words: List[Word],
     none. Source-independent by design -- applies whichever source
     answered.
     """
-    if not ref_lines or not words:
-        return False
-    ref_norm, _, _ = _tokenize_lines(ref_lines)
-    asr_norm = [_normalize(w.text) for w in words if _normalize(w.text)]
-    if not ref_norm or not asr_norm:
-        return False
-    ratio = difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False).ratio()
-    return ratio >= min_ratio
+    return reference_match_ratio(ref_lines, words) >= min_ratio
 
 
 def parse_lyrics_lines(raw_lyrics: str) -> List[str]:
@@ -331,18 +375,36 @@ def _normalize(s: str) -> str:
 
 def _tokenize_lines(lines: List[str]) -> Tuple[List[str], List[str], List[int]]:
     """Returns (normalized_tokens, original_tokens, line_ids) -- three
-    parallel lists, one entry per word across all lines."""
+    parallel lists, one entry per word across all lines.
+
+    A hyphenated token is split into its own separate tokens (2026-08-10)
+    -- lyrics sites commonly write a repeated ad-lib/backing-vocal
+    syllable as ONE hyphenated token ("Do-do-do-do-do" for 5 separately
+    sung "do"s, real case: Trixie Mattel - Gold), which otherwise counts
+    as a single reference word no matter how many real sung words it
+    represents. This under-counted severity for
+    `largest_unmatched_reference_run` (a whole dropped "Do-do-do-do-do"
+    passage only ever scored 1, never enough to clear a sane threshold)
+    and meant `align_words_to_reference`'s own alignment could only ever
+    match/miss the whole 5-syllable blob as one unit rather than as 5
+    separate words -- `align_words_to_reference`'s own uneven-"replace"-
+    block handling already has a dedicated `is_repeat_clamp` path for
+    when several ASR words map onto one repeated reference token; this
+    split makes that the FALLBACK case (ASR's own word count still
+    doesn't match) rather than the every-time case."""
     norm_tokens: List[str] = []
     orig_tokens: List[str] = []
     line_ids: List[int] = []
     for line_idx, line in enumerate(lines):
         for tok in line.split():
-            n = _normalize(tok)
-            if not n:
-                continue
-            norm_tokens.append(n)
-            orig_tokens.append(tok)
-            line_ids.append(line_idx)
+            parts = tok.split("-") if "-" in tok else [tok]
+            for part in parts:
+                n = _normalize(part)
+                if not n:
+                    continue
+                norm_tokens.append(n)
+                orig_tokens.append(part)
+                line_ids.append(line_idx)
     return norm_tokens, orig_tokens, line_ids
 
 
@@ -402,12 +464,60 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                 # enough to substitute directly here, but a real signal
                 # verification.py can cross-check a fresh, isolated
                 # re-transcription against.
+                #
+                # When a_len > b_len, min(b0+k, b1-1) clamps several ASR
+                # words onto the SAME single reference token -- fine for an
+                # ordinary word (verification.py just won't confirm it),
+                # but a real confirmed bug for a hyphenated repeated-unit
+                # token like LRC's "Do-do-do-do-do" (one written token
+                # standing in for 5 separately-sung "do"s, one per ASR
+                # word here): every one of those ASR words was getting the
+                # WHOLE 5-syllable blob as its reference_text, which
+                # verification.py's fallback ("neither confirms, trust
+                # reference") then stamped onto each word's final text
+                # verbatim -- multiplying one 5-syllable phrase into 5
+                # duplicate copies instead of splitting it across the 5
+                # words it actually spans. Fixed by handing out ONE
+                # hyphen-part of that token per repeated ASR word (reusing
+                # hyphenate() -- same tool lyric_alignment.py already uses
+                # to split a word across multiple notes, applied here at
+                # the reference-token level instead). A token that isn't
+                # itself hyphenated into >1 part (the common case) is
+                # unaffected -- this only changes behavior for the
+                # repeated-clamp case.
+                b_idx_counts: dict = {}
+                for k in range(a_len):
+                    b_idx_counts[min(b0 + k, b1 - 1)] = b_idx_counts.get(min(b0 + k, b1 - 1), 0) + 1
+                part_cache: dict = {}
+                part_cursor: dict = {}
                 for k in range(a_len):
                     w = words[a0 + k]
                     b_idx = min(b0 + k, b1 - 1)
+                    is_repeat_clamp = b_idx_counts[b_idx] > 1
+                    # Guard specifically for the repeat-clamp case: a real
+                    # confirmed bug had an unrelated ASR word ~10.6s later,
+                    # in silence, swept into this same block purely
+                    # because it was the last thing before the whole-song
+                    # sequence ran out on both sides -- never the same
+                    # repeated-token run as its (much closer together)
+                    # neighbors. See config.REFERENCE_CLAMP_MAX_GAP_SEC.
+                    if is_repeat_clamp and k > 0 and (w.start - words[a0 + k - 1].end) > config.REFERENCE_CLAMP_MAX_GAP_SEC:
+                        out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
+                                            confidence=w.confidence, line_id=None)
+                        continue
+                    ref_text = ref_orig[b_idx]
+                    if is_repeat_clamp:
+                        if b_idx not in part_cache:
+                            part_cache[b_idx] = hyphenate(ref_text)
+                            part_cursor[b_idx] = 0
+                        parts = part_cache[b_idx]
+                        if len(parts) > 1:
+                            p = min(part_cursor[b_idx], len(parts) - 1)
+                            ref_text = parts[p]
+                            part_cursor[b_idx] += 1
                     out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
                                         confidence=w.confidence, line_id=ref_line_ids[b_idx],
-                                        reference_text=ref_orig[b_idx])
+                                        reference_text=ref_text)
         elif tag == "delete":
             # ASR has word(s) the reference doesn't (ad-libs, hallucinated
             # filler, etc.) -- keep as-is; line_id filled in below from

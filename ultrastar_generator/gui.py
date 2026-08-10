@@ -25,7 +25,8 @@ from typing import Callable, List, Optional
 
 from . import config
 from .batch import run_batch
-from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError, resolve_artist_title, resolve_primary_source
+from .file_discovery import (AmbiguousInputError, NoAudioSourceFoundError, headline_case,
+                              resolve_artist_title, resolve_primary_source)
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
 from .main import PipelineResult, check_cuda_available, delete_work_files, run_pipeline
 from .realign import RealignPipelineOptions, run_realign_batch, run_realign_pipeline
@@ -441,26 +442,28 @@ class App(tk.Tk):
     def _resolved_artist_title(self) -> tuple:
         """Real artist/title if the user typed them, else auto-detected
         via the SAME real function run_pipeline itself uses
-        (file_discovery.resolve_artist_title -- tries the audio file's
-        own name first, falls back to the INPUT FOLDER's own name if
-        that doesn't parse, e.g. a ripped/downloaded file keeping a
-        generic name like "music.ogg" while its folder is still named
-        "<Artist> - <Title>") -- never a separate guess. Returns
-        (artist_or_None, title_or_None)."""
+        (file_discovery.resolve_artist_title -- the INPUT FOLDER's own
+        name is the sole source now that input is folder-based; a file
+        inside can be named anything at all) -- never a separate guess.
+        Headline-cased either way (see headline_case's own docstring),
+        matching what run_pipeline will actually use for the output
+        folder/file names. Returns (artist_or_None, title_or_None)."""
         artist = self.artist_entry.effective_value() if hasattr(self, "artist_entry") else None
         title = self.title_entry.effective_value() if hasattr(self, "title_entry") else None
-        if artist and title:
-            return artist, title
-        input_dir = self.input_dir.get().strip()
-        if not input_dir or not Path(input_dir).is_dir():
-            return artist, title
-        try:
-            audio_path, _kind = resolve_primary_source(
-                Path(input_dir), audio_file_override=(self.audio_file.get().strip() or None))
-        except (AmbiguousInputError, NoAudioSourceFoundError, OSError):
-            return artist, title
-        parsed_artist, parsed_title = resolve_artist_title(audio_path, Path(input_dir))
-        return artist or parsed_artist, title or parsed_title
+        if not (artist and title):
+            input_dir = self.input_dir.get().strip()
+            if input_dir and Path(input_dir).is_dir():
+                try:
+                    audio_path, _kind = resolve_primary_source(
+                        Path(input_dir), audio_file_override=(self.audio_file.get().strip() or None))
+                except (AmbiguousInputError, NoAudioSourceFoundError, OSError):
+                    audio_path = None
+                if audio_path is not None:
+                    parsed_artist, parsed_title = resolve_artist_title(audio_path, Path(input_dir))
+                    artist = artist or parsed_artist
+                    title = title or parsed_title
+        return (headline_case(artist) if artist else artist,
+                headline_case(title) if title else title)
 
     def _artist_placeholder_text(self) -> str:
         artist, _ = self._resolved_artist_title()
@@ -628,7 +631,7 @@ class App(tk.Tk):
         ttk.Label(realign_options_frame, text="Whisper model:").grid(row=0, column=0, sticky="w", padx=8, pady=2)
         realign_whisper_entry = ttk.Entry(realign_options_frame, textvariable=self.whisper_model, width=15)
         realign_whisper_entry.grid(row=0, column=1, sticky="w", padx=8, pady=2)
-        Tooltip(realign_whisper_entry, "ASR model size, e.g. small.en (default), medium.en, large-v3. "
+        Tooltip(realign_whisper_entry, "ASR model size, e.g. small.en, medium.en (default), large-v3. "
                                         "Bigger is more accurate but slower.")
         realign_use_lrc_check = ttk.Checkbutton(realign_options_frame, text="Use LRC synced lyrics",
                                                  variable=self.realign_use_lrc)

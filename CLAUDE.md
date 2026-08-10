@@ -1210,6 +1210,161 @@ again through the full generation pipeline), 6 genuine verified fixes
 (carried through to the actual written output, not just an intermediate
 score), 0 regressions anywhere.
 
+## ASR quality retry: re-transcribe with large-v3 on a low match rate
+## (PROTOTYPE, real-validated 2026-08-10, CLI-only)
+
+Motivated by a real case ("Trixie Mattel - Gold") where WhisperX
+silently dropped whole lines rather than just mistranscribing individual
+words. Deliberately NOT scoped to "count missing lines" specifically
+(per the user's own ask for "something smarter than that") -- instead
+reuses whichever real per-word match-rate metric a code path already
+computes for its own "does this really match the audio" gate, since
+that also catches partial degradation (garbled decoding, wrong-language
+ASR, hallucinated long segments -- see the rewindow section above) the
+same way it catches fully-dropped lines. Wired into all 3 places in the
+codebase that already have such a metric:
+
+- `realign.py`: `_retry_asr_if_low_quality` reuses `RealignQuality.
+  anchor_rate` against the SAME `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE`
+  bar `realign_song` already warns on. Only wired for `strategy=
+  "replace"` -- `realign_song_validate`'s `ValidateQuality` has no
+  `anchor_rate`, not addressed here.
+- `main.py`'s MXL+LRC primary path: retries via `mxl_lrc_generator.
+  try_mxl_lrc_primary`'s own `MxlLrcQuality.asr_placement_rate` against
+  the same bar (the exact gate that already decides success/fallback
+  there).
+- `main.py`'s standard (non-MXL) fallback path: no existing-file/MXL
+  candidate to measure against there, so uses `lyrics_lookup.
+  reference_match_ratio` (factored out of `reference_matches_transcript`,
+  which only returned a bool) against a fetched reference lyrics
+  candidate that has ALREADY cleared `REFERENCE_LYRICS_MIN_MATCH_RATIO`'s
+  (0.25) much lower "is this even the right song" bar.
+  `RETRY_ASR_MIN_REFERENCE_MATCH_RATIO = 0.6` is a first estimate,
+  validated only on Gold so far. **Known gap**: if `--no-fetch-lyrics`
+  or no reference is found at all, there's no ground truth to measure
+  against in this path, so the retry never fires there -- not addressed.
+
+Every retry site follows the same shape: fires only when the current
+model isn't already `config.RETRY_ASR_MODEL` ("large-v3") and the
+existing `retry_low_quality_asr` option is on (default ON in both
+`PipelineOptions`/`RealignPipelineOptions` -- `--no-retry-low-quality-
+asr` opts out on both CLIs); re-transcribes the WHOLE song once; keeps
+the retry's own result only if it's better on WHICHEVER signal actually
+triggered it, otherwise keeps the original untouched. Never retries a
+second time. `current_asr_model` tracking in `main.py` prevents a song
+that already retried in the MXL+LRC path from retrying AGAIN in the
+standard fallback path if it falls through to it.
+
+### Real validation found the initial whole-song-only design missed real cases
+
+First real runs (Gold via `main.py`, David Bowie - Magic Dance via
+`realign.py` with `--whisper-model small.en` to force a weak starting
+transcription) exposed TWO independent real cases where a whole-song
+aggregate metric hid a genuinely bad passage:
+
+- **Magic Dance**: `small.en` produced a real decoder hallucination (a
+  repeated "Dance Magic Dance Dance Magic Dance..." loop). Song-wide
+  anchor rate landed at 58% -- comfortably above the 50% retry bar -- so
+  the retry never fired, yet the actual written output had a real
+  passage ("Slap that baby... I saw my baby trying hard...") placed
+  ~12-14s late, because the rest of the song transcribed well enough to
+  keep the aggregate healthy.
+- **Gold**: the reference's own `"Do-do-do-do-do"` backing-vocal line
+  (LRCLIB writes it repeated at 3 separate chorus repeats) produced ZERO
+  ASR words at the FIRST repeat while the SAME phrase was transcribed
+  correctly at a later repeat -- confirmed directly from the raw decoder
+  segment text. `reference_match_ratio` stayed at 89-90% (well above the
+  0.6 retry bar) across multiple fresh runs that all reproduced the
+  identical drop, because 320+ other words in the song were fine.
+
+**Fix: added a second, independent per-PASSAGE trigger to each path**
+(`config.RETRY_ASR_MIN_UNCONFIDENT_RUN` / `RETRY_ASR_MIN_UNMATCHED_
+REFERENCE_RUN`, both first estimates at 5):
+- `realign.py`: `RealignQuality.longest_unconfident_run` -- longest
+  CONSECUTIVE run of words with no real anchor at all (computed for
+  free from the `confident` array `match_words_to_asr`/`_windowed`
+  already produce).
+- `main.py` standard fallback path: `lyrics_lookup.
+  largest_unmatched_reference_run` -- longest contiguous run of
+  reference words with NO corresponding ASR word (a difflib `insert`
+  opcode `align_words_to_reference` already recognized but had nothing
+  to DO with -- "reference has words ASR completely missed... simply
+  not represented").
+
+**First version of the per-passage trigger STILL missed Gold**: the
+reference's `"Do-do-do-do-do"` is written as ONE hyphenated token, and a
+correctly-matched `"They start to play"` line sitting between two
+occurrences split what's really one ~15s dropped passage into two
+separate 1-token `insert` blocks -- both under the threshold of 5. Root
+cause was really `_tokenize_lines` counting a hyphenated token as a
+single word no matter how many real sung syllables it represents.
+**Fixed at the tokenizer, not the threshold**: `_tokenize_lines` now
+splits every token on `-` as well as whitespace (2026-08-10) -- a
+general improvement, not just for this signal, since
+`align_words_to_reference`'s own alignment can now match/correct
+"Do-do-do-do-do" as 5 separate words instead of one opaque blob (its
+existing `is_repeat_clamp` uneven-block handling becomes the FALLBACK
+for when ASR's own word count still doesn't line up, rather than the
+every-time case). Confirmed against the real fetched reference + real
+parsed ASR debug-log data for this exact song:
+`largest_unmatched_reference_run` went from 1 (pre-fix) to 7 (post-fix,
+whole song) / 5 (an isolated single dropped repeat, synthetic test).
+
+**Real end-to-end re-validation after the fix (Gold, 4 total real
+runs)**: the per-passage trigger fired (`"a 5-word run of reference
+text has NO corresponding ASR word at all"`), retried with `large-v3`,
+and the retry was accepted (reference match 90% -> 95%). Confirmed
+DIRECTLY in the written output file (not just the intermediate metric):
+both previously-missing "Do do... do do." passages now have real text
+and timing, with "They start to play." correctly matched in between --
+`492` synced lines, same overall structure as before, no regression
+elsewhere. Note: the retry's own `largest_unmatched_reference_run`
+stayed at 5 (didn't drop to 0) even though it was accepted -- it was
+kept because the WHOLE-SONG ratio improved (90%->95%), not because the
+per-passage signal itself cleared; the specific passage that DID get
+fixed was a genuinely separate occurrence recovered by the bigger model,
+not proof that large-v3 fixes every dropped repeat every time. Also
+confirmed the OLD design's own two whole-song-only checks work as
+intended when they're what's actually needed: an early Gold run's
+`asr_placement_rate`-style checks correctly stayed quiet on a run where
+ASR quality was genuinely fine end to end (no false-fire).
+
+**Debug log gained the retry's decision narration, not just its raw
+data**: the retry's raw ASR/realign trace was already being captured
+(since `debug_log` was already threaded into the retry's own
+`transcribe_words`/`realign_song`/`try_mxl_lrc_primary` calls), but WHY
+it fired and what was decided (before/after numbers, accept/reject) only
+ever went to the console `log` callback, not the file -- a real gap
+found when asked directly "does the debug log contain the re-run data".
+Fixed: both `main.py` (both retry sites) and `realign.py` now mirror
+every top-level decision message into the debug log file via a small
+local `dlog()` helper, plus a labeled `debug_log.section(...)` marker
+(e.g. `"ASR QUALITY RETRY (standard fallback path)..."`) before each
+retry. Verified two ways: `realign.py`'s function exercised directly
+against a real file-backed `DebugLog`; `main.py` re-validated via a real
+Gold run showing both the trigger line and the outcome line landing in
+the actual file.
+
+Synthetic regression tests: `realign.py`'s `_retry_asr_if_low_quality`
+(whole-song trigger: fires/adopts an improvement, no-ops at the retry
+model, no-ops above the bar; per-passage trigger: fires on a long
+unconfident run even with a fine anchor rate, no-ops just under the
+per-passage bar) and `lyrics_lookup.largest_unmatched_reference_run` /
+`_tokenize_lines` (hyphenated-token splitting, matching the real Gold
+shape). `main.py`'s two retry sites are still NOT unit tested (same
+reasoning as the rewindow section above -- this is orchestration around
+real transcription calls) but ARE now real-audio validated end to end.
+
+**Still open**: Magic Dance's per-passage fix (`longest_unconfident_run`)
+has NOT yet been re-validated end-to-end the way Gold's has (Gold got 4
+real runs; Magic Dance only got the ORIGINAL small.en run that exposed
+the gap, before the per-passage trigger existed) -- re-run it to confirm
+the fix actually recovers the "Slap that baby..." passage's timing in a
+real written output, not just via the synthetic test. CLI-only for now
+(no GUI checkbox) -- same "ship CLI-only, add GUI once validated"
+pattern used for `--strategy validate` initially. The standard fallback
+path's no-reference-available gap (noted above) is unchanged.
+
 ## Environment
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.

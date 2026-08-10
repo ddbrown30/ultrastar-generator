@@ -34,25 +34,27 @@ assert comp.video and comp.video.name == "Bon Jovi - Its My Life.mp4"
 assert comp.cover and "[CO]" in comp.cover.name
 assert comp.background and "[BG]" in comp.background.name
 
-print("\n--- file_discovery.resolve_artist_title: falls back to the input FOLDER's name "
-      "when the audio file's own name doesn't parse (real case: a ripped/downloaded song "
-      "keeps a generic filename like 'music.ogg' while its folder is 'Artist - Title') ---")
+print("\n--- file_discovery.resolve_artist_title: the INPUT FOLDER's own name is the sole "
+      "source now (folder-based input) -- a file inside can be named anything at all, real "
+      "case: a ripped/downloaded song keeps a generic filename like 'music.ogg' while its "
+      "folder is 'Artist - Title' ---")
 import tempfile as _tempfile_artist_title
-with _tempfile_artist_title.TemporaryDirectory() as _tmp:
-    normal_folder = Path(_tmp) / "some_folder"
-    normal_folder.mkdir()
-    parseable_audio = normal_folder / "Bon Jovi - Its My Life.mp3"
-    artist2, title2 = resolve_artist_title(parseable_audio, normal_folder)
-    assert (artist2, title2) == ("Bon Jovi", "Its My Life"), (artist2, title2)
-print("OK: when the audio filename parses fine, resolve_artist_title uses it directly (folder name ignored)")
-
 with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     named_folder = Path(_tmp) / "Bon Jovi - Its My Life"
     named_folder.mkdir()
     unparseable_audio = named_folder / "music.mp3"
     artist3, title3 = resolve_artist_title(unparseable_audio, named_folder)
     assert (artist3, title3) == ("Bon Jovi", "Its My Life"), (artist3, title3)
-print("OK: when the audio filename doesn't parse, resolve_artist_title falls back to the folder's own name")
+print("OK: the folder name is used regardless of what the audio file itself is named")
+
+with _tempfile_artist_title.TemporaryDirectory() as _tmp:
+    normal_folder = Path(_tmp) / "some_folder"
+    normal_folder.mkdir()
+    parseable_audio = normal_folder / "Bon Jovi - Its My Life.mp3"
+    artist2, title2 = resolve_artist_title(parseable_audio, normal_folder)
+    assert (artist2, title2) == (None, None), (artist2, title2)
+print("OK: even when the AUDIO FILE's own name would parse fine, a non-parseable folder name "
+      "still returns (None, None) -- the audio filename is never consulted at all")
 
 with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     unparseable_folder = Path(_tmp) / "random_folder_name"
@@ -60,8 +62,7 @@ with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     unparseable_audio2 = unparseable_folder / "music.mp3"
     artist4, title4 = resolve_artist_title(unparseable_audio2, unparseable_folder)
     assert (artist4, title4) == (None, None), (artist4, title4)
-print("OK: when NEITHER the audio filename nor the folder name parse, resolve_artist_title "
-      "returns (None, None) rather than raising")
+print("OK: a folder name that doesn't parse returns (None, None) rather than raising")
 
 # A dot inside the folder name must not be misread as a file extension
 # (Path.stem would strip it; resolve_artist_title uses the folder's raw
@@ -73,8 +74,26 @@ with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     artist5, title5 = resolve_artist_title(unparseable_audio3, dotted_folder)
     assert (artist5, title5) == ("Mr. Roboto", "Styx"), (artist5, title5)
 print("OK: a dot inside the folder name (e.g. 'Mr. Roboto - Styx') is NOT misread as a file "
-      "extension when falling back to the folder name")
+      "extension")
 print("OK:", artist, title, comp)
+
+print("\n--- file_discovery.headline_case: minor words lowercased unless first/last, but "
+      "ALL CAPS or unusually-cased words are left completely untouched ---")
+from ultrastar_generator.file_discovery import headline_case
+assert headline_case("Beauty And The Beast") == "Beauty and the Beast"
+assert headline_case("Under The Sea") == "Under the Sea"
+assert headline_case("the lion king") == "The Lion King"  # first word always capitalized
+assert headline_case("A Bug's Life") == "A Bug's Life"  # first word "A" stays capitalized
+assert headline_case("Kill It With Fire, Or Not") == "Kill It with Fire, or Not"  # last word always capitalized
+assert headline_case("KPop Demon Hunters") == "KPop Demon Hunters"  # mixed-case word untouched
+assert headline_case("SHOUT AND WHISPER") == "SHOUT AND WHISPER"  # ALL CAPS words untouched
+assert headline_case("aND weird CaSe") == "aND Weird CaSe"  # unusual casing untouched, but a
+                                                                # normal (simple-case) word still
+                                                                # gets normalized regardless of
+                                                                # its neighbors' casing
+assert headline_case("Don't Stop Believin'") == "Don't Stop Believin'"  # apostrophes preserved
+print("OK: 'Beauty And The Beast' -> 'Beauty and the Beast', 'KPop'/'AND'/'aND' all left "
+      "untouched, first/last word always capitalized")
 
 print("\n--- file_discovery.find_companions: falls back to a single unambiguous video/image "
       "even when its name doesn't match the audio file's basename (real case: a SingStar-style "
@@ -643,6 +662,56 @@ wrong_language_words = [Word(text=w, start=float(i), end=float(i) + 0.5, confide
                          for i, w in enumerate(["quiero", "verte", "otro", "modelo", "patron"])]
 assert reference_matches_transcript(ref_lines_test, wrong_language_words) is False
 print("OK: right-language reference accepted, wrong-language reference rejected")
+
+print("\n--- lyrics_lookup.largest_unmatched_reference_run: measures the LARGEST contiguous run of "
+      "reference words with NO corresponding ASR word at all -- real case (Trixie Mattel - Gold, "
+      "2026-08-10): a whole chorus repeat's 'Do-do-do-do-do' backing vocal produced ZERO ASR words at one "
+      "occurrence while the rest of a 306-word real transcript (including this SAME phrase correctly "
+      "transcribed at a LATER repeat) was fine -- hidden from reference_match_ratio's own aggregate (89.3%, "
+      "well above the retry bar). LRCLIB writes the repeat as ONE hyphenated token, not 5 space-separated "
+      "words -- `_tokenize_lines` splits on '-' (2026-08-10 fix) specifically so this counts as 5 reference "
+      "words missing, not 1 -- confirmed against the real fetched reference + real parsed ASR debug-log "
+      "output for this exact song: largest_unmatched_reference_run went from 1 (pre-fix, split into two "
+      "even-smaller 1-token gaps by the correctly-matched 'They start to play' line sitting between them) "
+      "to 7 (post-fix) ---")
+from ultrastar_generator.lyrics_lookup import largest_unmatched_reference_run
+lur_ref_lines = [
+    "Will you grow from those cold blood wrongs",
+    "when those old love songs start to play",
+    "Do-do-do-do-do",
+    "They start to play",
+    "Do-do-do-do-do",
+]
+lur_words_dropped = [Word(text=w, start=float(i), end=float(i) + 0.3, confidence=0.9) for i, w in enumerate(
+    ["Will", "you", "grow", "from", "those", "cold", "blood", "wrongs",
+     "when", "those", "old", "love", "songs", "start", "to", "play",
+     "They", "start", "to", "play"]
+)]
+assert largest_unmatched_reference_run(lur_ref_lines, lur_words_dropped) == 5, \
+    largest_unmatched_reference_run(lur_ref_lines, lur_words_dropped)
+lur_words_present = lur_words_dropped[:16] + [
+    Word(text=w, start=16.0 + i * 0.3, end=16.3 + i * 0.3, confidence=0.9)
+    for i, w in enumerate(["Do", "do", "do", "do", "do"])
+] + lur_words_dropped[16:]
+assert largest_unmatched_reference_run(lur_ref_lines, lur_words_present) == 5, \
+    largest_unmatched_reference_run(lur_ref_lines, lur_words_present)  # the SECOND "Do-do-do-do-do" still missing
+lur_words_both_present = lur_words_present + [
+    Word(text=w, start=20.0 + i * 0.3, end=20.3 + i * 0.3, confidence=0.9)
+    for i, w in enumerate(["Do", "do", "do", "do", "do"])
+]
+assert largest_unmatched_reference_run(lur_ref_lines, lur_words_both_present) == 0, \
+    largest_unmatched_reference_run(lur_ref_lines, lur_words_both_present)
+print("OK: a hyphenated 'Do-do-do-do-do' reference passage (5 real sung words, ONE written token) with zero "
+      "ASR words scores a run of 5, not 1 -- with only ONE of its two real occurrences transcribed, the "
+      "still-missing occurrence still scores 5; with both transcribed, scores 0")
+
+print("\n--- lyrics_lookup._tokenize_lines: splits a hyphenated token into separate words generally, not "
+      "just for the run-detection case above -- benefits align_words_to_reference's own alignment too ---")
+from ultrastar_generator.lyrics_lookup import _tokenize_lines
+tl_norm, tl_orig, tl_line_ids = _tokenize_lines(["Do-do-do-do-do", "well-known fact"])
+assert tl_orig == ["Do", "do", "do", "do", "do", "well", "known", "fact"], tl_orig
+assert tl_line_ids == [0, 0, 0, 0, 0, 1, 1, 1], tl_line_ids
+print("OK:", tl_orig)
 
 print("\n--- lyrics_lookup._fetch_from_lrclib: picks the best candidate by duration closeness, "
       "excludes instrumental/lyric-less candidates, breaks ties toward a synced-lyrics candidate ---")
@@ -2263,33 +2332,59 @@ with _tempfile.TemporaryDirectory() as root:
     in_dir = root / "in"
     out_dir = root / "out"
     in_dir.mkdir()
-    mp3 = in_dir / "song.mp3"
-    mp3.write_bytes(b"mp3-bytes")
-    video = in_dir / "song.mp4"
+    mp3 = in_dir / "some_track.mp3"  # deliberately NOT "<Artist> - <Title>" -- a folder-based
+    mp3.write_bytes(b"mp3-bytes")     # input's own files can be named anything at all
+    video = in_dir / "clip.mp4"
     video.write_bytes(b"video-bytes")
-    cover = in_dir / "song [CO].jpg"
+    cover = in_dir / "random_pic.jpg"
     cover.write_bytes(b"cover-bytes")
+    bg = in_dir / "another_pic.png"
+    bg.write_bytes(b"bg-bytes")
 
-    staged = stage_companions_to_output(out_dir, mp3_src=mp3, video_src=video, cover_src=cover)
-    assert staged.mp3 == "song.mp3" and staged.video == "song.mp4" and staged.cover == "song [CO].jpg"
-    assert staged.background is None
-    assert (out_dir / "song.mp3").read_bytes() == b"mp3-bytes"
-    assert (out_dir / "song.mp4").read_bytes() == b"video-bytes"
-    assert (out_dir / "song [CO].jpg").read_bytes() == b"cover-bytes"
-print("OK: mp3/video/cover copied into the output folder under their own basenames")
+    staged = stage_companions_to_output(out_dir, "Some Artist", "Some Song",
+                                         mp3_src=mp3, video_src=video, cover_src=cover, background_src=bg)
+    assert staged.mp3 == "Some Artist - Some Song.mp3", staged.mp3
+    assert staged.video == "Some Artist - Some Song.mp4", staged.video
+    assert staged.cover == "Some Artist - Some Song[CO].jpg", staged.cover
+    assert staged.background == "Some Artist - Some Song[BG].png", staged.background
+    assert (out_dir / "Some Artist - Some Song.mp3").read_bytes() == b"mp3-bytes"
+    assert (out_dir / "Some Artist - Some Song.mp4").read_bytes() == b"video-bytes"
+    assert (out_dir / "Some Artist - Some Song[CO].jpg").read_bytes() == b"cover-bytes"
+    assert (out_dir / "Some Artist - Some Song[BG].png").read_bytes() == b"bg-bytes"
+print("OK: every companion is renamed to '<Artist> - <Title>[.ext]' in the output folder regardless "
+      "of its own name in the input folder; separate cover/background images each keep their own "
+      "'[CO]'/'[BG]' tag")
 
 with _tempfile.TemporaryDirectory() as root:
     root = Path(root)
     in_dir = root / "in"
     out_dir = root / "out"
     in_dir.mkdir()
-    mp4 = in_dir / "song.mp4"
+    mp4 = in_dir / "video_file.mp4"
     mp4.write_bytes(b"mp4-bytes")
 
-    staged = stage_companions_to_output(out_dir, mp3_src=mp4, video_src=mp4)
-    assert staged.mp3 == staged.video == "song.mp4"
+    staged = stage_companions_to_output(out_dir, "Some Artist", "Some Song", mp3_src=mp4, video_src=mp4)
+    assert staged.mp3 == staged.video == "Some Artist - Some Song.mp4", staged.mp3
     assert len(list(out_dir.iterdir())) == 1, "identical mp3/video source must only be copied ONCE"
-print("OK: identical mp3_src/video_src (mp4-as-audio case) copied exactly once, both roles reference it")
+print("OK: identical mp3_src/video_src (mp4-as-audio case) copied exactly once, renamed once, both "
+      "roles reference it")
+
+with _tempfile.TemporaryDirectory() as root:
+    root = Path(root)
+    in_dir = root / "in"
+    out_dir = root / "out"
+    in_dir.mkdir()
+    mp3b = in_dir / "song.mp3"
+    mp3b.write_bytes(b"mp3-bytes")
+    pic = in_dir / "cover.jpg"
+    pic.write_bytes(b"pic-bytes")
+
+    staged = stage_companions_to_output(out_dir, "Some Artist", "Some Song",
+                                         mp3_src=mp3b, cover_src=pic, background_src=pic)
+    assert staged.cover == staged.background == "Some Artist - Some Song.jpg", staged.cover
+    assert len(list(out_dir.iterdir())) == 2, "identical cover/background source must only be copied ONCE"
+print("OK: a single image serving both cover and background roles is renamed WITHOUT a '[CO]'/'[BG]' "
+      "tag (nothing to disambiguate), matching find_companions' own single-untagged-image convention")
 
 print("\n--- main.delete_work_files: deletes the entire work_dir, debug files included (intentional) ---")
 import tempfile as _tempfile_delint
@@ -2839,6 +2934,60 @@ print("  OK: lrc_mode='seed' also declines to seed from an uncalibrated candidat
       "'charlie' (first word of line 2) is left for interpolate_fallback instead of a raw, untrusted "
       "line timestamp")
 
+print("  realign_song: 'windowed' mode's own low anchor rate (under a CONFIDENTLY-calibrated candidate) "
+      "auto-falls-back to 'seed' mode instead of just warning -- a low rate here means the per-line window "
+      "itself is mis-targeted (e.g. words with no LRC line of their own get bucketed into the wrong line's "
+      "narrow window), not that whole-song ASR can't find these words at all:")
+wsf_entries = [
+    Syllable(text=t, start=float(i), end=float(i) + 0.5, midi_note=0, is_word_start=True)
+    for i, t in enumerate(["alpha", "bravo", "charlie", "delta", "echo",
+                            "golf", "hotel", "india", "juliet", "kilo", "lima", "mike"])
+]
+wsf_existing_song = ParsedSong(
+    title="T", artist="A", bpm=60.0, gap_ms=0, entries=wsf_entries,
+    raw_tags={"TITLE": "T", "ARTIST": "A", "BPM": "60", "GAP": "0"},
+)
+# LRC candidate only knows about 5 one-word lines (calibration needs
+# >= LRC_TIMING_MIN_CALIBRATION_SAMPLES=5 matched LINES, not words) --
+# 'golf'..'mike' have no LRC line of their own at all, so
+# assign_words_to_lines buckets them into the LAST confirmed line
+# ('echo')'s own narrow window (its own docstring: "inherit the nearest
+# PRECEDING confirmed match's line").
+wsf_candidate = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=None,
+    plain_lyrics="alpha bravo charlie delta echo",
+    synced_lyrics="[00:10.00]alpha\n[00:11.00]bravo\n[00:12.00]charlie\n[00:13.00]delta\n[00:14.00]echo\n",
+    instrumental=False, id=777,
+)
+wsf_asr = [
+    # Calibration + windowed-match anchors for the 5 real LRC lines (5
+    # samples, all in perfect agreement -> confident constant offset ~0).
+    _Word(text="alpha", start=10.05, end=10.3), _Word(text="bravo", start=11.05, end=11.3),
+    _Word(text="charlie", start=12.05, end=12.3), _Word(text="delta", start=13.05, end=13.3),
+    _Word(text="echo", start=14.05, end=14.3),
+    # 'golf'..'mike' really were transcribed -- just far outside the only
+    # window they can be bucketed into ([13.5, 19.5], from the last LRC
+    # line + its fallback "+5.0s" span since there's no next line).
+    _Word(text="golf", start=200.0, end=200.3), _Word(text="hotel", start=200.35, end=200.6),
+    _Word(text="india", start=200.65, end=200.9), _Word(text="juliet", start=200.95, end=201.2),
+    _Word(text="kilo", start=201.25, end=201.5), _Word(text="lima", start=201.55, end=201.8),
+    _Word(text="mike", start=201.85, end=202.1),
+]
+wsf_log = []
+wsf_result = realign_song(wsf_existing_song, wsf_asr, artist="A", title="T", audio_duration=300.0,
+                           use_lrc=True, lrc_mode="windowed", forced_lrc_candidate=wsf_candidate,
+                           log=wsf_log.append)
+assert wsf_result.success, wsf_result.error
+assert any("only 42%" in line and "real anchor" in line for line in wsf_log), wsf_log
+assert any("Falling back to 'seed' mode" in line for line in wsf_log), wsf_log
+assert wsf_result.quality.n_asr_matched == 12, wsf_result.quality  # the 'seed' retry's own result, not windowed's 5/12
+wsf_starts = {e.text: e.start for e in wsf_result.song.entries if isinstance(e, Syllable)}
+assert wsf_starts["golf"] == 200.0 and wsf_starts["mike"] == 201.85, wsf_starts  # real ASR times, not squeezed
+                                                                                    # into the 13.5-19.5 window
+print("  OK: 'windowed' mode's own 5/12 (42%) anchor rate triggers both the low-anchor warning AND an "
+      "automatic retry with lrc_mode='seed', which finds all 12/12 words via whole-song ASR matching "
+      "(no time window to exclude 'golf'..'mike's real, correctly-transcribed positions)")
+
 print("  realign_song end-to-end: a file whose notes are a degenerate flat list of equal-length "
       "placeholder notes (don't match the audio at all) gets re-timed to match real ASR, with the SAME "
       "note count/order/pitch and BPM, only start/end (and derived GAP) changed:")
@@ -2903,6 +3052,91 @@ assert rs_bad_result.quality.n_asr_matched == 0, rs_bad_result.quality
 assert any("WARNING" in line and "may not match" in line for line in rs_bad_log), rs_bad_log
 print("  OK: 0% real anchor rate still produces a valid (unchanged-timing) output rather than crashing, "
       "with a clear warning logged for the user to review")
+
+print("  _retry_asr_if_low_quality (PROTOTYPE): a low anchor rate triggers a re-transcription with "
+      "config.RETRY_ASR_MODEL, keeping whichever attempt has the higher anchor rate -- never fires when "
+      "already using the retry model, or when the anchor rate is already above the bar:")
+from ultrastar_generator.realign import _retry_asr_if_low_quality, RealignPipelineOptions
+import ultrastar_generator.transcription as transcription_mod
+
+_orig_transcribe_words = transcription_mod.transcribe_words
+rq_opts = RealignPipelineOptions(whisper_model="small.en", use_lrc=False, retry_low_quality_asr=True)
+
+# (a) low anchor rate + a retry model that DOES find the real words -> retry is accepted.
+rq_good_asr = [_Word(text=f"w{i}", start=float(i) + 50.0, end=float(i) + 50.4) for i in range(10)]
+transcription_mod.transcribe_words = lambda *a, **kw: rq_good_asr
+rq_log = []
+rq_retried = _retry_asr_if_low_quality(
+    rs_bad_result, existing=rs_bad_existing, vocals_path=Path("dummy.wav"), opts=rq_opts,
+    audio_duration=100.0, forced_candidate=None, debug_log=None, log=rq_log.append,
+)
+assert rq_retried is not rs_bad_result, "a genuine improvement must return the RETRY result, not the original"
+assert rq_retried.quality.n_asr_matched == 10, rq_retried.quality
+assert any(config_mod.RETRY_ASR_MODEL in line and "retrying" in line for line in rq_log), rq_log
+assert any("improved" in line for line in rq_log), rq_log
+print(f"  OK: original 0% anchor rate -> retry with '{config_mod.RETRY_ASR_MODEL}' finds all 10 words, "
+      f"retry result adopted")
+
+# (b) already using the retry model -- must never fire (and never call transcribe_words at all).
+def _rq_boom(*a, **kw):
+    raise AssertionError("transcribe_words must not be called when already at the retry model")
+transcription_mod.transcribe_words = _rq_boom
+rq_opts_already = RealignPipelineOptions(whisper_model=config_mod.RETRY_ASR_MODEL, use_lrc=False,
+                                          retry_low_quality_asr=True)
+rq_noop1 = _retry_asr_if_low_quality(
+    rs_bad_result, existing=rs_bad_existing, vocals_path=Path("dummy.wav"), opts=rq_opts_already,
+    audio_duration=100.0, forced_candidate=None, debug_log=None, log=lambda s: None,
+)
+assert rq_noop1 is rs_bad_result, "must be a no-op (same object) when whisper_model is already the retry model"
+print(f"  OK: whisper_model already '{config_mod.RETRY_ASR_MODEL}' -> no retry attempted")
+
+# (c) anchor rate already clears the bar -- must never fire either.
+rq_noop2 = _retry_asr_if_low_quality(
+    rs_result, existing=rs_existing, vocals_path=Path("dummy.wav"), opts=rq_opts,
+    audio_duration=100.0, forced_candidate=None, debug_log=None, log=lambda s: None,
+)
+assert rq_noop2 is rs_result, "must be a no-op when the anchor rate is already above the retry bar"
+print("  OK: anchor rate already above the retry bar -> no retry attempted")
+
+print("  _retry_asr_if_low_quality per-PASSAGE trigger (PROTOTYPE, 2026-08-10): a long consecutive run of "
+      "unconfident words must ALSO trigger a retry even when the whole-song anchor rate is already fine -- "
+      "real case: David Bowie - Magic Dance with small.en had a 58% anchor rate (well above the bar) while "
+      "one hallucinated decoder segment still left a real passage ~12-14s off in the final output:")
+from ultrastar_generator.realign import RealignQuality, RealignResult
+
+# (d) anchor rate clears the whole-song bar, but longest_unconfident_run alone clears ITS OWN bar -> fires.
+rq_passage_quality = RealignQuality(n_words=20, n_asr_matched=15, longest_unconfident_run=6)
+assert rq_passage_quality.anchor_rate >= config_mod.MXL_LRC_MIN_ASR_PLACEMENT_RATE, rq_passage_quality.anchor_rate
+assert rq_passage_quality.longest_unconfident_run >= config_mod.RETRY_ASR_MIN_UNCONFIDENT_RUN
+rq_passage_result = RealignResult(success=True, song=None, quality=rq_passage_quality)
+transcription_mod.transcribe_words = lambda *a, **kw: rq_good_asr   # same 10-word perfect-match fixture as (a)
+rq_passage_log = []
+rq_passage_retried = _retry_asr_if_low_quality(
+    rq_passage_result, existing=rs_bad_existing, vocals_path=Path("dummy.wav"), opts=rq_opts,
+    audio_duration=100.0, forced_candidate=None, debug_log=None, log=rq_passage_log.append,
+)
+assert rq_passage_retried is not rq_passage_result, "a long unconfident run alone must trigger a retry"
+assert any("consecutive word" in line and "retrying" in line for line in rq_passage_log), rq_passage_log
+print("  OK: 75% anchor rate (fine) + 6 consecutive unconfident words (over the per-passage bar) -> retry "
+      "fires anyway")
+
+# (e) neither signal clears its own bar -> no-op (anchor rate fine, run just under the per-passage bar).
+rq_passage_ok_quality = RealignQuality(n_words=20, n_asr_matched=15,
+                                        longest_unconfident_run=config_mod.RETRY_ASR_MIN_UNCONFIDENT_RUN - 1)
+rq_passage_ok_result = RealignResult(success=True, song=None, quality=rq_passage_ok_quality)
+def _rq_passage_boom(*a, **kw):
+    raise AssertionError("transcribe_words must not be called when neither trigger clears its bar")
+transcription_mod.transcribe_words = _rq_passage_boom
+rq_passage_noop = _retry_asr_if_low_quality(
+    rq_passage_ok_result, existing=rs_bad_existing, vocals_path=Path("dummy.wav"), opts=rq_opts,
+    audio_duration=100.0, forced_candidate=None, debug_log=None, log=lambda s: None,
+)
+assert rq_passage_noop is rq_passage_ok_result, "must be a no-op when neither trigger clears its own bar"
+print(f"  OK: anchor rate fine + unconfident run just under the bar "
+      f"({config_mod.RETRY_ASR_MIN_UNCONFIDENT_RUN - 1} < {config_mod.RETRY_ASR_MIN_UNCONFIDENT_RUN}) -> "
+      f"no retry attempted")
+
+transcription_mod.transcribe_words = _orig_transcribe_words
 
 print("  realign: the existing file being realigned is ALWAYS treated as read-only -- never overwritten, "
       "not even if an explicit --output path resolves to the same file:")

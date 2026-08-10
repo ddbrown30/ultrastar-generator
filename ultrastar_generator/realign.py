@@ -125,11 +125,30 @@ class RealignQuality:
     n_local_rematched: int = 0
     n_interpolated: int = 0
     n_kept_original: int = 0
+    # Longest CONSECUTIVE run of words with no real anchor (asr/lrc/local-
+    # rematch) at all -- see config.RETRY_ASR_MIN_UNCONFIDENT_RUN. A
+    # per-PASSAGE signal, independent of anchor_rate: real case (David
+    # Bowie - Magic Dance, small.en) had a song-wide anchor rate of 58%
+    # (well above the retry bar) while one hallucinated decoder segment
+    # still dragged a real, contiguous passage ~12-14s off in the final
+    # output -- an aggregate rate spread across an otherwise well-matched
+    # song hid it completely.
+    longest_unconfident_run: int = 0
 
     @property
     def anchor_rate(self) -> float:
         return ((self.n_asr_matched + self.n_lrc_seeded + self.n_local_rematched) / self.n_words
                  if self.n_words else 0.0)
+
+
+def _longest_false_run(confident: List[bool]) -> int:
+    """Longest consecutive run of `False` in `confident` -- see
+    `RealignQuality.longest_unconfident_run`'s docstring."""
+    best = cur = 0
+    for c in confident:
+        cur = 0 if c else cur + 1
+        best = max(best, cur)
+    return best
 
 
 def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
@@ -790,6 +809,18 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
         "windowed" already degrades to equivalent behavior on its own
         whenever LRC can't be trusted.
 
+    If "windowed" mode's own result still ends up with fewer than
+    `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE` of words getting a real anchor
+    (a low anchor rate under a CONFIDENTLY-calibrated candidate means the
+    per-line window itself is probably mis-targeted to this file's own line
+    structure, not that ASR can't find the words at all -- same class of
+    problem as `realign_song_validate`'s own fallback, just triggered by a
+    different mechanism), this transparently retries once with
+    `lrc_mode="seed"` and returns THAT result instead. Never retries a
+    second time -- "seed" mode's own low anchor rate (or "windowed" already
+    having degraded to "seed" behavior because calibration wasn't
+    confident) is left as the final, if disappointing, answer.
+
     `use_local_rematch` (OFF by default, PROTOTYPE, see config.
     REALIGN_LOCAL_REMATCH_SLACK_SEC): when True, runs `rematch_local_gaps`
     for any word still unmatched after the above, retrying the match
@@ -896,6 +927,8 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
             if confident[i] and not source[i]:
                 source[i] = "local_rematch"
 
+    quality.longest_unconfident_run = _longest_false_run(confident)
+
     had_any_anchor = any(confident)
     quality.n_interpolated, quality.n_kept_original = interpolate_fallback(words, starts, ends, confident)
     for i in range(len(words)):
@@ -909,6 +942,15 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:
         log(f"  WARNING: only {quality.anchor_rate:.0%} of words got a real anchor from the audio -- "
             f"this file's lyrics may not match this audio at all. Review the output carefully.")
+        if lrc_mode == "windowed" and lrc_confident:
+            log("  Falling back to 'seed' mode (whole-song ASR primary) -- this low an anchor rate under "
+                "per-line LRC windowing may mean the windowed search is mis-targeted to this file's own "
+                "line structure, not that ASR itself can't find these words at all.")
+            return realign_song(
+                existing, asr_words, artist=artist, title=title, audio_duration=audio_duration,
+                use_lrc=use_lrc, lrc_mode="seed", forced_lrc_candidate=forced_lrc_candidate,
+                use_local_rematch=use_local_rematch, log=log, debug_log=debug_log,
+            )
 
     if debug_log is not None:
         debug_log.section("REALIGN SUMMARY (strategy=replace)")
@@ -1070,7 +1112,14 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
     is either VALIDATED (kept exactly as-is beyond a single global GAP
     correction) or repositioned via `interpolate_fallback` using validated
     (+ optional LRC) anchors -- never simply overwritten with ASR's own
-    value the way `realign_song` does."""
+    value the way `realign_song` does.
+
+    If fewer than `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE` of words end up
+    validated or LRC-anchored, that's a sign the file's own original timing
+    can't be trusted -- exactly the case this strategy is bad at (it only
+    ever repositions relative to that untrusted timing). Falls back to
+    `realign_song(lrc_mode="seed")` instead, which replaces every word's
+    timing from ASR/LRC directly rather than trusting the input at all."""
     entries = copy.deepcopy(existing.entries)
     words = extract_words(entries)
     if not words:
@@ -1125,6 +1174,14 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
     if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:
         log(f"  WARNING: only {quality.anchor_rate:.0%} of words validated or got an LRC anchor -- "
             f"this file's lyrics may not match this audio at all. Review the output carefully.")
+        log("  Falling back to 'seed' mode (whole-song ASR primary, replacing every word's timing) -- "
+            "'validate' trusts the file's own original timing, which this low an anchor rate means "
+            "isn't safe to trust here.")
+        return realign_song(
+            existing, asr_words, artist=artist, title=title, audio_duration=audio_duration,
+            use_lrc=use_lrc, lrc_mode="seed", forced_lrc_candidate=forced_lrc_candidate, log=log,
+            debug_log=debug_log,
+        )
 
     if debug_log is not None:
         debug_log.section("REALIGN SUMMARY (strategy=validate)")
@@ -1334,6 +1391,18 @@ def build_arg_parser():
                          "where the decoder silently drops content, leaving a short remaining phrase "
                          "aligned against a much-too-large window.")
     p.add_argument("--no-rewindow-long-segments", dest="rewindow_long_segments", action="store_false")
+    p.add_argument("--retry-low-quality-asr", dest="retry_low_quality_asr", action="store_true",
+                    default=config.RETRY_LOW_QUALITY_ASR,
+                    # NOTE: literal '%' in argparse help text must be escaped as '%%' -- argparse
+                    # interpolates the stored help string with %-formatting when rendering --help.
+                    help=(f"PROTOTYPE, default: ON. Retries with '{config.RETRY_ASR_MODEL}' if either: fewer "
+                          f"than {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%} of words get a real anchor from "
+                          f"ASR/LRC (whole-song), or {config.RETRY_ASR_MIN_UNCONFIDENT_RUN}+ consecutive words "
+                          f"have no real anchor at all (one bad passage, even if the rest of the song is fine). "
+                          f"No-op if --whisper-model is already '{config.RETRY_ASR_MODEL}'; only kept if it "
+                          f"actually scores better. Only applies to --strategy replace. See CLAUDE.md."
+                          ).replace("%", "%%"))
+    p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
     p.add_argument("--strategy", choices=["replace", "validate"], default="replace",
                     help="PROTOTYPE, not GUI-exposed yet (default: replace). 'replace': a word confidently "
                          "matched to ASR has its timing REPLACED with ASR's own value (shipped behavior). "
@@ -1368,6 +1437,7 @@ class RealignPipelineOptions:
     delete_work_files: bool = False
     no_debug_log: bool = False
     rewindow_long_segments: bool = True
+    retry_low_quality_asr: bool = config.RETRY_LOW_QUALITY_ASR
     # "replace" (default, shipped): realign_song, a matched word's timing
     # is REPLACED with ASR's own value. "validate" (PROTOTYPE -- real-
     # validated but only helps when the file is already mostly accurate,
@@ -1384,6 +1454,97 @@ class RealignPipelineResult:
     success: bool
     output_path: Optional[Path] = None
     error: Optional[str] = None
+
+
+def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vocals_path: Path,
+                               opts: RealignPipelineOptions, audio_duration: float,
+                               forced_candidate: Optional[LrcLibCandidate],
+                               debug_log: Optional[DebugLog],
+                               log: Callable[[str], None]) -> RealignResult:
+    """PROTOTYPE, see config.RETRY_LOW_QUALITY_ASR's docstring. Only wired
+    up for `realign_song` (strategy="replace") -- `realign_song_validate`
+    uses a differently-shaped `ValidateQuality` with no `anchor_rate`, not
+    addressed here.
+
+    Two INDEPENDENT triggers, either is enough:
+      - `RealignQuality.anchor_rate` below `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE`
+        (the SAME metric/bar `realign_song` already uses for its own "this
+        file's lyrics may not match this audio at all" warning) -- a
+        whole-song signal.
+      - `RealignQuality.longest_unconfident_run` at or above
+        `config.RETRY_ASR_MIN_UNCONFIDENT_RUN` -- a per-PASSAGE signal
+        (real case: David Bowie - Magic Dance with `small.en`, song-wide
+        anchor rate 58% -- well above the bar -- while one hallucinated
+        decoder segment still dragged a real, contiguous passage ~12-14s
+        off in the final output).
+
+    Either way, re-transcribes the WHOLE song with `config.RETRY_ASR_MODEL`
+    and re-runs `realign_song` against the new transcription, keeping
+    whichever of the two results is better on WHICHEVER signal actually
+    triggered the retry (comparing only anchor_rate could miss a retry
+    that fixes one bad passage -- a handful of words out of the whole
+    song barely moves the aggregate rate -- without making it worse
+    either). Never retries a second time, and never fires at all if
+    `opts.whisper_model` is already the retry model."""
+    # Mirrors every top-level decision-narration message into the debug log FILE too, not just the
+    # console/GUI `log` callback -- otherwise the file only shows the retry's raw ASR/realign data (via
+    # `debug_log` threaded into the calls below) with no record of WHY it fired or what was decided,
+    # forcing anyone auditing the file alone to go dig up separately-captured console output instead.
+    def dlog(msg: str) -> None:
+        log(msg)
+        if debug_log is not None:
+            debug_log.line(msg)
+
+    if not (opts.retry_low_quality_asr and result.success and result.quality is not None):
+        return result
+    low_rate_trigger = result.quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
+    long_run_trigger = result.quality.longest_unconfident_run >= config.RETRY_ASR_MIN_UNCONFIDENT_RUN
+    if not (low_rate_trigger or long_run_trigger):
+        return result
+    if opts.whisper_model == config.RETRY_ASR_MODEL:
+        return result
+
+    if debug_log is not None:
+        debug_log.section(f"ASR QUALITY RETRY -- re-transcribing with '{config.RETRY_ASR_MODEL}'")
+    if long_run_trigger and not low_rate_trigger:
+        dlog(f"  Anchor rate is fine ({result.quality.anchor_rate:.0%}) but {result.quality.longest_unconfident_run} "
+             f"consecutive word(s) have no real anchor at all (a passage the whole-song rate doesn't catch) -- "
+             f"retrying transcription with '{config.RETRY_ASR_MODEL}' before accepting this result...")
+    else:
+        dlog(f"  Only {result.quality.anchor_rate:.0%} of words got a real anchor from the audio -- retrying "
+             f"transcription with '{config.RETRY_ASR_MODEL}' before accepting this result...")
+    from .transcription import transcribe_words
+    retry_asr_words = transcribe_words(
+        vocals_path, config.RETRY_ASR_MODEL, prefer_whisperx=not opts.no_whisperx,
+        whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
+        debug_log=debug_log, rewindow_long_segments=opts.rewindow_long_segments,
+    )
+    if not retry_asr_words:
+        dlog(f"  Retry transcription with '{config.RETRY_ASR_MODEL}' produced no words -- keeping the "
+             f"original result.")
+        return result
+
+    retry_result = realign_song(
+        existing, retry_asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
+        use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate, log=log,
+        debug_log=debug_log,
+    )
+    if retry_result.success and retry_result.quality is not None:
+        improved = (retry_result.quality.anchor_rate > result.quality.anchor_rate
+                    or retry_result.quality.longest_unconfident_run < result.quality.longest_unconfident_run)
+        if improved:
+            dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' improved: anchor rate {result.quality.anchor_rate:.0%} "
+                 f"-> {retry_result.quality.anchor_rate:.0%}, longest unconfident run "
+                 f"{result.quality.longest_unconfident_run} -> {retry_result.quality.longest_unconfident_run} "
+                 f"word(s) -- using the retry.")
+            return retry_result
+
+    got = (f"anchor rate {retry_result.quality.anchor_rate:.0%}, longest unconfident run "
+           f"{retry_result.quality.longest_unconfident_run} word(s)"
+           if retry_result.success and retry_result.quality is not None else "failed")
+    dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' did not improve on the original ({got}) -- keeping the "
+         f"original result.")
+    return result
 
 
 def run_realign_pipeline(input_dir: Path, existing_txt_path: Optional[Path], opts: RealignPipelineOptions,
@@ -1500,6 +1661,10 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
             use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate, log=log,
             debug_log=debug_log,
         )
+        result = _retry_asr_if_low_quality(
+            result, existing=existing, vocals_path=vocals_path, opts=opts, audio_duration=audio_duration,
+            forced_candidate=forced_candidate, debug_log=debug_log, log=log,
+        )
     if not result.success:
         return RealignPipelineResult(success=False, error=result.error)
 
@@ -1562,7 +1727,8 @@ def _opts_from_args(args) -> RealignPipelineOptions:
         artist=args.artist, title=args.title, lrclib_id=args.lrclib_id,
         use_lrc=args.use_lrc, lrc_mode=args.lrc_mode, output_path=args.output_path,
         delete_work_files=args.delete_work_files, no_debug_log=args.no_debug_log,
-        rewindow_long_segments=args.rewindow_long_segments, strategy=args.strategy,
+        rewindow_long_segments=args.rewindow_long_segments,
+        retry_low_quality_asr=args.retry_low_quality_asr, strategy=args.strategy,
     )
 
 

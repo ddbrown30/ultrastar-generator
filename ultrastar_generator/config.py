@@ -65,10 +65,11 @@ MAX_BPM = 200.0
 # beat duration, not display resolution.
 BPM_WRITE_MULTIPLIER = 2
 
-# Word-level ASR model to use with faster-whisper by default. "small.en" is
-# a good accuracy/speed tradeoff on GPU; use "medium.en" or "large-v3" for
-# better lyric accuracy at the cost of more VRAM/time.
-DEFAULT_WHISPER_MODEL = "small.en"
+# Word-level ASR model to use with faster-whisper by default. "medium.en" is
+# a good accuracy/speed tradeoff on GPU; use "small.en" for less VRAM/time
+# at the cost of accuracy, or "large-v3" for even better lyric accuracy at
+# the cost of more VRAM/time.
+DEFAULT_WHISPER_MODEL = "medium.en"
 
 # Demucs model. htdemucs is the current general-purpose default.
 DEFAULT_DEMUCS_MODEL = "htdemucs"
@@ -419,6 +420,21 @@ ENABLE_WHISPERX_NO_VAD = True
 # never affect this one, confirmed as a real bug when they did (see
 # lyric_alignment.py's module docstring).
 NOTE_ASSIGNMENT_MAX_GAP_SEC = 0.35
+
+# lyrics_lookup.align_words_to_reference: when an uneven replace block
+# clamps several ASR words onto the SAME single reference token (see that
+# function's own comment -- a hyphenated repeated-unit token like LRC's
+# "Do-do-do-do-do" clamped across the several ASR words it actually
+# spans), a real confirmed case had a totally unrelated ASR word ~10.6s
+# later (in silence, nothing else for the whole-sequence matcher to pair
+# it with) swept into the same block purely because it was the last ASR
+# word before the sequence ended. A gap this large from the previous ASR
+# word in the block is never the same repeated-token run, so that word is
+# left unmatched (line_id inherited from context, same as any other
+# unmatched word) instead of getting the block's reference text stamped
+# onto it. Deliberately generous vs. normal intra-phrase gaps (usually
+# well under 0.5s) so it never fires on a real, if slightly slow, repeat.
+REFERENCE_CLAMP_MAX_GAP_SEC = 2.0
 # When splitting a pass-1 note at a word boundary (_split_notes_by_word_
 # boundaries) leaves a word's leading piece shorter than this, it's DROPPED
 # instead of becoming its own syllable (see _drop_leading_slivers) -- a real
@@ -834,6 +850,79 @@ REWINDOW_STEP_SEC = 1.0
 REWINDOW_MIN_SCORE_IMPROVEMENT = 0.10
 
 
+# --- ASR quality retry (PROTOTYPE, 2026-08-10) -------------------------------
+# Real case that motivated this ("Gold"): WhisperX can, on a given run,
+# silently drop/garble whole passages rather than just mistranscribing a
+# word here and there -- decoder hallucination (see transcription.py's
+# rewindow section) or an unlucky sampling that recognizes far fewer real
+# words than actually exist. Rather than special-casing "completely
+# missing lines," this reuses whichever real per-word match-rate metric a
+# code path ALREADY computes for its own "does this file/candidate really
+# match this audio" gate -- realign.py's `RealignQuality.anchor_rate` and
+# mxl_lrc_generator.py's `MxlLrcQuality.asr_placement_rate` both already
+# share `MXL_LRC_MIN_ASR_PLACEMENT_RATE` as their existing warn/reject
+# bar, so that's reused as-is here too: if a run would already be warned
+# about or rejected for a low match rate, retry the whole transcription
+# with `RETRY_ASR_MODEL` once before accepting that verdict. A per-word
+# match-rate against real ground truth (an existing file's own text, or a
+# matched LRC/MXL candidate) catches partial degradation too, not just
+# fully-missing lines -- garbled decoding, wrong-language ASR, and
+# hallucinated segments all show up as a depressed match rate the same
+# way completely-dropped lines do.
+#
+# Only fires when the current model isn't already `RETRY_ASR_MODEL` (no
+# point re-running the same model twice), and the retry is only ever
+# ACCEPTED if its own match rate beats the original's -- if the bigger
+# model does no better (e.g. the original file's lyrics genuinely don't
+# match this audio at all), the original transcription's result is kept.
+#
+# PROTOTYPE -- needs real-audio validation before being trusted the way
+# `REWINDOW_ENABLED` now is. ON by default per this project's own
+# convention (a feature that only spends extra time when a run already
+# looks bad is low-risk by construction, and only ever pays that cost
+# once per song) -- `--no-retry-low-quality-asr` opts out.
+RETRY_ASR_MODEL = "large-v3"
+RETRY_LOW_QUALITY_ASR = True
+
+# The standard (non-MXL) pass-1-4 fallback path has no existing-file/MXL
+# candidate to measure a real match rate against -- the closest already-
+# computed, ground-truth-ish signal there is how well the ASR
+# transcript's OWN vocabulary overlaps a fetched reference-lyrics
+# candidate that has ALREADY cleared `REFERENCE_LYRICS_MIN_MATCH_RATIO`
+# (0.25, "is this even the right song"). This threshold is deliberately
+# higher than that one -- it isn't asking "is this the right song," it's
+# asking "did ASR transcribe it well" -- first estimate, not yet
+# validated across multiple songs.
+RETRY_ASR_MIN_REFERENCE_MATCH_RATIO = 0.6
+
+# Per-PASSAGE trigger, added 2026-08-10 after real validation found the
+# whole-song metrics above miss a localized failure: a single passage can
+# be completely dropped by ASR (Trixie Mattel - Gold: the reference's own
+# "Doo doo doo doo doo. They start to play." produces a real difflib
+# 'insert' block -- reference words with ZERO corresponding ASR word --
+# at one repeat of the chorus, while an aggregate 326-word transcript
+# stays well above `RETRY_ASR_MIN_REFERENCE_MATCH_RATIO` because the rest
+# of the song transcribed fine) or a real passage's TIMING can be dragged
+# badly wrong by one bad decoder segment even though the overall anchor
+# rate stays above `MXL_LRC_MIN_ASR_PLACEMENT_RATE` (David Bowie - Magic
+# Dance with `small.en`: a hallucinated "Dance Magic Dance Dance Magic
+# Dance..." loop segment left a real "Slap that baby... I saw my baby"
+# passage ~12-14s late in the realigned output, while the song-wide
+# anchor rate held at 58%). Both are the SAME underlying shape --
+# something real and contiguous going wrong in one place, invisible to a
+# whole-song average -- just surfaced through different existing
+# machinery per code path (`lyrics_lookup.largest_unmatched_reference_run`
+# for main.py's reference-alignment path; realign.py's own `confident`
+# per-word array, already computed by `match_words_to_asr`, for the
+# longest consecutive False run). Both are first estimates, sized to
+# clearly clear Gold's ~9-word dropped run and comparable-scale runs,
+# without firing on an ordinary single-word ad-lib gap -- not yet broadly
+# validated across multiple songs the way the whole-song metrics are
+# starting to be.
+RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN = 5
+RETRY_ASR_MIN_UNCONFIDENT_RUN = 5
+
+
 @dataclass
 class PipelineOptions:
     """Every knob `run_pipeline`/`run_batch` (main.py) need, decoupled from
@@ -859,6 +948,7 @@ class PipelineOptions:
     no_whisperx: bool = False
     whisperx_no_vad: bool = ENABLE_WHISPERX_NO_VAD
     rewindow_long_segments: bool = REWINDOW_ENABLED
+    retry_low_quality_asr: bool = RETRY_LOW_QUALITY_ASR
     verify_words: bool = ENABLE_WORD_VERIFICATION
     verify_placement: bool = ENABLE_PLACEMENT_VERIFICATION
     verify_all_words: bool = VERIFY_ALL_WORDS

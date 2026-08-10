@@ -29,7 +29,7 @@ from typing import Callable, Optional
 
 from . import config
 from .models import Song, Syllable
-from .file_discovery import resolve_artist_title, AmbiguousInputError, NoAudioSourceFoundError
+from .file_discovery import resolve_artist_title, headline_case, AmbiguousInputError, NoAudioSourceFoundError
 from .song_input import resolve_song_folder
 from .output_staging import stage_companions_to_output
 from .usdx_parser import parse_usdx_file, UsdxParseError
@@ -42,7 +42,8 @@ from .note_detection import detect_notes
 from .alignment import align_words
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
-                             alignment_diff_summary, reference_matches_transcript, fetch_lrclib_by_id)
+                             alignment_diff_summary, reference_match_ratio, largest_unmatched_reference_run,
+                             fetch_lrclib_by_id)
 from .musicxml_reference import apply_musicxml_references
 from .mxl_lrc_generator import try_mxl_lrc_primary
 from .lrc_timing import apply_lrc_timing_check
@@ -160,6 +161,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "the decoder silently drops content, leaving a short remaining phrase aligned "
                          "against a much-too-large window.")
     p.add_argument("--no-rewindow-long-segments", dest="rewindow_long_segments", action="store_false")
+    p.add_argument("--retry-low-quality-asr", dest="retry_low_quality_asr", action="store_true",
+                    default=config.RETRY_LOW_QUALITY_ASR,
+                    # NOTE: literal '%' in argparse help text must be escaped as '%%' -- argparse
+                    # interpolates the stored help string with %-formatting when rendering --help.
+                    help=(f"PROTOTYPE, default: ON. Retries the whole transcription once with "
+                          f"'{config.RETRY_ASR_MODEL}' when ASR quality looks bad: the MXL+LRC primary path's "
+                          f"own ASR-placement-rate gate (< {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%}), or, in "
+                          f"the standard fallback path, either a right-song reference-lyrics match with weak "
+                          f"vocabulary overlap (< {config.RETRY_ASR_MIN_REFERENCE_MATCH_RATIO:.0%}) or a run of "
+                          f"{config.RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN}+ consecutive reference words ASR "
+                          f"produced NO word for at all (one dropped passage, even if the rest of the song is "
+                          f"fine). No-op if --whisper-model is already '{config.RETRY_ASR_MODEL}'; only kept if "
+                          f"it actually scores better than the original. See CLAUDE.md.").replace("%", "%%"))
+    p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
     p.add_argument("--verify-words", dest="verify_words", action="store_true",
                     default=config.ENABLE_WORD_VERIFICATION,
                     help="Re-transcribe a tight, isolated audio crop around every word's own ASR "
@@ -203,8 +218,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "matching synced lyrics are both available, generate from those directly "
                          "(MusicXML for pitch, LRCLIB line starts as real-time anchors, real "
                          "transcription to place words within a line) instead of the standard "
-                         "audio-only pass 1-4 pipeline -- validated real end-to-end: 100% pitch-class "
-                         "accuracy, 99% timing within 500ms (see CLAUDE.md). Quality-gated: falls back "
+                         "audio-only pass 1-4 pipeline -- validated real end-to-end: 100%% pitch-class "
+                         "accuracy, 99%% timing within 500ms (see CLAUDE.md). Quality-gated: falls back "
                          "to the standard pipeline (with a warning) whenever no MusicXML/matching "
                          "lyrics are available or the result doesn't pass a consistency check.")
     p.add_argument("--no-mxl-lrc-primary", dest="mxl_lrc_primary", action="store_false",
@@ -340,6 +355,25 @@ def delete_work_files(work_dir: Path) -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _retry_transcribe(vocals_path: Path, opts: config.PipelineOptions, debug_log, log: Callable[[str], None]):
+    """PROTOTYPE, see config.RETRY_LOW_QUALITY_ASR's docstring. Re-runs
+    transcription with `config.RETRY_ASR_MODEL` -- shared by both retry
+    sites in `_run_pipeline_body` (the MXL+LRC primary path's own
+    `asr_placement_rate` gate, and the standard fallback path's
+    reference-match-ratio check) so the re-transcribe call itself isn't
+    duplicated. The caller writes its own (more specific, e.g. "MXL+LRC
+    path" vs "standard fallback path") `debug_log.section(...)` marker
+    before calling this -- this only logs the one line common to both."""
+    log(f"  Retrying transcription with '{config.RETRY_ASR_MODEL}'...")
+    if debug_log is not None:
+        debug_log.line(f"  Retrying transcription with '{config.RETRY_ASR_MODEL}'...")
+    return transcribe_words(
+        vocals_path, config.RETRY_ASR_MODEL, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
+        whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
+        rewindow_long_segments=opts.rewindow_long_segments,
+    )
+
+
 def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.PipelineOptions,
                   *, log: Callable[[str], None] = print) -> PipelineResult:
     """Runs the full pipeline for one song folder. Never raises on an
@@ -418,11 +452,20 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         parsed_artist, parsed_title = resolve_artist_title(resolved.output_mp3_source, input_dir)
         if parsed_artist is None or parsed_title is None:
             return PipelineResult(success=False, error=(
-                f'Could not parse "<Artist> - <Title>" from the audio filename '
-                f"({resolved.output_mp3_source.name!r}) or the input folder name "
+                f'Could not parse "<Artist> - <Title>" from the input folder name '
                 f"({input_dir.name!r}). Pass --artist and --title explicitly instead."))
         artist = opts.artist or parsed_artist
         title = opts.title or parsed_title
+
+    # Headline-cased for every OUTPUT folder/file name and #ARTIST/#TITLE
+    # tag from here on (e.g. "Beauty And The Beast" -> "Beauty and the
+    # Beast") -- applied uniformly regardless of source (folder name or
+    # explicit --artist/--title), since this is purely about the output
+    # naming convention. Deliberately conservative (see headline_case's
+    # own docstring): never touches an ALL CAPS or unusually-cased word
+    # like "KPop", so intentional stylization survives untouched.
+    artist = headline_case(artist)
+    title = headline_case(title)
 
     # --output-dir is now the PARENT folder under which a "<Artist> -
     # <Title>" folder is created (e.g. --output-dir C:\output produces
@@ -479,6 +522,15 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     debug_log = DebugLog(debug_log_path)
     if debug_log_path is not None:
         log(f"Writing debug log to: {debug_log_path}")
+
+    # Mirrors a decision-narration message into the debug log FILE too, not just the console/GUI `log`
+    # callback -- otherwise the file only shows a retry's raw ASR data (via `debug_log` threaded into
+    # transcribe_words/try_mxl_lrc_primary) with no record of WHY it fired or what was decided, forcing
+    # anyone auditing the file alone to go dig up separately-captured console output instead. Used by
+    # both ASR-quality retry sites below (see config.RETRY_LOW_QUALITY_ASR's docstring).
+    def dlog(msg: str) -> None:
+        log(msg)
+        debug_log.line(msg)
 
     # --- 1. Companion files (already resolved above) -------------------------
     for note in resolved.notes:
@@ -550,12 +602,56 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     syllables = None
     ref_lines = None
     synced_lyrics_text = None
+    # Tracks whichever model's transcription `words` currently holds --
+    # NOT always opts.whisper_model, since a low-quality-ASR retry below
+    # may have already swapped `words` for a config.RETRY_ASR_MODEL
+    # transcription. Guards both retry sites so a song that retries once
+    # in the MXL+LRC path never retries a second, redundant time in the
+    # standard fallback path below.
+    current_asr_model = opts.whisper_model
     if opts.mxl_lrc_primary and mxl_paths:
         log("Attempting MXL+LRC primary generation (MusicXML pitch + synced-lyric line anchors + ASR word placement)...")
         mxl_lrc_result = try_mxl_lrc_primary(
             mxl_paths, artist, title, audio_duration, words,
             forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
         )
+        # PROTOTYPE ASR-quality retry, see config.RETRY_LOW_QUALITY_ASR's
+        # docstring. Reuses the SAME asr_placement_rate/MXL_LRC_MIN_ASR_
+        # PLACEMENT_RATE gate `generate_from_mxl_and_lrc` already computes
+        # for its own "does the matched candidate really correspond to
+        # this recording" check -- if that's what's failing (not e.g. "no
+        # candidate found at all", which a bigger ASR model can't fix),
+        # retry the whole transcription once with config.RETRY_ASR_MODEL
+        # and re-run try_mxl_lrc_primary against it, keeping whichever
+        # attempt has the higher placement rate. A song where this retry
+        # succeeds gets the retried transcription carried forward into
+        # `words` even if used later (e.g. the standard fallback path).
+        if (opts.retry_low_quality_asr and mxl_lrc_result is not None and mxl_lrc_result.quality is not None
+                and mxl_lrc_result.quality.asr_placement_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
+                and current_asr_model != config.RETRY_ASR_MODEL):
+            debug_log.section(f"ASR QUALITY RETRY (MXL+LRC path) -- re-transcribing with '{config.RETRY_ASR_MODEL}'")
+            dlog(f"  Only {mxl_lrc_result.quality.asr_placement_rate:.0%} of MXL words got a real ASR anchor "
+                 f"(need {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%}) -- retrying before accepting this result.")
+            retry_words = _retry_transcribe(vocals_path, opts, debug_log, log)
+            if retry_words:
+                retry_mxl_result = try_mxl_lrc_primary(
+                    mxl_paths, artist, title, audio_duration, retry_words,
+                    forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
+                )
+                if (retry_mxl_result is not None and retry_mxl_result.quality is not None
+                        and retry_mxl_result.quality.asr_placement_rate > mxl_lrc_result.quality.asr_placement_rate):
+                    dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' improved the ASR placement rate: "
+                         f"{mxl_lrc_result.quality.asr_placement_rate:.0%} -> "
+                         f"{retry_mxl_result.quality.asr_placement_rate:.0%} -- using the retry.")
+                    mxl_lrc_result = retry_mxl_result
+                    words = retry_words
+                    current_asr_model = config.RETRY_ASR_MODEL
+                else:
+                    dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' did not improve the ASR placement rate -- "
+                         f"keeping the original transcription.")
+            else:
+                dlog(f"  Retry transcription with '{config.RETRY_ASR_MODEL}' produced no words -- keeping "
+                     f"the original transcription.")
         if mxl_lrc_result is not None and mxl_lrc_result.time_calibration is not None:
             tc = mxl_lrc_result.time_calibration
             if tc.offset_sec is not None:
@@ -633,7 +729,57 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 )
             if reference:
                 candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
-                if not reference_matches_transcript(candidate_lines, words):
+                match_ratio = reference_match_ratio(candidate_lines, words)
+                unmatched_run = largest_unmatched_reference_run(candidate_lines, words)
+                # PROTOTYPE ASR-quality retry, see config.RETRY_LOW_QUALITY_ASR's
+                # docstring. Only fires once this reference has already cleared
+                # REFERENCE_LYRICS_MIN_MATCH_RATIO's much lower "is this even the
+                # right song" bar -- below that bar means wrong song/language,
+                # which a bigger model can't fix. Two INDEPENDENT triggers above
+                # that bar: a low whole-song ratio (ASR mistranscribed a lot,
+                # spread thinly), or a long unmatched-reference run (real case:
+                # Trixie Mattel - Gold -- ASR completely dropped one repeat of
+                # the "Doo doo doo doo doo. They start to play." chorus while the
+                # rest of the 326-word transcript was fine, which kept the
+                # aggregate ratio well above the bar and would have hidden this
+                # from a whole-song-only check).
+                low_ratio_trigger = (config.REFERENCE_LYRICS_MIN_MATCH_RATIO <= match_ratio
+                                      < config.RETRY_ASR_MIN_REFERENCE_MATCH_RATIO)
+                dropped_passage_trigger = (match_ratio >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO
+                                            and unmatched_run >= config.RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN)
+                if (opts.retry_low_quality_asr and (low_ratio_trigger or dropped_passage_trigger)
+                        and current_asr_model != config.RETRY_ASR_MODEL):
+                    debug_log.section(f"ASR QUALITY RETRY (standard fallback path) -- re-transcribing with "
+                                       f"'{config.RETRY_ASR_MODEL}'")
+                    if dropped_passage_trigger and not low_ratio_trigger:
+                        dlog(f"  ASR transcript matches the reference lyrics overall ({match_ratio:.0%}), but a "
+                             f"{unmatched_run}-word run of reference text has NO corresponding ASR word at all "
+                             f"(a passage ASR completely dropped) -- retrying before accepting this transcription.")
+                    else:
+                        dlog(f"  ASR transcript only matches the reference lyrics {match_ratio:.0%} (right song, "
+                             f"but ASR quality looks weak) -- retrying before accepting this transcription.")
+                    retry_words = _retry_transcribe(vocals_path, opts, debug_log, log)
+                    if retry_words:
+                        retry_ratio = reference_match_ratio(candidate_lines, retry_words)
+                        retry_unmatched_run = largest_unmatched_reference_run(candidate_lines, retry_words)
+                        # Accept if it's better on WHICHEVER signal actually triggered the retry -- comparing
+                        # only the ratio could miss a retry that fixes one dropped passage (a handful of
+                        # words out of hundreds barely moves the aggregate) without making it worse either.
+                        if retry_ratio > match_ratio or retry_unmatched_run < unmatched_run:
+                            dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' improved: reference match "
+                                 f"{match_ratio:.0%} -> {retry_ratio:.0%}, largest dropped-passage run "
+                                 f"{unmatched_run} -> {retry_unmatched_run} word(s) -- using the retry.")
+                            words = retry_words
+                            match_ratio = retry_ratio
+                            unmatched_run = retry_unmatched_run
+                            current_asr_model = config.RETRY_ASR_MODEL
+                        else:
+                            dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' did not improve either signal -- "
+                                 f"keeping the original transcription.")
+                    else:
+                        dlog(f"  Retry transcription with '{config.RETRY_ASR_MODEL}' produced no words -- "
+                             f"keeping the original transcription.")
+                if match_ratio < config.REFERENCE_LYRICS_MIN_MATCH_RATIO:
                     log(f"  Got a reference from {reference.source}, but its words barely overlap "
                         f"the transcript (likely wrong song/language) -- discarding it, "
                         f"continuing with ASR text and gap-based phrasing only.")
@@ -777,9 +923,11 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
 
     # --- 11. Copy the companions this output actually references into
     # output_dir (input and output folders are required to differ -- see
-    # the check at the top of this function) -----------------------------
+    # the check at the top of this function), renamed to "<Artist> -
+    # <Title>[.ext]" (images keep their own "[CO]"/"[BG]" tag) regardless
+    # of what they were called in the input folder -----------------------
     staged = stage_companions_to_output(
-        output_dir,
+        output_dir, artist, title,
         mp3_src=resolved.output_mp3_source,
         video_src=resolved.output_video_source,
         cover_src=resolved.cover,
@@ -840,6 +988,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         fetch_lyrics=args.fetch_lyrics, no_video_sync=args.no_video_sync,
         no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
         rewindow_long_segments=args.rewindow_long_segments,
+        retry_low_quality_asr=args.retry_low_quality_asr,
         verify_words=args.verify_words,
         verify_placement=args.verify_placement, verify_all_words=args.verify_all_words,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,

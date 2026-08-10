@@ -14,12 +14,36 @@ and fall back to faster-whisper's own timestamps (with a warning) if not.
 
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
 from pathlib import Path
 from typing import List
 
 from . import config
 from . import model_cache
 from .models import Word
+
+# whisperx.audio.load_audio() shells out to ffmpeg via a bare
+# `subprocess.run(cmd, ...)` call inside the third-party package -- a call
+# site we don't own, unlike separation.py/media_extract.py's own ffmpeg/
+# Demucs calls, which pass CREATE_NO_WINDOW directly. On Windows, a
+# subprocess spawned by a parent with no console of its own (the GUI,
+# launched via pythonw.exe per run_gui.bat) otherwise pops up a new console
+# window for the moment it runs. Since we can't pass creationflags into
+# whisperx's own call, patch subprocess.Popen.__init__ itself, once, so
+# every child process this python process ever spawns picks up the flag by
+# default -- harmless for calls that already set creationflags explicitly
+# (ours), a no-op on non-Windows.
+if os.name == "nt" and not getattr(subprocess.Popen, "_ultrastar_no_window_patched", False):
+    _real_popen_init = subprocess.Popen.__init__
+
+    def _no_window_popen_init(self, *args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        _real_popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _no_window_popen_init
+    subprocess.Popen._ultrastar_no_window_patched = True
 
 
 def _mean_word_score(words: list) -> float:
@@ -82,17 +106,38 @@ def _rewindow_long_segments(segments: list, align_model, metadata, audio, device
     segment at least `config.REWINDOW_MIN_SEGMENT_DURATION_SEC` long --
     everything else (text, downstream whisperx.align()/Word construction)
     is untouched; this only fixes segment BOUNDARIES before they're used,
-    so it composes with the normal pipeline for free."""
-    fixed = []
-    for seg in segments:
-        duration = seg["end"] - seg["start"]
-        if duration < config.REWINDOW_MIN_SEGMENT_DURATION_SEC:
-            fixed.append(seg)
-            continue
-        new_start, new_end, improved = _find_best_window(seg, align_model, metadata, audio, device,
-                                                           debug_log=debug_log)
-        fixed.append(dict(seg, start=new_start, end=new_end) if improved else seg)
-    return fixed
+    so it composes with the normal pipeline for free.
+
+    The sweep in `_find_best_window` deliberately probes many implausible
+    candidate windows (including narrow tail-end ones as short as
+    `REWINDOW_STEP_SEC`, clamped against the segment's own end) -- most of
+    these predictably fail whisperx's own forced-alignment backtrack (too
+    little audio for the given text), score 0.0 via `_mean_word_score`, and
+    are correctly never selected. That's expected, not a real problem, but
+    whisperx logs each one as a WARNING regardless -- real case (David Bowie
+    - Absolute Beginners) produced ~20 of these in one run, all from sweep
+    candidates, none from the segment bounds actually used downstream.
+    Suppresses `whisperx.alignment`'s own WARNING logging for the duration of
+    this sweep so expected candidate failures don't spam the console/GUI log;
+    restored before returning, so a genuine failure in the FINAL alignment
+    call (on the segment bounds this function actually returns) still
+    surfaces normally."""
+    align_logger = logging.getLogger("whisperx.alignment")
+    prev_level = align_logger.level
+    align_logger.setLevel(logging.ERROR)
+    try:
+        fixed = []
+        for seg in segments:
+            duration = seg["end"] - seg["start"]
+            if duration < config.REWINDOW_MIN_SEGMENT_DURATION_SEC:
+                fixed.append(seg)
+                continue
+            new_start, new_end, improved = _find_best_window(seg, align_model, metadata, audio, device,
+                                                               debug_log=debug_log)
+            fixed.append(dict(seg, start=new_start, end=new_end) if improved else seg)
+        return fixed
+    finally:
+        align_logger.setLevel(prev_level)
 
 
 def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None,
