@@ -27,7 +27,7 @@ from . import config
 from .batch import run_batch
 from .file_discovery import (AmbiguousInputError, NoAudioSourceFoundError, headline_case,
                               resolve_artist_title, resolve_primary_source)
-from .lyrics_lookup import LrcLibCandidate, search_lrclib
+from .lyrics_lookup import LrcLibCandidate, search_lrclib, load_lrc_file
 from .main import PipelineResult, check_cuda_available, delete_work_files, run_pipeline
 from .realign import RealignPipelineOptions, run_realign_batch, run_realign_pipeline
 
@@ -414,6 +414,11 @@ class App(tk.Tk):
         # bypassing search/scoring entirely for both the MXL+LRC primary
         # path and the standard pipeline's own reference-lyrics fetch.
         self.lrclib_id = tk.StringVar(value="")
+        # Local .lrc file override -- bypasses LRCLIB search/fetch entirely,
+        # wins over both search and --lrclib-id if given. Same shared-var
+        # pattern as lrclib_id above (one Entry per Lyrics frame, single
+        # source of truth). See lyrics_lookup.load_lrc_file.
+        self.lrc_file = tk.StringVar(value="")
 
         self._running = False
         self._build_widgets()
@@ -602,6 +607,13 @@ class App(tk.Tk):
                                        "a linked video, and paste the id here) -- always wins over search and "
                                        "over the pick above, no ambiguity. Used for both MXL+LRC primary "
                                        "generation and the standard pipeline's own lyrics fetch.")
+        ttk.Label(lyrics_frame, text="LRC file:").pack(side="left", padx=(16, 2))
+        self.lrc_file_entry = ttk.Entry(lyrics_frame, textvariable=self.lrc_file, width=18)
+        self.lrc_file_entry.pack(side="left")
+        Tooltip(self.lrc_file_entry, "Path to a LOCAL .lrc synced-lyrics file to use directly, bypassing LRCLIB "
+                                      "entirely -- wins over both search and LRCLIB ID above if given.")
+        self.lrc_file_browse_button = ttk.Button(lyrics_frame, text="Browse...", command=self._browse_lrc_file)
+        self.lrc_file_browse_button.pack(side="left", padx=(2, 0))
         self.lyrics_ambiguity_check = ttk.Checkbutton(
             lyrics_frame, text="Ask when lyrics are ambiguous", variable=self.lyrics_ambiguity_prompt)
         self.lyrics_ambiguity_check.pack(side="left", padx=16)
@@ -623,6 +635,14 @@ class App(tk.Tk):
         self.realign_lrclib_id_entry.pack(side="left", padx=4, pady=4)
         Tooltip(self.realign_lrclib_id_entry, "A specific LRCLIB entry id (browse lrclib.net yourself and "
                                                "paste the id here) -- always wins over automatic search.")
+        ttk.Label(realign_lyrics_frame, text="LRC file:").pack(side="left", padx=(16, 2), pady=4)
+        self.realign_lrc_file_entry = ttk.Entry(realign_lyrics_frame, textvariable=self.lrc_file, width=18)
+        self.realign_lrc_file_entry.pack(side="left", padx=4, pady=4)
+        Tooltip(self.realign_lrc_file_entry, "Path to a LOCAL .lrc synced-lyrics file to use directly, bypassing "
+                                              "LRCLIB entirely -- wins over both search and LRCLIB ID above.")
+        self.realign_lrc_file_browse_button = ttk.Button(
+            realign_lyrics_frame, text="Browse...", command=self._browse_lrc_file)
+        self.realign_lrc_file_browse_button.pack(side="left", padx=(2, 8), pady=4)
 
         self.realign_options_frame = ttk.LabelFrame(self, text="Options")
         realign_options_frame = self.realign_options_frame
@@ -865,7 +885,11 @@ class App(tk.Tk):
         self.search_lyrics_button.config(state=lyrics_controls_state)
         self.lyrics_ambiguity_check.config(state=lyrics_controls_state)
         self.lrclib_id_entry.config(state=lyrics_controls_state)
+        self.lrc_file_entry.config(state=lyrics_controls_state)
+        self.lrc_file_browse_button.config(state=lyrics_controls_state)
         self.realign_lrclib_id_entry.config(state=artist_title_state)
+        self.realign_lrc_file_entry.config(state=artist_title_state)
+        self.realign_lrc_file_browse_button.config(state=artist_title_state)
 
     # --- LRCLIB lyrics search / disambiguation -----------------------------
 
@@ -1005,6 +1029,13 @@ class App(tk.Tk):
         if f:
             self.existing_txt_entry.set_real_value(str(Path(f)))
 
+    def _browse_lrc_file(self):
+        initial = self.input_dir.get().strip() or self._last_dir("input_dir")
+        filetypes = [("LRC synced lyrics files", "*.lrc"), ("All files", "*.*")]
+        f = filedialog.askopenfilename(title="Select .lrc file", initialdir=initial, filetypes=filetypes)
+        if f:
+            self.lrc_file.set(str(Path(f)))
+
     # --- work-file cleanup / open-output-folder -------------------
 
     def _delete_work_files_now(self):
@@ -1083,7 +1114,7 @@ class App(tk.Tk):
             # themselves in batch mode). A manual pre-run pick always wins
             # outright; the ambiguity-prompt callback is only wired up as
             # a fallback when nothing was pre-picked.
-            pinned_lyrics=self.pinned_lyrics if not is_batch else None,
+            pinned_lyrics=self._effective_pinned_lyrics() if not is_batch else None,
             lyrics_ambiguity_prompt=self.lyrics_ambiguity_prompt.get() if not is_batch else False,
             lyrics_disambiguation_callback=(
                 self._make_ambiguity_callback()
@@ -1111,6 +1142,20 @@ class App(tk.Tk):
         except ValueError:
             return None
 
+    def _effective_pinned_lyrics(self) -> Optional[LrcLibCandidate]:
+        """A typed LRC file path wins over a manual Search Lyrics... pick
+        (same precedence as the CLI's --lrc-file vs pinned_lyrics/
+        --lrclib-id -- see lyrics_lookup.load_lrc_file), since typing an
+        explicit local file is a more deliberate override than whatever
+        was picked earlier in the session."""
+        raw = self.lrc_file.get().strip()
+        if raw:
+            candidate = load_lrc_file(raw, artist=self.artist_entry.effective_value() or "",
+                                       title=self.title_entry.effective_value() or "")
+            if candidate is not None:
+                return candidate
+        return self.pinned_lyrics
+
     def _build_realign_opts(self) -> RealignPipelineOptions:
         is_batch = self._is_batch()
         return RealignPipelineOptions(
@@ -1121,6 +1166,7 @@ class App(tk.Tk):
             artist=None if is_batch else self.artist_entry.effective_value(),
             title=None if is_batch else self.title_entry.effective_value(),
             lrclib_id=None if is_batch else self._effective_lrclib_id(),
+            lrc_file=None if is_batch else (self.lrc_file.get().strip() or None),
             use_lrc=self.realign_use_lrc.get(),
             lrc_mode=self.lrc_mode.get(),
             strategy=self.realign_strategy.get(),

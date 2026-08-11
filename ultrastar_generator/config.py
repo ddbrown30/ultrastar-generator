@@ -465,6 +465,21 @@ NOTE_ASSIGNMENT_MAX_GAP_SEC = 0.35
 # onto it. Deliberately generous vs. normal intra-phrase gaps (usually
 # well under 0.5s) so it never fires on a real, if slightly slow, repeat.
 REFERENCE_CLAMP_MAX_GAP_SEC = 2.0
+# Same repeat-clamp mechanism, different failure mode (real case: David Bowie
+# - Magic Dance, 2026-08-10): the decoder hallucinated a real "Dance, magic,
+# dance" x5 passage into ~90 garbage ASR tokens, producing an extreme uneven
+# replace block (a_len >> b_len) where nearly all of them clamped onto the
+# SAME single reference token ("magic,"). The repeat-clamp path cycles that
+# token's own hyphenated syllables across the repeats (built for a much
+# smaller case -- LRC's "Do-do-do-do-do", ~5 real repeats) -- with ~90
+# repeats and only 2 syllables ("mag"/"ic"), the cursor ran off the end and
+# froze on the LAST syllable, stamping "ic" onto ~89 real notes as if it
+# were confirmed reference text. This many ASR words clamping onto one
+# reference token is itself the signal something is wrong (real repeated
+# ad-libs don't run this high) -- past this count, don't trust a fabricated
+# reference_text at all; fall back to keeping the ASR word's own raw text,
+# same treatment as an ordinary uneven block gets by default.
+REFERENCE_CLAMP_MAX_REPEAT = 8
 # When splitting a pass-1 note at a word boundary (_split_notes_by_word_
 # boundaries) leaves a word's leading piece shorter than this, it's DROPPED
 # instead of becoming its own syllable (see _drop_leading_slivers) -- a real
@@ -626,6 +641,108 @@ LRC_TIMING_MIN_DRIFT_CONFIDENCE = 0.5
 # constant-offset case's 1-second bucket width, not the (looser)
 # post-calibration flag tolerance above.
 LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC = 1.5
+# Tier 3, tried only when BOTH tier 1 (constant) and tier 2 (linear
+# drift) fail their own confidence gates above: a song where whichever
+# recording LRCLIB's synced lyrics were timed against was EDITED
+# differently from ours (a repeated chorus removed, a bridge shortened,
+# etc.) produces a DISCONTINUOUS drift -- the delta jumps, or the slope
+# itself changes, partway through the song -- that no single constant or
+# single global slope can fit, no matter how it's chosen. Two
+# interchangeable implementations exist (see lrc_timing.py's own
+# `_pava_isotonic`/`_piecewise_correction_anchors`): "isotonic" (PAVA
+# monotonic regression -- try first, no manual spacing heuristics
+# needed since PAVA pools noisy points instead of discarding them) and
+# "piecewise" (direct linear interpolation between confident anchors,
+# after greedily dropping any anchor that would make the correction
+# non-monotonic). Config-selectable rather than always building both --
+# they solve the exact same problem, and this project doesn't maintain
+# two production code paths for one job (see CLAUDE.md's own "Removed /
+# rejected approaches" history of exactly this kind of duplication).
+LRC_TIMING_DRIFT_MODEL = "isotonic"  # "isotonic" | "piecewise"
+# Tier 3's own noise filter: a candidate must be within this many seconds
+# of tier 2's OWN Theil-Sen fit (even a fit that itself didn't clear
+# LRC_TIMING_MIN_DRIFT_CONFIDENCE is still useful here purely as an
+# outlier filter -- see the module docstring) to be trusted as real
+# signal for tier 3 at all. Deliberately LOOSER than
+# LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC above: tier 3 exists specifically
+# to survive cases the tier-2 fit itself doesn't trust (a real regime
+# change can sit several seconds off the GLOBAL fit by construction),
+# so this only needs to catch raw text-matching noise / wrong-repeated-
+# line-instance mismatches, not real per-segment drift.
+LRC_TIMING_PIECEWISE_OUTLIER_TOLERANCE_SEC = 4.0
+# Minimum anchors surviving the outlier filter (+ monotonicity, for
+# "piecewise") before tier 3 is even attempted. Fewer than this can't
+# distinguish a real multi-segment edit from "2 points define a line" --
+# that's just tier 2 (already failed) with extra steps.
+LRC_TIMING_PIECEWISE_MIN_ANCHORS = 6
+# Reject the whole tier-3 attempt if any two ADJACENT surviving anchors
+# (by lrc_start) are farther apart than this. Interpolating linearly
+# across a huge silent/unmatched gap with only the 2 anchors bounding it
+# is exactly the global-linear-drift case again, just applied locally
+# with much less evidence -- 2 points can't distinguish a real step
+# change from noise, so this should fall through to "uncalibrated" (same
+# as tier 2 already found) rather than fabricate a locally-linear guess
+# across a gap this wide.
+LRC_TIMING_PIECEWISE_MAX_ANCHOR_GAP_SEC = 45.0
+# REAL VALIDATION FINDING (2026-08-11, see lrc_timing.py's own module
+# docstring for the full real-audio evidence) that MOTIVATED the
+# refine-vs-rescue split below: tier 3's confidence number is NOT
+# directly comparable to tier 1/2's on its own -- a flexible piecewise/
+# isotonic fit can look confident (84% on a real tested case, David
+# Bowie "Heroes" vs a choral-cover candidate) on a recording that's
+# wrong for a STRUCTURAL reason (different arrangement/artist), not just
+# a timing-drift reason, because more degrees of freedom make scattered
+# disagreement easier to locally explain away than a rigid 2-parameter
+# line can. A genuine real win was ALSO found on a different song (33%->
+# 87% within 1s on Chicago's own previously-uncalibratable real
+# candidate) -- tier 3 is not broken, but a HIGH tier-3 confidence alone
+# (regardless of the number) can't distinguish "genuinely complex real
+# drift" from "overfit to a wrong recording", since both look like a
+# flexible model finding SOME fit. The fix isn't a stricter residual
+# threshold (same blind spot, just moved) -- it's asking for INDEPENDENT
+# evidence, checked below.
+#
+# `two_tier_time_calibration` now splits tier 3 into two cases based on
+# whether tier 1/2's OWN best (still-rejected) fit already cleared this
+# floor BEFORE tier 3 ran:
+#   - "refine" (floor cleared): two independent RIGID models (constant,
+#     linear) already partially agree with each other on this candidate
+#     -- tier 3 is sharpening a shape they were already circling, not
+#     inventing one from nothing. Proceeds exactly as before, no
+#     structural check required.
+#   - "rescue" (floor NOT cleared): neither rigid model found ANY real
+#     support -- tier 3 succeeding here means the flexible model is
+#     supplying both the hypothesis (a discontinuous drift exists) and
+#     its own validation (a good-looking fit to it), with no independent
+#     check that the candidate is even the right recording. Gated behind
+#     `structural_check` (see `two_tier_time_calibration`'s own
+#     docstring) -- declines (falls through to uncalibrated) unless the
+#     caller provides a check AND it passes.
+# Threshold chosen from the only 2 real "borderline" (still-rejected-by-
+# tier-1/2) data points available: Heroes' wrong-recording candidate
+# (tier1 21%, tier2 26% -- the max of the two is what's compared here)
+# vs. Chicago's genuinely-rescuable candidate (tier1 24%, tier2 38%).
+# 0.30 sits between them, correctly classifying both -- but this is a
+# 2-point real sample, not a robustly-fit threshold; revisit if a real
+# case lands on the wrong side of it.
+LRC_TIMING_RESCUE_MIN_PRIOR_CONFIDENCE = 0.30
+# Odd/even-anchor holdout validation (see lrc_timing._holdout_residual_
+# sec): fits tier 3's correction on the ODD-indexed anchors only, scores
+# it against the EVEN-indexed anchors' own real times -- targets the
+# general "genuine drift vs. fit to noise" question (not just the wrong-
+# recording case the refine/rescue split targets), cheap since the
+# anchor set already exists. Computed and returned for every tier-3
+# result (both refine and rescue) as a DIAGNOSTIC value, not currently a
+# hard gate -- real-tested on Heroes (2026-08-11): did NOT by itself
+# flag the wrong-recording case (holdout residual was NOT dramatically
+# worse than Chicago's own genuine-rescue case), so it doesn't close the
+# gap the refine/rescue split targets on its own. Kept because it's
+# cheap and may still catch a different failure shape (a fit that's
+# locally smooth but doesn't generalize between its own anchors) that
+# the refine/rescue split, which only looks at tier 1/2's prior
+# confidence, can't see -- see lrc_timing.py's own docstring for the
+# real numbers.
+LRC_TIMING_HOLDOUT_MIN_ANCHORS = 4
 
 
 # --- Existing-file verification (verify_existing_song.py) ------------------
@@ -980,6 +1097,9 @@ class PipelineOptions:
     fetch_lyrics: bool = True
     no_video_sync: bool = False
     no_whisperx: bool = False
+    no_transcribe: bool = False  # DIAGNOSTIC (default off): skip the WhisperX
+        # decoder entirely, force-align a pinned LRC candidate's own known
+        # line text instead -- see transcription.force_align_reference_lyrics
     whisperx_no_vad: bool = ENABLE_WHISPERX_NO_VAD
     rewindow_long_segments: bool = REWINDOW_ENABLED
     retry_low_quality_asr: bool = RETRY_LOW_QUALITY_ASR

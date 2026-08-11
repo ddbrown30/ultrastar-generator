@@ -315,6 +315,78 @@ def force_align_words_in_window(words_text: List[str], window_start: float, wind
     return out
 
 
+def force_align_reference_lyrics(vocals_path: Path, synced_lyrics: str, audio_duration: float,
+                                  debug_log=None) -> List[Word]:
+    """DIAGNOSTIC/EXPERIMENTAL (config.PipelineOptions.no_transcribe /
+    --no-transcribe, 2026-08-10): builds the ENTIRE initial Word list
+    without ever running the WhisperX DECODER (`model.transcribe()`, the
+    component that guesses what was sung and can hallucinate/drop content
+    -- see the David Bowie - Magic Dance 'ic ic ic...' case in CLAUDE.md,
+    where a decoder hallucination on a real repeated passage ultimately
+    corrupted output text even after reference-lyrics correction). Only
+    the SEPARATE wav2vec2 CTC forced-alignment model runs here
+    (`force_align_words_in_window`, same mechanism `force_align_gaps`
+    already uses to recover known-but-undetected words), driven entirely
+    by the KNOWN text from a pinned LRC candidate's own synced lyrics --
+    there is no ASR output at all for anything downstream to inherit
+    hallucinated text from.
+
+    This is meant for isolating whether ASR-decoder hallucination is
+    bleeding into output some OTHER way this project hasn't found yet --
+    not a replacement for the normal transcription path in general (it
+    requires a trustworthy pinned LRC candidate with per-line timestamps,
+    and gives up whatever real information the decoder would have added
+    for content the LRC doesn't cover, e.g. ad-libs).
+
+    Each LRC line gets its own window: [this line's timestamp, next
+    line's timestamp), last line to `audio_duration`. A line whose
+    force-alignment fails (window implausibly short for its word count,
+    whisperx.align() itself raises, or the result is out-of-order/
+    ambiguous -- see force_align_words_in_window's own contract) is
+    skipped entirely and logged; never guessed or interpolated here --
+    downstream stages (force-align-gaps, pass 3's own fallback-to-
+    nearest-note handling) already exist to cope with missing words."""
+    import whisperx
+    from .lrc_timing import parse_lrc
+
+    lines = parse_lrc(synced_lyrics)
+    if not lines:
+        return []
+
+    audio = whisperx.load_audio(str(vocals_path))
+    align_model, metadata = model_cache.get_whisperx_align_model()
+
+    if debug_log is not None:
+        debug_log.section("FORCED-ALIGNMENT-ONLY MODE (--no-transcribe) -- the WhisperX DECODER never ran; "
+                           "every word below comes from forcing the pinned LRC candidate's own known line "
+                           "text onto the audio via wav2vec2 CTC alone")
+
+    words: List[Word] = []
+    n_failed = 0
+    for i, (line_start, line_text) in enumerate(lines):
+        line_end = lines[i + 1][0] if i + 1 < len(lines) else audio_duration
+        line_words_text = line_text.split()
+        if not line_words_text or line_end <= line_start:
+            continue
+        result = force_align_words_in_window(line_words_text, line_start, line_end,
+                                              align_model, metadata, audio, device="cuda")
+        if result is None:
+            n_failed += 1
+            if debug_log is not None:
+                debug_log.line(f"  [{line_start:8.3f} - {line_end:8.3f}]  FAILED to force-align: {line_text!r}")
+            continue
+        for text, (start, end, score) in zip(line_words_text, result):
+            words.append(Word(text=text, start=start, end=end, confidence=score))
+        if debug_log is not None:
+            debug_log.line(f"  [{line_start:8.3f} - {line_end:8.3f}]  OK: {line_text!r}")
+
+    if debug_log is not None:
+        debug_log.line(f"  {len(lines) - n_failed}/{len(lines)} line(s) force-aligned successfully "
+                        f"({n_failed} failed and were skipped -- no words for those lines).")
+
+    return words
+
+
 def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None,
                                vad_options: dict = None, rewindow_long_segments: bool = False) -> List[Word]:
     import whisperx

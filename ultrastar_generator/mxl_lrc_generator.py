@@ -51,7 +51,7 @@ import difflib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib
@@ -720,8 +720,16 @@ class TimeCalibration:
     offset_sec: Optional[float] = None
     slope: float = 0.0
     confidence: float = 0.0
-    kind: Optional[str] = None   # "constant", "drift", or None if uncalibrated
+    kind: Optional[str] = None   # "constant", "drift", "piecewise", "isotonic", or None if uncalibrated
     skipped_reason: Optional[str] = None
+    # `correction_fn(lrc_start) -> corrected_real_time`, populated for
+    # every successful `kind` -- see two_tier_time_calibration's own
+    # docstring for why offset_sec/slope alone aren't enough for
+    # "piecewise"/"isotonic".
+    correction_fn: Optional[Callable[[float], float]] = None
+    # Diagnostic-only odd/even-anchor holdout residual (seconds), tier 3
+    # ("piecewise"/"isotonic") only -- see lrc_timing._holdout_residual_sec.
+    holdout_residual_sec: Optional[float] = None
 
 
 @dataclass
@@ -764,12 +772,26 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
     # just being imprecise. A null/near-zero calibration is a no-op here
     # (offset+slope of ~0 shifts nothing), so this can't regress an
     # already-well-aligned candidate.
+    #
+    # No `structural_check` passed (2026-08-11 scope decision, see
+    # CLAUDE.md's tier-3 real-validation writeup): would need "our own
+    # lines" built from `mxl_words` (a flat per-syllable list with no
+    # native line grouping the way realign.py's already-authored existing
+    # file has), left as a follow-up rather than built speculatively here.
+    # This means tier 3's "rescue" case (see two_tier_time_calibration's
+    # own docstring) always declines for THIS path -- only "refine"
+    # (tier 1/2 already found some real support) is available -- the
+    # safe default, not a regression: this path's own downstream ASR-
+    # placement-rate quality gate (MXL_LRC_MIN_ASR_PLACEMENT_RATE) is
+    # also still there as a backstop either way.
     time_candidates = match_asr_to_lrc_lines(asr_words, lrc_match.lrc_lines)
-    offset, slope, confidence, kind, skipped_reason = two_tier_time_calibration(time_candidates)
+    offset, slope, confidence, kind, skipped_reason, correction_fn, holdout = two_tier_time_calibration(
+        time_candidates)
     time_cal = TimeCalibration(offset_sec=offset, slope=slope, confidence=confidence,
-                                kind=kind, skipped_reason=skipped_reason)
+                                kind=kind, skipped_reason=skipped_reason, correction_fn=correction_fn,
+                                holdout_residual_sec=holdout)
     if offset is not None:
-        lrc_match.lrc_lines = [(t + offset + slope * t, text) for t, text in lrc_match.lrc_lines]
+        lrc_match.lrc_lines = [(correction_fn(t), text) for t, text in lrc_match.lrc_lines]
 
     word_lines, word_clean_text = assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
     word_starts, word_ends, quality = place_words_via_asr(mxl_words, word_lines, lrc_match.lrc_lines, asr_words,

@@ -776,6 +776,35 @@ assert aligned[2].start == 0.4 and aligned[2].end == 0.6
 print("OK: corrected words:", diffs)
 print("OK: line ids:", [w.line_id for w in aligned])
 
+print("\n--- lyrics_lookup.align_words_to_reference: repeat-clamp caps + wraps instead of freezing "
+      "(real case: David Bowie - Magic Dance, 2026-08-10 -- decoder hallucinated a 'Dance, magic, dance' "
+      "x5 passage into ~90 garbage ASR tokens, all clamped onto the SAME reference token; the syllable "
+      "cursor froze on the last syllable ('ic') and verify_words then stamped that onto ~89 real notes as "
+      "if it were confirmed reference text) ---")
+# Below the cap: repeats should WRAP across the reference token's own syllables
+# instead of freezing on the last one once the cursor runs out.
+wrap_ref_lines = ["magic"]
+wrap_asr_words = [Word(text="dance", start=float(i), end=float(i) + 0.2, confidence=0.9) for i in range(4)]
+wrap_aligned = align_words_to_reference(wrap_asr_words, wrap_ref_lines)
+wrap_texts = [w.reference_text for w in wrap_aligned]
+assert wrap_texts == ["mag", "ic", "mag", "ic"], wrap_texts
+print("OK: below the cap, syllables wrap:", wrap_texts)
+
+# Above the cap: this many ASR words clamping onto one reference token is
+# itself the hallucination signal -- don't fabricate a reference_text at all,
+# keep the ASR word's own (still garbage, but at least not falsely
+# "confirmed") text untouched.
+runaway_ref_lines = ["magic"]
+runaway_asr_words = [Word(text="ic", start=float(i), end=float(i) + 0.2, confidence=0.9) for i in range(20)]
+runaway_aligned = align_words_to_reference(runaway_asr_words, runaway_ref_lines)
+assert all(w.reference_text is None for w in runaway_aligned), [w.reference_text for w in runaway_aligned]
+assert all(w.text == "ic" for w in runaway_aligned)
+assert all(w.line_id == 0 for w in runaway_aligned), [w.line_id for w in runaway_aligned]
+import ultrastar_generator.config as _config_mod
+print(f"OK: {len(runaway_asr_words)} words clamping onto one reference token (> "
+      f"config.REFERENCE_CLAMP_MAX_REPEAT={_config_mod.REFERENCE_CLAMP_MAX_REPEAT}) leaves reference_text "
+      f"unset, keeps ASR's own text, still tags line_id for phrase grouping")
+
 print("\n--- lyrics_lookup.reference_matches_transcript: rejects a wrong-song/wrong-language "
       "reference before it's ever trusted (real case: Gaston's lyrics.ovh lookup silently "
       "returned Spanish lyrics for an English song) ---")
@@ -962,6 +991,44 @@ print("  OK: an unrecoverable gap (no usable alignment result) is left dropped, 
 
 transcription_mod_fa.force_align_words_in_window = _orig_force_align_fa
 model_cache_mod_fa.get_whisperx_align_model = _orig_align_model_fa
+
+print("\n--- transcription.force_align_reference_lyrics (DIAGNOSTIC, 2026-08-10, --no-transcribe): builds "
+      "the ENTIRE word list by force-aligning a pinned LRC candidate's own KNOWN per-line text, never "
+      "running the WhisperX decoder at all -- motivated by the David Bowie - Magic Dance case where the "
+      "decoder hallucinated a real repeated 'Dance, magic, dance' passage into ~90 garbage tokens ---")
+from ultrastar_generator.transcription import force_align_reference_lyrics
+
+_orig_force_align_fr = transcription_mod_fa.force_align_words_in_window
+_orig_align_model_fr = model_cache_mod_fa.get_whisperx_align_model
+transcription_mod_fa.force_align_words_in_window = lambda words_text, w0, w1, *a, **kw: [
+    (w0 + i * 0.3, w0 + i * 0.3 + 0.25, 0.9) for i in range(len(words_text))
+]
+model_cache_mod_fa.get_whisperx_align_model = lambda *a, **kw: (None, None)
+_sys_fa.modules["whisperx"] = _types_fa.SimpleNamespace(load_audio=lambda path: [0] * 160000)
+
+fr_synced = "[00:10.00]hello world\n[00:15.00]second line here\n"
+fr_words = force_align_reference_lyrics(Path("dummy.wav"), fr_synced, audio_duration=20.0)
+assert [w.text for w in fr_words] == ["hello", "world", "second", "line", "here"], [w.text for w in fr_words]
+# first line's window is [10.0, 15.0) (next line's own timestamp), second line's is [15.0, 20.0) (audio_duration)
+assert all(10.0 <= w.start < 15.0 for w in fr_words[:2]), [(w.start, w.end) for w in fr_words[:2]]
+assert all(15.0 <= w.start < 20.0 for w in fr_words[2:]), [(w.start, w.end) for w in fr_words[2:]]
+print(f"  OK: {len(fr_words)} words built purely from KNOWN LRC line text + forced alignment, windowed "
+      f"per-line (no decoder output anywhere in this path)")
+
+# A line whose force-alignment fails is skipped entirely (not guessed/interpolated here).
+transcription_mod_fa.force_align_words_in_window = lambda words_text, w0, w1, *a, **kw: (
+    None if w0 == 10.0 else [(w0 + i * 0.3, w0 + i * 0.3 + 0.25, 0.9) for i in range(len(words_text))]
+)
+fr_partial = force_align_reference_lyrics(Path("dummy.wav"), fr_synced, audio_duration=20.0)
+assert [w.text for w in fr_partial] == ["second", "line", "here"], [w.text for w in fr_partial]
+print("  OK: a line whose forced alignment fails is skipped entirely, not force-guessed")
+
+# No synced lyrics at all -> empty list, never crashes.
+assert force_align_reference_lyrics(Path("dummy.wav"), "", audio_duration=20.0) == []
+print("  OK: empty/no synced lyrics -> empty word list")
+
+transcription_mod_fa.force_align_words_in_window = _orig_force_align_fr
+model_cache_mod_fa.get_whisperx_align_model = _orig_align_model_fr
 del _sys_fa.modules["whisperx"]
 
 print("\n--- lyrics_lookup._fetch_from_lrclib: picks the best candidate by duration closeness, "
@@ -1495,10 +1562,133 @@ off_asr = [
 off_candidates = match_asr_to_lrc_lines(off_asr, off_lrc_lines)
 assert len(off_candidates) == 6, off_candidates
 assert all(abs(delta - 3.0) < 1e-9 for _, _, delta in off_candidates), off_candidates
-off_offset, off_slope, off_confidence, off_kind, off_skipped = two_tier_time_calibration(off_candidates)
+off_offset, off_slope, off_confidence, off_kind, off_skipped, off_fn, _off_holdout = two_tier_time_calibration(off_candidates)
 assert off_offset == 3.0 and off_kind == "constant" and off_confidence == 1.0, (off_offset, off_kind, off_confidence)
+assert off_fn is not None and abs(off_fn(10.0) - 13.0) < 1e-9, off_fn(10.0)
 print("OK: match_asr_to_lrc_lines recovers a per-line real-ASR-vs-LRC delta straight from ASR's own flat "
-      "word stream, and two_tier_time_calibration confidently calibrates the constant +3.0s offset from it")
+      "word stream, and two_tier_time_calibration confidently calibrates the constant +3.0s offset from it "
+      "(correction_fn agrees: 10.0 -> 13.0)")
+
+print("\n--- lrc_timing: THIRD tier (piecewise/isotonic) -- a DISCONTINUOUS drift (real edit difference "
+      "between recordings, e.g. a chorus removed/bridge shortened) that neither tier 1 (constant) nor "
+      "tier 2 (single linear slope) can fit ---")
+from ultrastar_generator.lrc_timing import (
+    _enforce_monotonic_anchors, _pava_isotonic, _piecewise_or_isotonic_calibration, _robust_linear_fit,
+    _correction_from_anchors,
+)
+
+print("  _enforce_monotonic_anchors ('piecewise' strategy) DROPS a real monotonicity violator (an anchor "
+      "whose implied real time is earlier than an already-kept earlier anchor's), 'isotonic' (PAVA) POOLS "
+      "it with its neighbor instead of discarding it:")
+mono_cands = [(0, 0.0, 5.0), (1, 10.0, 5.0), (2, 20.0, 5.0), (3, 30.0, -15.0), (4, 40.0, 5.0), (5, 50.0, 5.0)]
+# index 3's implied real time (30 + -15 = 15.0) is EARLIER than index 2's (20+5=25.0) -- a genuine violation.
+piecewise_anchors = _enforce_monotonic_anchors(mono_cands)
+isotonic_anchors = _pava_isotonic(mono_cands)
+assert piecewise_anchors == [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0), (40.0, 45.0), (50.0, 55.0)], piecewise_anchors
+# PAVA pools the violator (30, 15) with its IMMEDIATE predecessor (20, 25) into one block
+# (mean_x=25.0, mean_y=20.0) -- that merged mean (20.0) is still >= the block before it ((10,15),
+# mean 15.0), so the merge doesn't cascade any further back; (0,5) and (10,15) are untouched.
+assert isotonic_anchors == [(0.0, 5.0), (10.0, 15.0), (25.0, 20.0), (40.0, 45.0), (50.0, 55.0)], isotonic_anchors
+print("  OK: piecewise drops the violator entirely (5 anchors, jumps straight from (20,25) to (40,45)); "
+      "isotonic instead POOLS it with its predecessor (20,25) into one blended (25.0, 20.0) anchor (also "
+      "5 anchors, but a smoothed value instead of an outright drop)")
+
+print("  _correction_from_anchors: linear interpolation between anchors, extrapolation past the first/last "
+      "using that boundary segment's own local slope:")
+interp_fn = _correction_from_anchors([(0.0, 10.0), (10.0, 20.0), (30.0, 30.0)])
+assert abs(interp_fn(5.0) - 15.0) < 1e-9, interp_fn(5.0)     # midpoint of first segment (slope 1.0)
+assert abs(interp_fn(20.0) - 25.0) < 1e-9, interp_fn(20.0)   # midpoint of second segment (slope 0.5)
+assert abs(interp_fn(-10.0) - 0.0) < 1e-9, interp_fn(-10.0)  # extrapolated BEFORE the first anchor, slope 1.0
+assert abs(interp_fn(40.0) - 35.0) < 1e-9, interp_fn(40.0)   # extrapolated AFTER the last anchor, slope 0.5
+print("  OK: interpolates exactly between anchors and extrapolates past both ends using the boundary "
+      "segment's own local slope, not a flat hold or the whole-song average slope")
+
+print("  _piecewise_or_isotonic_calibration: gated on BOTH a minimum anchor count and a maximum gap "
+      "between adjacent anchors -- either failing means 'fall through to uncalibrated', not a degraded guess:")
+few_cands = [(i, float(i * 10), 2.0) for i in range(5)]
+few_fit = _robust_linear_fit(few_cands, 4.0)
+assert _piecewise_or_isotonic_calibration(few_cands, few_fit, min_anchors=6) is None
+print("  OK: fewer than min_anchors surviving candidates -> tier 3 declines (5 < 6)")
+
+gapped_cands = [(i, float(i * 5), 2.0) for i in range(4)] + [(4, 100.0, 2.0), (5, 105.0, 2.0)]
+gapped_fit = _robust_linear_fit(gapped_cands, 4.0)
+assert _piecewise_or_isotonic_calibration(
+    gapped_cands, gapped_fit, min_anchors=6, max_anchor_gap_sec=45.0) is None
+print("  OK: 6 anchors but one adjacent gap (15.0 -> 100.0, 85s) exceeds max_anchor_gap_sec -> tier 3 "
+      "declines rather than interpolate across a gap 2 points can't distinguish from noise")
+
+reasonable_cands = [(i, float(i * 8), 2.0) for i in range(6)]
+reasonable_fit = _robust_linear_fit(reasonable_cands, 4.0)
+ok_result = _piecewise_or_isotonic_calibration(reasonable_cands, reasonable_fit, min_anchors=6, max_anchor_gap_sec=45.0)
+assert ok_result is not None and ok_result[3] == "isotonic", ok_result
+print("  OK: 6 anchors within a reasonable adjacent gap -> tier 3 succeeds (default drift_model='isotonic')")
+
+print("  two_tier_time_calibration end-to-end: a genuine 3-segment DISCONTINUOUS drift (simulating 2 real "
+      "edit-cut points) that defeats both tier 1 (no single bucket clears 40% -- 3 roughly-equal segments) "
+      "and tier 2 (a single global slope badly misfits 3 flat plateaus) is recovered by tier 3 instead of "
+      "reported as 'uncalibrated':")
+disc_cands = []
+for i in range(7):
+    disc_cands.append((i, float(i * 5), 2.0))     # segment A: lrc_start 0-30, delta +2.0
+for i in range(7, 14):
+    disc_cands.append((i, float(i * 5), 10.0))    # segment B: lrc_start 35-65, delta +10.0 (jump)
+for i in range(14, 20):
+    disc_cands.append((i, float(i * 5), 20.0))    # segment C: lrc_start 70-95, delta +20.0 (jump)
+disc_offset, disc_slope, disc_confidence, disc_kind, disc_skipped, disc_fn, disc_holdout = two_tier_time_calibration(disc_cands)
+assert disc_kind == "isotonic", (disc_kind, disc_offset, disc_confidence, disc_skipped)
+assert disc_offset is not None and disc_fn is not None
+# mid-plateau points should recover their own segment's real offset closely
+assert abs(disc_fn(0.0) - 2.0) < 1.0, disc_fn(0.0)      # segment A: 0 + 2.0
+assert abs(disc_fn(50.0) - 60.0) < 2.0, disc_fn(50.0)    # segment B: 50 + 10.0
+assert abs(disc_fn(95.0) - 115.0) < 1.0, disc_fn(95.0)   # segment C: 95 + 20.0
+print(f"  OK: tier 1/2 both declined this data, tier 3 ({disc_kind}) recovered a piecewise correction "
+      f"tracking all 3 segments ({disc_confidence:.0%} of candidates passed the Theil-Sen inlier filter, "
+      f"holdout residual {disc_holdout}) instead of reporting 'uncalibrated'")
+
+print("  two_tier_time_calibration: this 3-segment case is a REFINE, not a rescue -- tier 1's best (still-"
+      "rejected) bucket confidence (35%) and tier 2's own Theil-Sen fit (45%) both already clear the "
+      "rescue floor (30%), so no structural_check is needed for it to succeed (confirms the split doesn't "
+      "regress the ordinary 'two independent rigid models already partially agree' case):")
+refine_offset, refine_slope, refine_confidence, refine_kind, refine_skipped, refine_fn, _rh = two_tier_time_calibration(
+    disc_cands, structural_check=None)
+assert refine_kind == "isotonic" and refine_offset is not None, (refine_kind, refine_skipped)
+print("  OK: refine case succeeds with no structural_check at all")
+
+print("  two_tier_time_calibration: a genuine RESCUE case (tier 1/2 both near 0%, no independent support) "
+      "declines by default (no structural_check given) even though tier 3 itself finds a fit -- this is "
+      "the real Heroes-shaped failure mode this split exists to close:")
+import random as _random
+_rng = _random.Random(42)
+rescue_cands = []
+for i in range(30):
+    # scattered deltas (tier1/tier2 find no real pattern) EXCEPT a clean monotonic
+    # sub-pattern buried in it that a flexible isotonic/piecewise fit can still track --
+    # mimics "flexible model finds SOME fit even though rigid models found nothing".
+    rescue_cands.append((i, float(i * 3), (i % 5) * 7.0 + _rng.uniform(-0.1, 0.1)))
+r_offset, r_slope, r_confidence, r_kind, r_skipped, r_fn, r_holdout = two_tier_time_calibration(
+    rescue_cands, min_calibration_samples=5, min_drift_samples=5)
+assert r_offset is None and r_kind is None, (r_offset, r_kind, r_skipped)
+assert r_skipped is not None and "rescue" in r_skipped, r_skipped
+print(f"  OK: declined ({r_skipped!r}) -- no structural_check means an unverified rescue is never accepted")
+
+print("  two_tier_time_calibration: the SAME rescue case is accepted when a structural_check is provided "
+      "AND it passes -- and still declined when the check itself rejects it:")
+r2_offset, r2_slope, r2_confidence, r2_kind, r2_skipped, r2_fn, r2_holdout = two_tier_time_calibration(
+    rescue_cands, min_calibration_samples=5, min_drift_samples=5, structural_check=lambda: None)
+assert r2_offset is not None and r2_kind in ("isotonic", "piecewise"), (r2_offset, r2_kind, r2_skipped)
+r3_offset, r3_slope, r3_confidence, r3_kind, r3_skipped, r3_fn, r3_holdout = two_tier_time_calibration(
+    rescue_cands, min_calibration_samples=5, min_drift_samples=5,
+    structural_check=lambda: "fake rejection reason for this test")
+assert r3_offset is None and "fake rejection reason" in r3_skipped, r3_skipped
+print("  OK: structural_check passing (returns None) -> rescue accepted; structural_check rejecting "
+      "(returns a reason string) -> rescue declined, reason surfaced in skipped_reason")
+
+print("  two_tier_time_calibration: 'piecewise' selectable via drift_model= (config.LRC_TIMING_DRIFT_MODEL "
+      "default is 'isotonic', but a caller/config override must be honored):")
+pw_offset, pw_slope, pw_confidence, pw_kind, pw_skipped, pw_fn, pw_holdout = two_tier_time_calibration(
+    disc_cands, drift_model="piecewise")
+assert pw_kind == "piecewise", pw_kind
+print("  OK: drift_model='piecewise' produces kind='piecewise' on the same discontinuous data")
 
 off_mxl_words = [
     MxlWord(text=t, norm=t, offset=float(i), syllables=[(float(i), 1.0, 60, t)])
@@ -3378,6 +3568,41 @@ assert vw_starts[0] == 15.0 and vw_ends[0] == 15.5, (vw_starts[0], vw_ends[0])  
 print("  OK: 'alpha' validated with its OWN original 0.5s length (10.0-10.5, shifted to 15.0-15.5), "
       "NOT overwritten by ASR's own slightly-different 15.0-15.6 span; 'bravo' (ASR disagrees) is "
       "correctly left unvalidated")
+
+print("  compute_gap_calibration + validate_words_against_asr: a DISCONTINUOUS whole-file drift (tier 3) "
+      "is calibrated and applied via correction_fn, not the offset+slope fallback (which would badly "
+      "misfit a real step change):")
+gc3_words = extract_words(
+    [Syllable(text=f"w{i}", start=float(i * 5), end=float(i * 5) + 0.3, midi_note=0, is_word_start=True)
+     for i in range(20)]
+)
+gc3_asr = []
+for i in range(20):
+    orig = float(i * 5)
+    delta = 2.0 if i < 7 else (10.0 if i < 14 else 20.0)  # same 3-segment shape as the lrc_timing test above
+    gc3_asr.append(_Word(text=f"w{i}", start=orig + delta, end=orig + delta + 0.3))
+gc3 = compute_gap_calibration(gc3_words, gc3_asr)
+assert gc3.kind == "isotonic" and gc3.correction_fn is not None, gc3
+vw3_starts, _vw3_ends, vw3_validated = validate_words_against_asr(gc3_words, gc3, tolerance_sec=1.5)
+# a word in each segment should validate near its own segment's real offset (via correction_fn), not a
+# single global offset/slope compromise that would misfit segments B/C badly
+assert vw3_validated[0] and abs(vw3_starts[0] - 2.0) < 1.5, (vw3_validated[0], vw3_starts[0])
+assert vw3_validated[10] and abs(vw3_starts[10] - 60.0) < 2.0, (vw3_validated[10], vw3_starts[10])
+assert vw3_validated[18] and abs(vw3_starts[18] - 110.0) < 1.5, (vw3_validated[18], vw3_starts[18])
+print(f"  OK: compute_gap_calibration recovered kind={gc3.kind!r} for a 3-segment discontinuous whole-file "
+      f"drift, and validate_words_against_asr's per-word expected_start correctly tracked each segment via "
+      f"correction_fn (not a single misfit offset+slope)")
+
+print("  GapCalibration manually constructed WITHOUT a correction_fn (e.g. older/test code) still works "
+      "via the offset+slope fallback in validate_words_against_asr -- backward compatible:")
+gc4 = GapCalibration(offset=5.0, slope=0.0, confidence=1.0, kind="constant", skipped_reason=None,
+                      asr_starts=[15.0], asr_ends=[15.5], asr_confident=[True])
+assert gc4.correction_fn is None
+vw4_starts, _vw4_ends, vw4_validated = validate_words_against_asr(
+    extract_words([Syllable(text="alpha", start=10.0, end=10.5, midi_note=0, is_word_start=True)]), gc4)
+assert vw4_validated == [True] and vw4_starts[0] == 15.0, (vw4_validated, vw4_starts)
+print("  OK: correction_fn=None (default) falls back to the offset+slope formula, unchanged from before "
+      "this session's tier-3 addition")
 
 print("  realign_song_validate end-to-end: an already-correct file whose ONLY problem is a wrong GAP -- "
       "every word's own relative timing/length is preserved EXACTLY, just uniformly shifted, and pitch/"

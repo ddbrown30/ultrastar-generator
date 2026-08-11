@@ -14,6 +14,9 @@ inspect individual values before trusting the aggregate stat — this
 project has been burned twice by text-matching silently pairing the
 wrong repeated instance.
 
+Any time a new option/argument is added/removed, it should be added/removed
+to the gui at the same time.
+
 ## Architecture: pitch/timing-first, lyrics-second
 
 1. **Pass 1** (`note_detection.py`): detects notes from vocal audio
@@ -1741,3 +1744,139 @@ a stale test, not a bug: the user had intentionally changed
 `main.delete_work_files` the same day to delete the ENTIRE work_dir,
 debug files included, rather than just `separated/`+`extracted/` — see
 Shipped Defaults above. Test updated to match.)
+
+### Real bug: `align_words_to_reference`'s repeat-clamp mechanism froze on
+### the LAST syllable and got trusted unconditionally by `verify_words`
+### (David Bowie - Magic Dance, 2026-08-10)
+
+User reported real hallucinated output (`lrclib_id=37699224`, all default
+options): a huge stretch of the file (~89 consecutive notes) reads
+literally `"ic"` repeated over and over, landing where the real lyric is
+"Dance, magic, dance" x5. Traced end to end through the real run's own
+`[DEBUG LOG].txt` (not guessed):
+
+1. **WhisperX's decoder hallucinated** on this real repeated passage —
+   instead of 5 clean repeats it decoded ~90 garbage `"Dance,"/"dance,"/
+   "dance."` tokens, all LOW SCORE (0.0-0.3). Same failure class already
+   documented for Heroes/"Just for one day" and Americans/"Johnny wants a
+   brain" above.
+2. This created a wildly uneven `difflib` "replace" block in
+   `lyrics_lookup.align_words_to_reference` (~90 ASR words vs. a handful
+   of real reference words). The existing repeat-clamp path (built for
+   LRC's much smaller "Do-do-do-do-do" case) maps all the overflow words
+   onto the SAME last reference token in the block ("magic,") and cycles
+   its hyphenated syllables (`hyphenate("magic,")` → `["mag", "ic,"]`)
+   across the repeats — but `p = min(part_cursor[b_idx], len(parts) - 1)`
+   **froze** on the last syllable once the cursor ran past the real
+   syllable count instead of wrapping: syllable 0 ("mag") once, then
+   every remaining word frozen at syllable 1 ("ic,") — forever.
+3. `verify_words` (on by default) then ran its isolated-recheck
+   confirmation pass. Per `verification.py`'s own `_resolve`, once a word
+   has ANY `reference_text` at all, the function always returns either
+   the current text (if it matches) or the reference text — including
+   the "neither the original nor the recheck confirms it" branch,
+   explicitly logged as "kept reference, unconfirmed". That's deliberate
+   elsewhere (reference lyrics are meant to be the most-trusted TEXT
+   source in this pipeline), but here the "reference_text" being trusted
+   wasn't real reference text — it was the frozen-syllable-cursor bug's
+   own output. Nothing ever confirmed `"ic"` was right; it got written
+   into the final file anyway.
+
+**Fixed** (`lyrics_lookup.py`, `config.REFERENCE_CLAMP_MAX_REPEAT = 8`):
+this many ASR words clamping onto the SAME single reference token is
+itself the hallucination signal — real repeated ad-libs don't run this
+high. Past that count, the block no longer fabricates a `reference_text`
+at all; it falls back to keeping the ASR word's own raw text (still
+garbled, but no longer falsely "confirmed"), same treatment an ordinary
+uneven block already gets by default — `verify_words` then takes its
+"no reference expectation" branch, which by design never overwrites
+current text from an unconfirmed isolated recheck alone. Also fixed the
+syllable-cursor itself to WRAP (`part_cursor % len(parts)`) instead of
+freezing, for whatever stays under the cap (defense in depth; the
+"Do-do-do-do-do" case is unaffected either way since `_tokenize_lines`
+already pre-splits that hyphenated token into 5 separate reference words,
+making the repeat-clamp path itself only a fallback there).
+
+**Real-data validation, two stages.** First, replayed the fix against the
+ACTUAL real WhisperX word list captured in the failing run's own debug
+log (298 words) and the ACTUAL LRCLIB #37699224 reference (fetched fresh
+over the network — confirmed it really does write the passage as
+`"Dance, magic dance (dance, magic dance)"`, i.e. a genuine ~90:1
+mismatch): 0 `"ic"` words in the block (was ~89), 0 corrections applied.
+
+Second, a REAL live end-to-end rerun (initially blocked by an environment
+mixup on my end — I'd invoked the bare `python`, which resolved to the
+system install with no CUDA torch, instead of this project's own venv;
+the user's machine has a working RTX 3070 the whole time). Re-ran via
+`venv/Scripts/python.exe` against the real cached Demucs vocals (bit-
+identical audio input), which reproduced the EXACT SAME decoder
+hallucination as the original bug report (confirmed via the debug log's
+raw-whisperx-output section matching verbatim) — a true apples-to-apples
+before/after. In the actual written `.txt`: the passage now reads
+`"Dance,"`/`"dance,"`/`"dance."` repeated (still the underlying decoder
+mishearing "magic, dance" as "dance, dance, dance" — a separate, already-
+documented issue, not this fix's job to solve) instead of frozen `"ic"` x
+~89; `mag`/`ic` counts across the whole file dropped to a sane 12 each
+(matching the real "magic," occurrences) from the previous unbounded
+freeze. New synthetic regression tests added (`test_dry_run.py`):
+repeat-clamp wraps below the cap, refuses to fabricate `reference_text`
+above it, still tags `line_id`. Full suite green throughout.
+
+### `--no-transcribe`: DIAGNOSTIC forced-alignment-only mode, skips the
+### WhisperX decoder entirely (2026-08-10, off by default)
+
+Follow-up to the bug above, user's explicit request: "add an option that
+disabled transcription (but not alignment) completely" to isolate
+whether ASR-decoder hallucination bleeds into output some OTHER way this
+project hasn't found yet — "theoretically, we shouldn't be using
+transcription any time we're using an LRC."
+
+New `transcription.force_align_reference_lyrics` builds the ENTIRE
+initial `Word` list without ever calling WhisperX's decoder
+(`model.transcribe()` — the component that guesses what was sung and can
+hallucinate/drop content). Only the SEPARATE wav2vec2 CTC forced-
+alignment model runs, via the EXISTING `force_align_words_in_window`
+(same mechanism `force_align_gaps` already uses to recover known-but-
+undropped words) — driven entirely by a pinned LRC candidate's own
+synced-lyrics line text (`lrc_timing.parse_lrc`). Each LRC line gets its
+own window (`[this line's timestamp, next line's timestamp)`, last line
+to `audio_duration`); a line whose forced alignment fails is skipped
+entirely and logged, never guessed.
+
+Wired into `main.py` as `--no-transcribe` (`PipelineOptions.
+no_transcribe`, default off): requires a pinned LRC candidate WITH
+synced lyrics already resolved (`--lrclib-id` / `pinned_lyrics`) —
+without one, logs a warning and falls back to normal transcription, same
+as any other unmet-precondition case in this pipeline. Does NOT special-
+case the MXL+LRC primary path (an earlier version of this did, on the
+reasoning that its own per-line ASR word-placement "isn't meaningful
+with no ASR to place" — user pushed back: the whole point is checking
+for decoder-hallucination bleed EVERYWHERE, including that path, so
+carving it out defeats the purpose). The force-aligned words just flow
+into whichever path (`mxl_lrc_primary` or standard) would have run
+anyway; the normal reference-lyrics-fetch/`align_words_to_reference`/
+`force_align_gaps`/`verify_words` steps all still run afterward
+unchanged (harmless near-no-ops here, since the words' text already IS
+the reference text).
+
+Off by default deliberately — this is a diagnostic/isolation tool, not a
+general replacement for the normal transcription path: it needs a
+trustworthy pinned LRC candidate with per-line timestamps, and gives up
+whatever real information the decoder would otherwise add for content
+the LRC doesn't cover (ad-libs, etc).
+
+**Real end-to-end validation** (David Bowie - Magic Dance,
+`--lrclib-id 37699224 --no-transcribe`, via the project's own venv on
+the user's real RTX 3070): 254 words force-aligned directly from the
+pinned LRC candidate's synced lyrics, zero WhisperX decoder calls for
+lyric text anywhere in the run. `"ASR text already matched the
+reference; no corrections needed"` and `verify_words` re-checked all 254
+words and replaced 0 (exactly as expected — nothing to correct when the
+text already IS the reference). Checked the actual written `.txt`
+directly against the same "Dance, magic dance"/"Jump, magic jump"
+passages that were hallucinated garbage in the normal-transcription run:
+every one now reads the correct real lyric, verbatim, with no flood/
+freeze pattern anywhere in the file. This is the cleanest possible
+confirmation that skipping the decoder entirely removes this whole class
+of failure for LRC-covered content, exactly as the user's hypothesis
+predicted.

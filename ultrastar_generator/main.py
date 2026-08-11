@@ -36,14 +36,14 @@ from .usdx_parser import parse_usdx_file, UsdxParseError
 from .verify_existing_song import verify_existing_song
 from .youtube_source import download_youtube_source, YoutubeDownloadError
 from .separation import isolate_vocals, SeparationError
-from .transcription import transcribe_words
+from .transcription import transcribe_words, force_align_reference_lyrics
 from .tempo import detect_bpm
 from .note_detection import detect_notes
 from .alignment import align_words
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
                              alignment_diff_summary, reference_match_ratio, largest_unmatched_reference_run,
-                             recover_dropped_reference_words, fetch_lrclib_by_id)
+                             recover_dropped_reference_words, fetch_lrclib_by_id, load_lrc_file)
 from .musicxml_reference import apply_musicxml_references
 from .mxl_lrc_generator import try_mxl_lrc_primary
 from .lrc_timing import apply_lrc_timing_check
@@ -140,6 +140,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-whisperx", action="store_true",
                     help="Don't use whisperx forced alignment for word timing even if installed "
                          "(uses faster-whisper's own, less precise, timestamps instead)")
+    p.add_argument("--no-transcribe", dest="no_transcribe", action="store_true", default=False,
+                    help="DIAGNOSTIC (default: off). Skip the WhisperX DECODER entirely -- never guesses "
+                         "what was sung, so it can't hallucinate/drop content. Instead force-aligns a "
+                         "pinned LRC candidate's own known line text (--lrclib-id / pinned_lyrics, must "
+                         "have synced lyrics) directly onto the audio via wav2vec2 CTC alone. Requires a "
+                         "pinned LRC candidate with synced lyrics; falls back to normal transcription "
+                         "with a warning if none is available.")
     p.add_argument("--whisperx-no-vad", dest="whisperx_no_vad", action="store_true",
                     default=config.ENABLE_WHISPERX_NO_VAD,
                     help="Force whisperx's own pyannote VAD to near-zero onset/offset thresholds "
@@ -238,6 +245,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "primary path and the standard pipeline's own reference-lyrics fetch, no "
                          "ambiguity. Same idea as --existing-txt/--musicxml-reference: an explicit "
                          "override always wins over auto-detection.")
+    p.add_argument("--lrc-file", dest="lrc_file", default=None,
+                    help="Path to a LOCAL .lrc synced-lyrics file to use directly, bypassing LRCLIB "
+                         "search/fetch entirely -- wins over both search and --lrclib-id if given. For "
+                         "a user who already has a synced-lyrics file on disk, including a deliberately "
+                         "imprecise one for testing how the LRC-seeding/windowing/MXL+LRC logic handles "
+                         "an off-but-close candidate.")
     p.add_argument("--no-musicxml-force-calibration", dest="musicxml_force_calibration",
                     action="store_false", default=config.ENABLE_MUSICXML_FORCE_CALIBRATION,
                     help="Without a confident calibration offset (config."
@@ -587,13 +600,41 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     # --- 4. Transcription (lyrics text + rough timing) -- moved ahead of pass 1
     # so the MXL+LRC primary path below can use it without a second, redundant
     # transcription call; pass 1's own note detection never depended on it.
-    log(f"Transcribing with {'whisperx' if not opts.no_whisperx else 'faster-whisper'} ({opts.whisper_model})"
-        f"{' [VAD near-disabled]' if opts.whisperx_no_vad else ''}...")
-    words = transcribe_words(
-        vocals_path, opts.whisper_model, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
-        whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
-        rewindow_long_segments=opts.rewindow_long_segments,
-    )
+    # `no_transcribe` (DIAGNOSTIC, --no-transcribe, default off): bypasses this
+    # entirely -- the WhisperX DECODER never runs, so it can never hallucinate/
+    # drop content in the first place (see force_align_reference_lyrics's own
+    # docstring, and the Magic Dance 'ic ic ic...' case in CLAUDE.md that
+    # motivated this). Needs a pinned LRC candidate WITH synced lyrics already
+    # resolved above (forced_lrc_candidate); falls back to normal transcription
+    # with a warning otherwise, same as any other unmet-precondition case in
+    # this pipeline.
+    forced_align_only = False
+    if opts.no_transcribe and forced_lrc_candidate is not None and forced_lrc_candidate.synced_lyrics:
+        log("--no-transcribe: skipping the WhisperX decoder entirely -- force-aligning the pinned LRC "
+            "candidate's own known line text onto the audio via wav2vec2 CTC alone...")
+        words = force_align_reference_lyrics(vocals_path, forced_lrc_candidate.synced_lyrics, audio_duration,
+                                              debug_log=debug_log)
+        if words:
+            forced_align_only = True
+            log(f"Force-aligned {len(words)} word(s) directly from the pinned LRC candidate's synced "
+                f"lyrics -- no ASR decoder output exists anywhere downstream of this.")
+        else:
+            log("  Forced alignment against the pinned LRC candidate produced no words at all "
+                "(every line failed -- check it actually matches this audio); falling back to normal "
+                "transcription.")
+    elif opts.no_transcribe:
+        log("--no-transcribe requires a pinned LRC candidate WITH synced lyrics (--lrclib-id, or a "
+            "pinned candidate with no per-line timestamps); none available here -- falling back to "
+            "normal transcription.")
+
+    if not forced_align_only:
+        log(f"Transcribing with {'whisperx' if not opts.no_whisperx else 'faster-whisper'} ({opts.whisper_model})"
+            f"{' [VAD near-disabled]' if opts.whisperx_no_vad else ''}...")
+        words = transcribe_words(
+            vocals_path, opts.whisper_model, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
+            whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
+            rewindow_long_segments=opts.rewindow_long_segments,
+        )
     if not words:
         return PipelineResult(success=False,
                                error="No words were transcribed -- check the audio / vocal isolation quality.")
@@ -675,7 +716,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             tc = mxl_lrc_result.time_calibration
             if tc.offset_sec is not None:
                 drift_desc = f", drift {tc.slope:+.4f}s/LRC-s" if tc.kind == "drift" else ""
-                log(f"  LRC/audio time calibration ({tc.kind}): offset {tc.offset_sec:+.1f}s{drift_desc} "
+                rep_desc = " (representative only, see correction_fn)" if tc.kind in ("piecewise", "isotonic") else ""
+                log(f"  LRC/audio time calibration ({tc.kind}): offset {tc.offset_sec:+.1f}s{drift_desc}{rep_desc} "
                     f"({tc.confidence:.0%} agreement) -- applied to LRC line timestamps before placement.")
             else:
                 log(f"  LRC/audio time calibration: none found ({tc.skipped_reason}) -- using LRC "
@@ -1036,13 +1078,19 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
     """Builds a PipelineOptions from argparse's Namespace -- the CLI's own
     way of constructing the same options object gui.py builds directly
     from widget state."""
+    pinned_lyrics = None
+    if args.lrc_file:
+        pinned_lyrics = load_lrc_file(args.lrc_file, artist=args.artist or "", title=args.title or "")
+        if pinned_lyrics is None:
+            print(f"Could not read/parse --lrc-file {args.lrc_file!r} -- ignoring.")
     return config.PipelineOptions(
+        pinned_lyrics=pinned_lyrics,
         artist=args.artist, title=args.title, audio_file=args.audio_file, work_dir=args.work_dir,
         whisper_model=args.whisper_model, verify_whisper_model=args.verify_whisper_model,
         demucs_model=args.demucs_model, bpm_override=args.bpm,
         skip_separation=args.skip_separation, vocals_path=args.vocals_path,
         fetch_lyrics=args.fetch_lyrics, no_video_sync=args.no_video_sync,
-        no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
+        no_whisperx=args.no_whisperx, no_transcribe=args.no_transcribe, whisperx_no_vad=args.whisperx_no_vad,
         rewindow_long_segments=args.rewindow_long_segments,
         retry_low_quality_asr=args.retry_low_quality_asr,
         force_align_gaps=args.force_align_gaps,
@@ -1094,6 +1142,8 @@ def run(argv=None) -> int:
             incompatible.append("--work-dir")
         if args.lrclib_id:
             incompatible.append("--lrclib-id")
+        if args.lrc_file:
+            incompatible.append("--lrc-file")
         if args.audio_file:
             incompatible.append("--audio-file")
         if incompatible:

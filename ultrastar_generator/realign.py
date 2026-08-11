@@ -51,7 +51,6 @@ from __future__ import annotations
 import copy
 import difflib
 import re
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -61,8 +60,8 @@ from .debug_log import DebugLog
 from .models import LineBreak, Song, Syllable, Word
 from .usdx_parser import ParsedSong, UsdxParseError, parse_usdx_file
 from .usdx_writer import write_song
-from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id
-from .lrc_timing import match_asr_to_lrc_lines, two_tier_time_calibration
+from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id, load_lrc_file
+from .lrc_timing import match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
 
 
@@ -323,81 +322,13 @@ def _reconstruct_our_lines(entries: List[Union[Syllable, LineBreak]]) -> List[st
     return lines
 
 
-def _normalize_line(text: str) -> str:
-    return " ".join(n for n in (_normalize(tok) for tok in text.split()) if n)
-
-
-def check_repeat_structure(our_lines: List[str], lrc_line_texts: List[str],
-                            min_repeat: int = 3, min_word_len: int = 4) -> Optional[str]:
-    """Rejects an LRC candidate whose REPEAT STRUCTURE doesn't match ours --
-    real confirmed case (David Bowie - "I'm Afraid of Americans", see
-    CLAUDE.md): our own file's most-repeated line ("I'm afraid of
-    Americans") appears 31 times total across its repeated-word family, but
-    the auto-picked LRCLIB candidate (a different edition/box-set mix of
-    the same song) has 40 -- 9 EXTRA chorus repeats, a real structural
-    arrangement difference between recordings, not just per-line timing
-    noise. Global time CALIBRATION alone can't reliably catch this: a
-    genuinely different-but-similar-length edition can still clear the
-    confidence bar by chance on the non-repeated portions of the song
-    (confirmed: this exact candidate calibrated at 48%, in the same range
-    as OTHER real candidates' validated-good calibrations, e.g. Ordinary
-    Day's 46% -- the confidence NUMBER alone can't tell these apart).
-
-    First finds OUR OWN most-repeated normalized LINE (skipped entirely if
-    nothing repeats at least `min_repeat` times -- most songs have no such
-    line, and this check has nothing to say about them). A repeated
-    CHORUS is rarely one single exact-duplicate line, though -- real
-    confirmed case: "I'm afraid of Americans"/"...of the world"/"...I
-    can't help it"/"...I can't" are four DIFFERENT lines, so comparing
-    only the single most-repeated exact line (10x in our file, 12x in the
-    candidate -- within tolerance on its own) completely misses the real
-    mismatch, since the true repeat count is split across all four
-    variants. Instead, this counts WORD occurrences (not exact-line
-    matches) for the most-repeated line's own content words (short/filler
-    words under `min_word_len` chars excluded, since a common word like
-    "of"/"the" repeating a lot doesn't indicate a repeated CHORUS the way
-    a shared distinctive word across every variant does) across the WHOLE
-    song on each side, and uses whichever qualifying word has the HIGHEST
-    count in our own file as the comparison signal -- confirmed this
-    picks "afraid" (appears in all four variants, 31 vs 40 in the real
-    case, a 29% difference) over a less complete signal like "Americans"
-    (present in only one variant).
-
-    A real edition/arrangement difference tends to differ by MORE than a
-    small fraction of the true repeat count (tolerance +-15%, minimum
-    +-1, absorbs ordinary per-song noise like an intro/outro repeat some
-    editions add or drop) -- confirmed this tolerance passes Ordinary
-    Day's genuinely-matching candidate (its own most-repeated line count:
-    4 vs 4) while rejecting Americans' (31 vs 40).
-
-    Returns a human-readable rejection reason, or None if the candidate's
-    repeat structure is consistent enough to trust (including whenever
-    there's no repeated line in our own file to check at all)."""
-    our_normalized_lines = [_normalize_line(t) for t in our_lines]
-    line_counts = Counter(nl for nl in our_normalized_lines if nl)
-    if not line_counts:
-        return None
-    most_line, line_n = line_counts.most_common(1)[0]
-    if line_n < min_repeat:
-        return None
-
-    our_word_counts = Counter(_normalize(tok) for line in our_lines for tok in line.split())
-    lrc_word_counts = Counter(_normalize(tok) for line in lrc_line_texts for tok in line.split())
-    candidate_words = {w for w in most_line.split() if len(w) >= min_word_len}
-    if not candidate_words:
-        return None
-    fingerprint_word, our_n = max(
-        ((w, our_word_counts.get(w, 0)) for w in candidate_words), key=lambda t: t[1])
-    if our_n < min_repeat:
-        return None
-    lrc_n = lrc_word_counts.get(fingerprint_word, 0)
-    tolerance = max(1, round(0.15 * our_n))
-    if abs(our_n - lrc_n) > tolerance:
-        return (f"our most-repeated line ({most_line!r}, {line_n}x) has a distinctive word "
-                f"({fingerprint_word!r}) appearing {our_n}x total in the existing file but {lrc_n}x in "
-                f"the LRC candidate's own lyrics (tolerance +/-{tolerance}) -- likely a different "
-                f"edition/arrangement with a different repeat structure, not just timing noise")
-    return None
+# `check_repeat_structure` moved to lrc_timing.py, 2026-08-11 (re-exported
+# here unchanged so `from .realign import check_repeat_structure` --
+# including test_dry_run.py's own import -- keeps working) -- lrc_timing.
+# py's own tier-3 rescue gate (see `two_tier_time_calibration`'s
+# `structural_check` param) needed the exact same check and can't import
+# FROM realign.py (this module already imports FROM lrc_timing.py), so it
+# moved to the shared module instead of being duplicated a second time.
 
 
 def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
@@ -449,12 +380,22 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
     # and OUR audio's real timing (e.g. different lead-in silence) BEFORE
     # trusting a line start as an anchor -- same technique/function
     # mxl_lrc_generator uses, factored into lrc_timing.py for exactly this
-    # kind of reuse.
+    # kind of reuse. `structural_check` reuses the SAME check_repeat_
+    # structure comparison as the upfront rejection above (when `our_lines`
+    # is available) -- gates tier 3's own "rescue" case (see two_tier_time_
+    # calibration's own docstring); redundant-but-harmless when the
+    # upfront check already ran (this candidate already passed it), and
+    # the real backstop when `our_lines` wasn't available for that check.
     time_candidates = match_asr_to_lrc_lines(asr_words, lrc_match.lrc_lines)
-    offset, slope, confidence, kind, _skipped = two_tier_time_calibration(time_candidates)
+    structural_check = None
+    if our_lines is not None:
+        lrc_line_texts_for_check = [text for _t, text in lrc_match.lrc_lines]
+        structural_check = lambda: check_repeat_structure(our_lines, lrc_line_texts_for_check)
+    offset, slope, confidence, kind, _skipped, correction_fn, _holdout = two_tier_time_calibration(
+        time_candidates, structural_check=structural_check)
     lrc_lines = lrc_match.lrc_lines
     if offset is not None:
-        lrc_lines = [(t + offset + slope * t, text) for t, text in lrc_lines]
+        lrc_lines = [(correction_fn(t), text) for t, text in lrc_lines]
 
     word_lines, _clean_text = assign_words_to_lines(fake_words, lrc_lines)
 
@@ -1118,11 +1059,17 @@ class GapCalibration:
     offset: Optional[float]
     slope: float
     confidence: float
-    kind: Optional[str]           # "constant", "drift", or None if uncalibrated
+    kind: Optional[str]           # "constant", "drift", "piecewise", "isotonic", or None if uncalibrated
     skipped_reason: Optional[str]
     asr_starts: List[Optional[float]]   # whole-song match_words_to_asr's own raw results,
     asr_ends: List[Optional[float]]     # reused directly by validate_words_against_asr
     asr_confident: List[bool]           # so it's never recomputed a second time
+    # `correction_fn(orig_start) -> corrected_real_time`, populated for
+    # every successful `kind` (incl. constant/drift, for API uniformity)
+    # -- see two_tier_time_calibration's own docstring. Defaults to None
+    # so a manually-constructed GapCalibration (e.g. in tests) still
+    # works via the offset/slope fallback in validate_words_against_asr.
+    correction_fn: Optional[Callable[[float], float]] = None
 
 
 def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[Word]) -> GapCalibration:
@@ -1138,14 +1085,23 @@ def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[
     `two_tier_time_calibration` (the SAME robust, repeat-safe two-tier fit
     already validated for LRC line calibration -- don't reimplement a
     third time) using each word's own original start (seconds) as the "x"
-    axis, exactly mirroring how LRC line timestamps are used there."""
+    axis, exactly mirroring how LRC line timestamps are used there.
+
+    No `structural_check` passed -- unlike LRC candidate calibration,
+    there's no separate "candidate identity" to verify here (both sides
+    are the SAME existing file's own words vs. the SAME audio's own
+    ASR, just two different timing views of one source, never a
+    different recording). Tier 3's "rescue" case therefore never fires
+    for GAP calibration -- only "refine" (tier 1/2 already found some
+    real support) -- which is the safe, correct default for this call
+    site, not a missing feature."""
     starts, ends, confident = match_words_to_asr(existing_words, asr_words)
     candidates = [(i, w.orig_start, starts[i] - w.orig_start)
                   for i, w in enumerate(existing_words) if confident[i]]
-    offset, slope, confidence, kind, skipped_reason = two_tier_time_calibration(candidates)
+    offset, slope, confidence, kind, skipped_reason, correction_fn, _holdout = two_tier_time_calibration(candidates)
     return GapCalibration(offset=offset, slope=slope, confidence=confidence, kind=kind,
                            skipped_reason=skipped_reason, asr_starts=starts, asr_ends=ends,
-                           asr_confident=confident)
+                           asr_confident=confident, correction_fn=correction_fn)
 
 
 def validate_words_against_asr(existing_words: List[ExistingWord], gap: GapCalibration,
@@ -1177,7 +1133,10 @@ def validate_words_against_asr(existing_words: List[ExistingWord], gap: GapCalib
     validated: List[bool] = [False] * n
     offset = gap.offset if gap.offset is not None else 0.0
     for i, w in enumerate(existing_words):
-        expected_start = w.orig_start + offset + gap.slope * w.orig_start
+        if gap.correction_fn is not None:
+            expected_start = gap.correction_fn(w.orig_start)
+        else:
+            expected_start = w.orig_start + offset + gap.slope * w.orig_start
         if gap.asr_confident[i] and abs(gap.asr_starts[i] - expected_start) <= tolerance_sec:
             orig_dur = w.orig_end - w.orig_start
             starts[i] = expected_start
@@ -1230,7 +1189,8 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
     gap = compute_gap_calibration(words, asr_words)
     if gap.offset is not None:
         drift_desc = f", drift {gap.slope:+.4f}s/s" if gap.kind == "drift" else ""
-        log(f"  GAP check ({gap.kind}): offset {gap.offset:+.2f}s{drift_desc} "
+        rep_desc = " (representative only, see correction_fn)" if gap.kind in ("piecewise", "isotonic") else ""
+        log(f"  GAP check ({gap.kind}): offset {gap.offset:+.2f}s{drift_desc}{rep_desc} "
             f"({gap.confidence:.0%} agreement) -- applying as a single correction before validating "
             f"individual words.")
     else:
@@ -1462,6 +1422,12 @@ def build_arg_parser():
     p.add_argument("--title", default=None, help="Override the title used for LRCLIB lookup "
                                                    "(default: the existing file's own #TITLE tag).")
     p.add_argument("--lrclib-id", dest="lrclib_id", type=int, default=None)
+    p.add_argument("--lrc-file", dest="lrc_file", default=None,
+                    help="Path to a LOCAL .lrc synced-lyrics file to use directly, bypassing LRCLIB "
+                         "search/fetch entirely -- same override tier as --lrclib-id (wins over it if "
+                         "both are given). For a user who already has a synced-lyrics file on disk, "
+                         "including a deliberately imprecise one for testing how the LRC-seeding/"
+                         "windowing logic handles an off-but-close candidate.")
     p.add_argument("--no-lrc", dest="use_lrc", action="store_false", default=True,
                     help="Don't use LRCLIB synced lyrics even if available -- ASR matching only.")
     p.add_argument("--lrc-mode", choices=["seed", "windowed"], default="windowed",
@@ -1543,6 +1509,7 @@ class RealignPipelineOptions:
     artist: Optional[str] = None
     title: Optional[str] = None
     lrclib_id: Optional[int] = None
+    lrc_file: Optional[str] = None
     use_lrc: bool = True
     lrc_mode: str = "windowed"
     output_path: Optional[str] = None
@@ -1782,7 +1749,11 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     log(f"Transcribed {len(asr_words)} words.")
 
     forced_candidate = None
-    if opts.lrclib_id is not None:
+    if opts.lrc_file is not None:
+        forced_candidate = load_lrc_file(opts.lrc_file, artist=opts.artist or "", title=opts.title or "")
+        if forced_candidate is None:
+            log(f"Could not read/parse --lrc-file {opts.lrc_file!r} -- ignoring.")
+    elif opts.lrclib_id is not None:
         forced_candidate = fetch_lrclib_by_id(opts.lrclib_id)
         if forced_candidate is None:
             log(f"Could not fetch LRCLIB id {opts.lrclib_id} -- ignoring.")
@@ -1864,7 +1835,7 @@ def _opts_from_args(args) -> RealignPipelineOptions:
         audio_file=args.audio_file, work_dir=args.work_dir, whisper_model=args.whisper_model,
         demucs_model=args.demucs_model, skip_separation=args.skip_separation, vocals_path=args.vocals_path,
         no_whisperx=args.no_whisperx, whisperx_no_vad=args.whisperx_no_vad,
-        artist=args.artist, title=args.title, lrclib_id=args.lrclib_id,
+        artist=args.artist, title=args.title, lrclib_id=args.lrclib_id, lrc_file=args.lrc_file,
         use_lrc=args.use_lrc, lrc_mode=args.lrc_mode, output_path=args.output_path,
         delete_work_files=args.delete_work_files, no_debug_log=args.no_debug_log,
         rewindow_long_segments=args.rewindow_long_segments,
@@ -1894,6 +1865,8 @@ def run(argv=None) -> int:
             incompatible.append("--artist/--title")
         if args.lrclib_id:
             incompatible.append("--lrclib-id")
+        if args.lrc_file:
+            incompatible.append("--lrc-file")
         if incompatible:
             print(f"--batch is not allowed together with {', '.join(incompatible)} "
                   f"(a single override doesn't make sense across multiple songs).", file=sys.stderr)

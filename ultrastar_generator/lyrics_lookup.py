@@ -165,6 +165,35 @@ def fetch_lrclib_by_id(lrclib_id: int) -> Optional[LrcLibCandidate]:
     )
 
 
+def load_lrc_file(path, artist: str = "", title: str = "") -> Optional[LrcLibCandidate]:
+    """Loads a LOCAL .lrc file as a forced `LrcLibCandidate`, bypassing
+    LRCLIB entirely -- same override tier as `--lrclib-id`/`fetch_lrclib_
+    by_id` (both feed the same `forced_candidate` parameter downstream),
+    for a user who already has a synced-lyrics file on disk (hand-typed,
+    sourced elsewhere, or deliberately imprecise for testing -- see
+    [[project-uskm-comparison-magic-dance]]-style investigations) and
+    wants it used directly with no search/scoring involved. `duration` is
+    left `None` (no local audio-duration number to compare against, and
+    `select_lrc_candidate` never gates on it for a forced candidate
+    anyway -- see its own docstring). Returns `None` on any read/parse
+    failure (missing file, no parseable `[mm:ss.xx]` timestamp lines)
+    rather than raising, same best-effort convention as the network
+    fetchers above."""
+    from .lrc_timing import parse_lrc
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    lrc_lines = parse_lrc(text)
+    if not lrc_lines:
+        return None
+    return LrcLibCandidate(
+        track_name=title, artist_name=artist, album_name="",
+        duration=None, plain_lyrics="\n".join(t for _, t in lrc_lines),
+        synced_lyrics=text, instrumental=False, id=None,
+    )
+
+
 def _real_lrclib_candidates(candidates: List[LrcLibCandidate],
                              duration_sec: Optional[float]) -> List[LrcLibCandidate]:
     """Filters to candidates worth treating as genuine options for
@@ -576,7 +605,8 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                 for k in range(a_len):
                     w = words[a0 + k]
                     b_idx = min(b0 + k, b1 - 1)
-                    is_repeat_clamp = b_idx_counts[b_idx] > 1
+                    repeat_count = b_idx_counts[b_idx]
+                    is_repeat_clamp = repeat_count > 1
                     # Guard specifically for the repeat-clamp case: a real
                     # confirmed bug had an unrelated ASR word ~10.6s later,
                     # in silence, swept into this same block purely
@@ -588,6 +618,19 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                         out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
                                             confidence=w.confidence, line_id=None)
                         continue
+                    # A second, independent guard (real case: David Bowie -
+                    # Magic Dance): this many ASR words clamping onto the
+                    # SAME reference token is itself a sign of decoder
+                    # hallucination/runaway repetition, not a legitimate
+                    # repeated ad-lib -- see config.REFERENCE_CLAMP_MAX_REPEAT's
+                    # own comment. Past that count, don't fabricate a
+                    # reference_text at all; keep the ASR word's own raw
+                    # text, same as the ordinary (non-repeat-clamp) uneven
+                    # block default just below.
+                    if is_repeat_clamp and repeat_count > config.REFERENCE_CLAMP_MAX_REPEAT:
+                        out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
+                                            confidence=w.confidence, line_id=ref_line_ids[b_idx])
+                        continue
                     ref_text = ref_orig[b_idx]
                     if is_repeat_clamp:
                         if b_idx not in part_cache:
@@ -595,7 +638,12 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                             part_cursor[b_idx] = 0
                         parts = part_cache[b_idx]
                         if len(parts) > 1:
-                            p = min(part_cursor[b_idx], len(parts) - 1)
+                            # Wrap rather than freeze on the last syllable
+                            # once the cursor runs past the real syllable
+                            # count -- freezing is what turned "mag"/"ic"
+                            # into ~89 straight repeats of "ic" in the Magic
+                            # Dance case above the (now-capped) repeat count.
+                            p = part_cursor[b_idx] % len(parts)
                             ref_text = parts[p]
                             part_cursor[b_idx] += 1
                     out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
