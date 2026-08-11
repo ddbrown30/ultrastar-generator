@@ -125,9 +125,13 @@ wrong repeated instance.
   for `realign.py`'s `"windowed"` mode (Heroes/Americans/Ordinary Day,
   see below). Confirms this isn't fixable by more tuning without adding
   occurrence-disambiguation, same conclusion as `--zone-boundary-snap`.
-  Kept in codebase (the underlying confirmed-in-window-then-align
-  technique could still be salvaged with that fix), stays off by
-  default.
+  **Fully removed from the codebase 2026-08-10** (user's explicit
+  request: "Completely remove verify-placement" — different treatment
+  from `--zone-boundary-snap` below, which stays as dead-but-present
+  code) — `verification.verify_placement`, `PlacementCorrection`/
+  `PlacementWarning`, the CLI flags, the GUI checkbox, and its tests are
+  all gone; `alignment.py`/`lyric_alignment.py`'s `placement_corrections`/
+  `placement_warnings` plumbing removed too.
 - **`--zone-boundary-snap`** (snap zone/word boundaries to nearby pass-1
   note onsets): synthetically verified, but flat-to-negative on all 5
   real songs tested. Second independent instance of "well-motivated
@@ -1426,7 +1430,98 @@ history) -- summary: still a net regression on real ground truth
 (BATB: 105->101 words matched, 97.1%->93.1% timing agreement) even
 after this session's other improvements, root-caused this time to the
 in-window text-presence check having no way to disambiguate WHICH
-occurrence of a repeated word is correct. Stays off by default.
+occurrence of a repeated word is correct. **Fully removed from the
+codebase same day** (user's explicit follow-up: "Completely remove
+verify-placement") rather than kept as dead-but-present code.
+
+## Rewindow follow-ups: split-into-sub-phrases and LRC-line-anchored
+## recovery, both real-validated and REJECTED (2026-08-10)
+
+User's motivating question: could long-segment rewindowing (see above)
+be made more effective at actually improving WORD ACCURACY, either by
+searching more aggressively or by breaking a long segment into smaller
+pieces first? Two different designs were built and real-tested; both
+were rejected.
+
+### 1. Split-into-sub-phrases rewindow (`REWINDOW_SPLIT_ENABLED`) --
+### tried, real-validated, REJECTED, code KEPT (off by default)
+
+Instead of `_find_best_window`'s one sliding window over a long
+segment's ENTIRE text as a single block, `_rewindow_split_segment`
+splits the segment's own text into sub-phrases (`_split_segment_text` --
+sentence-ending punctuation primarily, fixed word-count chunks as a
+fallback for punctuation-less repeated-chorus text) and searches each
+sub-phrase's own best window SEQUENTIALLY (each subsequent search
+starts no earlier than where the previous one landed, so total
+`whisperx.align()` calls stay roughly the same order as the existing
+whole-block search, not multiplied by sub-phrase count).
+
+**Real-tested on Chicago** (properly LRC-matched -- see
+[[feedback-lrc-required-for-tests]], which this investigation's first
+attempt, on "I'm Afraid of Americans", violated and had to be redone):
+every segment where a split was attempted scored WORSE than the
+whole-block baseline, not marginally -- e.g. 0.716 vs 0.826, 0.671 vs
+0.793. Root cause: forcing wav2vec2 CTC to align a short (6-8 word)
+sub-phrase in isolation loses the longer-context signal that helps it
+lock onto the right audio -- the SAME "don't trust inference from a
+tiny isolated clip" failure class this project has already hit with
+pYIN pitch analysis and `verify_words`'s own isolated recheck (see
+Lessons learned above). Kept in the codebase as a documented dead end
+(`config.REWINDOW_SPLIT_ENABLED = False`), same treatment as
+`--zone-boundary-snap` -- not pursued further without new evidence.
+
+### 2. LRC-line-anchored recovery -- tried, real-validated, REJECTED,
+### code FULLY REMOVED (user's explicit request, different treatment
+### from the split prototype above)
+
+A structurally different mechanism, proposed as a way to avoid split's
+context-loss problem: instead of a blind search (no ground truth, just
+comparing CTC scores against itself), use LRC line timing as
+INDEPENDENT ground truth. Calibrates a per-song time offset between LRC
+line timestamps and our own audio (reusing `lrc_timing.py`'s own
+`two_tier_time_calibration` -- an uncalibrated candidate never touches
+word timing, same gate `realign.py`'s `lrc_mode` uses). For any LRC
+line whose matched words are AT LEAST half outside the calibrated
+expected window (the "Johnny wants a brain" failure signature -- a
+whole decoder segment placed against the wrong stretch of audio, not
+just a couple of individually noisy words), re-aligns that line's OWN
+reference text (not whatever ASR decoded -- the decoder's own text can
+be wrong in exactly this failure case) via a SINGLE
+`force_align_words_in_window` call scoped to a real line's worth of
+text, avoiding the split prototype's context-loss failure.
+
+**Real-tested on Chicago, standard fallback path forced via
+`--no-mxl-lrc-primary`** (Chicago's own MXL+LRC primary path would have
+skipped this code entirely). Fired on 3 of 4 flagged lines (1 correctly
+declined -- force-align failed, left unchanged, safe fallback working
+as designed). Compared against Chicago's own real ground-truth `.txt`
+(`sandbox/Chicago - When You're Good to Mama/Chicago - When You're Good
+to Mama.txt` -- note this file's PITCH convention isn't calibrated to
+ours, so pitch-class comparisons against it are meaningless; only
+TIMING is usable) via `verify_existing_song`: baseline (no recovery)
+scored 99% timing agreement (188 matched words, only 2 mismatches
+unrelated to this line); with LRC-anchor-recovery active, timing
+agreement DROPPED to 97% -- the mechanism took an ALREADY-CORRECT
+passage ("and I'll boost you up yours, let's...", none of these 5 words
+were mismatches in the baseline) and moved every word 0.65-1.09s away
+from its correct ground-truth position. A second flagged line
+("chickies") fired but had ZERO net effect on the final written output
+-- pass 3's own line-level proportional distribution for a matched
+reference line already absorbs this kind of raw-ASR-word-level error,
+so "fixing" the raw word achieved nothing either way. Net real result:
+one confirmed regression, one wasted no-op, one safe decline, zero
+genuine wins -- same shape as `--verify-placement`/`--zone-boundary-
+snap`'s own history of a well-motivated mechanism that doesn't survive
+contact with real data.
+
+**User's explicit instruction, different from every other rejected
+prototype in this file**: "Reject. Don't keep the functionality
+around." -- `lrc_timing.recover_misaligned_lrc_lines`/
+`_match_words_to_lrc_lines_full`, the `--lrc-anchor-recovery` CLI flag,
+`config.LRC_ANCHOR_RECOVERY_*`, `PipelineOptions.lrc_anchor_recovery`,
+and its tests are all fully removed, not kept as dead-but-present code
+the way `--zone-boundary-snap`/`REWINDOW_SPLIT_ENABLED` are. Don't
+re-add without new evidence.
 
 ## UltraStarKaraokeMaker-inspired improvements: force-align gaps, note
 ## over-segmentation investigation, and melisma-tail merging (2026-08-10)

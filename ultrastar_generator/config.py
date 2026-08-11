@@ -834,6 +834,26 @@ REWINDOW_CANDIDATE_WIDTH_SEC = 10.0
 REWINDOW_STEP_SEC = 1.0
 REWINDOW_MIN_SCORE_IMPROVEMENT = 0.10
 
+# --- Split-segment re-windowing (PROTOTYPE, 2026-08-10, OFF by default) -----
+# User's idea: instead of _find_best_window's single sliding window over a
+# long segment's ENTIRE text treated as one block, split the segment's own
+# text into sub-phrases and find EACH sub-phrase's own best window
+# SEQUENTIALLY within the segment's [start, end] span -- each subsequent
+# sub-phrase's search is constrained to start no earlier than where the
+# previous one was found (never searches backward). This can fix
+# misalignment INSIDE a segment, not just at its outer edges, which the
+# whole-block search structurally can't do. Total whisperx.align() calls
+# stay roughly the same order as the existing whole-block search (not
+# multiplied by sub-phrase count), since each sub-phrase's search range is
+# a shrinking suffix of the previous one's, not a fresh full-range sweep.
+# Splitting strategy (_split_segment_text): primary split on sentence-
+# ending punctuation (. ! ?), which whisper's decoder often still emits
+# even within one long VAD-merged region; falls back to fixed word-count
+# chunks (REWINDOW_SPLIT_FALLBACK_WORDS) for punctuation-less text (e.g. a
+# repeated chorus run with no periods between repeats).
+REWINDOW_SPLIT_ENABLED = False
+REWINDOW_SPLIT_FALLBACK_WORDS = 8
+
 
 # --- ASR quality retry (PROTOTYPE, 2026-08-10) -------------------------------
 # Real case that motivated this ("Gold"): WhisperX can, on a given run,

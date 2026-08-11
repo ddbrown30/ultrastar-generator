@@ -3609,3 +3609,27 @@ print("OK: main.py's build_arg_parser() builds and parses without error")
 from ultrastar_generator.realign import build_arg_parser as _realign_build_arg_parser
 _realign_build_arg_parser().parse_args(["dummy_input_dir"])
 print("OK: realign.py's build_arg_parser() builds and parses without error")
+
+print("\n--- transcription._split_segment_text (PROTOTYPE, 2026-08-10, config.REWINDOW_SPLIT_ENABLED): "
+      "splits a long decoder segment's own text into sub-phrases for split-rewindowing ---")
+from ultrastar_generator.transcription import _split_segment_text
+
+punct_split = _split_segment_text(" Johnny's in America. Johnny wants a brain! Johnny wants to know?")
+assert punct_split == ["Johnny's in America.", "Johnny wants a brain!", "Johnny wants to know?"], punct_split
+print("OK: splits cleanly on sentence-ending punctuation:", punct_split)
+
+single_sentence = _split_segment_text(" Just one short sentence.")
+assert single_sentence == ["Just one short sentence."], single_sentence
+print("OK: a single sentence (no internal punctuation split, under the word-count fallback "
+      "threshold) is returned as one whole piece")
+
+# No punctuation at all (a repeated-chorus run, the real motivating case) -- falls back
+# to fixed word-count chunks (config.REWINDOW_SPLIT_FALLBACK_WORDS, default 8).
+no_punct = "I'm afraid of Americans I'm afraid of the world I'm afraid I can't help it I'm afraid I can't"
+no_punct_split = _split_segment_text(no_punct)
+assert len(no_punct_split) > 1, no_punct_split
+reconstructed = " ".join(no_punct_split)
+assert reconstructed == no_punct, (reconstructed, no_punct)
+assert all(len(p.split()) <= config_mod.REWINDOW_SPLIT_FALLBACK_WORDS for p in no_punct_split), no_punct_split
+print("OK: punctuation-less repeated text falls back to fixed word-count chunks, "
+      "reconstructing the original text exactly:", no_punct_split)
