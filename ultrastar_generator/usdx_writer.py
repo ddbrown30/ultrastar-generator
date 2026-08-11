@@ -95,6 +95,25 @@ def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
     return out
 
 
+def _remove_orphan_short_melisma_tails(quantized: List[tuple]) -> List[tuple]:
+    """Second, more aggressive cleanup step (user's explicit request,
+    2026-08-10): after _merge_connected_melisma_tails, any melisma-
+    continuation ('~') entry that's STILL only 1 beat long -- it didn't
+    get absorbed because it wasn't beat-adjacent+same-pitch to its
+    predecessor -- is deleted outright, leaving a gap on the beat grid
+    rather than being merged into anything. A single isolated 1-beat '~'
+    carries almost no real musical information (too short to actually
+    sing) and is more often onset/release tracking noise than a genuine
+    melisma continuation. Runs at the same INTEGER BEAT level as the
+    merge pass, after it (so a '~' the merge pass already folded into a
+    longer note is untouched -- only entries that SURVIVED as their own
+    1-beat note are candidates here)."""
+    return [
+        item for item in quantized
+        if not (item[0] == "syl" and item[4].strip() == config.MELISMA_CONTINUATION_TEXT and item[2] == 1)
+    ]
+
+
 def render_song(song: Song, merge_connected_melisma: bool = False) -> str:
     lines: List[str] = []
 
@@ -130,6 +149,7 @@ def render_song(song: Song, merge_connected_melisma: bool = False) -> str:
     quantized = _quantize_entries(song.entries, song.bpm, song.gap_ms)
     if merge_connected_melisma:
         quantized = _merge_connected_melisma_tails(quantized)
+        quantized = _remove_orphan_short_melisma_tails(quantized)
 
     first_syllable_seen = False
     for item in quantized:

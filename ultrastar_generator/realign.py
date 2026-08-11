@@ -1500,7 +1500,10 @@ def build_arg_parser():
                           f"ASR/LRC (whole-song), or {config.RETRY_ASR_MIN_UNCONFIDENT_RUN}+ consecutive words "
                           f"have no real anchor at all (one bad passage, even if the rest of the song is fine). "
                           f"No-op if --whisper-model is already '{config.RETRY_ASR_MODEL}'; only kept if it "
-                          f"actually scores better. Only applies to --strategy replace. See CLAUDE.md."
+                          f"actually scores better. The actual re-transcription only runs in --batch mode "
+                          f"(roughly doubles this run's ASR time) -- outside --batch, a triggered condition "
+                          f"logs a WARNING suggesting --batch or a manual --whisper-model large-v3 instead. "
+                          f"Only applies to --strategy replace. See CLAUDE.md."
                           ).replace("%", "%%"))
     p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
     p.add_argument("--force-align-gaps", dest="force_align_gaps", action="store_true",
@@ -1548,6 +1551,11 @@ class RealignPipelineOptions:
     rewindow_long_segments: bool = True
     retry_low_quality_asr: bool = config.RETRY_LOW_QUALITY_ASR
     force_align_gaps: bool = config.FORCE_ALIGN_GAPS
+    # Whether this run is part of a --batch invocation -- see
+    # _retry_asr_if_low_quality's own docstring for why the large-v3
+    # retry itself is gated on this (set by run() from args.batch, and by
+    # gui.py's _build_realign_opts from its own _is_batch()).
+    batch: bool = False
     # "replace" (default, shipped): realign_song, a matched word's timing
     # is REPLACED with ASR's own value. "validate" (PROTOTYPE -- real-
     # validated but only helps when the file is already mostly accurate,
@@ -1595,7 +1603,17 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
     that fixes one bad passage -- a handful of words out of the whole
     song barely moves the aggregate rate -- without making it worse
     either). Never retries a second time, and never fires at all if
-    `opts.whisper_model` is already the retry model."""
+    `opts.whisper_model` is already the retry model.
+
+    `opts.batch` gates whether a triggered retry actually RUNS (2026-08-
+    10, user's explicit request): a whole-song re-transcription roughly
+    doubles this run's ASR time, which is a reasonable cost to pay
+    automatically in an unattended `--batch` run, but a surprising one to
+    silently eat in a single-song run where the user is presumably
+    watching and would rather decide for themselves. Outside `--batch`,
+    a triggered condition logs a WARNING (same explanation, both console
+    and debug log) suggesting `--batch` or a manual `--whisper-model
+    large-v3` instead of retrying automatically."""
     # Mirrors every top-level decision-narration message into the debug log FILE too, not just the
     # console/GUI `log` callback -- otherwise the file only shows the retry's raw ASR/realign data (via
     # `debug_log` threaded into the calls below) with no record of WHY it fired or what was decided,
@@ -1614,15 +1632,25 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
     if opts.whisper_model == config.RETRY_ASR_MODEL:
         return result
 
+    if long_run_trigger and not low_rate_trigger:
+        reason = (f"anchor rate is fine ({result.quality.anchor_rate:.0%}) but "
+                  f"{result.quality.longest_unconfident_run} consecutive word(s) have no real anchor at all "
+                  f"(a passage the whole-song rate doesn't catch)")
+    else:
+        reason = f"only {result.quality.anchor_rate:.0%} of words got a real anchor from the audio"
+
+    if not opts.batch:
+        dlog(f"  WARNING: {reason} -- retrying with '{config.RETRY_ASR_MODEL}' would likely help, but "
+             f"automatic retries only run in --batch mode (a whole-song re-transcription roughly doubles "
+             f"this run's ASR time, which --batch runs unattended but a single run doesn't spend without "
+             f"asking). Re-run with --batch, or pass --whisper-model {config.RETRY_ASR_MODEL} directly, to "
+             f"get this fixed.")
+        return result
+
     if debug_log is not None:
         debug_log.section(f"ASR QUALITY RETRY -- re-transcribing with '{config.RETRY_ASR_MODEL}'")
-    if long_run_trigger and not low_rate_trigger:
-        dlog(f"  Anchor rate is fine ({result.quality.anchor_rate:.0%}) but {result.quality.longest_unconfident_run} "
-             f"consecutive word(s) have no real anchor at all (a passage the whole-song rate doesn't catch) -- "
-             f"retrying transcription with '{config.RETRY_ASR_MODEL}' before accepting this result...")
-    else:
-        dlog(f"  Only {result.quality.anchor_rate:.0%} of words got a real anchor from the audio -- retrying "
-             f"transcription with '{config.RETRY_ASR_MODEL}' before accepting this result...")
+    dlog(f"  {reason[0].upper()}{reason[1:]} -- retrying transcription with '{config.RETRY_ASR_MODEL}' "
+         f"before accepting this result...")
     from .transcription import transcribe_words
     retry_asr_words = transcribe_words(
         vocals_path, config.RETRY_ASR_MODEL, prefer_whisperx=not opts.no_whisperx,
@@ -1841,7 +1869,7 @@ def _opts_from_args(args) -> RealignPipelineOptions:
         delete_work_files=args.delete_work_files, no_debug_log=args.no_debug_log,
         rewindow_long_segments=args.rewindow_long_segments,
         retry_low_quality_asr=args.retry_low_quality_asr,
-        force_align_gaps=args.force_align_gaps, strategy=args.strategy,
+        force_align_gaps=args.force_align_gaps, batch=args.batch, strategy=args.strategy,
     )
 
 

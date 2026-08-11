@@ -120,10 +120,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "This is what drives word timing accuracy feeding pass 3's note-zone assignment -- a bigger "
                          "model here is the lever worth pulling for accuracy.")
     p.add_argument("--verify-whisper-model", default=config.DEFAULT_WHISPER_MODEL,
-                    help=f"whisper model name for verify_words/verify_placement's re-transcription re-checks "
-                         f"(default: {config.DEFAULT_WHISPER_MODEL}, independent of --whisper-model). These loops "
-                         "call the model hundreds of times on tiny clips, where a big model's fixed per-call "
-                         "overhead dominates -- --whisper-model large-v3 for both made the verify passes alone "
+                    help=f"whisper model name for verify_words's re-transcription re-checks "
+                         f"(default: {config.DEFAULT_WHISPER_MODEL}, independent of --whisper-model). This loop "
+                         "calls the model hundreds of times on tiny clips, where a big model's fixed per-call "
+                         "overhead dominates -- --whisper-model large-v3 for both made the verify pass alone "
                          "take ~10x longer than a small model in one real run.")
     p.add_argument("--demucs-model", default=config.DEFAULT_DEMUCS_MODEL,
                     help=f"Demucs model name (default: {config.DEFAULT_DEMUCS_MODEL})")
@@ -173,7 +173,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                           f"{config.RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN}+ consecutive reference words ASR "
                           f"produced NO word for at all (one dropped passage, even if the rest of the song is "
                           f"fine). No-op if --whisper-model is already '{config.RETRY_ASR_MODEL}'; only kept if "
-                          f"it actually scores better than the original. See CLAUDE.md.").replace("%", "%%"))
+                          f"it actually scores better than the original. The actual re-transcription only runs "
+                          f"in --batch mode (roughly doubles this run's ASR time) -- outside --batch, a "
+                          f"triggered condition logs a WARNING suggesting --batch or a manual --whisper-model "
+                          f"large-v3 instead. See CLAUDE.md.").replace("%", "%%"))
     p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
     p.add_argument("--force-align-gaps", dest="force_align_gaps", action="store_true",
                     default=config.FORCE_ALIGN_GAPS,
@@ -199,18 +202,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "recheck actively confirms a different answer than what's already there.")
     p.add_argument("--no-verify-words", dest="verify_words", action="store_false",
                     help="Disable the text re-transcription check")
-    p.add_argument("--verify-placement", dest="verify_placement", action="store_true",
-                    default=config.ENABLE_PLACEMENT_VERIFICATION,
-                    help="Crop a small window at every word's FINAL note-assigned position, "
-                         "transcribe it, and expand the window until the expected word is found "
-                         "(or give up) -- flags (never auto-corrects) cases where the word turns out "
-                         "to be somewhere else, catching pass 3 putting a correctly-transcribed word "
-                         "on the wrong notes (default: OFF -- detection-only and never wrong on what "
-                         "it flagged, but the actual bugs it was catching trace back further upstream "
-                         "to bad WhisperX word timestamps, and the check itself is an expensive "
-                         "expand-search re-transcription loop over every word).")
-    p.add_argument("--no-verify-placement", dest="verify_placement", action="store_false",
-                    help="Explicitly disable the placement check (already off by default)")
     p.add_argument("--verify-suspicious-only", dest="verify_all_words", action="store_false",
                     default=config.VERIFY_ALL_WORDS,
                     help="Only run enabled verification checks on words pass 3 flagged suspicious "
@@ -642,9 +633,21 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         # attempt has the higher placement rate. A song where this retry
         # succeeds gets the retried transcription carried forward into
         # `words` even if used later (e.g. the standard fallback path).
-        if (opts.retry_low_quality_asr and mxl_lrc_result is not None and mxl_lrc_result.quality is not None
-                and mxl_lrc_result.quality.asr_placement_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
-                and current_asr_model != config.RETRY_ASR_MODEL):
+        # PROTOTYPE ASR-quality retry gating (2026-08-10, user's explicit request): a whole-song
+        # re-transcription roughly doubles this run's ASR time -- a reasonable cost to pay automatically
+        # in an unattended --batch run, but not one to silently eat in a single-song run where the user is
+        # presumably watching. Outside --batch, log a WARNING with the same explanation instead of retrying.
+        mxl_retry_triggered = (opts.retry_low_quality_asr and mxl_lrc_result is not None
+                                and mxl_lrc_result.quality is not None
+                                and mxl_lrc_result.quality.asr_placement_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
+                                and current_asr_model != config.RETRY_ASR_MODEL)
+        if mxl_retry_triggered and not opts.batch:
+            dlog(f"  WARNING: only {mxl_lrc_result.quality.asr_placement_rate:.0%} of MXL words got a real ASR "
+                 f"anchor (need {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%}) -- retrying with "
+                 f"'{config.RETRY_ASR_MODEL}' would likely help, but automatic retries only run in --batch "
+                 f"mode. Re-run with --batch, or pass --whisper-model {config.RETRY_ASR_MODEL} directly, to "
+                 f"get this fixed.")
+        elif mxl_retry_triggered:
             debug_log.section(f"ASR QUALITY RETRY (MXL+LRC path) -- re-transcribing with '{config.RETRY_ASR_MODEL}'")
             dlog(f"  Only {mxl_lrc_result.quality.asr_placement_rate:.0%} of MXL words got a real ASR anchor "
                  f"(need {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%}) -- retrying before accepting this result.")
@@ -777,8 +780,28 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                                       < config.RETRY_ASR_MIN_REFERENCE_MATCH_RATIO)
                 dropped_passage_trigger = (match_ratio >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO
                                             and unmatched_run >= config.RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN)
-                if (opts.retry_low_quality_asr and (low_ratio_trigger or dropped_passage_trigger)
-                        and current_asr_model != config.RETRY_ASR_MODEL):
+                # PROTOTYPE ASR-quality retry gating (2026-08-10, user's explicit request): a whole-song
+                # re-transcription roughly doubles this run's ASR time -- a reasonable cost to pay
+                # automatically in an unattended --batch run, but not one to silently eat in a single-song
+                # run where the user is presumably watching. Outside --batch, log a WARNING with the same
+                # explanation instead of retrying.
+                standard_retry_triggered = (opts.retry_low_quality_asr and (low_ratio_trigger or dropped_passage_trigger)
+                                             and current_asr_model != config.RETRY_ASR_MODEL)
+                if standard_retry_triggered and not opts.batch:
+                    if dropped_passage_trigger and not low_ratio_trigger:
+                        dlog(f"  WARNING: ASR transcript matches the reference lyrics overall ({match_ratio:.0%}), "
+                             f"but a {unmatched_run}-word run of reference text has NO corresponding ASR word at "
+                             f"all (a passage ASR completely dropped) -- retrying with '{config.RETRY_ASR_MODEL}' "
+                             f"would likely help, but automatic retries only run in --batch mode. Re-run with "
+                             f"--batch, or pass --whisper-model {config.RETRY_ASR_MODEL} directly, to get this "
+                             f"fixed.")
+                    else:
+                        dlog(f"  WARNING: ASR transcript only matches the reference lyrics {match_ratio:.0%} "
+                             f"(right song, but ASR quality looks weak) -- retrying with "
+                             f"'{config.RETRY_ASR_MODEL}' would likely help, but automatic retries only run in "
+                             f"--batch mode. Re-run with --batch, or pass --whisper-model "
+                             f"{config.RETRY_ASR_MODEL} directly, to get this fixed.")
+                elif standard_retry_triggered:
                     debug_log.section(f"ASR QUALITY RETRY (standard fallback path) -- re-transcribing with "
                                        f"'{config.RETRY_ASR_MODEL}'")
                     if dropped_passage_trigger and not low_ratio_trigger:
@@ -850,7 +873,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         # --- PASS 3: fit words onto the pass-1 note grid (timing untouched) --
         log("Pass 3: fitting words onto the pass-1 note grid...")
         syllables, stats = align_words(words, notes, y, sr,
-                                        verify_words=opts.verify_words, verify_placement=opts.verify_placement,
+                                        verify_words=opts.verify_words,
                                         verify_all_words=opts.verify_all_words,
                                         verify_whisper_model=opts.verify_whisper_model,
                                         snap_boundaries=opts.zone_boundary_snap, debug_log=debug_log,
@@ -876,14 +899,6 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             n_replaced = sum(1 for r in stats.verification_results if r.replaced)
             log(f"    verification: re-transcribed {n_checked} suspicious word(s) in isolation, "
                 f"replaced {n_replaced}")
-        if stats.placement_corrections:
-            log(f"    placement check: corrected {len(stats.placement_corrections)} word(s) whose FINAL "
-                f"note-assigned position didn't match what's actually sung there (see [placement] lines "
-                f"above) -- pass 3 was re-run with the fix applied")
-        if stats.placement_warnings:
-            log(f"    placement check: {len(stats.placement_warnings)} word(s) flagged -- the audio at "
-                f"their FINAL note-assigned position doesn't say the expected word (see [placement] lines "
-                f"above); these were NOT corrected automatically and are worth checking by hand")
 
         # --- PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s).
         if mxl_paths:
@@ -1033,7 +1048,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         force_align_gaps=args.force_align_gaps,
         merge_connected_melisma=args.merge_connected_melisma,
         verify_words=args.verify_words,
-        verify_placement=args.verify_placement, verify_all_words=args.verify_all_words,
+        verify_all_words=args.verify_all_words,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,
         musicxml_force_calibration=args.musicxml_force_calibration,
         lrc_timing_check=args.lrc_timing_check, zone_boundary_snap=args.zone_boundary_snap,
@@ -1048,6 +1063,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         youtube_url=args.youtube_url, youtube_audio_only=args.youtube_audio_only,
         delete_work_files=args.delete_work_files,
         mxl_lrc_primary=args.mxl_lrc_primary, lrclib_id=args.lrclib_id,
+        batch=args.batch,
     )
 
 

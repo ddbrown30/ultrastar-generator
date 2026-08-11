@@ -231,6 +231,12 @@ print("\n--- tempo math vs. real reference files ---")
 assert abs(beat_duration_ms(300) - 50.0) < 1e-6
 assert seconds_to_beat(23.0, 23000, 300) == 0
 assert seconds_to_beat_length(0.400, 300) == 8
+# FLOORS, never rounds up (2026-08-10, user's explicit request: undershoot
+# note length rather than overshoot). beat_duration_ms(300)=50ms exactly;
+# 427ms/50ms = 8.54 beats -- round() would give 9 (overshoot), floor must give 8.
+assert seconds_to_beat_length(0.427, 300) == 8, seconds_to_beat_length(0.427, 300)
+# Still guarantees at least 1 beat even for a near-zero duration.
+assert seconds_to_beat_length(0.001, 300) == 1
 t = 8300 + 200 * beat_duration_ms(120)
 assert seconds_to_beat(t / 1000.0, 8300, 120) == 200
 assert seconds_to_beat(48.030, 48030, 382.7) == 0
@@ -645,6 +651,54 @@ assert "~" in mcm_txt_off, mcm_txt_off
 assert mcm_txt_on != mcm_txt_off
 print("OK: render_song(merge_connected_melisma=True) actually removes the redundant '~'; "
       "=False (the function's own default) leaves it untouched")
+
+print("\n--- usdx_writer._remove_orphan_short_melisma_tails (2026-08-10): a '~' that's STILL only "
+      "1 beat long after the same-pitch merge above is deleted outright (leaves a gap, not merged) ---")
+from ultrastar_generator.usdx_writer import _remove_orphan_short_melisma_tails
+
+orphan_input = [
+    ("syl", 0, 2, 4, "held", True, ":"),
+    ("syl", 2, 1, 6, "~", False, ":"),   # adjacent but DIFFERENT pitch (6 vs 4) -- merge pass leaves this alone,
+                                          # but it's still only 1 beat long -> this pass deletes it
+    ("syl", 4, 2, 4, "held", True, ":"),
+]
+orphan_out = _remove_orphan_short_melisma_tails(orphan_input)
+assert orphan_out == [
+    ("syl", 0, 2, 4, "held", True, ":"),
+    ("syl", 4, 2, 4, "held", True, ":"),
+], orphan_out
+print("OK: a 1-beat, different-pitch '~' is deleted outright, leaving a gap:", orphan_out)
+
+orphan_multi_beat_input = [
+    ("syl", 0, 2, 4, "held", True, ":"),
+    ("syl", 2, 2, 6, "~", False, ":"),   # 2 beats -- NOT a 1-beat orphan, must survive untouched
+]
+assert _remove_orphan_short_melisma_tails(orphan_multi_beat_input) == orphan_multi_beat_input
+print("OK: a '~' longer than 1 beat is never touched by this pass, only the same-pitch merge above can shrink it")
+
+orphan_texted_input = [
+    ("syl", 0, 1, 4, "a", True, ":"),    # a real, 1-beat WORD syllable (not '~') -- must never be deleted
+]
+assert _remove_orphan_short_melisma_tails(orphan_texted_input) == orphan_texted_input
+print("OK: a genuine 1-beat WORD syllable (not the melisma-continuation placeholder) is left alone")
+
+# End-to-end: render_song(merge_connected_melisma=True) chains BOTH steps -- a same-pitch adjacent
+# '~' still gets folded in (not deleted), while a different-pitch 1-beat orphan '~' disappears entirely.
+orphan_song = Song(
+    title="T", artist="A", mp3="a.mp3", bpm=240.0, gap_ms=0,
+    entries=[
+        Syllable("held", 0.0, 0.125, 4, is_word_start=True),   # 2 beats
+        Syllable("~", 0.125, 0.1875, 7, is_word_start=False),  # 1 beat, DIFFERENT pitch -> orphan, deleted
+        Syllable("next", 0.1875, 0.3125, 4, is_word_start=True),  # 2 beats
+        Syllable("~", 0.3125, 0.375, 4, is_word_start=False),  # 1 beat, SAME pitch as "next" -> merged, not deleted
+    ],
+)
+orphan_txt_on = _render_merge(orphan_song, merge_connected_melisma=True)
+orphan_txt_off = _render_merge(orphan_song, merge_connected_melisma=False)
+assert orphan_txt_on.count("~") == 0, orphan_txt_on
+assert orphan_txt_off.count("~") == 2, orphan_txt_off
+print("OK: end-to-end, merge_connected_melisma=True both merges the same-pitch '~' AND deletes the "
+      "different-pitch 1-beat orphan '~', leaving zero '~' in the output; =False leaves both untouched")
 
 print("\nALL DRY-RUN CHECKS PASSED")
 
@@ -2055,152 +2109,6 @@ print("OK: verification correctly resolved all 5 cases against reference lyrics:
 del _sys.modules["whisperx"]
 verification_mod.model_cache.reset()
 
-print("\n--- verification._word_spans_from_syllables: reconstructs each word's FINAL "
-      "note-assigned span from its syllable run ---")
-span_words = [
-    Word(text="Lucifer", start=10.0, end=10.5, confidence=0.9),
-    Word(text="fell", start=11.0, end=11.3, confidence=0.9),
-]
-span_syllables = [
-    Syllable(text="Lu", start=10.1, end=10.3, midi_note=0, is_word_start=True),
-    Syllable(text="cifer", start=10.3, end=10.6, midi_note=0, is_word_start=False),
-    Syllable(text="fell", start=10.7, end=11.4, midi_note=0, is_word_start=True),
-]
-spans = verification_mod._word_spans_from_syllables(span_words, span_syllables)
-assert spans == [(10.1, 10.6), (10.7, 11.4)], spans
-print("OK: word spans correctly reconstructed from multi-syllable runs:", spans)
-
-print("\n--- verification.verify_placement: crops a small window at each word's FINAL "
-      "note-assigned position, expands it until the expected word is found, then refines "
-      "the exact position with forced alignment over that confirmed window (the real "
-      "'Stars' bug: text was correct, but pass 3 put it far from where it's really sung) ---")
-
-
-class _ExpandSearchFakeASRModel:
-    """Deterministic fake: 'Stars' isn't found until the search window has
-    grown enough to reach its real position (~60.0s, far from where pass 3
-    assigned it); 'your' is found immediately since pass 3 assigned it
-    correctly. One response per transcribe() call, in call order."""
-    _responses = ["", "", "", "the great Stars shine", "your"]
-
-    def __init__(self, *a, **k):
-        self._iter = iter(self._responses)
-
-    def transcribe(self, audio, language=None, batch_size=None):
-        return {"segments": [{"text": next(self._iter)}]}
-
-
-def _fake_load_model(model_name, device=None, compute_type=None, language=None, vad_options=None):
-    return _ExpandSearchFakeASRModel()
-
-
-def _fake_load_align_model(language_code=None, device=None):
-    return object(), {}
-
-
-_fake_align_responses = {
-    # Window at the point "Stars" is finally found is (44.7, 60.7) -- see
-    # the radius math in the comment below -- so a relative offset of
-    # 15.3s is absolute 60.0s, matching where it's really sung.
-    "the great Stars shine": [
-        {"word": "the", "start": 14.0, "end": 14.2, "score": 0.9},
-        {"word": "great", "start": 14.3, "end": 14.6, "score": 0.9},
-        {"word": "Stars", "start": 15.3, "end": 15.6, "score": 0.9},
-        {"word": "shine", "start": 15.7, "end": 16.0, "score": 0.9},
-    ],
-    # Window at (79.5, 81.5); relative 1.0s is absolute 80.5s, exactly
-    # matching pass 3's (correct) assignment.
-    "your": [
-        {"word": "your", "start": 1.0, "end": 1.3, "score": 0.9},
-    ],
-}
-
-
-def _fake_align(segments, model, metadata, audio, device=None):
-    words_out = _fake_align_responses.get(segments[0]["text"], [])
-    return {"segments": [{"words": words_out}]}
-
-
-fake_whisperx = _types.ModuleType("whisperx")
-fake_whisperx.load_model = _fake_load_model
-fake_whisperx.load_align_model = _fake_load_align_model
-fake_whisperx.align = _fake_align
-_sys.modules["whisperx"] = fake_whisperx
-verification_mod.model_cache.reset()
-
-expand_words = [
-    # "Stars" mis-assigned notes at 52.7s; really sung at ~60.0s. Initial
-    # search radius 1.0s doubles each miss (1, 2, 4, 8) -- at radius 8.0
-    # the window (44.7, 60.7) finally reaches 60.0s. The fake aligner
-    # returns a precise per-word hit for "Stars", so this should be
-    # AUTO-CORRECTED, not just flagged.
-    Word(text="Stars", start=80.0, end=80.4, confidence=0.9, line_id=0, reference_text="Stars"),
-    # "your" correctly assigned -- found on the very first (radius 1.0) try.
-    Word(text="your", start=80.5, end=80.8, confidence=0.9, line_id=0, reference_text="your"),
-]
-expand_syllables = [
-    Syllable(text="Stars", start=52.7, end=53.0, midi_note=0, is_word_start=True, line_id=0),
-    Syllable(text="your", start=80.5, end=80.8, midi_note=0, is_word_start=True, line_id=0),
-]
-y_fake_expand = np.zeros(16000 * 100, dtype=np.float32)
-expand_words_out, expand_corrections, expand_warnings = verification_mod.verify_placement(
-    expand_words, expand_syllables, [0, 1], y_fake_expand, 16000, "small.en", verbose=True,
-)
-assert expand_warnings == [], expand_warnings
-assert [c.word_index for c in expand_corrections] == [0], expand_corrections
-assert expand_corrections[0].word_text == "Stars", expand_corrections[0]
-assert abs(expand_corrections[0].new_start - 60.0) < 0.01, expand_corrections[0]
-assert abs(expand_words_out[0].start - 60.0) < 0.01, expand_words_out[0]
-assert expand_words_out[1].start == 80.5, expand_words_out[1]  # "your" untouched
-print("OK: expand-search placement check correctly auto-corrected the mis-assigned word, "
-      "left the correctly-assigned one untouched:",
-      [(c.word_index, c.word_text, c.new_start) for c in expand_corrections])
-del _sys.modules["whisperx"]
-verification_mod.model_cache.reset()
-
-print("\n--- verification.verify_placement: a word genuinely not findable anywhere in the "
-      "search radius stays a WARNING, never an auto-correction ---")
-
-
-class _NeverFoundFakeASRModel:
-    """Every transcribe() call returns empty text -- the expected word is
-    never in the result, no matter how far the search window grows."""
-    def __init__(self, *a, **k):
-        pass
-
-    def transcribe(self, audio, language=None, batch_size=None):
-        return {"segments": [{"text": ""}]}
-
-
-def _fake_load_model_never(model_name, device=None, compute_type=None, language=None, vad_options=None):
-    return _NeverFoundFakeASRModel()
-
-
-fake_whisperx_never = _types.ModuleType("whisperx")
-fake_whisperx_never.load_model = _fake_load_model_never
-fake_whisperx_never.load_align_model = _fake_load_align_model
-fake_whisperx_never.align = _fake_align
-_sys.modules["whisperx"] = fake_whisperx_never
-verification_mod.model_cache.reset()
-
-never_found_words = [
-    Word(text="ghost", start=10.0, end=10.4, confidence=0.9, line_id=0, reference_text="ghost"),
-]
-never_found_syllables = [
-    Syllable(text="ghost", start=10.0, end=10.4, midi_note=0, is_word_start=True, line_id=0),
-]
-y_fake_never = np.zeros(16000 * 30, dtype=np.float32)
-never_words_out, never_corrections, never_warnings = verification_mod.verify_placement(
-    never_found_words, never_found_syllables, [0], y_fake_never, 16000, "small.en", verbose=True,
-)
-assert never_corrections == [], never_corrections
-assert [w.word_index for w in never_warnings] == [0], never_warnings
-assert never_words_out[0].start == 10.0, never_words_out[0]  # untouched -- nothing confident to act on
-print("OK: a genuinely unfindable word stayed a warning, word list left untouched:",
-      [(w.word_index, w.word_text) for w in never_warnings])
-del _sys.modules["whisperx"]
-verification_mod.model_cache.reset()
-
 print("\n--- musicxml_reference.apply_musicxml_reference: calibrates at the PITCH-CLASS level "
       "(absorbs a per-song transposition) and corrects only where confident ---")
 import tempfile as _tempfile
@@ -3307,9 +3215,9 @@ from ultrastar_generator.realign import _retry_asr_if_low_quality, RealignPipeli
 import ultrastar_generator.transcription as transcription_mod
 
 _orig_transcribe_words = transcription_mod.transcribe_words
-rq_opts = RealignPipelineOptions(whisper_model="small.en", use_lrc=False, retry_low_quality_asr=True)
+rq_opts = RealignPipelineOptions(whisper_model="small.en", use_lrc=False, retry_low_quality_asr=True, batch=True)
 
-# (a) low anchor rate + a retry model that DOES find the real words -> retry is accepted.
+# (a) low anchor rate + a retry model that DOES find the real words, in --batch mode -> retry is accepted.
 rq_good_asr = [_Word(text=f"w{i}", start=float(i) + 50.0, end=float(i) + 50.4) for i in range(10)]
 transcription_mod.transcribe_words = lambda *a, **kw: rq_good_asr
 rq_log = []
@@ -3321,8 +3229,25 @@ assert rq_retried is not rs_bad_result, "a genuine improvement must return the R
 assert rq_retried.quality.n_asr_matched == 10, rq_retried.quality
 assert any(config_mod.RETRY_ASR_MODEL in line and "retrying" in line for line in rq_log), rq_log
 assert any("improved" in line for line in rq_log), rq_log
-print(f"  OK: original 0% anchor rate -> retry with '{config_mod.RETRY_ASR_MODEL}' finds all 10 words, "
-      f"retry result adopted")
+print(f"  OK: original 0% anchor rate, --batch mode -> retry with '{config_mod.RETRY_ASR_MODEL}' finds all "
+      f"10 words, retry result adopted")
+
+# (a2) SAME low anchor rate, but NOT --batch mode (2026-08-10, user's explicit request) -> logs a WARNING
+# suggesting --batch instead, never actually calls transcribe_words, returns the original unchanged.
+def _rq_boom_not_batch(*a, **kw):
+    raise AssertionError("transcribe_words must not be called outside --batch mode")
+transcription_mod.transcribe_words = _rq_boom_not_batch
+rq_opts_not_batch = RealignPipelineOptions(whisper_model="small.en", use_lrc=False, retry_low_quality_asr=True,
+                                            batch=False)
+rq_not_batch_log = []
+rq_not_batch_result = _retry_asr_if_low_quality(
+    rs_bad_result, existing=rs_bad_existing, vocals_path=Path("dummy.wav"), opts=rq_opts_not_batch,
+    audio_duration=100.0, forced_candidate=None, debug_log=None, log=rq_not_batch_log.append,
+)
+assert rq_not_batch_result is rs_bad_result, "must be a no-op (same object) outside --batch mode"
+assert any("WARNING" in line and "--batch" in line for line in rq_not_batch_log), rq_not_batch_log
+print("  OK: same low anchor rate, but NOT --batch mode -> logs a WARNING suggesting --batch, never "
+      "actually retries, original result returned unchanged")
 
 # (b) already using the retry model -- must never fire (and never call transcribe_words at all).
 def _rq_boom(*a, **kw):
@@ -3674,3 +3599,13 @@ with _tempfile.TemporaryDirectory() as d:
         assert "Video unavailable" in str(e), e
 print("OK: a download failure (network/private/removed video) raises YoutubeDownloadError, never a raw exception")
 del _sys.modules["yt_dlp"]
+
+print("\n--- CLI smoke test: both entry points' build_arg_parser() must not crash "
+      "(catches a missing config constant an argparse default references, e.g. FORCE_ALIGN_GAPS "
+      "went missing from config.py once this session without any other test catching it) ---")
+from ultrastar_generator.main import build_arg_parser as _main_build_arg_parser
+_main_build_arg_parser().parse_args(["dummy_input_dir"])
+print("OK: main.py's build_arg_parser() builds and parses without error")
+from ultrastar_generator.realign import build_arg_parser as _realign_build_arg_parser
+_realign_build_arg_parser().parse_args(["dummy_input_dir"])
+print("OK: realign.py's build_arg_parser() builds and parses without error")

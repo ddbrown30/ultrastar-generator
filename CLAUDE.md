@@ -107,7 +107,27 @@ wrong repeated instance.
 - **`--verify-placement`** (expand-search re-transcription to fix note
   boundaries): fixes individual real cases but is a net regression on
   every pitch/timing metric end-to-end on tested songs. Off by default;
-  don't flip on without addressing this.
+  don't flip on without addressing this. **Re-validated 2026-08-10**
+  (user's explicit ask: "is it still worth keeping around?") after this
+  session's other changes (rewindow, ASR-quality retry, force-align-gaps,
+  melisma-tail merge) — regression confirmed to still hold. Controlled
+  BATB run (same song, same ground truth, only this flag differs): words
+  matched 105→101, timing agreement 97.1%→93.1%, coverage 78%→75%,
+  timing mismatches 3→7. Root cause identified this time (not just
+  "regresses," but why): the "is the expected word's text present
+  anywhere in this search window" check has no way to disambiguate WHICH
+  occurrence of a REPEATED word is correct — for words that recur often
+  (Gold's "do" in its 4x-repeated chorus, BATB's "as"/"the"/"the"), the
+  window can contain more than one real instance, and forced-alignment
+  then confidently returns whichever one it finds, sometimes 6-10s away
+  (near `PLACEMENT_SEARCH_MAX_RADIUS_SEC`) from the correct one — the
+  same repeated-phrase disambiguation failure class already documented
+  for `realign.py`'s `"windowed"` mode (Heroes/Americans/Ordinary Day,
+  see below). Confirms this isn't fixable by more tuning without adding
+  occurrence-disambiguation, same conclusion as `--zone-boundary-snap`.
+  Kept in codebase (the underlying confirmed-in-window-then-align
+  technique could still be salvaged with that fix), stays off by
+  default.
 - **`--zone-boundary-snap`** (snap zone/word boundaries to nearby pass-1
   note onsets): synthetically verified, but flat-to-negative on all 5
   real songs tested. Second independent instance of "well-motivated
@@ -1363,6 +1383,50 @@ directly, 26 more recovered via `force_align_gaps`, only 4 interpolated,
 CLI-only, add GUI once validated" pattern used for `--strategy
 validate` initially. The standard fallback path's no-reference-available
 gap (noted above) is unchanged.
+
+### Retry gated to `--batch` mode only (2026-08-10, user's explicit ask)
+
+User's request: "Make the large-v3 re-run only happen during batch mode.
+In single mode, add a warning to the log that suggests doing that" --
+motivated by cost: a whole-song large-v3 re-transcription roughly
+doubles that run's ASR time, which `--batch` (unattended, cost-tolerant
+by its own existing convention) can absorb but an interactive single run
+shouldn't spend without asking first. All 3 retry sites (`realign.py`'s
+`_retry_asr_if_low_quality`, `main.py`'s MXL+LRC-path retry, `main.py`'s
+standard-fallback-path retry) now check `opts.batch` before firing: in
+`--batch` mode, unchanged (retries as before); outside `--batch`, logs a
+WARNING naming the specific metric that triggered, that a retry would
+likely help, and that `--batch` (or `--whisper-model large-v3` directly)
+would fix it -- then returns the original untouched result, same as the
+existing "no reference to check against" no-op path. Required adding
+`batch: bool = False` to `RealignPipelineOptions` (didn't exist there
+before) and wiring `batch=opts.batch`/`batch=is_batch` through both
+`gui.py`'s `_build_opts`/`_build_realign_opts` (the realign one was
+previously missing entirely) and `main.py`'s `_opts_from_args` (a
+pre-existing, unrelated gap -- `PipelineOptions.batch` existed but was
+never actually populated from the CLI args before this session).
+
+Real-validated live via the BATB and Gold `--verify-placement` test runs
+below (run in single-song mode, not `--batch`): both correctly logged
+the WARNING instead of retrying -- BATB's MXL+LRC path (8%/9% ASR
+placement rate, known wrong-cast "(Finale)" candidate) and Gold's
+standard fallback path (a 5-word unmatched-reference run) both declined
+to retry and fell through to their normal non-retried behavior, exactly
+as designed.
+
+### `--verify-placement` re-tested, regression reconfirmed -- see
+### "Removed / rejected approaches" above for the full write-up
+
+User's second ask this session: "Run some tests on the 'Verify
+placement' option to see if it's still worth keeping around." Full
+methodology, numbers, and root-cause explanation are recorded in the
+"Removed / rejected approaches" section near the top of this file
+(kept there since that's the canonical home for this constant's
+history) -- summary: still a net regression on real ground truth
+(BATB: 105->101 words matched, 97.1%->93.1% timing agreement) even
+after this session's other improvements, root-caused this time to the
+in-window text-presence check having no way to disambiguate WHICH
+occurrence of a repeated word is correct. Stays off by default.
 
 ## UltraStarKaraokeMaker-inspired improvements: force-align gaps, note
 ## over-segmentation investigation, and melisma-tail merging (2026-08-10)

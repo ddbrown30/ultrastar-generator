@@ -28,6 +28,13 @@ lyrics as ground truth for TEXT), but a recheck that actively confirms a
 different, better answer is used instead of blindly keeping stale text.
 
 This never touches note timing/pitch -- only word text.
+
+Note: this module used to also offer a `verify_placement` check (cropped
+a window at each word's FINAL note-assigned position and cross-checked
+it, auto-correcting via forced alignment). Removed 2026-08-10 -- real
+ground-truth comparison confirmed it a net regression on every pitch/
+timing metric (see CLAUDE.md's "Removed / rejected approaches"), even
+after further pipeline improvements; not worth keeping around.
 """
 
 from __future__ import annotations
@@ -51,36 +58,6 @@ class VerificationResult:
     rechecked_text: Optional[str]
     final_text: str
     replaced: bool
-
-
-@dataclass
-class PlacementWarning:
-    """A word whose FINAL note-assigned position (not its original ASR
-    timestamp) doesn't seem to match what's actually sung there, and
-    where the mismatch could NOT be confidently corrected (either not
-    found anywhere in the search radius, or found in-window but forced
-    alignment didn't return a precise per-word position) -- see
-    verify_placement. Genuinely needs a human to look at it."""
-    word_index: int
-    word_text: str
-    reference_text: Optional[str]
-    assigned_start: float
-    assigned_end: float
-    heard_text: str
-
-
-@dataclass
-class PlacementCorrection:
-    """A word whose FINAL note-assigned position was confirmed wrong AND
-    precisely re-located via forced alignment over a window already known
-    to contain it -- see verify_placement. Applied by shifting the word's
-    own (start, end) to the confirmed position and re-running pass 3."""
-    word_index: int
-    word_text: str
-    old_start: float
-    old_end: float
-    new_start: float
-    new_end: float
 
 
 def _normalize(text: str) -> str:
@@ -211,33 +188,6 @@ def verify_words(
     return (new_words if any_replaced else words), results
 
 
-def _word_spans_from_syllables(words: List[Word], syllables: List[Syllable]) -> List[Tuple[float, float]]:
-    """Reconstructs each word's FINAL note-assigned (start, end) span from
-    the syllables lyric_alignment.align_words_to_notes produced for it.
-    That function always emits exactly one contiguous run of syllables per
-    word (the first marked is_word_start=True), in the same order as
-    `words` -- see its own docstring. Falls back to each word's own ASR
-    span if that invariant doesn't hold (shouldn't normally happen), since
-    mis-mapping a span to the wrong word would be worse than not checking.
-    """
-    spans: List[Tuple[float, float]] = []
-    cur_start: Optional[float] = None
-    cur_end: Optional[float] = None
-    for syl in syllables:
-        if syl.is_word_start or cur_start is None:
-            if cur_start is not None:
-                spans.append((cur_start, cur_end))
-            cur_start, cur_end = syl.start, syl.end
-        else:
-            cur_end = max(cur_end, syl.end)
-    if cur_start is not None:
-        spans.append((cur_start, cur_end))
-
-    if len(spans) != len(words):
-        return [(w.start, w.end) for w in words]
-    return spans
-
-
 def _transcribe_clip_whisperx(model, clip: np.ndarray) -> Tuple[str, Optional[float], Optional[float]]:
     """Returns (text, seg_start, seg_end) -- seg_start/seg_end are
     Whisper's OWN rough segment timing (relative to `clip`), not a
@@ -256,194 +206,3 @@ def _transcribe_clip_whisperx(model, clip: np.ndarray) -> Tuple[str, Optional[fl
     seg_start = min(starts) if starts else None
     seg_end = max(ends) if ends else None
     return text, seg_start, seg_end
-
-
-def verify_placement(
-    words: List[Word],
-    syllables: List[Syllable],
-    indices: List[int],
-    y: np.ndarray,
-    sr: int,
-    model_name: str,
-    verbose: bool = True,
-) -> tuple:
-    """Checks whether each word's FINAL note-assigned position is actually
-    where it's sung -- catches pass 3 putting a word on the wrong notes
-    even when the word's own TEXT is correct (verify_words can't see this:
-    it re-transcribes around the word's ORIGINAL ASR timestamp, not where
-    pass 3 actually placed it). Returns (corrected_words, corrections,
-    warnings) -- same shape as verify_words: `corrected_words` is `words`
-    unchanged, or a copy with corrected (start, end) where a confident fix
-    was applied.
-
-    For each word: crop a small window around its assigned start, run an
-    open-vocabulary transcription (whisperx), and check whether the
-    expected word is in the result. If not, the window expands (doubling
-    each time, up to config.PLACEMENT_SEARCH_MAX_RADIUS_SEC) and retries --
-    this distinguishes "the word IS in the audio, just not where pass 3
-    put it" (a real bug) from "not findable nearby at all". Once found,
-    the exact position is refined with a forced-alignment pass over that
-    SAME confirmed window -- well-conditioned, since the text handed to
-    the aligner is already known to genuinely be in that window (unlike
-    an earlier, abandoned version of this check that force-aligned a wide
-    window with no such confirmation first, and turned out unreliable:
-    whisperx.align() anchors near wherever the window starts rather than
-    truly searching it, so it produced confident-looking but wrong answers
-    whenever the true position wasn't near the window's start).
-
-    Confirmed on a real bug report: "Stars" ended up assigned to notes
-    spanning beat 341 to beat ~421 (~11s) -- the audio at beat 341 actually
-    says "the flame the sword", and "Stars" itself isn't sung until
-    ~beat 381.
-
-    When the forced-alignment pass returns a PRECISE per-word position
-    (the expected word matched by name inside the aligned output, not just
-    "somewhere in this confirmed window"), that position is trusted enough
-    to auto-correct: the word's (start, end) is shifted to it (end from the
-    aligner's own word-level end when available, else the original
-    ASR-estimated duration preserved and shifted by the same delta), and
-    alignment.align_words re-runs pass 3 with the corrected word list --
-    same pattern as verify_words already re-running pass 3 after a text
-    correction. This is deliberately NOT one of the two rejected
-    correction heuristics from CLAUDE.md's open threads (snapping to the
-    nearest note gap; rebalancing by syllable-count deficit/surplus) --
-    those guessed a new boundary from indirect signals with no confirmation
-    the guess was right. This instead applies the SAME position that was
-    already positively confirmed present and located by forced alignment
-    for detection -- using it is not a new guess, just not discarding a
-    confirmed answer.
-
-    Only the "not found anywhere" case, and the rarer case where the word
-    was confirmed present in-window but forced alignment didn't return a
-    precise per-word hit (falls back to the raw window start, which could
-    be off by up to the final search radius), remain warnings -- genuinely
-    nothing confident enough to act on automatically.
-    """
-    if not indices:
-        return words, [], []
-
-    import whisperx
-
-    asr_model = model_cache.get_whisperx_asr_model(model_name)
-    align_model, align_metadata = model_cache.get_whisperx_align_model()
-
-    if sr != 16000:
-        import librosa
-        audio16k = librosa.resample(y, orig_sr=sr, target_sr=16000).astype(np.float32)
-    else:
-        audio16k = y.astype(np.float32)
-    duration = len(audio16k) / 16000.0
-
-    spans = _word_spans_from_syllables(words, syllables)
-
-    new_words = list(words)
-    corrections: List[PlacementCorrection] = []
-    warnings: List[PlacementWarning] = []
-    sorted_indices = sorted(set(indices))
-    progress = ProgressReporter("verify_placement", len(sorted_indices), verbose=verbose)
-    for i in sorted_indices:
-        progress.advance(extra=f"{len(corrections)} corrected, {len(warnings)} flagged so far")
-        word = words[i]
-        assigned_start, assigned_end = spans[i]
-        expected = word.reference_text or word.text
-        expected_norm = _normalize(expected)
-        if not expected_norm:
-            continue
-
-        radius = config.PLACEMENT_SEARCH_INITIAL_RADIUS_SEC
-        found_text: Optional[str] = None
-        found_seg_start = found_seg_end = None
-        window_start = window_end = 0.0
-        while True:
-            window_start = max(0.0, assigned_start - radius)
-            window_end = min(duration, assigned_start + radius)
-            if window_end <= window_start:
-                break
-            clip = audio16k[int(round(window_start * 16000)):int(round(window_end * 16000))]
-            if len(clip) == 0:
-                break
-            text, seg_start, seg_end = _transcribe_clip_whisperx(asr_model, clip)
-            tokens = {_normalize(t) for t in text.split()}
-            if expected_norm in tokens:
-                found_text = text
-                found_seg_start = seg_start if seg_start is not None else 0.0
-                found_seg_end = seg_end if seg_end is not None else (window_end - window_start)
-                break
-            if radius >= config.PLACEMENT_SEARCH_MAX_RADIUS_SEC:
-                break
-            radius = min(radius * config.PLACEMENT_SEARCH_GROWTH_FACTOR, config.PLACEMENT_SEARCH_MAX_RADIUS_SEC)
-
-        if found_text is None:
-            warnings.append(PlacementWarning(
-                i, word.text, word.reference_text, assigned_start, assigned_end,
-                f"not found within {radius:.1f}s of assigned position",
-            ))
-            if verbose:
-                print(f'    [placement] "{word.text}" not found anywhere within {radius:.1f}s of its '
-                      f'assigned position ({assigned_start:.2f}s) -- worth checking by hand')
-            continue
-
-        # Confirmed present somewhere in [window_start, window_end) --
-        # refine the exact position with forced alignment over that SAME
-        # window (safe now: the text is already known to genuinely be
-        # there, unlike the abandoned blind-search approach).
-        clip = audio16k[int(round(window_start * 16000)):int(round(window_end * 16000))]
-        segment = {"text": found_text, "start": found_seg_start, "end": found_seg_end}
-        true_start = true_end = None
-        precise = False
-        try:
-            aligned = whisperx.align([segment], align_model, align_metadata, clip, device="cuda")
-            # align() commonly splits one long segment's text into SEVERAL
-            # returned segments (e.g. at sentence boundaries) -- checking
-            # only the first was a real bug: any match past the first
-            # segment was silently missed, always falling back to
-            # window_start below, which looked exactly like (but wasn't)
-            # whisperx anchoring near the window's start.
-            for aligned_seg in (aligned.get("segments") or []):
-                for w in aligned_seg.get("words", []):
-                    if _normalize(w.get("word", "")) == expected_norm and w.get("start") is not None:
-                        true_start = window_start + float(w["start"])
-                        if w.get("end") is not None:
-                            true_end = window_start + float(w["end"])
-                        precise = True
-                        break
-                if true_start is not None:
-                    break
-        except Exception:
-            pass
-        if true_start is None:
-            true_start = window_start  # at least confirmed within this window
-
-        if abs(true_start - assigned_start) <= config.PLACEMENT_MISMATCH_TOLERANCE_SEC:
-            continue
-
-        if precise:
-            if true_end is not None and true_end > true_start:
-                new_end = true_end
-            else:
-                new_end = word.end + (true_start - word.start)
-                if new_end <= true_start:
-                    new_end = true_start + config.MIN_NOTE_DURATION_SEC
-            corrections.append(PlacementCorrection(
-                i, word.text, word.start, word.end, true_start, new_end,
-            ))
-            new_words[i] = Word(
-                text=word.text, start=true_start, end=new_end,
-                confidence=word.confidence, line_id=word.line_id,
-                reference_text=word.reference_text,
-            )
-            if verbose:
-                print(f'    [placement] "{word.text}" assigned to notes starting at {assigned_start:.2f}s, '
-                      f'but actually found at {true_start:.2f}s (search radius {radius:.1f}s) -- corrected')
-            continue
-
-        warnings.append(PlacementWarning(
-            i, word.text, word.reference_text, assigned_start, assigned_end,
-            f"found at ~{true_start:.2f}s (search radius {radius:.1f}s)",
-        ))
-        if verbose:
-            print(f'    [placement] "{word.text}" assigned to notes starting at {assigned_start:.2f}s, '
-                  f'but actually found at ~{true_start:.2f}s (search radius {radius:.1f}s) -- likely a '
-                  f'note-boundary mismatch (not precisely located enough to auto-correct)')
-
-    return (new_words if corrections else words), corrections, warnings

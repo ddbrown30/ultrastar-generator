@@ -277,9 +277,8 @@ class LrcLibSearchDialog(tk.Toplevel):
         self.preview.configure(state="disabled")
 
     def _on_use(self):
-        sel = self.listbox.curselection()
-        if sel:
-            self.result = self.candidates[sel[0]]
+        if self.selected_index is not None:
+            self.result = self.candidates[self.selected_index]
         self.destroy()
 
     def _on_cancel(self):
@@ -388,7 +387,6 @@ class App(tk.Tk):
         # for why only a subset of the ~30 CLI flags are exposed here).
         self.fetch_lyrics = tk.BooleanVar(value=True)
         self.verify_words = tk.BooleanVar(value=config.ENABLE_WORD_VERIFICATION)
-        self.verify_placement = tk.BooleanVar(value=config.ENABLE_PLACEMENT_VERIFICATION)
         self.existing_txt_check = tk.BooleanVar(value=config.ENABLE_EXISTING_TXT_CHECK)
         self.musicxml_force_calibration = tk.BooleanVar(value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.whisper_model = tk.StringVar(value=config.DEFAULT_WHISPER_MODEL)
@@ -680,10 +678,6 @@ class App(tk.Tk):
         Tooltip(c2, "Re-transcribe each word in isolation and cross-check against reference lyrics. "
                     "Never changes timing/pitch, only swaps in text when the recheck actively confirms "
                     "a different answer.")
-        c3 = ttk.Checkbutton(opts_frame, text="Verify placement", variable=self.verify_placement)
-        c3.grid(row=1, column=1, sticky="w", padx=8, pady=2)
-        Tooltip(c3, "Expensive expand-search re-transcription pass that can correct a word's timing "
-                    "position, not just its text. Off by default.")
         c4 = ttk.Checkbutton(opts_frame, text="Check existing .txt before overwriting", variable=self.existing_txt_check)
         c4.grid(row=2, column=0, sticky="w", padx=8, pady=2)
         Tooltip(c4, "If an existing '<Artist> - <Title>.txt' is found in the input folder, verify its "
@@ -894,6 +888,7 @@ class App(tk.Tk):
 
     def _update_pinned_lyrics_label(self):
         if self.pinned_lyrics is not None:
+            self.lrclib_id.set(self.pinned_lyrics.id)
             self.pinned_lyrics_label.config(
                 text=f"Using: {self.pinned_lyrics.track_name} - {self.pinned_lyrics.artist_name}")
             self.clear_pinned_button.pack(side="left", padx=4)
@@ -1071,7 +1066,6 @@ class App(tk.Tk):
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             fetch_lyrics=self.fetch_lyrics.get(),
             verify_words=self.verify_words.get(),
-            verify_placement=self.verify_placement.get(),
             existing_txt_check=self.existing_txt_check.get(),
             musicxml_force_calibration=self.musicxml_force_calibration.get(),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
@@ -1131,6 +1125,7 @@ class App(tk.Tk):
             lrc_mode=self.lrc_mode.get(),
             strategy=self.realign_strategy.get(),
             delete_work_files=self.realign_delete_work_files.get(),
+            batch=is_batch,
         )
 
     def _on_run(self):

@@ -8,6 +8,7 @@ detector into config.MIN_BPM..MAX_BPM.
 
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 import numpy as np
@@ -45,8 +46,15 @@ def seconds_to_beat(t_sec: float, gap_ms: int, bpm_as_written: float) -> int:
 
 
 def seconds_to_beat_length(duration_sec: float, bpm_as_written: float) -> int:
+    """FLOORS (never rounds up) -- user's explicit request, 2026-08-10: a
+    note that's a bit too SHORT is preferable to one that's a bit too
+    LONG. round() would overshoot on any duration whose fractional beat
+    count is >= 0.5; floor() always undershoots (or lands exact), never
+    overshoots, at the cost of a slightly shorter note on average.
+    `max(1, ...)` still guarantees every note gets written (never 0
+    beats), same as before."""
     ms = duration_sec * 1000.0
-    length = int(round(ms / beat_duration_ms(bpm_as_written)))
+    length = int(math.floor(ms / beat_duration_ms(bpm_as_written)))
     return max(1, length)
 
 

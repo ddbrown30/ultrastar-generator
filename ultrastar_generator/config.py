@@ -222,6 +222,17 @@ MIN_NOTE_GAP_SEC = 0.01
 # quantization itself can change what counts as "adjacent". Generation
 # pipeline only (main.py) -- NOT applied to realign.py, which has its own
 # stricter "never add/remove/reorder a note" contract this would violate.
+#
+# Second step, added 2026-08-10 (user's explicit request, tried as a
+# further experiment on top of the above): after the same-pitch merge,
+# any "~" that's STILL only 1 beat long -- it wasn't adjacent/same-pitch
+# to its predecessor, so the merge above didn't touch it -- is deleted
+# outright (`_remove_orphan_short_melisma_tails`), leaving a gap on the
+# beat grid rather than being folded into anything. A single 1-beat "~"
+# is too short to carry real melodic information and is more often
+# tracking noise than a genuine melisma continuation. Same flag controls
+# both steps (both are "final lyric-placement cleanup", generation
+# pipeline only).
 MERGE_CONNECTED_MELISMA_TAILS = True
 
 # CREPE (torchcrepe) runs alongside pYIN as a second, independent pitch
@@ -509,21 +520,6 @@ RECHECK_PAD_SEC = 1.0
 # CONFIRMS a different answer than what's already there (see
 # verification.py's _resolve) -- low blast radius by construction.
 ENABLE_WORD_VERIFICATION = True
-# Placement verification+correction (verify_placement) is OFF by default
-# (--verify-placement to enable). It now auto-corrects a word's (start,
-# end) and re-runs pass 3 when it gets a PRECISE forced-alignment fix
-# (the exact bug this targets: a word's ASR timestamp was badly wrong at
-# a zone boundary with no acoustic pause nearby to anchor a fix on --
-# "sword"/"Stars" in Les Misérables - Stars, see CLAUDE.md's open
-# threads). Kept OFF by default purely for COST, not reliability: it's an
-# expand-search re-transcription loop over every word (when
-# VERIFY_ALL_WORDS is True), which is expensive next to the rest of the
-# pipeline. Only ever corrects on a POSITIVELY CONFIRMED, precisely
-# forced-aligned position -- never guesses (the two heuristic
-# auto-correction ideas that WERE guesses -- snapping to the nearest note
-# gap, rebalancing by syllable-count deficit/surplus -- were tried and
-# rejected; see CLAUDE.md).
-ENABLE_PLACEMENT_VERIFICATION = False
 # Verify every word, not just the ones pass 3 flagged suspicious -- the
 # extra recheck calls are cheap next to Demucs/WhisperX, and this catches
 # cases pass 3's own heuristics can't see (e.g. lyrics_lookup.py's
@@ -531,36 +527,6 @@ ENABLE_PLACEMENT_VERIFICATION = False
 # text is deliberately left uncorrected pending a more confident check).
 # --verify-suspicious-only restricts back to just the flagged words.
 VERIFY_ALL_WORDS = True
-# verification.verify_placement checks whether a word's FINAL note-assigned
-# position is actually where it's sung: crop a small window around that
-# position, transcribe it (open vocabulary, via whisperx), and check
-# whether the expected word is in the result. If not, the window expands
-# and retries -- this distinguishes "the word IS in the audio, just not
-# where pass 3 put it" (a real placement bug) from "nothing findable
-# nearby at all". An earlier version tried forced-alignment against a wide
-# window instead of this expand-and-search approach; that turned out
-# unreliable in practice (whisperx.align() anchors near the window's start
-# rather than truly searching it, so it produced confident-looking but
-# wrong answers when the true position wasn't near the window start) --
-# replaced with this approach instead.
-#
-# Initial search radius (seconds) on each side of the assigned position.
-PLACEMENT_SEARCH_INITIAL_RADIUS_SEC = 1.0
-# Radius multiplier applied each time the word isn't found.
-PLACEMENT_SEARCH_GROWTH_FACTOR = 2.0
-# Hard cap on search radius -- bounds cost, and a word that genuinely
-# isn't findable even this far out is its own kind of finding (reported
-# as "not found", not silently expanded forever).
-PLACEMENT_SEARCH_MAX_RADIUS_SEC = 10.0
-# Once the word IS found, its exact position is refined with a
-# forced-alignment pass over that SAME confirmed window (well-conditioned
-# now, since the text is already known to genuinely be in that window --
-# unlike the abandoned approach above). If that refined position still
-# differs from the assigned position by more than this many seconds, it's
-# flagged as a mismatch. Not zero -- alignment has its own small jitter,
-# and this shouldn't cry wolf over sub-second imprecision, only real
-# multi-beat placement errors.
-PLACEMENT_MISMATCH_TOLERANCE_SEC = 1.0
 
 # Pass 4 (optional, musicxml_reference.py): confirms/corrects pass-3
 # syllable PITCH CLASS (never octave, never timing) against a
@@ -1000,7 +966,6 @@ class PipelineOptions:
     force_align_gaps: bool = FORCE_ALIGN_GAPS
     merge_connected_melisma: bool = MERGE_CONNECTED_MELISMA_TAILS
     verify_words: bool = ENABLE_WORD_VERIFICATION
-    verify_placement: bool = ENABLE_PLACEMENT_VERIFICATION
     verify_all_words: bool = VERIFY_ALL_WORDS
     musicxml_reference: Optional[str] = None
     musicxml_part: Optional[str] = None
