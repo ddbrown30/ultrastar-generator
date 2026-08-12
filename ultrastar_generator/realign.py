@@ -1317,7 +1317,7 @@ class AmbiguousExistingTxtError(ValueError):
     silently guesses which file the user meant)."""
 
 
-def find_existing_txt_in_folder(folder: Path) -> Path:
+def find_existing_txt_in_folder(folder: Path, *, exclude_markers: Tuple[str, ...] = ("[REALIGNED]",)) -> Path:
     """Auto-detects the single existing UltraStar .txt to realign within
     a folder -- used when no explicit --existing-txt is given (required
     for batch mode, where a single explicit path can't apply across
@@ -1328,7 +1328,11 @@ def find_existing_txt_in_folder(folder: Path) -> Path:
     output would either see two candidates (falsely "ambiguous") or,
     worse, pick the REALIGNED file itself as this run's new INPUT,
     compounding drift across repeated runs instead of always realigning
-    the same original file.
+    the same original file. `exclude_markers` is overridable so a sibling
+    module with its own output naming convention (e.g. `pitch_refresh.py`'s
+    "[PITCH REFRESHED]") can reuse this same auto-detection logic and
+    exclude its OWN prior output too, without either module needing to
+    know about the other's marker by default.
 
     When more than one real candidate remains, tries ONE further
     disambiguation before giving up: a file named exactly "<folder
@@ -1338,7 +1342,9 @@ def find_existing_txt_in_folder(folder: Path) -> Path:
     when it narrows the field to EXACTLY one match; still fails closed
     (never guesses) otherwise."""
     folder = Path(folder)
-    candidates = sorted(p for p in folder.glob("*.txt") if "[REALIGNED]" not in p.stem)
+    candidates = sorted(
+        p for p in folder.glob("*.txt") if not any(marker in p.stem for marker in exclude_markers)
+    )
     if not candidates:
         raise AmbiguousExistingTxtError(f"No .txt file found in {folder} to realign.")
     if len(candidates) == 1:

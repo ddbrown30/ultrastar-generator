@@ -3834,6 +3834,9 @@ print("OK: main.py's build_arg_parser() builds and parses without error")
 from ultrastar_generator.realign import build_arg_parser as _realign_build_arg_parser
 _realign_build_arg_parser().parse_args(["dummy_input_dir"])
 print("OK: realign.py's build_arg_parser() builds and parses without error")
+from ultrastar_generator.pitch_refresh import build_arg_parser as _pitch_refresh_build_arg_parser
+_pitch_refresh_build_arg_parser().parse_args(["dummy_input_dir"])
+print("OK: pitch_refresh.py's build_arg_parser() builds and parses without error")
 
 print("\n--- transcription._split_segment_text (PROTOTYPE, 2026-08-10, config.REWINDOW_SPLIT_ENABLED): "
       "splits a long decoder segment's own text into sub-phrases for split-rewindowing ---")
@@ -3858,3 +3861,132 @@ assert reconstructed == no_punct, (reconstructed, no_punct)
 assert all(len(p.split()) <= config_mod.REWINDOW_SPLIT_FALLBACK_WORDS for p in no_punct_split), no_punct_split
 print("OK: punctuation-less repeated text falls back to fixed word-count chunks, "
       "reconstructing the original text exactly:", no_punct_split)
+
+print("\n--- pitch_refresh: pitch-only refresh of an existing usdx timing base (same basic idea as "
+      "the external ultrastar_pitch/usp tool, see CLAUDE.md/project memory) ---")
+import ultrastar_generator.pitch_refresh as pitch_refresh_mod
+from ultrastar_generator.pitch_refresh import (
+    refresh_song_pitch, compute_pitch_class_predictions, resolve_pitch_refresh_output_path,
+    find_existing_txt_in_folder as pr_find_existing_txt_in_folder, _KeyNudge, OUTPUT_MARKER,
+)
+
+
+def _fake_pitch_source_for_refresh_test(y, sr, hop_length, frame_length, fmin, fmax, n_frames, **kwargs):
+    """A deterministic stand-in for a real PITCH_SOURCES entry: note0
+    (0-1s) is voiced at pitch class 3, note1 (1-2s) is left COMPLETELY
+    UNVOICED (to exercise the nearest-neighbor fallback), note2/note3
+    (2-4s) are voiced at pitch class 9."""
+    frame_dur = hop_length / sr
+    times = np.arange(n_frames) * frame_dur
+    midi = np.full(n_frames, np.nan)
+    conf = np.zeros(n_frames)
+    voiced = np.zeros(n_frames, dtype=bool)
+    for i, t in enumerate(times):
+        if 0.0 <= t < 1.0:
+            midi[i], conf[i], voiced[i] = 60 + 3, 0.9, True
+        elif 2.0 < t < 4.0:
+            # strictly > 2.0 (not >=) so the inclusive right boundary of note1's own
+            # [1.0, 2.0] search window (see _pred_for_note's side="right") can't pick up
+            # a stray voiced frame exactly AT t=2.0 and accidentally give note1 a real
+            # (wrong) prediction instead of exercising the unvoiced-fallback path.
+            midi[i], conf[i], voiced[i] = 60 + 9, 0.9, True
+        # 1.0 <= t <= 2.0 (note1 and the boundary frame right after it): left unvoiced on purpose
+    return midi, conf, voiced
+
+
+pitch_refresh_mod.PITCH_SOURCES["_fake_test_source"] = _fake_pitch_source_for_refresh_test
+try:
+    pr_entries = [
+        Syllable(text="Al", start=0.0, end=1.0, midi_note=60, is_word_start=True),   # pc0 -> expect pc3
+        Syllable(text="pha", start=1.0, end=2.0, midi_note=61, is_word_start=False),  # pc1, unvoiced -> fallback
+        LineBreak(start=2.0),
+        Syllable(text="Bra", start=2.0, end=3.0, midi_note=62, is_word_start=True),   # pc2 -> expect pc9
+        Syllable(text="vo", start=3.0, end=4.0, midi_note=74, is_word_start=False),   # pc2 (74%12) -> expect pc9
+    ]
+    pr_song = ParsedSong(title="Test Song", artist="Test Artist", bpm=200.0, gap_ms=1234,
+                          entries=pr_entries, raw_tags={"MP3": "audio.mp3"})
+    # Real sr + the module's own default hop_length/frame_length (256/2048), matching what
+    # refresh_song_pitch itself uses -- big enough (4.5s) to clear the frame_length floor.
+    sr_fake = 16000
+    y_fake = np.zeros(int(4.5 * sr_fake))
+
+    preds = compute_pitch_class_predictions(
+        pr_entries, y_fake, sr_fake, pitch_source="_fake_test_source",
+        attack_trim_sec=0.0, confidence_floor_percentile=0.0, voicing_threshold=None,
+    )
+    assert preds == [3, None, 9, 9], preds
+    print("OK: compute_pitch_class_predictions returns the fake source's own per-note pitch class, "
+          "None for the note with zero voiced frames")
+
+    result_song = refresh_song_pitch(
+        pr_song, y_fake, sr_fake, pitch_source="_fake_test_source",
+        attack_trim_sec=0.0, confidence_floor_percentile=0.0, voicing_threshold=None, key_nudge=False,
+    )
+    result_notes = [e for e in result_song.entries if isinstance(e, Syllable)]
+    assert len(result_notes) == 4, result_notes
+    assert [n.text for n in result_notes] == ["Al", "pha", "Bra", "vo"]
+    assert [(n.start, n.end) for n in result_notes] == [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)]
+    assert [n.is_word_start for n in result_notes] == [True, False, True, False]
+    assert sum(1 for e in result_song.entries if isinstance(e, LineBreak)) == 1, "LineBreak must survive untouched"
+    print("OK: refresh_song_pitch never touches timing, text, note count, note order, or line breaks")
+
+    new_pcs = [n.midi_note % 12 for n in result_notes]
+    assert new_pcs == [3, 3, 9, 9], new_pcs
+    print("OK: every note's pitch CLASS was replaced with the (fallback-filled) prediction:", new_pcs)
+
+    new_midis = [n.midi_note for n in result_notes]
+    # octave preserved: only the pitch-CLASS component changes, same convention as usp itself
+    assert new_midis == [63, 63, 69, 81], new_midis
+    print("OK: each note's OCTAVE is preserved -- only the pitch-class digit changed "
+          f"(orig midi [60,61,62,74] -> {new_midis})")
+    print("OK: note1 (no voiced frames at all) borrowed pitch class 3 from its nearest scored "
+          "neighbor (note0, tied-distance with note2 -- ties resolve backward) rather than being "
+          "left unset or crashing")
+
+    assert result_song.gap_ms == 1234 and result_song.bpm == 200.0 and result_song.mp3 == "audio.mp3"
+    assert result_song.title == "Test Song" and result_song.artist == "Test Artist"
+    print("OK: GAP/BPM/other header tags carried through from the existing file completely "
+          "untouched (pitch_refresh reuses realign._song_from_existing for this, not a re-implementation)")
+finally:
+    del pitch_refresh_mod.PITCH_SOURCES["_fake_test_source"]
+
+print("\n--- pitch_refresh: the existing file is ALWAYS treated as read-only, same guarantee as "
+      "realign.py (reuses realign.check_output_not_existing_file directly, not re-implemented) ---")
+default_out = resolve_pitch_refresh_output_path(Path("song/Artist - Title.txt"), None)
+assert default_out.name == f"Artist - Title {OUTPUT_MARKER}.txt", default_out
+print(f"OK: the default output path is a separate '{OUTPUT_MARKER}' file, never the existing file itself")
+
+import tempfile as _tempfile_pr
+with _tempfile_pr.TemporaryDirectory() as _tmp_pr:
+    _tmp_pr = Path(_tmp_pr)
+    same_path = _tmp_pr / "Artist - Title.txt"
+    same_path.write_text("dummy")
+    guard = pitch_refresh_mod.check_output_not_existing_file(same_path, same_path)
+    assert guard is not None, "must refuse to overwrite the existing file"
+    print("OK: an --output that resolves to the SAME path as the existing file is refused")
+
+print("\n--- pitch_refresh: find_existing_txt_in_folder auto-detection excludes BOTH this module's "
+      "own '[PITCH REFRESHED]' output AND realign.py's '[REALIGNED]' output, not just its own ---")
+with _tempfile_pr.TemporaryDirectory() as _tmp_pr2:
+    _tmp_pr2 = Path(_tmp_pr2)
+    original = _tmp_pr2 / "My Song.txt"
+    original.write_text("dummy")
+    (_tmp_pr2 / f"My Song {OUTPUT_MARKER}.txt").write_text("dummy")
+    (_tmp_pr2 / "My Song [REALIGNED].txt").write_text("dummy")
+    found = pr_find_existing_txt_in_folder(_tmp_pr2, exclude_markers=pitch_refresh_mod._EXCLUDE_MARKERS)
+    assert found == original, found
+print("OK: a folder with a previous pitch-refresh output AND a previous realign output still "
+      "correctly picks the ORIGINAL file, never either module's own prior output as the next input")
+
+print("\n--- pitch_refresh._KeyNudge: vendored port of usp's own StochasticPostprocessor (OFF by "
+      "default in this module -- see key_nudge=False default and project memory on why) ---")
+key0 = _KeyNudge.detect_key([0] * 10)
+assert key0 == 0, key0
+print(f"OK: a pitch-class distribution concentrated entirely at class 0 detects pseudo-key {key0} "
+      "(argmax of that key table column, deterministic)")
+nudged = _KeyNudge.correct(0, [1])
+assert nudged == [2], nudged
+unnudged = _KeyNudge.correct(0, [0])
+assert unnudged == [0], unnudged
+print("OK: an out-of-key pitch class (1, zero probability under key 0) is nudged +-1 semitone toward "
+      "whichever neighbor scores higher (2), while an in-key class (0) is left untouched")
