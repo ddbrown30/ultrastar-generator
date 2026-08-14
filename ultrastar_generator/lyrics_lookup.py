@@ -520,7 +520,70 @@ def _tokenize_lines(lines: List[str]) -> Tuple[List[str], List[str], List[int]]:
     return norm_tokens, orig_tokens, line_ids
 
 
-def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> List[Word]:
+def _time_based_line_lookup(words: List[Word], synced_lyrics_text: str):
+    """Builds a `lookup(t: float) -> Optional[int]` closure that maps a
+    real ASR timestamp to the reference LINE it falls chronologically
+    within, using calibrated LRC line timestamps -- or returns None if
+    there isn't enough synced-lyrics data or
+    `lrc_timing.two_tier_time_calibration` can't confidently calibrate
+    the LRC's own timestamps against this song's real audio. Same
+    calibration gate already used by `realign.py`'s
+    `lrc_mode="windowed"` and `mxl_lrc_generator.place_words_via_asr`,
+    reused here rather than reinvented; an uncalibrated LRC is known to
+    be actively harmful, not just unhelpful.
+
+    Used ONLY to fix up `line_id` for words the whole-song TEXT match
+    below couldn't place at all (see the "fill remaining unmatched
+    words" step) -- never to re-match text or re-window the alignment
+    itself. An earlier attempt at a full per-line windowed RE-MATCH
+    (2026-08-14) fixed the motivating bug but caused two different severe
+    real-audio regressions in two different attempts (a boundary-
+    spillover bug, then a second unresolved regression even after fixing
+    that) -- rejected/removed entirely, not kept around disabled (see
+    CLAUDE.md's "repeated-phrase/occurrence disambiguation" history: this
+    project has hit this failure class independently many times, and a
+    plausible-looking fix regressing elsewhere is the norm, not the
+    exception, for this specific problem). This narrower fix only
+    repairs LINE ASSIGNMENT for already-unmatched content, using
+    timestamps directly -- it never touches how words get text-matched,
+    so it can't reintroduce that same failure class.
+    """
+    from .lrc_timing import parse_lrc, match_asr_to_lrc_lines, two_tier_time_calibration
+
+    lrc_lines = parse_lrc(synced_lyrics_text)
+    if len(lrc_lines) < 2 or not words:
+        return None
+
+    candidates = match_asr_to_lrc_lines(words, lrc_lines)
+    _offset, _slope, _confidence, _kind, _skipped, correction_fn, _holdout = two_tier_time_calibration(candidates)
+    if correction_fn is None:
+        return None
+
+    calibrated_starts = [correction_fn(t) for t, _ in lrc_lines]
+
+    # Same clamped-monotonic-midpoint boundary technique already used in
+    # lyric_alignment._assign_notes_to_groups -- a boundary can never be
+    # pushed earlier than the line it belongs to actually starts, even if
+    # a later line's calibrated start is locally noisy/out of order.
+    boundaries: List[float] = []
+    running_max = float("-inf")
+    for i in range(len(calibrated_starts) - 1):
+        raw = (calibrated_starts[i] + calibrated_starts[i + 1]) / 2.0
+        running_max = max(running_max, raw, calibrated_starts[i])
+        boundaries.append(running_max)
+
+    def lookup(t: float) -> int:
+        zone_idx = 0
+        while zone_idx < len(boundaries) and t >= boundaries[zone_idx]:
+            zone_idx += 1
+        return zone_idx
+
+    return lookup
+
+
+def align_words_to_reference(
+    words: List[Word], reference_lines: List[str], synced_lyrics_text: Optional[str] = None,
+) -> List[Word]:
     """Aligns the full ASR word sequence against the full reference lyric
     sequence (whole-sequence alignment, not a per-word confidence-gated
     lookup), and returns a new word list where:
@@ -542,6 +605,15 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
     `reference_matches_transcript`/`REFERENCE_LYRICS_MIN_MATCH_RATIO` in
     main.py) -- by the time this function runs, the reference is trusted
     as the definitive word LIST for the song, not just a text corrector.
+
+    `synced_lyrics_text` (optional): does NOT change how words get
+    TEXT-matched at all -- only used later, in the "fill remaining
+    unmatched words" step, to assign a real, time-correct `line_id` to
+    content the whole-song text match below couldn't place (instead of
+    blindly inheriting whatever line_id happened to match right before
+    the gap). See `_time_based_line_lookup`'s own docstring for why this
+    narrower design replaced an earlier, rejected full per-line
+    re-matching attempt.
     """
     if not reference_lines or not words:
         return words
@@ -778,16 +850,43 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
         # by the time we get here, most genuinely-missing content should
         # already be filled in.)
 
-    # Fill any remaining unmatched (line_id is None) words by inheriting
-    # from the nearest matched neighbor -- prefer the previous one so a
-    # trailing ad-lib stays attached to the line it's part of.
-    last_seen = None
-    for i in range(len(out)):
-        if out[i].line_id is not None:
-            last_seen = out[i].line_id
-        else:
-            out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
-                           confidence=out[i].confidence, line_id=last_seen, dropped=out[i].dropped)
+    # Fill any remaining unmatched (line_id is None) words' line_id.
+    #
+    # When synced LRC timing is available and confidently calibrated,
+    # assign each such word to whichever reference LINE's own timestamp
+    # is nearest its own real ASR time -- correctly tracks the real flow
+    # of lines across a large unmatched run (e.g. a whole verse the
+    # whole-song text match failed to pair), instead of freezing the
+    # ENTIRE run on one stale line_id. Real confirmed bug (Trixie Mattel
+    # - Video Games, 2026-08-14): the old "copy the nearest PRECEDING
+    # matched neighbor" rule below froze a 219-word unmatched run
+    # (spanning several real reference lines, including one occurrence
+    # of a repeated chorus) on a single stale line_id, suppressing/
+    # misplacing real line breaks throughout that whole passage.
+    #
+    # Falls back to the OLD "copy nearest preceding matched neighbor"
+    # rule when no synced lyrics are given or calibration isn't
+    # confident -- same "don't touch anything without confidence" gate
+    # used everywhere else calibrated LRC timestamps drive a decision in
+    # this codebase.
+    time_lookup = _time_based_line_lookup(words, synced_lyrics_text) if synced_lyrics_text else None
+    if time_lookup is not None:
+        for i in range(len(out)):
+            if out[i].line_id is None:
+                out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
+                               confidence=out[i].confidence, line_id=time_lookup(out[i].start),
+                               dropped=out[i].dropped)
+    else:
+        # Inherit from the nearest matched neighbor -- prefer the
+        # previous one so a trailing ad-lib stays attached to the line
+        # it's part of.
+        last_seen = None
+        for i in range(len(out)):
+            if out[i].line_id is not None:
+                last_seen = out[i].line_id
+            else:
+                out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
+                               confidence=out[i].confidence, line_id=last_seen, dropped=out[i].dropped)
 
     return out
 

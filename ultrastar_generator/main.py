@@ -194,6 +194,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "forced alignment -- doesn't need ASR to have transcribed anything in the gap. "
                          "Adapted from UltraStarKaraokeMaker. See CLAUDE.md.")
     p.add_argument("--no-force-align-gaps", dest="force_align_gaps", action="store_false")
+    p.add_argument("--time-based-line-assignment", dest="time_based_line_assignment", action="store_true",
+                    default=config.ENABLE_TIME_BASED_LINE_ASSIGNMENT,
+                    help="Default: ON. When the reference lyrics came with synced (LRC) timestamps, a word "
+                         "the whole-song TEXT match couldn't "
+                         "place at all gets its line_id assigned by nearest CALIBRATED LRC line timestamp to "
+                         "its own real ASR time, instead of blindly inheriting the nearest matched neighbor's "
+                         "line_id -- fixes a long unmatched run (e.g. around a repeated chorus) freezing on "
+                         "one stale line_id and suppressing/misplacing line breaks. Never re-matches text. "
+                         "Falls back to the old neighbor-inherit rule when no synced lyrics/confident "
+                         "calibration. See CLAUDE.md.")
+    p.add_argument("--no-time-based-line-assignment", dest="time_based_line_assignment", action="store_false")
     p.add_argument("--merge-connected-melisma", dest="merge_connected_melisma", action="store_true",
                     default=config.MERGE_CONNECTED_MELISMA_TAILS,
                     help="Default: ON. Final write-time cleanup: a melisma-continuation note ('~') that's "
@@ -896,7 +907,10 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                     synced_lyrics_text = reference.synced_lyrics
                     log(f"  Got {len(ref_lines)} reference line(s) from {reference.source}"
                         f"{' (synced)' if reference.synced_lyrics else ''}.")
-                    corrected = align_words_to_reference(words, ref_lines)
+                    corrected = align_words_to_reference(
+                        words, ref_lines,
+                        synced_lyrics_text=synced_lyrics_text if opts.time_based_line_assignment else None,
+                    )
                     diffs = alignment_diff_summary(words, corrected)
                     # corrected is always the same length as words now --
                     # a dropped word is flagged via Word.dropped, not
@@ -1101,6 +1115,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         rewindow_long_segments=args.rewindow_long_segments,
         retry_low_quality_asr=args.retry_low_quality_asr,
         force_align_gaps=args.force_align_gaps,
+        time_based_line_assignment=args.time_based_line_assignment,
         merge_connected_melisma=args.merge_connected_melisma,
         verify_words=args.verify_words,
         verify_all_words=args.verify_all_words,

@@ -915,6 +915,71 @@ assert len(uneven_aligned) == 3, [w.text for w in uneven_aligned]
 print("OK: uneven-block words are kept (not dropped), only zero-correspondence words are:",
       [w.text for w in uneven_aligned])
 
+print("\n--- lyrics_lookup._time_based_line_lookup: maps a real ASR timestamp to the reference LINE it "
+      "chronologically falls within, using calibrated LRC line timestamps -- the mechanism "
+      "align_words_to_reference's 'fill remaining unmatched words' step uses instead of blindly "
+      "inheriting the nearest matched neighbor's line_id. Real motivating bug (Trixie Mattel - Video "
+      "Games, 2026-08-14): a 219-word unmatched run (the whole-song text match paired the ASR's 2nd "
+      "real singing of a repeated chorus against the reference's 1st occurrence, leaving the 1st real "
+      "singing -- and everything after it, up to the 2nd repeat -- completely unmatched) froze on the "
+      "single stale line_id of whatever matched right before the gap, instead of tracking the real "
+      "flow of lines through that whole passage. (An earlier, full per-line RE-MATCHING approach was "
+      "tried and rejected after two separate real-audio regressions -- see config.py's own history "
+      "note; this narrower mechanism only fixes LINE ASSIGNMENT for already-unmatched words, never "
+      "re-touches text matching, so it can't reintroduce that failure class.) ---")
+from ultrastar_generator.lyrics_lookup import _time_based_line_lookup
+
+_tbl_ref_lines = ["put your favorite perfume on", "and i say youre the bestest", "go play a video game",
+                   "its you its you its all for you everything i do", "tell you all the time heaven is a place",
+                   "leaning for a big kiss", "put the kettle on"]
+_tbl_times = [40.0, 42.0, 44.0, 46.0, 52.0, 58.0, 61.0]
+_tbl_synced = "\n".join(f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}" for t, txt in zip(_tbl_times, _tbl_ref_lines))
+# 8 confidently-anchorable lines clears LRC_TIMING_MIN_CALIBRATION_SAMPLES; ASR words match each
+# line's own text exactly (offset by a fixed +0.1s) so calibration finds a clean constant offset.
+_tbl_words = [Word(text=w, start=t + i * 0.3 + 0.1, end=t + i * 0.3 + 0.35, confidence=0.9)
+              for t, line in zip(_tbl_times, _tbl_ref_lines) for i, w in enumerate(line.split())]
+_tbl_lookup = _time_based_line_lookup(_tbl_words, _tbl_synced)
+assert _tbl_lookup is not None, "calibration should succeed with 7 clean anchors"
+# A timestamp shortly after line 3's own declared start (46.0, boundary to line 4 at midpoint(46,52)
+# =49.0) must resolve to line 3, not line 2 or 4 -- this is exactly the real bug's own shape: a long
+# unmatched run's EARLY words must land on the EARLIER of two real lines it spans, not freeze on
+# whichever line matched last before the gap.
+assert _tbl_lookup(46.2) == 3, _tbl_lookup(46.2)
+assert _tbl_lookup(48.5) == 3, _tbl_lookup(48.5)
+# ...and a timestamp after that boundary (but before the NEXT one, midpoint(52,58)=55.0) must resolve
+# to line 4, not stay frozen on line 3 -- the actual mechanism this test exists to verify: the SAME
+# unmatched run correctly tracks through MULTIPLE real lines by each word's own time, instead of one
+# value for the whole run.
+assert _tbl_lookup(49.5) == 4, _tbl_lookup(49.5)
+assert _tbl_lookup(54.0) == 4, _tbl_lookup(54.0)
+print("OK: a timestamp resolves to its own real line (3 vs 4), correctly distinguishing two different "
+      "lines within what would otherwise be treated as one long unmatched run")
+
+# Too few LRC lines to calibrate (< LRC_TIMING_MIN_CALIBRATION_SAMPLES) -> None, caller falls back.
+_tbl_too_few = "\n".join(f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}"
+                          for t, txt in zip(_tbl_times[:2], _tbl_ref_lines[:2]))
+assert _time_based_line_lookup(_tbl_words, _tbl_too_few) is None
+print("OK: too few LRC lines to calibrate returns None (caller falls back to the old "
+      "nearest-matched-neighbor rule, unchanged)")
+
+print("\n--- lyrics_lookup.align_words_to_reference: synced_lyrics_text integration -- with no synced "
+      "lyrics at all, behavior is byte-identical to the 2-arg call; a real per-song run only reaches "
+      "the time-based fill when the whole-song match actually left some word(s) unmatched ---")
+_tbli_ref_lines = ["Swinging in the backyard"]
+_tbli_words = [
+    Word(text=w, start=float(i), end=float(i) + 0.2, confidence=0.9)
+    for i, w in enumerate(["It's", "you,", "it's", "you,", "it's", "all", "for", "you"])
+] + [
+    Word(text="Swinging", start=10.0, end=10.2, confidence=0.9),
+    Word(text="in", start=10.3, end=10.4, confidence=0.9),
+    Word(text="the", start=10.5, end=10.6, confidence=0.9),
+    Word(text="backyard", start=10.7, end=11.0, confidence=0.9),
+]
+_tbli_no_lrc = align_words_to_reference(_tbli_words, _tbli_ref_lines)
+_tbli_none_lrc = align_words_to_reference(_tbli_words, _tbli_ref_lines, synced_lyrics_text=None)
+assert [w.line_id for w in _tbli_no_lrc] == [w.line_id for w in _tbli_none_lrc]
+print("OK: synced_lyrics_text=None (the default) is byte-identical to the 2-arg call")
+
 print("\n--- lyrics_lookup.reference_matches_transcript: rejects a wrong-song/wrong-language "
       "reference before it's ever trusted (real case: Gaston's lyrics.ovh lookup silently "
       "returned Spanish lyrics for an English song) ---")

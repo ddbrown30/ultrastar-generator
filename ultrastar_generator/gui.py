@@ -409,6 +409,7 @@ class App(tk.Tk):
         # Advanced/experimental -- collapsed by default.
         self.lrc_timing_check = tk.BooleanVar(value=config.ENABLE_LRC_TIMING_CHECK)
         self.zone_boundary_snap = tk.BooleanVar(value=config.ENABLE_ZONE_BOUNDARY_SNAP)
+        self.time_based_line_assignment = tk.BooleanVar(value=config.ENABLE_TIME_BASED_LINE_ASSIGNMENT)
         self.no_video_sync = tk.BooleanVar(value=False)
         self.quiet = tk.BooleanVar(value=False)
         self._advanced_visible = False
@@ -799,6 +800,14 @@ class App(tk.Tk):
         a4.grid(row=3, column=0, sticky="w", padx=8, pady=2)
         Tooltip(a4, "Suppress the verbose [pass1] diagnostic logging (still prints the main pipeline "
                     "stage messages).")
+        a5 = ttk.Checkbutton(self.advanced_frame, text="Time-based line assignment",
+                              variable=self.time_based_line_assignment)
+        a5.grid(row=4, column=0, sticky="w", padx=8, pady=2)
+        Tooltip(a5, "When the reference lyrics have synced (LRC) timestamps, a word the text match "
+                    "couldn't place at all gets its line break assigned by nearest calibrated LRC line "
+                    "timestamp instead of blindly inheriting the nearest matched neighbor's -- fixes a "
+                    "long unmatched run (e.g. around a repeated chorus) freezing on one stale line and "
+                    "suppressing/misplacing line breaks. Never re-matches text.")
 
         self.run_frame = ttk.Frame(self)
         self.run_frame.pack(fill="x", **pad)
@@ -1183,6 +1192,7 @@ class App(tk.Tk):
             pitch_source=self.pitch_source.get(),
             lrc_timing_check=self.lrc_timing_check.get(),
             zone_boundary_snap=self.zone_boundary_snap.get(),
+            time_based_line_assignment=self.time_based_line_assignment.get(),
             no_video_sync=self.no_video_sync.get(),
             quiet=self.quiet.get(),
             youtube_url=(self.youtube_url.get().strip() or None) if mode == "youtube" else None,

@@ -502,6 +502,66 @@ REFERENCE_CLAMP_MAX_REPEAT = 8
 # than risk mass-deleting real lyrics -- same "count is itself the signal"
 # shape as REFERENCE_CLAMP_MAX_REPEAT above, just for a different opcode.
 REFERENCE_DELETE_MAX_RUN = 5
+# align_words_to_reference's default matching runs ONE global, text-only
+# difflib.SequenceMatcher over the WHOLE song's ASR words vs the whole
+# reference -- it has no notion of TIME, only text. When a phrase repeats
+# multiple times in both the song and the reference (a chorus sung 3x),
+# SequenceMatcher can pair the WRONG occurrences together (it only
+# maximizes total matched-token count, not chronological correspondence):
+# real confirmed case (Trixie Mattel - Video Games, 2026-08-14) -- the
+# ASR's 2nd real singing of "It's you, it's you, it's all for you,
+# everything I do" matched the reference's 1st occurrence, leaving the
+# ASR's 1st real singing of the SAME chorus (plus everything after it, up
+# to the 2nd repeat -- 219 words) as one giant unmatched "delete" block.
+# Those unmatched words then inherited a stale line_id from whatever
+# matched right before the gap ("go play a video game"), and since
+# phrasing.py's build_lines treats a matching line_id on both sides as
+# fully overriding gap-based break heuristics, this suppressed a real
+# line break and produced a spurious one elsewhere in the same passage.
+#
+# REJECTED APPROACH (2026-08-14, don't re-attempt without new evidence):
+# a full per-LINE, time-WINDOWED re-match (bound each reference line's
+# own text matching to a time window around its calibrated timestamp,
+# so a repeated phrase elsewhere in the song is physically excluded from
+# a given line's window). Fixed the motivating Video Games bug directly,
+# but caused a severe real-audio regression on the SAME song in the
+# FIRST attempt (word count 353->277, F1 84.0%->14.3%, from window-
+# boundary spillover splitting a line's own tail words into the next
+# line's window). A SECOND attempt (gap-grouping words before assigning
+# them to a window, so a contiguous phrase can never be split by a
+# boundary) fixed that specific spillover but still regressed severely
+# elsewhere on the same song (F1 down to 21.7%, a different repeated-
+# passage cross-contamination). Two independent regressions from two
+# different angles on the same underlying idea -- consistent with this
+# project's own repeated-phrase-disambiguation history (CLAUDE.md: hit
+# independently in at least 5 other mechanisms already). Fully removed,
+# not kept around disabled.
+#
+# ACTUAL FIX: when True and the reference lyrics came with synced (LRC)
+# timestamps, `align_words_to_reference` NEVER re-windows or re-matches
+# TEXT at all -- the whole-song text match above runs completely
+# unchanged. Only the existing "fill remaining unmatched words" step
+# (words the text match couldn't place, line_id=None) changes: instead
+# of blindly inheriting the nearest matched neighbor's line_id (which is
+# what froze that whole 219-word run on one stale value), each such word
+# is assigned to whichever reference line's own (calibrated -- same
+# lrc_timing.two_tier_time_calibration gate as everywhere else in this
+# codebase) timestamp is nearest ITS OWN real ASR time. This can't
+# reintroduce the rejected approach's failure class, because it never
+# touches text matching/correctness -- only which line a word that's
+# ALREADY unmatched gets attributed to for break purposes. Falls back to
+# the old "inherit nearest matched neighbor" rule, unchanged, whenever no
+# synced lyrics are available or calibration isn't confident.
+# Real-audio validated (2026-08-14): Trixie Mattel - Video Games (the
+# motivating case) -- fixes the reported break bug, ground-truth F1/
+# recall/precision/pitch-class accuracy all IDENTICAL before/after (this
+# mechanism only ever touches line_id on already-unmatched words, never
+# timing/pitch/text); Great Big Sea - Ordinary Day (forced onto the
+# standard, non-MXL+LRC path via --no-mxl-lrc-primary since it has a
+# valid MXL+LRC candidate that would otherwise skip this code entirely)
+# -- byte-identical output with the flag on vs off, confirming a true
+# no-op on a song with nothing for it to fix.
+ENABLE_TIME_BASED_LINE_ASSIGNMENT = True
 # When splitting a pass-1 note at a word boundary (_split_notes_by_word_
 # boundaries) leaves a word's leading piece shorter than this, it's DROPPED
 # instead of becoming its own syllable (see _drop_leading_slivers) -- a real
@@ -1126,6 +1186,7 @@ class PipelineOptions:
     rewindow_long_segments: bool = REWINDOW_ENABLED
     retry_low_quality_asr: bool = RETRY_LOW_QUALITY_ASR
     force_align_gaps: bool = FORCE_ALIGN_GAPS
+    time_based_line_assignment: bool = ENABLE_TIME_BASED_LINE_ASSIGNMENT
     merge_connected_melisma: bool = MERGE_CONNECTED_MELISMA_TAILS
     verify_words: bool = ENABLE_WORD_VERIFICATION
     verify_all_words: bool = VERIFY_ALL_WORDS
