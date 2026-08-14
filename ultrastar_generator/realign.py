@@ -62,7 +62,8 @@ from .models import LineBreak, Song, Syllable, Word
 from .usdx_parser import ParsedSong, UsdxParseError, parse_usdx_file
 from .usdx_writer import write_song
 from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id, load_lrc_file
-from .lrc_timing import match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure
+from .lrc_timing import (match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure,
+                          reconcile_line_structure)
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
 
 
@@ -355,12 +356,21 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
     candidate-selection/line-assignment logic a third time.
 
     `our_lines` (the existing file's own display lines, see
-    `_reconstruct_our_lines`) -- when given -- additionally rejects a
+    `_reconstruct_our_lines`) -- when given -- additionally RECONCILES a
     candidate whose REPEAT STRUCTURE doesn't match ours (see
-    `check_repeat_structure`; real confirmed case: David Bowie - "I'm
-    Afraid of Americans", CLAUDE.md). Optional and skipped (no rejection)
-    when not given, since not every caller has the original entries handy
-    (e.g. `seed_lrc_anchors`'s own standalone/test-only call path)."""
+    `reconcile_line_structure`; real confirmed case: David Bowie - "I'm
+    Afraid of Americans", CLAUDE.md) instead of rejecting it outright: a
+    localized repeat-count difference (an edition with a few extra/
+    missing chorus repeats) gets the extra lines on whichever side
+    dropped, and the candidate's own lines used from here on are the
+    reconciled subset, not its raw lines. Still rejects outright (returns
+    None) when reconciliation can't find a real correspondence for most
+    of our own lines at all (see `reconcile_line_structure`'s own
+    `min_match_ratio`) -- a genuinely different recording/arrangement,
+    not just a differing repeat count. Optional and skipped (no
+    reconciliation/rejection) when not given, since not every caller has
+    the original entries handy (e.g. `seed_lrc_anchors`'s own standalone/
+    test-only call path)."""
     fake_words = [MxlWord(text=w.text, norm=w.norm, offset=float(i), syllables=[])
                   for i, w in enumerate(existing_words)]
 
@@ -368,33 +378,43 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
     if lrc_match is None:
         return None
 
+    candidate_lrc_lines = lrc_match.lrc_lines
     if our_lines is not None:
-        lrc_line_texts = [text for _t, text in lrc_match.lrc_lines]
-        rejection = check_repeat_structure(our_lines, lrc_line_texts)
-        if rejection is not None:
+        lrc_line_texts = [text for _t, text in candidate_lrc_lines]
+        reconciliation = reconcile_line_structure(our_lines, candidate_lrc_lines)
+        if reconciliation is None:
             if log is not None:
                 log(f"  Warning: LRC candidate {lrc_match.candidate.track_name!r}/{lrc_match.candidate.artist_name!r} "
-                    f"rejected: {rejection}")
+                    f"rejected: repeat structure doesn't reconcile against our own lines "
+                    f"({len(our_lines)} of our own lines, {len(lrc_line_texts)} candidate lines)")
             return None
+        if reconciliation.n_lrc_dropped or reconciliation.n_our_unmatched:
+            if log is not None:
+                log(f"  LRC candidate {lrc_match.candidate.track_name!r}/{lrc_match.candidate.artist_name!r} "
+                    f"repeat structure reconciled: {reconciliation.n_matched}/{reconciliation.n_our_lines} of "
+                    f"our own lines matched, {reconciliation.n_lrc_dropped} candidate line(s) dropped as extras, "
+                    f"{reconciliation.n_our_unmatched} of our own line(s) have no LRC counterpart")
+        candidate_lrc_lines = reconciliation.lrc_lines
 
     # Calibrate away a systematic offset between LRC's own line timestamps
     # and OUR audio's real timing (e.g. different lead-in silence) BEFORE
     # trusting a line start as an anchor -- same technique/function
     # mxl_lrc_generator uses, factored into lrc_timing.py for exactly this
-    # kind of reuse. `structural_check` reuses the SAME check_repeat_
-    # structure comparison as the upfront rejection above (when `our_lines`
-    # is available) -- gates tier 3's own "rescue" case (see two_tier_time_
-    # calibration's own docstring); redundant-but-harmless when the
-    # upfront check already ran (this candidate already passed it), and
-    # the real backstop when `our_lines` wasn't available for that check.
-    time_candidates = match_asr_to_lrc_lines(asr_words, lrc_match.lrc_lines)
+    # kind of reuse. `structural_check` deliberately reuses check_repeat_
+    # structure against the candidate's RAW (un-reconciled) lines, not the
+    # filtered ones above -- it's answering a different question (is this
+    # fundamentally the WRONG recording, e.g. a choral cover) than the
+    # reconciliation above (is this the right recording with a differing
+    # repeat count) -- gates tier 3's own "rescue" case (see
+    # two_tier_time_calibration's own docstring).
+    time_candidates = match_asr_to_lrc_lines(asr_words, candidate_lrc_lines)
     structural_check = None
     if our_lines is not None:
         lrc_line_texts_for_check = [text for _t, text in lrc_match.lrc_lines]
         structural_check = lambda: check_repeat_structure(our_lines, lrc_line_texts_for_check)
     offset, slope, confidence, kind, _skipped, correction_fn, _holdout = two_tier_time_calibration(
         time_candidates, structural_check=structural_check)
-    lrc_lines = lrc_match.lrc_lines
+    lrc_lines = candidate_lrc_lines
     if offset is not None:
         lrc_lines = [(correction_fn(t), text) for t, text in lrc_lines]
 

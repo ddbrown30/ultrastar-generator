@@ -576,16 +576,100 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   of a repeated phrase — could flatten or overshoot many already-correct
   neighboring matches; see "Real bugs" below.)
 - `lrc_timing.check_repeat_structure` (moved here from `realign.py`,
-  re-exported from `realign.py` for backward compat) rejects an LRC
+  re-exported from `realign.py` for backward compat) detects an LRC
   candidate whose repeat structure doesn't match ours — compares WORD
   occurrence counts of the most-repeated line's own distinctive content
   words (not exact-line-repeat counts, since a chorus is often split
   across several near-duplicate line variants that would each pass a
-  naive per-line check individually), tolerance ±15%/min ±1. Catches a
-  wrong-edition/wrong-arrangement candidate that duration/content
-  matching alone misses (real case: a candidate with 9 extra chorus
-  repeats, invisible in duration since it coincidentally matched within
-  the existing tolerance).
+  naive per-line check individually), tolerance ±15%/min ±1. Still used
+  as-is for `two_tier_time_calibration`'s tier-3 rescue gate (is this
+  fundamentally the WRONG recording, e.g. Heroes' choral cover — see
+  that constant's own memory) — real case: a candidate with 9 extra
+  chorus repeats, invisible in duration since it coincidentally matched
+  within the existing tolerance.
+- `lrc_timing.reconcile_line_structure` (2026-08-14, user's own design,
+  replaces `check_repeat_structure`'s use as `prepare_lrc`'s upfront
+  accept/reject gate — that function itself is unchanged, still used for
+  the tier-3 rescue gate above): rather than rejecting a whole candidate
+  outright over a differing repeat count (the "I'm Afraid of Americans"
+  case above), walks our own lines and the candidate's own lines forward
+  together — two cursors, each only ever advancing — matching each pair
+  by exact normalized text; on a mismatch, looks up to 8 lines ahead on
+  BOTH sides for the next real match (whichever side needs the smaller
+  skip wins, ties drop the LRC side) and drops the skipped lines on
+  whichever side had the extras. `prepare_lrc` then uses the reconciled,
+  filtered candidate lines (not the raw ones) for both time calibration
+  and per-word line assignment. Still declines the candidate outright
+  (same fallback as the old rejection) if under half of our own lines
+  find no match at all — a genuinely different recording, not just a
+  differing repeat count. Real validation: reproduces the "Americans"
+  case's 3-extra-repeat structure exactly (all of our own lines matched,
+  the 3 extra candidate lines dropped, landing back in sync at the next
+  shared line) — see `test_dry_run.py`'s own `reconcile_line_structure`
+  tests.
+
+  **REAL validation, 2026-08-15** (scanned every `sandbox/` song with an
+  existing `.txt` against its real, live-network-searched LRCLIB
+  candidate): 4 real candidates would have tripped the old
+  `check_repeat_structure` reject (Absolute Beginners, "I'm Afraid of
+  Americans", Magic Dance, Video Games). Found and fixed a real
+  pre-existing bug this surfaced: `lrc_timing.py`'s and
+  `lyrics_lookup.py`'s own `_normalize()` only kept STRAIGHT apostrophes
+  (regex `[^a-z0-9']`), silently deleting a real existing file's CURLY
+  ones (e.g. "Johnny’s") — desyncing an otherwise byte-identical line
+  ("johnnys" vs "johnny's") and blocking EVERY apostrophe-containing line
+  from matching at all. `realign.py`/`mxl_lrc_generator.py`'s own
+  `_normalize` already had the curly→straight fix; the other two module's
+  copies had drifted out of sync with it — now fixed identically in all
+  four. After the fix: Absolute Beginners (34/47 matched — the candidate
+  simply omits the "Bababauuu" ad-lib bridge, correctly left unmatched
+  rather than force-fit) and Americans (47/64 matched — our own
+  recording's outro genuinely differs from the candidate's own extended
+  outro, correctly left unmatched) now reconcile and get real LRC timing
+  instead of zero. Magic Dance still correctly declines — inspected
+  directly: NOT a repeat-count difference at all, the candidate is a
+  longer arrangement with a whole extra bridge section and a different
+  backing-vocal-echo line-splitting convention; declining is correct, not
+  a gap, and no `max_skip` widening (tried up to 40) changes that.
+
+  **Video Games initially also looked like a decline, but wasn't a real
+  gap** (user caught this, 2026-08-15) — two separate causes, neither in
+  `reconcile_line_structure` itself: (1) the validation script's own
+  audio-duration estimate (last syllable's end time) missed ~22s of real
+  trailing outro, pushing the correct candidate outside
+  `MXL_LRC_DURATION_TOLERANCE_SEC` in the SCRIPT only, not the real
+  pipeline (fixed: use the real audio file's own duration); (2) a real,
+  separate bug in `mxl_lrc_generator.select_lrc_candidate`'s own ranking
+  — see its own docstring/memory below. Once both were fixed,
+  `check_repeat_structure` never even rejected the correct candidate
+  (id 2958984) — it was only ever hitting the WRONG one. Against the
+  correct candidate, reconciliation matches 33/59 (56%, accepted) — held
+  back by a genuinely different, still-open problem: the candidate MERGES
+  two of our lines into one starting partway through (see "Open /
+  deferred" below), not a repeat-count issue.
+- `mxl_lrc_generator.select_lrc_candidate` ranking fixed (2026-08-15,
+  real bug found via the Video Games investigation above): used to rank
+  candidates by content-match ratio first, duration only as a tiebreaker
+  that floating-point ratios essentially never reach — real case: the
+  CORRECT candidate (Trixie Mattel's own "Video Games" cover, id
+  2958984, real duration within 0.7s of ours) was passed over for Lana
+  Del Rey's ORIGINAL (a different performer entirely, 14.5s off) purely
+  because `difflib.SequenceMatcher`'s ratio happened to score the
+  wrong-performer candidate higher — text-similarity alone can't be
+  trusted to prefer the right PERFORMER over a same-titled original/cover
+  by someone else. Now ranks by (1) `_artist_matches` (substring match
+  after normalization, catches a YouTube "- Topic" suffix, "feat."
+  credits, cast-recording listings, etc. in either direction) —
+  DECISIVELY, any same-artist candidate beats any different-artist one
+  regardless of ratio/duration — (2) duration proximity, (3) content
+  ratio as the final tiebreaker. `artist` blank or no candidate
+  resembling it at all (real case: Chicago, credited to individual cast
+  members like "Marcia Lewis - Topic" rather than the show name we use as
+  our own artist tag) falls through to ranking by duration then ratio
+  among whatever's left, same as before this existed — this is
+  deliberate, not a gap: the user's own words were "basically never
+  allow the wrong artist unless there is literally nothing available for
+  the correct artist."
 - `force_align_gaps` and `retry_low_quality_asr` (see below) default ON.
   `rewindow_long_segments` (see below) defaults ON, independently of the
   shared `config.REWINDOW_ENABLED` used elsewhere.
@@ -773,3 +857,14 @@ isolation) across 6 real gen+realign runs — zero regressions.
 - Repeated-phrase/occurrence disambiguation, generally (see "Lessons
   learned" above) — the single biggest recurring unsolved failure class
   in this codebase; no design proposed yet.
+- `lrc_timing.reconcile_line_structure` can't bridge a real LRC candidate
+  that MERGES two+ of our own lines into one (confirmed real case: Trixie
+  Mattel - "Video Games", id 2958984 — the correct, word-for-word-correct
+  candidate — merges our own lines "It's you, it's you, it's all for
+  you," + "Everything I do" into one combined LRC line partway through
+  the song; the current design only ever matches/skips whole lines 1:1,
+  so those specific words get no LRC anchor from this mechanism — not a
+  regression, since they fall through to whatever else already handles
+  unanchored words, but a real, known gap). User's explicit call
+  (2026-08-15): deferred, not attempted yet — tackle after other current
+  work finishes.

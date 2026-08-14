@@ -1370,6 +1370,48 @@ assert fake_at_module.last_params == {"artist_name": "Some Artist", "track_name"
 print("OK: search_lrclib(artist, title) without q still sends artist_name/track_name as before")
 del _sys.modules["requests"]
 
+print("\n--- mxl_lrc_generator.select_lrc_candidate: ranks a same-artist candidate DECISIVELY over a "
+      "different-artist one, regardless of content-match ratio -- BUG REGRESSION (real case: Trixie "
+      "Mattel - Video Games, 2026-08-15): the correct candidate (Trixie Mattel's own cover, duration "
+      "within 0.7s of ours) was being passed over for a different performer's original (duration 14.5s "
+      "off) purely because difflib's own ratio happened to score the wrong-performer candidate higher ---")
+from ultrastar_generator.mxl_lrc_generator import select_lrc_candidate, MxlWord
+
+slc_our_words = [MxlWord(text=w, norm=w.lower(), offset=float(i), syllables=[])
+                 for i, w in enumerate(["hello", "world", "this", "is", "a", "song"])]
+slc_candidates = [
+    # Wrong artist, but a much higher content-match ratio AND still within
+    # duration tolerance -- the old ratio-first ranking picked this one.
+    {"trackName": "Song", "artistName": "Some Other Performer", "duration": 114,
+     "instrumental": False, "plainLyrics": "hello world this is a song", "syncedLyrics": "[00:01.00]line"},
+    # Correct artist (our own "Right Artist"), near-exact duration, but a
+    # deliberately WORSE (still-clears-the-floor) content ratio -- must
+    # still win outright.
+    {"trackName": "Song", "artistName": "Right Artist", "duration": 100,
+     "instrumental": False, "plainLyrics": "hello world this is completely different",
+     "syncedLyrics": "[00:01.00]hello world"},
+]
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=slc_candidates)
+slc_match = select_lrc_candidate("Right Artist", "Song", slc_our_words, audio_duration=100.0)
+del _sys.modules["requests"]
+assert slc_match is not None and slc_match.candidate.artist_name == "Right Artist", slc_match
+print("OK: the same-artist candidate won despite a worse content-match ratio")
+
+print("  select_lrc_candidate: with NO candidate resembling our own artist at all (e.g. a cast "
+      "recording credited to individual performers, not the show name we use as our own artist tag -- "
+      "real case: Chicago), falls through to ranking by duration then ratio among what's left, unaffected:")
+slc_no_artist_match = [
+    {"trackName": "Song", "artistName": "Cast Member A", "duration": 108,
+     "instrumental": False, "plainLyrics": "hello world this is a song", "syncedLyrics": "[00:01.00]line"},
+    {"trackName": "Song", "artistName": "Cast Member B", "duration": 100,
+     "instrumental": False, "plainLyrics": "hello world this is a song too", "syncedLyrics": "[00:01.00]line"},
+]
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=slc_no_artist_match)
+slc_match2 = select_lrc_candidate("Some Show Title", "Song", slc_our_words, audio_duration=100.0)
+del _sys.modules["requests"]
+assert slc_match2 is not None and slc_match2.candidate.artist_name == "Cast Member B", slc_match2  # closer duration
+print("OK: no artist match anywhere -> falls back to duration-then-ratio ranking as before")
+
 print("\n--- lyrics_lookup._fetch_from_lrclib: on_ambiguous callback (GUI disambiguation path) ---")
 # Dedicated fixture (config.LRCLIB_DURATION_TOLERANCE_SEC == 60.0, so the
 # ambiguity filter's 3x-tolerance cutoff is 180s): duration_sec=100 makes
@@ -3416,9 +3458,50 @@ print("  OK: mismatched repeat structure ('chorus' 6x vs 8x, split across TWO ne
 assert check_repeat_structure(["alpha", "bravo", "charlie"], ["anything", "goes", "here"]) is None
 print("  OK: no repeated line in our own file at all -> nothing to check, never rejects")
 
-print("  prepare_lrc: a repeat-structure-mismatched candidate is rejected outright (via our_lines/log), "
-      "even though it would otherwise be perfectly usable (forced candidate, so selection/duration/"
-      "content filters don't apply):")
+print("  reconcile_line_structure (2026-08-14, user's own design): RECONCILES a repeat-structure "
+      "mismatch instead of rejecting the whole candidate -- walks both line sequences forward "
+      "together, dropping whichever side's extra lines don't correspond to anything on the other:")
+from ultrastar_generator.lrc_timing import reconcile_line_structure
+
+rls_matching = reconcile_line_structure(crs_our_lines, [(float(i), t) for i, t in enumerate(crs_lrc_matching)])
+assert rls_matching is not None
+assert rls_matching.n_matched == 6 and rls_matching.n_lrc_dropped == 0 and rls_matching.n_our_unmatched == 0, rls_matching
+print("  OK: matching structure -> everything matches 1:1, nothing dropped on either side")
+
+rls_lrc_extra = [(float(i), t) for i, t in enumerate(crs_lrc_mismatched)]  # 4x/4x vs our own 3x/3x
+rls_mismatched = reconcile_line_structure(crs_our_lines, rls_lrc_extra)
+assert rls_mismatched is not None, "a real repeat-count difference should reconcile, not reject outright"
+assert rls_mismatched.n_matched == 6 and rls_mismatched.n_our_unmatched == 0, rls_mismatched
+assert rls_mismatched.n_lrc_dropped == 2, rls_mismatched  # the LRC's 2 extra repeats
+assert [t for _t, t in rls_mismatched.lrc_lines] == crs_our_lines, rls_mismatched.lrc_lines
+print(f"  OK: LRC's extra repeats (4x/4x vs our 3x/3x) reconciled -- all {rls_mismatched.n_matched} of our "
+      f"own lines matched, {rls_mismatched.n_lrc_dropped} genuinely-extra LRC line(s) dropped, none of our "
+      f"own lines left without an LRC counterpart")
+
+rls_unrelated = reconcile_line_structure(
+    ["totally", "unrelated", "content", "here", "not", "the", "same", "song", "at", "all"],
+    [(float(i), t) for i, t in enumerate(["something", "else", "entirely", "different", "words"])],
+)
+assert rls_unrelated is None, rls_unrelated
+print("  OK: genuinely unrelated content (not just a differing repeat count) still declines -- "
+      "match ratio falls below the minimum, same fail-closed behavior check_repeat_structure used to give")
+
+print("  BUG REGRESSION (real case, found via reconcile_line_structure's own real-audio validation on "
+      "David Bowie - I'm Afraid of Americans, 2026-08-15): an existing file's CURLY apostrophes "
+      "(’, e.g. “Johnny’s”) must normalize the same as LRCLIB's straight ones -- the old "
+      "regex-only _normalize silently deleted every curly apostrophe, desyncing an otherwise byte-"
+      "identical line ('johnnys' vs \"johnny's\") and making EVERY apostrophe-containing line fail to "
+      "match, even on a real, well-matched candidate:")
+rls_curly = reconcile_line_structure(
+    ["Johnny’s in America", "I’m afraid of Americans", "can’t help it"],
+    [(0.0, "Johnny's in America"), (1.0, "I'm afraid of Americans"), (2.0, "can't help it")],
+)
+assert rls_curly is not None and rls_curly.n_matched == 3 and rls_curly.n_our_unmatched == 0, rls_curly
+print("  OK: curly vs. straight apostrophes no longer block an otherwise-identical line from matching")
+
+print("  prepare_lrc: a repeat-structure-mismatched candidate is now RECONCILED (extras dropped) instead "
+      "of rejected outright, even though it would otherwise be perfectly usable (forced candidate, so "
+      "selection/duration/content filters don't apply):")
 crs_prep_words = extract_words(crs_entries)
 crs_lrc_text = "\n".join(f"[00:{i:02d}.00]chorus one" for i in range(4)) + "\n" + \
                "\n".join(f"[00:{i + 10:02d}.00]chorus two" for i in range(4))
@@ -3430,8 +3513,12 @@ crs_forced = LrcLibCandidate(
 crs_prep_log = []
 crs_prep_result = prepare_lrc(crs_prep_words, [], "A", "T", 100.0, forced_candidate=crs_forced,
                                our_lines=crs_our_lines, log=crs_prep_log.append)
-assert crs_prep_result is None, crs_prep_result
-assert any("rejected" in line for line in crs_prep_log), crs_prep_log
+assert crs_prep_result is not None, "a real repeat-count difference should no longer reject the whole candidate"
+assert len(crs_prep_result.lrc_lines) == 6, crs_prep_result.lrc_lines
+assert [text for _t, text in crs_prep_result.lrc_lines] == crs_our_lines, crs_prep_result.lrc_lines
+assert any("reconciled" in line for line in crs_prep_log), crs_prep_log
+print("  OK: prepare_lrc succeeded using the reconciled 6-line subset (matching our own line count), "
+      "not the candidate's raw 8 lines, and logged the reconciliation")
 print("  OK: prepare_lrc itself rejects the candidate (returns None, same as 'no candidate found') and "
       "logs the specific reason when our_lines/log are provided")
 
@@ -3483,6 +3570,14 @@ bg_existing_song = ParsedSong(
     entries=[
         Syllable(text="alpha", start=0.0, end=1.0, midi_note=1, is_word_start=True),
         Syllable(text="bravo", start=1.0, end=2.0, midi_note=2, is_word_start=True),
+        LineBreak(start=2.0, end=2.0),  # matches sla_candidate's own "alpha bravo" /
+                                          # "charlie delta" 2-line LRC structure below --
+                                          # a real existing file always has LineBreaks;
+                                          # without one here, reconcile_line_structure
+                                          # sees only 1 giant line that can't match either
+                                          # LRC line and declines BEFORE ever reaching the
+                                          # calibration-confidence rejection this test is
+                                          # actually about.
         Syllable(text="charlie", start=2.0, end=3.0, midi_note=3, is_word_start=True),
         Syllable(text="delta", start=3.0, end=4.0, midi_note=4, is_word_start=True),
     ],
@@ -3502,11 +3597,17 @@ print("  realign_song: 'windowed' mode's own low anchor rate (under a CONFIDENTL
       "auto-falls-back to 'seed' mode instead of just warning -- a low rate here means the per-line window "
       "itself is mis-targeted (e.g. words with no LRC line of their own get bucketed into the wrong line's "
       "narrow window), not that whole-song ASR can't find these words at all:")
-wsf_entries = [
-    Syllable(text=t, start=float(i), end=float(i) + 0.5, midi_note=0, is_word_start=True)
-    for i, t in enumerate(["alpha", "bravo", "charlie", "delta", "echo",
-                            "golf", "hotel", "india", "juliet", "kilo", "lima", "mike"])
-]
+wsf_entries = []
+for i, t in enumerate(["alpha", "bravo", "charlie", "delta", "echo",
+                        "golf", "hotel", "india", "juliet", "kilo", "lima", "mike"]):
+    wsf_entries.append(Syllable(text=t, start=float(i), end=float(i) + 0.5, midi_note=0, is_word_start=True))
+    if i < 5:
+        # One LineBreak per real LRC line ('alpha'..'echo' below) -- matches
+        # a real existing file's own structure and lets reconcile_line_
+        # structure match those 5 lines cleanly; 'golf'..'mike' stay on one
+        # trailing line with no LRC counterpart at all, which is exactly
+        # what this test is about.
+        wsf_entries.append(LineBreak(start=float(i) + 0.5, end=float(i) + 0.5))
 wsf_existing_song = ParsedSong(
     title="T", artist="A", bpm=60.0, gap_ms=0, entries=wsf_entries,
     raw_tags={"TITLE": "T", "ARTIST": "A", "BPM": "60", "GAP": "0"},

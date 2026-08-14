@@ -172,7 +172,19 @@ _LRC_TAG_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 
 
 def _normalize(s: str) -> str:
-    return re.sub(r"[^a-z0-9']", "", s.lower())
+    # Real bug found via reconcile_line_structure's own real-audio
+    # validation (2026-08-15, David Bowie - I'm Afraid of Americans):
+    # our own file's apostrophes are curly (U+2019, e.g. "Johnny's"),
+    # LRCLIB's are straight ASCII ('). The old regex below only ever kept
+    # straight apostrophes, silently DELETING every curly one -- "Johnny's"
+    # normalized to "johnnys" on our side but "johnny's" on the LRC side,
+    # so EVERY line containing an apostrophe failed to match at all, even
+    # an otherwise byte-identical line. realign.py/mxl_lrc_generator.py's
+    # own _normalize already had this exact fix; this module's copy (and
+    # lyrics_lookup.py's) had drifted out of sync with it.
+    s = s.lower()
+    s = s.replace("’", "'").replace("‘", "'")
+    return re.sub(r"[^a-z0-9']", "", s)
 
 
 def _normalize_line(text: str) -> str:
@@ -260,6 +272,124 @@ def check_repeat_structure(our_lines: List[str], lrc_line_texts: List[str],
                 f"the LRC candidate's own lyrics (tolerance +/-{tolerance}) -- likely a different "
                 f"edition/arrangement with a different repeat structure, not just timing noise")
     return None
+
+
+@dataclass
+class LineReconciliation:
+    """Result of `reconcile_line_structure` -- see its own docstring."""
+    lrc_lines: List[Tuple[float, str]]   # the candidate's own lines that
+                                          # matched something in our_lines,
+                                          # in original LRC order/timing --
+                                          # everything else was dropped.
+    n_our_lines: int
+    n_matched: int
+    n_lrc_dropped: int    # candidate lines with no match in our_lines
+    n_our_unmatched: int  # our own lines with no match in the candidate
+    match_ratio: float    # n_matched / n_our_lines
+
+
+def reconcile_line_structure(
+    our_lines: List[str],
+    lrc_lines: List[Tuple[float, str]],
+    max_skip: int = 8,
+    min_match_ratio: float = 0.5,
+) -> Optional[LineReconciliation]:
+    """Reconciles an LRC candidate's own lines against OUR OWN file's
+    lines when their REPEAT STRUCTURE doesn't match, instead of
+    `check_repeat_structure`'s outright reject-the-whole-candidate
+    response to the same situation (real confirmed case: David Bowie -
+    "I'm Afraid of Americans", where an alternate edition's LRC has
+    extra chorus repeats ours doesn't -- see `check_repeat_structure`'s
+    own docstring). A real, LOCALIZED repeat-count difference gets
+    resolved here (the extra lines on whichever side dropped) instead of
+    discarding an otherwise-good candidate outright.
+
+    User's own design (2026-08-14): walk both line sequences forward
+    TOGETHER, one cursor per side, each only ever advancing forward --
+    same cursor-based principle as `lyrics_lookup.
+    assign_lrc_line_ids_sequentially` (there: ASR words vs. one LRC
+    line's text; here: our own file's lines vs. the LRC candidate's own
+    lines), so a repeated phrase later in either sequence can never be
+    confused with an earlier occurrence -- by the time a later position
+    is being resolved, the cursor has already moved past the earlier
+    occurrence's own line.
+
+    Algorithm: at each step, compare our_lines[i] to lrc_lines[j] (exact
+    match after normalization, see `_normalize_line`). On a match, keep
+    the LRC line and advance both cursors. On a mismatch, look ahead up
+    to `max_skip` lines on BOTH sides for the next real match:
+      - our_lines[i] found later in lrc_lines (at j+k) -> lrc_lines[j:j+k]
+        are extras only the candidate has (a different edition's added
+        chorus repeat, an extra bridge, etc.) -- drop them, advance j.
+      - lrc_lines[j] found later in our_lines (at i+k) -> our_lines[i:i+k]
+        have no LRC counterpart at all -- leave them unmatched (no LRC
+        anchor for those lines), advance i.
+      - Both found -> whichever needs the SMALLER skip wins (ties go to
+        dropping the LRC side, the less-trusted external source) -- keeps
+        the walk from jumping further than necessary on either side.
+        Confirmed against the "Americans" case: after a run of genuine
+        matches, our_lines[i] is "...the world" while lrc_lines[j] is 3
+        lines into a run of extra "...Americans" repeats the candidate
+        alone has -- both sides find their match exactly 3 lines ahead
+        (tying), so the LRC side's 3 extra lines get dropped, landing
+        both cursors back in sync at the shared "...the world" line.
+      - Neither found within the window -> this LRC line has no
+        plausible match nearby at all; drop it (advance j by 1) and keep
+        walking, rather than aborting the whole reconciliation over one
+        bad line.
+
+    Returns None (caller should fall back to the old outright-rejection
+    behavior) if the fraction of OUR OWN lines that found a real match
+    falls below `min_match_ratio` -- a genuinely different
+    recording/arrangement (not just a differing repeat count) should
+    still show up as a low match rate here, not get silently patched
+    together from whatever happens to align. Otherwise returns a
+    `LineReconciliation` whose `lrc_lines` is the candidate's own lines
+    filtered down to only the ones that matched something in our_lines --
+    everything downstream (time calibration, per-word line assignment)
+    should use THIS list instead of the candidate's raw, un-reconciled
+    lines.
+    """
+    our_norm = [_normalize_line(t) for t in our_lines]
+    lrc_norm = [_normalize_line(t) for _t, t in lrc_lines]
+    n_i, n_j = len(our_norm), len(lrc_norm)
+
+    i = j = 0
+    kept: List[Tuple[float, str]] = []
+    n_matched = 0
+    while i < n_i and j < n_j:
+        if our_norm[i] and our_norm[i] == lrc_norm[j]:
+            kept.append(lrc_lines[j])
+            n_matched += 1
+            i += 1
+            j += 1
+            continue
+
+        lrc_skip = next(
+            (k for k in range(1, max_skip + 1)
+             if j + k < n_j and our_norm[i] and our_norm[i] == lrc_norm[j + k]),
+            None,
+        )
+        our_skip = next(
+            (k for k in range(1, max_skip + 1)
+             if i + k < n_i and lrc_norm[j] and our_norm[i + k] == lrc_norm[j]),
+            None,
+        )
+        if lrc_skip is not None and (our_skip is None or lrc_skip <= our_skip):
+            j += lrc_skip
+        elif our_skip is not None:
+            i += our_skip
+        else:
+            j += 1
+
+    match_ratio = n_matched / n_i if n_i else 0.0
+    if match_ratio < min_match_ratio:
+        return None
+    return LineReconciliation(
+        lrc_lines=kept, n_our_lines=n_i, n_matched=n_matched,
+        n_lrc_dropped=n_j - n_matched, n_our_unmatched=n_i - n_matched,
+        match_ratio=match_ratio,
+    )
 
 
 def parse_lrc(synced_lyrics: str) -> List[Tuple[float, str]]:

@@ -183,6 +183,21 @@ class LrcMatch:
     duration_delta: Optional[float]
 
 
+def _artist_matches(our_artist: str, candidate_artist: str) -> bool:
+    """Whether a candidate's own credited artist plausibly refers to the
+    same performer/production as ours -- substring match after
+    normalization (handles a YouTube "- Topic" channel suffix, "feat."
+    credits, multi-name cast-recording listings, a show title embedded in
+    a longer cast credit, etc. in EITHER direction) rather than exact
+    string equality, which real LRCLIB data rarely gives you. Empty on
+    either side never counts as a match."""
+    a = _normalize(our_artist)
+    b = _normalize(candidate_artist)
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
 def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audio_duration: float,
                           forced: Optional[LrcLibCandidate] = None) -> Optional[LrcMatch]:
     """Picks an LRC candidate to use for timing. If `forced` is given (a
@@ -192,11 +207,36 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
     was found necessary this session: LRCLIB's artist/title search alone
     can miss a candidate its own free-text search finds), requires
     `synced_lyrics`, requires duration within
-    `config.MXL_LRC_DURATION_TOLERANCE_SEC`, and picks the best
-    content-match (difflib ratio of MXL words vs the candidate's plain
-    lyrics) among those clearing `config.MXL_LRC_MIN_CONTENT_MATCH_RATIO`.
-    This bar is intentionally permissive -- see this module's docstring
-    for why the real validity gate is downstream, not here."""
+    `config.MXL_LRC_DURATION_TOLERANCE_SEC`, and requires a content-match
+    (difflib ratio of MXL words vs the candidate's plain lyrics) clearing
+    `config.MXL_LRC_MIN_CONTENT_MATCH_RATIO`. This bar is intentionally
+    permissive -- see this module's docstring for why the real validity
+    gate is downstream, not here.
+
+    Among candidates clearing those bars, ranks by (1) whether the
+    candidate's own credited artist plausibly matches ours
+    (`_artist_matches`) -- decisively, not just as a tiebreaker: a
+    same-artist candidate always outranks a different-artist one,
+    regardless of content ratio or duration -- (2) duration proximity to
+    OUR real audio, (3) content-match ratio as the final tiebreaker. Real
+    confirmed case (Trixie Mattel - "Video Games", 2026-08-15): the
+    correct candidate (Trixie Mattel's own cover, duration within 0.7s of
+    ours) was being passed over for Lana Del Rey's ORIGINAL (a different
+    performer entirely, duration 14.5s off) purely because
+    difflib.SequenceMatcher's ratio happened to score the wrong-performer
+    candidate higher -- content-text similarity alone can't be trusted to
+    prefer the right PERFORMER over a same-titled original/cover by
+    someone else; a real, close duration + a real artist-credit match are
+    much harder to fake by coincidence than a text ratio is. Duration
+    ranks above ratio (not just artist above ratio) for the same reason:
+    a genuine different edition/arrangement reliably shows up as a
+    duration difference, while ratio among candidates that already
+    cleared the content-match floor is noisier than it looks. `artist`
+    empty/blank, or no candidate's credit resembling it at all (e.g. a
+    cast-recording credited to individual performers, not the show name
+    used as our own artist tag -- real case: Chicago), falls through to
+    ranking purely by duration then ratio among whatever's left, same as
+    before this ranking existed."""
     mxl_norm_words = [w.norm for w in mxl_words if w.norm]
 
     if forced is not None:
@@ -235,12 +275,12 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
         ratio = difflib.SequenceMatcher(None, mxl_norm_words, lrc_norm, autojunk=False).ratio()
         if ratio < config.MXL_LRC_MIN_CONTENT_MATCH_RATIO:
             continue
-        scored.append((ratio, delta, c))
+        scored.append((_artist_matches(artist, c.artist_name), ratio, delta, c))
 
     if not scored:
         return None
-    scored.sort(key=lambda t: (-t[0], t[1]))
-    ratio, delta, best = scored[0]
+    scored.sort(key=lambda t: (not t[0], t[2], -t[1]))
+    artist_match, ratio, delta, best = scored[0]
     lrc_lines = parse_lrc(best.synced_lyrics)
     if not lrc_lines:
         return None
