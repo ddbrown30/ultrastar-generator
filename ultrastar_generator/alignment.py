@@ -72,7 +72,13 @@ def align_words(
         snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
     )
     if verify_words:
-        indices = list(range(len(words))) if verify_all_words else stats.suspicious_word_indices
+        # Dropped words (lyrics_lookup.align_words_to_reference found no
+        # real reference correspondence at all) are never re-transcribed
+        # here -- their text will never reach the final output regardless
+        # of what a recheck says, so verifying them only wastes an ASR
+        # call per word.
+        candidate_indices = range(len(words)) if verify_all_words else stats.suspicious_word_indices
+        indices = [i for i in candidate_indices if not words[i].dropped]
         if indices:
             corrected_words, verify_results = _verify_words_check(
                 words, indices, y, sr, verify_whisper_model, verbose=verbose,

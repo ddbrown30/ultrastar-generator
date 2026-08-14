@@ -898,8 +898,13 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         f"{' (synced)' if reference.synced_lyrics else ''}.")
                     corrected = align_words_to_reference(words, ref_lines)
                     diffs = alignment_diff_summary(words, corrected)
+                    # corrected is always the same length as words now --
+                    # a dropped word is flagged via Word.dropped, not
+                    # omitted (see its own docstring for why).
+                    n_dropped = sum(1 for w in corrected if w.dropped)
                     if diffs:
-                        log(f"  Corrected {len(diffs)} word(s) against the reference lyrics:")
+                        log(f"  Corrected/dropped {len(diffs)} word(s) against the reference lyrics"
+                            f"{f' ({n_dropped} dropped, no reference match at all)' if n_dropped else ''}:")
                         for d in diffs[:20]:
                             log(f"    {d}")
                         if len(diffs) > 20:

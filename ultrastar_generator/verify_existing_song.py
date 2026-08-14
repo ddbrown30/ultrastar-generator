@@ -14,18 +14,27 @@ data (see CLAUDE.md's 0i/0o for the numbers) rather than reinventing them:
   - Pitch compared at PITCH CLASS (mod 12), matching how UltraStar Deluxe
     itself scores and how pass 4 already treats reference data -- never
     exact-MIDI/octave.
-  - Timing compared with the repeat-instance bucketing guard confirmed
-    necessary in CLAUDE.md's 0i (a repeated chorus/line can otherwise get
-    matched against the wrong sung instance, corrupting the comparison):
-    bucket candidate deltas at 200ms resolution, keep only the dominant
-    cluster before scoring.
+  - Nothing is excluded from scoring: every text-matched pair counts
+    toward pitch_class_accuracy/timing_within_tolerance_pct's
+    denominators, and recall/precision/f1 are computed bidirectionally
+    over the FULL existing/fresh word counts, same design as
+    scratchpad/compare_video_games.py. An EARLIER version of this module
+    bucketed candidate timing deltas at 200ms resolution and silently
+    DROPPED any candidate more than 3.0s from the dominant cluster before
+    scoring at all (meant as a repeat-instance guard, since a repeated
+    chorus/line can otherwise get matched against the wrong sung
+    instance) -- real confirmed bug (2026-08-14, user's own catch): a
+    repeat-instance mixup is a REAL timing failure, and excluding it from
+    the denominator instead of counting it wrong inflated every reported
+    accuracy number, most visibly when comparing against USKM's own
+    output. A wildly-wrong delta already fails the plain timing-tolerance
+    check on its own -- no separate exclusion step was ever needed.
 """
 
 from __future__ import annotations
 
 import difflib
 import re
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -48,14 +57,25 @@ class ExistingSongVerification:
     pitch_mismatches: List[Tuple[str, int, int]] = field(default_factory=list)       # text, existing_pc, fresh_pc
     timing_mismatches: List[Tuple[str, float, float]] = field(default_factory=list)  # text, existing_start, fresh_start
     # Coverage: what fraction of EACH side's own word-start syllables text-
-    # matched the other side AT ALL, before the repeat-instance guard. A
-    # word that never matches (e.g. garbled/wrong text on either side)
-    # never appears in pitch_mismatches/timing_mismatches -- it just isn't
-    # scored -- so these are the only signal that catches that failure mode.
+    # matched the other side AT ALL. A word that never matches (e.g.
+    # garbled/wrong text on either side) never appears in pitch_mismatches/
+    # timing_mismatches -- it just isn't scored -- so these are the only
+    # signal that catches that failure mode.
     coverage_fresh: float = 0.0     # n_matched / len(fresh words)
     coverage_existing: float = 0.0  # n_matched / len(existing words)
     unmatched_fresh: List[str] = field(default_factory=list)     # fresh words that matched nothing in existing
     unmatched_existing: List[str] = field(default_factory=list)  # existing words that matched nothing in fresh
+    # Real bidirectional "is this a 100% match" numbers, same design as
+    # scratchpad/compare_video_games.py (2026-08-13/14): a word only
+    # counts as CORRECT if it text-matched AND landed within timing
+    # tolerance -- nothing is excluded from either denominator, so a
+    # missing GT word (recall) or an extra/hallucinated candidate word
+    # (precision) both directly bring the score down. For a true 100%
+    # match, recall == precision == 1.0 is required -- matching every GT
+    # word is not enough on its own if extra notes are also present.
+    recall: float = 0.0     # n_correct / len(existing words) -- every real word reproduced, in the right place
+    precision: float = 0.0  # n_correct / len(fresh words) -- every produced word is a real, correctly-placed one
+    f1: float = 0.0
 
 
 def _word_start_words(syllables: List[Syllable]) -> List[Tuple[str, float, int]]:
@@ -129,29 +149,45 @@ def verify_existing_song(
             print(f"[existing-txt] {stats.reason}")
         return stats
 
-    # Repeat-instance guard (see module docstring): bucket timing deltas
-    # at 200ms resolution, keep only candidates near the dominant cluster.
-    # Unlike lrc_timing.py's cross-recording comparison, these two
-    # timelines describe the SAME audio, so the true cluster should sit
-    # very close to 0 -- but a repeated line/chorus can still pair a
-    # word against the wrong occurrence of itself, so the guard still
-    # matters here, just with the dominant offset expected near zero
-    # rather than an arbitrary per-song value.
-    BUCKET_SEC = 0.2
-    deltas = [e_start - f_start for _, e_start, f_start, _, _ in candidates]
-    bucket_counts = Counter(round(d / BUCKET_SEC) for d in deltas)
-    best_bucket, _ = bucket_counts.most_common(1)[0]
-    center = best_bucket * BUCKET_SEC
-    guarded = [c for c, d in zip(candidates, deltas) if abs(d - center) <= 3.0]
-
-    n_pitch_ok = sum(1 for _, _, _, e_pc, f_pc in guarded if e_pc == f_pc)
-    n_timing_ok = sum(1 for _, e_start, f_start, _, _ in guarded if abs(e_start - f_start) <= timing_tolerance_sec)
-
-    stats.pitch_class_accuracy = n_pitch_ok / len(guarded)
-    stats.timing_within_tolerance_pct = n_timing_ok / len(guarded)
-    stats.pitch_mismatches = [(text, e_pc, f_pc) for text, _, _, e_pc, f_pc in guarded if e_pc != f_pc]
-    stats.timing_mismatches = [(text, e_start, f_start) for text, e_start, f_start, _, _ in guarded
+    # NOTHING is excluded from scoring here -- every text-matched pair in
+    # `candidates` counts toward the denominator below. This module used to
+    # bucket timing deltas at 200ms resolution and DROP any candidate more
+    # than 3.0s from the dominant cluster before scoring pitch/timing
+    # accuracy at all (a "repeat-instance guard"), on the theory that a
+    # repeated line/chorus pairing against the wrong occurrence of itself
+    # was noise to filter out. Real confirmed bug (2026-08-14, user's own
+    # catch): that's exactly backwards -- a repeat-occurrence mixup is a
+    # REAL timing failure, and silently excluding it from the denominator
+    # (rather than counting it as wrong) inflated every reported accuracy
+    # number, most visibly when comparing against USKM's own output. Same
+    # fix already validated in scratchpad/compare_video_games.py's own
+    # design: nothing is excluded, an outlier's own displacement already
+    # fails the timing-tolerance check on its own, no separate exclusion
+    # step needed.
+    n_timing_ok = sum(1 for _, e_start, f_start, _, _ in candidates if abs(e_start - f_start) <= timing_tolerance_sec)
+    stats.timing_within_tolerance_pct = n_timing_ok / len(candidates)
+    stats.timing_mismatches = [(text, e_start, f_start) for text, e_start, f_start, _, _ in candidates
                                 if abs(e_start - f_start) > timing_tolerance_sec]
+
+    # Pitch is scored only among pairs that ALSO have correct timing --
+    # comparing pitch class across a repeat-mismatched pair would be
+    # comparing two different sung instances, not a meaningful check of
+    # this one. Same "pitch conditional on correct recall" design as
+    # compare_video_games.py.
+    correct = [c for c in candidates if abs(c[1] - c[2]) <= timing_tolerance_sec]
+    n_pitch_ok = sum(1 for _, _, _, e_pc, f_pc in correct if e_pc == f_pc)
+    stats.pitch_class_accuracy = n_pitch_ok / len(correct) if correct else 0.0
+    stats.pitch_mismatches = [(text, e_pc, f_pc) for text, _, _, e_pc, f_pc in correct if e_pc != f_pc]
+
+    # Real bidirectional "100% match" numbers (see the dataclass field
+    # docstrings): a word only counts as correct if BOTH text and timing
+    # match, over the FULL existing/fresh word counts -- a missing GT word
+    # or an extra/hallucinated candidate word both directly cost score.
+    n_correct = len(correct)
+    stats.recall = n_correct / len(existing_words) if existing_words else 0.0
+    stats.precision = n_correct / len(fresh_words) if fresh_words else 0.0
+    stats.f1 = (2 * stats.precision * stats.recall / (stats.precision + stats.recall)
+                if (stats.precision + stats.recall) else 0.0)
 
     problems = []
     if stats.pitch_class_accuracy < min_pitch_accuracy:
@@ -180,10 +216,14 @@ def verify_existing_song(
         stats.verdict = "PASS"
 
     if verbose:
-        print(f"[existing-txt] {len(candidates)} word(s) matched by text, {len(guarded)} after repeat-instance guard: "
+        print(f"[existing-txt] {len(candidates)} word(s) matched by text: "
               f"pitch-class accuracy {stats.pitch_class_accuracy:.0%}, "
               f"timing agreement {stats.timing_within_tolerance_pct:.0%}, "
               f"coverage fresh={stats.coverage_fresh:.0%}/existing={stats.coverage_existing:.0%} -> {stats.verdict}")
+        print(f"    real match (text+timing correct, nothing excluded from either denominator): "
+              f"recall={stats.recall:.0%} ({n_correct}/{len(existing_words)} existing/GT word(s) reproduced), "
+              f"precision={stats.precision:.0%} ({n_correct}/{len(fresh_words)} fresh word(s) are real matches), "
+              f"F1={stats.f1:.0%} -- a 100% match requires BOTH at 100% (no missing words AND no extras)")
         if stats.verdict != "PASS":
             if stats.unmatched_fresh:
                 shown = stats.unmatched_fresh[:15]
@@ -204,6 +244,7 @@ def verify_existing_song(
                         f"timing_agreement={stats.timing_within_tolerance_pct:.2f} "
                         f"coverage_fresh={stats.coverage_fresh:.2f} "
                         f"coverage_existing={stats.coverage_existing:.2f} "
+                        f"recall={stats.recall:.2f} precision={stats.precision:.2f} f1={stats.f1:.2f} "
                         f"n_matched={len(candidates)}")
 
     return stats

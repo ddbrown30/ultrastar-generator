@@ -527,9 +527,21 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
       - a word matched to a different-but-similar reference word gets its
         TEXT corrected (timing untouched)
       - every matched word gets `line_id` set to its reference line index
-      - unmatched ASR words (e.g. ad-libs the reference doesn't have)
-        keep their original text and inherit the nearest matched
-        neighbor's line_id, so phrase breaks still work around them
+      - an ASR word with NO reference counterpart at all (a difflib
+        "delete" block) is DROPPED entirely, not kept, but ONLY when the
+        unmatched run is short (<= config.REFERENCE_DELETE_MAX_RUN) --
+        see the "delete" branch below for why a long run is kept instead.
+      - a word inside an uneven "replace" block still keeps its own ASR
+        text (a real, if imprecisely-mapped, reference correspondence
+        exists there -- not the same as having none at all) and inherits
+        the nearest matched neighbor's line_id, so phrase breaks still
+        work around it.
+
+    Only ever called once `reference_lines` has already cleared the
+    caller's own "is this even the right song" gate (see
+    `reference_matches_transcript`/`REFERENCE_LYRICS_MIN_MATCH_RATIO` in
+    main.py) -- by the time this function runs, the reference is trusted
+    as the definitive word LIST for the song, not just a text corrector.
     """
     if not reference_lines or not words:
         return words
@@ -541,15 +553,15 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
     asr_norm = [_normalize(w.text) for w in words]
 
     matcher = difflib.SequenceMatcher(None, asr_norm, ref_norm, autojunk=False)
-    out: List[Optional[Word]] = [None] * len(words)
+    out: List[Word] = []
 
     for tag, a0, a1, b0, b1 in matcher.get_opcodes():
         if tag == "equal":
             for k in range(a1 - a0):
                 w = words[a0 + k]
-                out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
-                                    confidence=w.confidence, line_id=ref_line_ids[b0 + k],
-                                    reference_text=ref_orig[b0 + k])
+                out.append(Word(text=w.text, start=w.start, end=w.end,
+                                 confidence=w.confidence, line_id=ref_line_ids[b0 + k],
+                                 reference_text=ref_orig[b0 + k]))
         elif tag == "replace":
             a_len = a1 - a0
             b_len = b1 - b0
@@ -563,9 +575,24 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                     new_text = ref_word if sim >= 0.3 else w.text
                     if new_text != w.text and w.text[:1].isupper() and new_text[:1].islower():
                         new_text = new_text[:1].upper() + new_text[1:]
-                    out[a0 + k] = Word(text=new_text, start=w.start, end=w.end,
-                                        confidence=w.confidence, line_id=ref_line_ids[b0 + k],
-                                        reference_text=ref_word)
+                    # Below the similarity bar, this 1:1 positional pairing
+                    # isn't trusted enough to even RECORD as a reference
+                    # expectation, not just not trusted enough to substitute
+                    # text with directly -- a real confirmed bug (Trixie
+                    # Mattel - Video Games, 2026-08-13): a hallucinated ASR
+                    # word ("You're") landed 1:1 against an unrelated
+                    # reference word ("Swingin'") purely by sequence
+                    # position, sim far below 0.3, text correctly left
+                    # alone here -- but reference_text was still stamped
+                    # with "Swingin'" unconditionally, and verification.py's
+                    # own "neither confirms, default to reference" fallback
+                    # later blindly trusted that bogus tag and overwrote the
+                    # word's text with it anyway. Same "don't record a
+                    # reference_text you don't trust" principle already
+                    # applied to REFERENCE_CLAMP_MAX_REPEAT above.
+                    out.append(Word(text=new_text, start=w.start, end=w.end,
+                                     confidence=w.confidence, line_id=ref_line_ids[b0 + k],
+                                     reference_text=ref_word if sim >= 0.3 else None))
             else:
                 # Uneven block (ASR split/merged words differently than
                 # the reference does) -- keep ASR text as-is rather than
@@ -614,9 +641,50 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                     # sequence ran out on both sides -- never the same
                     # repeated-token run as its (much closer together)
                     # neighbors. See config.REFERENCE_CLAMP_MAX_GAP_SEC.
-                    if is_repeat_clamp and k > 0 and (w.start - words[a0 + k - 1].end) > config.REFERENCE_CLAMP_MAX_GAP_SEC:
-                        out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
-                                            confidence=w.confidence, line_id=None)
+                    #
+                    # Checked against BOTH neighbors (missing on one side
+                    # counts as "far" on that side, not a pass) -- a
+                    # backward-only check missed the SAME failure at the
+                    # very START of a clamp run, since the first word has no
+                    # previous neighbor to compare against and always fell
+                    # through unconditionally. Real confirmed case (Trixie
+                    # Mattel - Video Games, 2026-08-13): a non-lyrical audio
+                    # intro decoder-hallucinated as "You're welcome." (2
+                    # words) landed as the whole song's first 2 ASR words,
+                    # clamped onto reference word 0 ("Swingin'") along with
+                    # the real "Swinging" ~16s later; "welcome." was already
+                    # correctly rejected by the backward check, but "You're"
+                    # (k=0, no backward neighbor) was not -- and kept a
+                    # bogus reference_text of "Swingin'" that verification.py
+                    # later trusted and used to overwrite "You're" outright.
+                    # Neighbors are looked up in the GLOBAL `words` sequence
+                    # (idx +-1), not clamped to this opcode block's own
+                    # a0..a1 range -- a word can be the first/last element of
+                    # ITS block while still having a real, close neighbor in
+                    # the very next/previous block (e.g. "Swinging" is the
+                    # last word of this block, but "in" -- its real, close
+                    # neighbor -- is the FIRST word of the next block). Using
+                    # a block-relative bound here would have deleted that
+                    # real, correctly-transcribed word too.
+                    idx = a0 + k
+                    far_from_prev = idx == 0 or (w.start - words[idx - 1].end) > config.REFERENCE_CLAMP_MAX_GAP_SEC
+                    far_from_next = (idx + 1 >= len(words)
+                                      or (words[idx + 1].start - w.end) > config.REFERENCE_CLAMP_MAX_GAP_SEC)
+                    if is_repeat_clamp and far_from_prev and far_from_next:
+                        # DROPPED (word.dropped=True), not just unlabeled:
+                        # this word has no real reference correspondence at
+                        # all (same status as a short "delete"-opcode run
+                        # above) and is isolated in time from its own clamp
+                        # run -- keeping it unlabeled still put real
+                        # hallucinated content in the final output. User's
+                        # explicit policy (2026-08-14): a hallucinated word
+                        # must never reach the final file, not just avoid
+                        # being mislabeled as something it isn't. STILL
+                        # appended to `out` (not `continue`d past) -- see
+                        # Word.dropped's own docstring for why removing it
+                        # from the sequence entirely is itself a regression.
+                        out.append(Word(text=w.text, start=w.start, end=w.end,
+                                         confidence=w.confidence, line_id=None, dropped=True))
                         continue
                     # A second, independent guard (real case: David Bowie -
                     # Magic Dance): this many ASR words clamping onto the
@@ -628,8 +696,8 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                     # text, same as the ordinary (non-repeat-clamp) uneven
                     # block default just below.
                     if is_repeat_clamp and repeat_count > config.REFERENCE_CLAMP_MAX_REPEAT:
-                        out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
-                                            confidence=w.confidence, line_id=ref_line_ids[b_idx])
+                        out.append(Word(text=w.text, start=w.start, end=w.end,
+                                         confidence=w.confidence, line_id=ref_line_ids[b_idx]))
                         continue
                     ref_text = ref_orig[b_idx]
                     if is_repeat_clamp:
@@ -646,21 +714,69 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
                             p = part_cursor[b_idx] % len(parts)
                             ref_text = parts[p]
                             part_cursor[b_idx] += 1
-                    out[a0 + k] = Word(text=w.text, start=w.start, end=w.end,
-                                        confidence=w.confidence, line_id=ref_line_ids[b_idx],
-                                        reference_text=ref_text)
+                    out.append(Word(text=w.text, start=w.start, end=w.end,
+                                     confidence=w.confidence, line_id=ref_line_ids[b_idx],
+                                     reference_text=ref_text))
         elif tag == "delete":
-            # ASR has word(s) the reference doesn't (ad-libs, hallucinated
-            # filler, etc.) -- keep as-is; line_id filled in below from
-            # neighboring context. No reference word exists to check
-            # against at all.
-            for k in range(a1 - a0):
-                w = words[a0 + k]
-                out[a0 + k] = Word(text=w.text, start=w.start, end=w.end, confidence=w.confidence, line_id=None)
+            # ASR has word(s) with NO reference counterpart anywhere in the
+            # whole song. A SHORT run is dropped entirely, not kept -- this
+            # used to keep them as-is on the theory that an unmatched word
+            # is probably a real ad-lib the reference source just didn't
+            # transcribe, but this project's own WhisperX-hallucination
+            # history (long-segment rewindow, ASR-quality retry,
+            # --no-transcribe -- see CLAUDE.md) shows the far more damaging
+            # real case: a non-lyrical stretch of audio (a spoken sample,
+            # an intro, near-silence) gets decoded as confident-looking
+            # FAKE lyrics with real timestamps, and those became permanent,
+            # wrong "lyrics" in the final file. Real confirmed case: Trixie
+            # Mattel - Video Games -- WhisperX decoded a non-lyrical audio
+            # intro as "You're... welcome.", which used to become the
+            # song's own first two lyric words even though nothing in the
+            # reference remotely matches them. Once a reference lyrics
+            # source is trusted enough to reach this function at all (see
+            # this function's own docstring), it's trusted as the
+            # definitive word LIST for a SHORT unmatched run -- a real
+            # ad-lib the reference happens to omit is an accepted,
+            # deliberate tradeoff of this policy (user's explicit
+            # decision), not an oversight.
+            #
+            # A LONG run is the opposite case and is kept (old behavior),
+            # per config.REFERENCE_DELETE_MAX_RUN's own docstring: a real
+            # confirmed regression on this SAME song showed difflib's
+            # global alignment can misclassify a large stretch of
+            # genuinely-correct, real reference-matching content (a
+            # repeated chorus) as one giant "delete" block -- mass-deleting
+            # 219 of 355 words, nearly all of them real, correctly-heard
+            # lyrics. A short delete-run is almost always genuine
+            # hallucination; a long one is far more likely an alignment
+            # failure than a genuinely long non-lyrical passage.
+            run_len = a1 - a0
+            if run_len > config.REFERENCE_DELETE_MAX_RUN:
+                for k in range(run_len):
+                    w = words[a0 + k]
+                    out.append(Word(text=w.text, start=w.start, end=w.end,
+                                     confidence=w.confidence, line_id=None))
+            else:
+                # STILL appended to `out` with dropped=True, not omitted --
+                # see Word.dropped's own docstring: omitting it from the
+                # sequence entirely let a NEIGHBORING real word's pass-1
+                # note zone silently swallow this word's own claimed notes
+                # instead (real confirmed regression, Video Games,
+                # 2026-08-14). lyric_alignment.py is what actually keeps
+                # this word's text/notes out of the final output.
+                for k in range(run_len):
+                    w = words[a0 + k]
+                    out.append(Word(text=w.text, start=w.start, end=w.end,
+                                     confidence=w.confidence, line_id=None, dropped=True))
+            continue
         # tag == "insert": reference has word(s) ASR completely missed --
         # nothing to attach them to (no ASR timing exists for them), so
         # they're simply not represented. Their line boundary is still
         # captured by whatever comes before/after in the ASR sequence.
+        # (`recover_dropped_reference_words`/force_align_gaps, run BEFORE
+        # this function, is the real recovery mechanism for this case --
+        # by the time we get here, most genuinely-missing content should
+        # already be filled in.)
 
     # Fill any remaining unmatched (line_id is None) words by inheriting
     # from the nearest matched neighbor -- prefer the previous one so a
@@ -671,16 +787,28 @@ def align_words_to_reference(words: List[Word], reference_lines: List[str]) -> L
             last_seen = out[i].line_id
         else:
             out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
-                           confidence=out[i].confidence, line_id=last_seen)
+                           confidence=out[i].confidence, line_id=last_seen, dropped=out[i].dropped)
 
     return out
 
 
 def alignment_diff_summary(original: List[Word], corrected: List[Word]) -> List[str]:
-    """Returns human-readable "word -> word" lines for every word whose
-    text actually changed, for diagnostic logging."""
+    """Returns human-readable "word -> word" (corrected) or "word ->
+    [DROPPED]" (no reference counterpart at all -- see
+    align_words_to_reference's "delete"/repeat-clamp-gap-guard handling)
+    lines for every word that changed, for diagnostic logging. Matches
+    original-to-corrected words by (start, end) rather than list
+    position/`zip` -- more robust than a positional zip even though
+    `corrected` is always the same length/order as `original` now (a
+    dropped word is flagged via `Word.dropped`, not omitted -- see its
+    own docstring for why omitting it broke downstream note-zone
+    boundaries)."""
+    corrected_by_span = {(c.start, c.end): c for c in corrected}
     diffs = []
-    for o, c in zip(original, corrected):
-        if o.text != c.text:
+    for o in original:
+        c = corrected_by_span.get((o.start, o.end))
+        if c is None or c.dropped:
+            diffs.append(f'"{o.text}" -> [DROPPED, no reference match] (at {o.start:.2f}s)')
+        elif o.text != c.text:
             diffs.append(f'"{o.text}" -> "{c.text}" (at {o.start:.2f}s)')
     return diffs

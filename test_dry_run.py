@@ -776,6 +776,34 @@ assert aligned[2].start == 0.4 and aligned[2].end == 0.6
 print("OK: corrected words:", diffs)
 print("OK: line ids:", [w.line_id for w in aligned])
 
+print("\n--- lyrics_lookup.align_words_to_reference: a LONG unmatched (delete) run is KEPT, not "
+      "dropped -- real regression (Trixie Mattel - Video Games, 2026-08-13): a repeat-heavy song's "
+      "own repeated chorus ('It's you, it's you, it's all for you' x4+) made difflib's global "
+      "alignment misclassify 219 of 355 REAL, correctly-transcribed words as one giant delete "
+      "block, which the unconditional drop then mass-deleted from the final file. Past "
+      "config.REFERENCE_DELETE_MAX_RUN words in one run, dropping is more likely to destroy real "
+      "content than remove genuine hallucination -- fall back to keeping them (old behavior) ---")
+long_delete_ref_lines = ["Swinging in the backyard"]
+# 8 unmatched ASR words in a row (> REFERENCE_DELETE_MAX_RUN=5) representing
+# content genuinely absent from this tiny reference -- the function can't
+# tell "real alignment failure" from "genuinely long non-lyrical passage"
+# apart, which is exactly why the cap treats a long run conservatively.
+long_delete_words = [
+    Word(text=w, start=float(i), end=float(i) + 0.2, confidence=0.9)
+    for i, w in enumerate(["It's", "you,", "it's", "you,", "it's", "all", "for", "you"])
+] + [
+    Word(text="Swinging", start=10.0, end=10.2, confidence=0.9),
+    Word(text="in", start=10.3, end=10.4, confidence=0.9),
+    Word(text="the", start=10.5, end=10.6, confidence=0.9),
+    Word(text="backyard", start=10.7, end=11.0, confidence=0.9),
+]
+long_delete_aligned = align_words_to_reference(long_delete_words, long_delete_ref_lines)
+assert len(long_delete_aligned) == len(long_delete_words), \
+    f"expected all {len(long_delete_words)} words kept, got {len(long_delete_aligned)}"
+assert [w.text for w in long_delete_aligned[:8]] == ["It's", "you,", "it's", "you,", "it's", "all", "for", "you"]
+print(f"OK: a {8}-word unmatched run (> REFERENCE_DELETE_MAX_RUN) is kept in full, not dropped:",
+      [w.text for w in long_delete_aligned])
+
 print("\n--- lyrics_lookup.align_words_to_reference: repeat-clamp caps + wraps instead of freezing "
       "(real case: David Bowie - Magic Dance, 2026-08-10 -- decoder hallucinated a 'Dance, magic, dance' "
       "x5 passage into ~90 garbage ASR tokens, all clamped onto the SAME reference token; the syllable "
@@ -804,6 +832,88 @@ import ultrastar_generator.config as _config_mod
 print(f"OK: {len(runaway_asr_words)} words clamping onto one reference token (> "
       f"config.REFERENCE_CLAMP_MAX_REPEAT={_config_mod.REFERENCE_CLAMP_MAX_REPEAT}) leaves reference_text "
       f"unset, keeps ASR's own text, still tags line_id for phrase grouping")
+
+print("\n--- lyrics_lookup.align_words_to_reference: repeat-clamp gap guard is checked against BOTH "
+      "GLOBAL neighbors (not block-relative, and not just the previous one) -- real confirmed bug "
+      "(Trixie Mattel - Video Games, 2026-08-13): a non-lyrical audio intro hallucinated as 'You're "
+      "welcome.' landed as the song's first 2 ASR words, clamped onto reference word 0 ('Swingin'') "
+      "along with the real 'Swinging' ~16s later; a backward-only gap check correctly rejected "
+      "'welcome.' but let 'You're' (the very first word, no previous neighbor to compare against) "
+      "through with a bogus reference_text that verification.py's own fallback then trusted and used "
+      "to overwrite it. Hallucinated words are now flagged word.dropped=True -- STILL KEPT in the "
+      "returned sequence (not omitted), because removing a word from the sequence entirely let a "
+      "NEIGHBORING real word's pass-1 note zone silently swallow its ~16s of notes instead (real "
+      "confirmed regression, Video Games, 2026-08-14 -- see Word.dropped's own docstring); "
+      "lyric_alignment.py is what actually keeps a dropped word's text/notes out of the final output. "
+      "The real, correctly-transcribed 'Swinging' (last word of THIS opcode block, clamped onto the "
+      "same reference token) must NOT be flagged dropped, because its real close neighbor 'in' sits "
+      "just outside the block, in the NEXT opcode -- a block-relative-only neighbor check would have "
+      "wrongly flagged it too ---")
+leading_outlier_ref_lines = ["Swingin'", "in"]
+leading_outlier_words = [
+    Word(text="You're", start=9.595, end=10.035, confidence=0.9),
+    Word(text="welcome.", start=12.476, end=13.636, confidence=0.9),
+    Word(text="Swinging", start=26.058, end=26.4, confidence=0.9),
+    Word(text="in", start=26.5, end=26.6, confidence=0.9),
+]
+leading_outlier_aligned = align_words_to_reference(leading_outlier_words, leading_outlier_ref_lines)
+assert [w.text for w in leading_outlier_aligned] == ["You're", "welcome.", "Swinging", "in"], \
+    [w.text for w in leading_outlier_aligned]
+assert [w.dropped for w in leading_outlier_aligned] == [True, True, False, False], \
+    [(w.text, w.dropped) for w in leading_outlier_aligned]
+print("OK: 'You're'/'welcome.' (no real reference correspondence, isolated in time even from each "
+      "other) are flagged dropped but still kept in sequence; 'Swinging' (real word, close global "
+      "neighbor 'in' just outside its own opcode block) is NOT flagged:",
+      [(w.text, w.dropped) for w in leading_outlier_aligned])
+
+print("\n--- lyrics_lookup.align_words_to_reference: an ASR word with NO reference counterpart at "
+      "all is flagged dropped (word.dropped=True), not kept as visible text -- real case (Trixie "
+      "Mattel - Video Games, 2026-08-13): WhisperX decoded a non-lyrical audio intro as 'You're... "
+      "welcome.', which used to become the song's own first two 'lyric' words even though nothing in "
+      "the reference remotely matches them; a real trailing hallucination ('you' after the song's "
+      "last real word) had the same problem. Still KEPT in the returned sequence (not omitted) -- see "
+      "Word.dropped's own docstring for why omitting it broke downstream note-zone boundaries; "
+      "lyric_alignment.py is what actually excludes a dropped word's text/notes from the final "
+      "output ---")
+drop_ref_lines = ["Swinging in the backyard"]
+drop_asr_words = [
+    Word(text="You're", start=9.6, end=10.0, confidence=0.9),     # leading hallucination, no ref match
+    Word(text="welcome.", start=12.5, end=13.6, confidence=0.9),  # leading hallucination, no ref match
+    Word(text="Swinging", start=26.0, end=26.5, confidence=0.9),
+    Word(text="in", start=26.6, end=26.8, confidence=0.9),
+    Word(text="the", start=26.9, end=27.0, confidence=0.9),
+    Word(text="backyard", start=27.1, end=27.6, confidence=0.9),
+    Word(text="you", start=220.0, end=223.7, confidence=0.9),     # trailing hallucination, no ref match
+]
+drop_aligned = align_words_to_reference(drop_asr_words, drop_ref_lines)
+assert len(drop_aligned) == len(drop_asr_words), \
+    f"expected all {len(drop_asr_words)} words kept (flagged, not omitted), got {len(drop_aligned)}"
+visible_texts = [w.text for w in drop_aligned if not w.dropped]
+assert visible_texts == ["Swinging", "in", "the", "backyard"], visible_texts
+dropped_texts = [w.text for w in drop_aligned if w.dropped]
+assert dropped_texts == ["You're", "welcome.", "you"], dropped_texts
+drop_diffs = alignment_diff_summary(drop_asr_words, drop_aligned)
+assert any('"You\'re" -> [DROPPED' in d for d in drop_diffs), drop_diffs
+assert any('"welcome." -> [DROPPED' in d for d in drop_diffs), drop_diffs
+assert any('"you" -> [DROPPED' in d for d in drop_diffs), drop_diffs
+print("OK: leading+trailing hallucinated words with no reference match are flagged dropped (excluded "
+      "from visible text) and reported, but still occupy their slot in the sequence:", visible_texts,
+      dropped_texts)
+print("OK: alignment_diff_summary reports drops explicitly:", drop_diffs)
+
+print("\n--- lyrics_lookup.align_words_to_reference: a word inside an UNEVEN replace block (a real, "
+      "if imprecisely-mapped, reference correspondence -- NOT the same as having none at all) is "
+      "still kept, only a clean 'delete' block (zero correspondence anywhere) is dropped ---")
+uneven_ref_lines = ["double-edged knife"]
+uneven_asr_words = [
+    Word(text="double", start=0.0, end=0.2, confidence=0.9),
+    Word(text="edged", start=0.2, end=0.4, confidence=0.9),
+    Word(text="kide", start=0.4, end=0.6, confidence=0.9),  # OCR/ASR garble of "knife", still kept
+]
+uneven_aligned = align_words_to_reference(uneven_asr_words, uneven_ref_lines)
+assert len(uneven_aligned) == 3, [w.text for w in uneven_aligned]
+print("OK: uneven-block words are kept (not dropped), only zero-correspondence words are:",
+      [w.text for w in uneven_aligned])
 
 print("\n--- lyrics_lookup.reference_matches_transcript: rejects a wrong-song/wrong-language "
       "reference before it's ever trusted (real case: Gaston's lyrics.ovh lookup silently "
@@ -2854,6 +2964,30 @@ assert set(result.unmatched_fresh) == {f"garbled{i}" for i in range(10)}, result
 print(f"OK: perfect pitch/timing on the matched subset does NOT mean PASS when coverage is low "
       f"(coverage_fresh={result.coverage_fresh:.0%}, {len(result.unmatched_fresh)} unmatched word(s)) -- "
       f"the real bug this gate catches (a real ~10% failure rate was previously invisible)")
+
+# Case 6: a text-matched pair with a WILDLY wrong timing delta (real shape:
+# a repeated line/chorus pairing against the wrong sung instance -- see
+# CLAUDE.md's "repeated-phrase disambiguation" lessons) must count directly
+# against timing_within_tolerance_pct/recall/precision, not vanish from the
+# denominator. Real confirmed bug (2026-08-14, user's own catch): an EARLIER
+# version of this module bucketed candidate deltas and silently EXCLUDED
+# any pair more than 3.0s from the dominant cluster before scoring pitch/
+# timing accuracy at all -- this exact case (14/15 words correct, 1 matched
+# pair 50s off) used to report 100% pitch/timing accuracy on the "guarded"
+# subset, hiding the real failure. Same root cause independently confirmed
+# in scratchpad/compare_video_games.py's own design notes.
+mismatch_words = base_words + [("echo", 500.0, 0)]
+existing_mismatch = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
+                                entries=_mk_word_syllables(mismatch_words))
+fresh_mismatch = _mk_word_syllables(base_words, start_offset=0.02) + _mk_word_syllables([("echo", 550.0, 0)])
+result = verify_existing_song(existing_mismatch, fresh_mismatch, min_matched=10, verbose=True)
+assert result.n_matched == 16, result.n_matched
+assert result.timing_within_tolerance_pct == 15 / 16, result.timing_within_tolerance_pct
+assert any(text == "echo" for text, _, _ in result.timing_mismatches), result.timing_mismatches
+assert result.recall == 15 / 16 and result.precision == 15 / 16, (result.recall, result.precision)
+print(f"OK: a single 50s-off matched pair correctly drags down timing_within_tolerance_pct "
+      f"({result.timing_within_tolerance_pct:.0%}, not the old bucket-excluded 100%), "
+      f"recall={result.recall:.0%}, precision={result.precision:.0%} -- nothing silently excluded")
 
 print("\n--- usdx_parser.parse_usdx_file: TRAILING-space word convention (real SingStar-shipped ground "
       "truth files, e.g. Beauty and the Beast's notes.txt) parses word boundaries correctly -- BUG "

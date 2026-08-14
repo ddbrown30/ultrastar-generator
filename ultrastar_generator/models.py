@@ -27,6 +27,24 @@ class Word:
                                      # re-transcription against what the
                                      # reference actually expected here,
                                      # not just self-consistency.
+    dropped: bool = False  # lyrics_lookup.align_words_to_reference found NO
+                                     # real reference correspondence for this
+                                     # word at all (decoder hallucination --
+                                     # a non-lyrical stretch of audio decoded
+                                     # as confident-looking fake text). Kept
+                                     # in the word SEQUENCE (not removed) so
+                                     # its own ASR timing still correctly
+                                     # bounds neighboring words' pass-1 note
+                                     # zones in lyric_alignment.py -- real
+                                     # confirmed regression (Video Games,
+                                     # 2026-08-14): removing a dropped word
+                                     # from the sequence entirely let the
+                                     # NEXT real word's zone silently swallow
+                                     # the dropped word's own ~16s of pass-1
+                                     # notes instead. Only excluded at the
+                                     # very end, when producing syllables for
+                                     # writing -- never emitted as text/notes
+                                     # in the final output.
 
 
 @dataclass

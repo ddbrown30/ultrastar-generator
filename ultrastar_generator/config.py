@@ -480,6 +480,28 @@ REFERENCE_CLAMP_MAX_GAP_SEC = 2.0
 # reference_text at all; fall back to keeping the ASR word's own raw text,
 # same treatment as an ordinary uneven block gets by default.
 REFERENCE_CLAMP_MAX_REPEAT = 8
+# align_words_to_reference drops an ASR word with NO reference counterpart
+# at all (a difflib "delete" block -- real cases: a non-lyrical audio intro
+# decoded as fake lyrics, a trailing hallucination after the song's real
+# last word) rather than keeping it, per the user's explicit policy: if a
+# word isn't in the trusted reference, it shouldn't appear in the final
+# song. BUT a real, confirmed regression (Trixie Mattel - Video Games,
+# 2026-08-13) showed this is only safe for SHORT runs: on a repeat-heavy
+# song ("It's you, it's you, it's all for you" x4+), difflib's own global
+# alignment can misclassify a LARGE stretch of genuinely-correct, real
+# reference-matching content as one giant "delete" block (219 of 355 words
+# in the real failing run) -- the same repeated-phrase-disambiguation
+# failure class this project has hit repeatedly elsewhere (verify-
+# placement, realign.py's lrc_mode, --zone-boundary-snap), just surfacing
+# in the reference-text alignment itself this time, not note placement.
+# A short delete-run is almost always a genuine hallucination/ad-lib the
+# reference doesn't have (both real motivating cases were 1-2 words); a
+# long one is far more likely a real alignment failure than 6+ consecutive
+# words of genuine non-lyrical content. Past this count, fall back to the
+# OLD behavior (keep the ASR words, line_id inherited from context) rather
+# than risk mass-deleting real lyrics -- same "count is itself the signal"
+# shape as REFERENCE_CLAMP_MAX_REPEAT above, just for a different opcode.
+REFERENCE_DELETE_MAX_RUN = 5
 # When splitting a pass-1 note at a word boundary (_split_notes_by_word_
 # boundaries) leaves a word's leading piece shorter than this, it's DROPPED
 # instead of becoming its own syllable (see _drop_leading_slivers) -- a real

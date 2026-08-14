@@ -449,6 +449,17 @@ def align_words_to_notes(
             # Singleton group (isolated by gaps on both sides): same as the
             # original per-word behavior, using that word's own notes.
             word = words[indices[0]]
+            if word.dropped:
+                # A hallucinated word (see Word.dropped's own docstring)
+                # still went through grouping/zone-assignment above so its
+                # ASR timing correctly bounded its NEIGHBORS' zones -- but
+                # it emits no syllables of its own here. Its claimed
+                # pass-1 notes (g_notes) are simply discarded, not
+                # reassigned to a neighbor: real audio may genuinely exist
+                # there, but with no trustworthy lyric text for it, an
+                # unlabeled gap in the final output is the correct
+                # outcome, not fabricated or borrowed text.
+                continue
             if not g_notes:
                 # Zero pass-1 notes in this word's own zone -- a fallback,
                 # and therefore suspicious (see verification.py).
@@ -468,7 +479,7 @@ def align_words_to_notes(
             g_notes, word_spans, snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
         )
         for i, w_notes in zip(indices, per_word_notes):
-            if not w_notes:
+            if not w_notes and not words[i].dropped:
                 # No note overlapped this word's own ASR span -- it's
                 # about to fall back, same as a singleton fallback word.
                 stats.suspicious_word_indices.append(i)
@@ -478,8 +489,13 @@ def align_words_to_notes(
             for i, w_notes in zip(indices, per_word_notes):
                 span_str = f"({w_notes[0].start:.3f}, {w_notes[-1].end:.3f})" if w_notes else "(none -- fallback)"
                 debug_log.line(f"    {words[i].text!r}: ASR=({words[i].start:.3f}, {words[i].end:.3f}) "
-                                f"-> {len(w_notes)} note piece(s) {span_str}")
+                                f"-> {len(w_notes)} note piece(s) {span_str}"
+                                + (" [DROPPED -- no syllables emitted]" if words[i].dropped else ""))
         for i, w_notes in zip(indices, per_word_notes):
+            # Same "claim the zone, emit nothing" treatment as the
+            # singleton branch above -- see Word.dropped's own docstring.
+            if words[i].dropped:
+                continue
             all_syllables.extend(_syllables_for_word(words[i], w_notes, notes, y, sr, stats))
 
     final = enforce_monotonic(all_syllables)
