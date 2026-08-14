@@ -520,65 +520,121 @@ def _tokenize_lines(lines: List[str]) -> Tuple[List[str], List[str], List[int]]:
     return norm_tokens, orig_tokens, line_ids
 
 
-def _time_based_line_lookup(words: List[Word], synced_lyrics_text: str):
-    """Builds a `lookup(t: float) -> Optional[int]` closure that maps a
-    real ASR timestamp to the reference LINE it falls chronologically
-    within, using calibrated LRC line timestamps -- or returns None if
-    there isn't enough synced-lyrics data or
-    `lrc_timing.two_tier_time_calibration` can't confidently calibrate
-    the LRC's own timestamps against this song's real audio. Same
-    calibration gate already used by `realign.py`'s
-    `lrc_mode="windowed"` and `mxl_lrc_generator.place_words_via_asr`,
-    reused here rather than reinvented; an uncalibrated LRC is known to
-    be actively harmful, not just unhelpful.
-
-    Used ONLY to fix up `line_id` for words the whole-song TEXT match
-    below couldn't place at all (see the "fill remaining unmatched
-    words" step) -- never to re-match text or re-window the alignment
-    itself. An earlier attempt at a full per-line windowed RE-MATCH
-    (2026-08-14) fixed the motivating bug but caused two different severe
-    real-audio regressions in two different attempts (a boundary-
-    spillover bug, then a second unresolved regression even after fixing
-    that) -- rejected/removed entirely, not kept around disabled (see
-    CLAUDE.md's "repeated-phrase/occurrence disambiguation" history: this
-    project has hit this failure class independently many times, and a
-    plausible-looking fix regressing elsewhere is the norm, not the
-    exception, for this specific problem). This narrower fix only
-    repairs LINE ASSIGNMENT for already-unmatched content, using
-    timestamps directly -- it never touches how words get text-matched,
-    so it can't reintroduce that same failure class.
-    """
+def is_lrc_line_tracking_confident(words: List[Word], synced_lyrics_text: str) -> bool:
+    """Whether `assign_lrc_line_ids_sequentially` should be trusted for
+    this song at all -- reuses `lrc_timing.two_tier_time_calibration`
+    purely as a PLAUSIBILITY gate (is this LRC candidate even the right
+    recording?), same as `realign.py`'s `lrc_mode="windowed"` and
+    `mxl_lrc_generator.place_words_via_asr` already do; an uncalibrated/
+    wrong-recording LRC is known to be actively harmful, not just
+    unhelpful, elsewhere in this codebase. The calibrated TIMESTAMPS
+    themselves are NOT used for the actual line-splitting -- see
+    `assign_lrc_line_ids_sequentially`'s own docstring for why."""
     from .lrc_timing import parse_lrc, match_asr_to_lrc_lines, two_tier_time_calibration
 
     lrc_lines = parse_lrc(synced_lyrics_text)
     if len(lrc_lines) < 2 or not words:
-        return None
-
+        return False
     candidates = match_asr_to_lrc_lines(words, lrc_lines)
     _offset, _slope, _confidence, _kind, _skipped, correction_fn, _holdout = two_tier_time_calibration(candidates)
-    if correction_fn is None:
+    return correction_fn is not None
+
+
+def assign_lrc_line_ids_sequentially(words: List[Word], synced_lyrics_text: str) -> Optional[List[Word]]:
+    """Sequential, CURSOR-based LRC line assignment -- user's explicit
+    design (2026-08-14): "going through each line of the LRC, one by
+    one, finding the matching words, and then inserting line breaks
+    accordingly." Returns None (caller falls back to the whole-song text
+    match) when `is_lrc_line_tracking_confident` says this LRC candidate
+    isn't trustworthy for this song at all.
+
+    Walks the reference LINES in order. For each line, searches a
+    generously-sized but bounded window of ASR words starting exactly
+    where the PREVIOUS line's own match left off (a cursor that only
+    ever advances forward -- reused via `align_words_to_reference`'s own
+    single-line matching, so all of its existing word-level correction
+    logic -- uneven blocks, repeat-clamp, hyphen-split, drop handling --
+    applies unchanged), assigns every word up through the last real
+    match to this line, and advances the cursor past it.
+
+    This is deliberately NOT time/gap-based (two earlier, REJECTED
+    attempts were): the cursor-based design makes both of those
+    approaches' failure modes structurally impossible here --
+      - A repeated phrase later in the song can never be confused with
+        an earlier occurrence, because the cursor has already moved past
+        the earlier occurrence's own words by the time a later line's
+        search begins -- the later occurrence is simply unreachable.
+      - A real line transition with NO audio pause is still split
+        correctly, because the boundary comes from how many words THIS
+        line's own text actually matched, not from a time boundary or a
+        gap in the audio (the real failure mode of both earlier
+        attempts: Video Games' "...with you" -> "Tell me..." transition
+        has only a 0.14s gap, invisible to any gap-based grouping).
+    """
+    from .lrc_timing import parse_lrc
+
+    lrc_lines = parse_lrc(synced_lyrics_text)
+    if not is_lrc_line_tracking_confident(words, synced_lyrics_text):
         return None
 
-    calibrated_starts = [correction_fn(t) for t, _ in lrc_lines]
+    # Deliberately TIGHT -- a too-generous window (an earlier version used
+    # 4x+15) can reach far enough into unrelated later content that a
+    # coincidentally-shared common word (e.g. "on" appearing in both this
+    # line and a much later one) gets matched too, making the cursor jump
+    # far past this line's own real content. A modest multiplier plus a
+    # small flat slack is enough to tolerate normal ASR noise (extra
+    # hallucinated words, a few dropped/garbled words) without reaching
+    # into a DIFFERENT line's own vocabulary.
+    WINDOW_WORD_MULTIPLIER = 2
+    WINDOW_WORD_SLACK = 8
 
-    # Same clamped-monotonic-midpoint boundary technique already used in
-    # lyric_alignment._assign_notes_to_groups -- a boundary can never be
-    # pushed earlier than the line it belongs to actually starts, even if
-    # a later line's calibrated start is locally noisy/out of order.
-    boundaries: List[float] = []
-    running_max = float("-inf")
-    for i in range(len(calibrated_starts) - 1):
-        raw = (calibrated_starts[i] + calibrated_starts[i + 1]) / 2.0
-        running_max = max(running_max, raw, calibrated_starts[i])
-        boundaries.append(running_max)
+    cursor = 0
+    n = len(words)
+    out: List[Word] = []
+    for li, (_t, line_text) in enumerate(lrc_lines):
+        line_word_count = max(1, len(line_text.split()))
+        window_end = min(cursor + line_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n)
+        window_words = words[cursor:window_end]
+        if not window_words:
+            continue
+        aligned = align_words_to_reference(window_words, [line_text])
+        # Real match = has a reference_text, NOT just a non-None line_id.
+        # The single-line recursive call above falls through to
+        # align_words_to_reference's OWN "no synced_lyrics_text" fallback
+        # path when it returns (no calibration to gate on for a single
+        # line) -- its "fill remaining unmatched words from nearest
+        # matched neighbor" step back-fills every line_id=None word in
+        # the window (a real "delete"-tag rejection, e.g. the NEXT line's
+        # own vocabulary bleeding into this window) with line_id=0
+        # anyway, since there's nothing else in a single-line reference
+        # for it to inherit. That made line_id alone useless as a stop
+        # signal -- it was ALWAYS set by the time this loop saw it,
+        # regardless of whether the word was ever a real match.
+        # reference_text is NOT touched by that fallback (it only fills
+        # line_id), so it still reliably tells real matches apart from
+        # window overflow into the next line's own content.
+        last_matched_offset = None
+        for i, w in enumerate(aligned):
+            if w.reference_text is not None:
+                last_matched_offset = i
+        if last_matched_offset is None:
+            # No real match for this line anywhere in the window -- don't
+            # advance the cursor; the NEXT line's search starts from the
+            # same position (this line contributes 0 words rather than
+            # guessing).
+            continue
+        for w in aligned[:last_matched_offset + 1]:
+            out.append(w if w.line_id is None else Word(
+                text=w.text, start=w.start, end=w.end, confidence=w.confidence,
+                line_id=li, reference_text=w.reference_text, dropped=w.dropped,
+            ))
+        cursor += last_matched_offset + 1
 
-    def lookup(t: float) -> int:
-        zone_idx = 0
-        while zone_idx < len(boundaries) and t >= boundaries[zone_idx]:
-            zone_idx += 1
-        return zone_idx
-
-    return lookup
+    # Trailing content after the LAST line's own window (e.g. an outro
+    # ad-lib) -- keep it, unmatched (line_id=None), preserving order and
+    # total word count.
+    out.extend(words[cursor:])
+    return out
 
 
 def align_words_to_reference(
@@ -606,15 +662,21 @@ def align_words_to_reference(
     main.py) -- by the time this function runs, the reference is trusted
     as the definitive word LIST for the song, not just a text corrector.
 
-    `synced_lyrics_text` (optional): does NOT change how words get
-    TEXT-matched at all -- only used later, in the "fill remaining
-    unmatched words" step, to assign a real, time-correct `line_id` to
-    content the whole-song text match below couldn't place (instead of
-    blindly inheriting whatever line_id happened to match right before
-    the gap). See `_time_based_line_lookup`'s own docstring for why this
-    narrower design replaced an earlier, rejected full per-line
-    re-matching attempt.
+    `synced_lyrics_text` (optional): when given and
+    `is_lrc_line_tracking_confident` trusts it, this function's own
+    whole-song text match below is BYPASSED ENTIRELY in favor of
+    `assign_lrc_line_ids_sequentially` -- see that function's own
+    docstring for the sequential, cursor-based design and why it
+    replaced two earlier, rejected time/gap-based attempts. Falls
+    through to the whole-song match below, completely unchanged,
+    whenever no synced lyrics are given or the LRC candidate isn't
+    confidently trusted for this song.
     """
+    if synced_lyrics_text:
+        sequential = assign_lrc_line_ids_sequentially(words, synced_lyrics_text)
+        if sequential is not None:
+            return sequential
+
     if not reference_lines or not words:
         return words
 
@@ -850,43 +912,19 @@ def align_words_to_reference(
         # by the time we get here, most genuinely-missing content should
         # already be filled in.)
 
-    # Fill any remaining unmatched (line_id is None) words' line_id.
-    #
-    # When synced LRC timing is available and confidently calibrated,
-    # assign each such word to whichever reference LINE's own timestamp
-    # is nearest its own real ASR time -- correctly tracks the real flow
-    # of lines across a large unmatched run (e.g. a whole verse the
-    # whole-song text match failed to pair), instead of freezing the
-    # ENTIRE run on one stale line_id. Real confirmed bug (Trixie Mattel
-    # - Video Games, 2026-08-14): the old "copy the nearest PRECEDING
-    # matched neighbor" rule below froze a 219-word unmatched run
-    # (spanning several real reference lines, including one occurrence
-    # of a repeated chorus) on a single stale line_id, suppressing/
-    # misplacing real line breaks throughout that whole passage.
-    #
-    # Falls back to the OLD "copy nearest preceding matched neighbor"
-    # rule when no synced lyrics are given or calibration isn't
-    # confident -- same "don't touch anything without confidence" gate
-    # used everywhere else calibrated LRC timestamps drive a decision in
-    # this codebase.
-    time_lookup = _time_based_line_lookup(words, synced_lyrics_text) if synced_lyrics_text else None
-    if time_lookup is not None:
-        for i in range(len(out)):
-            if out[i].line_id is None:
-                out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
-                               confidence=out[i].confidence, line_id=time_lookup(out[i].start),
-                               dropped=out[i].dropped)
-    else:
-        # Inherit from the nearest matched neighbor -- prefer the
-        # previous one so a trailing ad-lib stays attached to the line
-        # it's part of.
-        last_seen = None
-        for i in range(len(out)):
-            if out[i].line_id is not None:
-                last_seen = out[i].line_id
-            else:
-                out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
-                               confidence=out[i].confidence, line_id=last_seen, dropped=out[i].dropped)
+    # Fill any remaining unmatched (line_id is None) words by inheriting
+    # from the nearest matched neighbor -- prefer the previous one so a
+    # trailing ad-lib stays attached to the line it's part of. Only ever
+    # reached here when `synced_lyrics_text` wasn't given/trusted (the
+    # confident-LRC case returns early via
+    # `assign_lrc_line_ids_sequentially`, above).
+    last_seen = None
+    for i in range(len(out)):
+        if out[i].line_id is not None:
+            last_seen = out[i].line_id
+        else:
+            out[i] = Word(text=out[i].text, start=out[i].start, end=out[i].end,
+                           confidence=out[i].confidence, line_id=last_seen, dropped=out[i].dropped)
 
     return out
 

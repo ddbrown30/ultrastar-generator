@@ -915,52 +915,82 @@ assert len(uneven_aligned) == 3, [w.text for w in uneven_aligned]
 print("OK: uneven-block words are kept (not dropped), only zero-correspondence words are:",
       [w.text for w in uneven_aligned])
 
-print("\n--- lyrics_lookup._time_based_line_lookup: maps a real ASR timestamp to the reference LINE it "
-      "chronologically falls within, using calibrated LRC line timestamps -- the mechanism "
-      "align_words_to_reference's 'fill remaining unmatched words' step uses instead of blindly "
-      "inheriting the nearest matched neighbor's line_id. Real motivating bug (Trixie Mattel - Video "
-      "Games, 2026-08-14): a 219-word unmatched run (the whole-song text match paired the ASR's 2nd "
-      "real singing of a repeated chorus against the reference's 1st occurrence, leaving the 1st real "
-      "singing -- and everything after it, up to the 2nd repeat -- completely unmatched) froze on the "
-      "single stale line_id of whatever matched right before the gap, instead of tracking the real "
-      "flow of lines through that whole passage. (An earlier, full per-line RE-MATCHING approach was "
-      "tried and rejected after two separate real-audio regressions -- see config.py's own history "
-      "note; this narrower mechanism only fixes LINE ASSIGNMENT for already-unmatched words, never "
-      "re-touches text matching, so it can't reintroduce that failure class.) ---")
-from ultrastar_generator.lyrics_lookup import _time_based_line_lookup
+print("\n--- lyrics_lookup.assign_lrc_line_ids_sequentially: sequential, cursor-based LRC line "
+      "assignment -- user's explicit design (2026-08-14): 'going through each line of the LRC, one "
+      "by one, finding the matching words, and then inserting line breaks accordingly.' Replaces two "
+      "earlier, REJECTED time/gap-based attempts (see config.py's own history note) that both caused "
+      "real regressions. Real motivating case (Trixie Mattel - Video Games): '...on earth with you' "
+      "(end of one LRC line) flows into 'Tell me all the things...' (start of the NEXT line, same "
+      "starting word as the line before it) with only a 0.14s gap -- invisible to any gap-based "
+      "grouping, but the cursor-based design still gets it right because the split comes from how "
+      "many words each line's OWN text matches, not from a time boundary or an audio pause ---")
+from ultrastar_generator.lyrics_lookup import assign_lrc_line_ids_sequentially
 
-_tbl_ref_lines = ["put your favorite perfume on", "and i say youre the bestest", "go play a video game",
-                   "its you its you its all for you everything i do", "tell you all the time heaven is a place",
-                   "leaning for a big kiss", "put the kettle on"]
-_tbl_times = [40.0, 42.0, 44.0, 46.0, 52.0, 58.0, 61.0]
-_tbl_synced = "\n".join(f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}" for t, txt in zip(_tbl_times, _tbl_ref_lines))
-# 8 confidently-anchorable lines clears LRC_TIMING_MIN_CALIBRATION_SAMPLES; ASR words match each
-# line's own text exactly (offset by a fixed +0.1s) so calibration finds a clean constant offset.
-_tbl_words = [Word(text=w, start=t + i * 0.3 + 0.1, end=t + i * 0.3 + 0.35, confidence=0.9)
-              for t, line in zip(_tbl_times, _tbl_ref_lines) for i, w in enumerate(line.split())]
-_tbl_lookup = _time_based_line_lookup(_tbl_words, _tbl_synced)
-assert _tbl_lookup is not None, "calibration should succeed with 7 clean anchors"
-# A timestamp shortly after line 3's own declared start (46.0, boundary to line 4 at midpoint(46,52)
-# =49.0) must resolve to line 3, not line 2 or 4 -- this is exactly the real bug's own shape: a long
-# unmatched run's EARLY words must land on the EARLIER of two real lines it spans, not freeze on
-# whichever line matched last before the gap.
-assert _tbl_lookup(46.2) == 3, _tbl_lookup(46.2)
-assert _tbl_lookup(48.5) == 3, _tbl_lookup(48.5)
-# ...and a timestamp after that boundary (but before the NEXT one, midpoint(52,58)=55.0) must resolve
-# to line 4, not stay frozen on line 3 -- the actual mechanism this test exists to verify: the SAME
-# unmatched run correctly tracks through MULTIPLE real lines by each word's own time, instead of one
-# value for the whole run.
-assert _tbl_lookup(49.5) == 4, _tbl_lookup(49.5)
-assert _tbl_lookup(54.0) == 4, _tbl_lookup(54.0)
-print("OK: a timestamp resolves to its own real line (3 vs 4), correctly distinguishing two different "
-      "lines within what would otherwise be treated as one long unmatched run")
 
-# Too few LRC lines to calibrate (< LRC_TIMING_MIN_CALIBRATION_SAMPLES) -> None, caller falls back.
-_tbl_too_few = "\n".join(f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}"
-                          for t, txt in zip(_tbl_times[:2], _tbl_ref_lines[:2]))
-assert _time_based_line_lookup(_tbl_words, _tbl_too_few) is None
-print("OK: too few LRC lines to calibrate returns None (caller falls back to the old "
-      "nearest-matched-neighbor rule, unchanged)")
+def _seql_words(tokens, t0, dur=0.3, gap=0.05):
+    out, t = [], t0
+    for tok in tokens:
+        out.append(Word(text=tok, start=t, end=t + dur, confidence=0.9))
+        t += dur + gap
+    return out, t
+
+
+_seql_lines = ["put your favorite perfume on", "and i say youre the bestest", "go play a video game",
+               "tell you all the time heaven", "tell me all the things you wanna do",
+               "leaning for a big kiss", "put the kettle on"]
+_seql_words_all = []
+_seql_line_times = []
+_seql_t = 40.0
+for _i, _line in enumerate(_seql_lines):
+    _seql_line_times.append(_seql_t)
+    _w, _seql_t = _seql_words(_line.split(), _seql_t)
+    _seql_words_all.extend(_w)
+    # Every transition has a generous 2s pause EXCEPT line 3 -> line 4,
+    # which gets only 0.05s -- the real no-pause case this test exists
+    # to verify, deliberately chosen so line 3 and line 4 both start
+    # with the SAME word ("tell") too.
+    _seql_t += 0.05 if _i == 3 else 2.0
+_seql_synced = "\n".join(f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}"
+                          for t, txt in zip(_seql_line_times, _seql_lines))
+
+_seql_out = assign_lrc_line_ids_sequentially(_seql_words_all, _seql_synced)
+assert _seql_out is not None, "expected confident calibration with 7 clean anchors"
+assert len(_seql_out) == len(_seql_words_all), (len(_seql_out), len(_seql_words_all))
+assert [w.line_id for w in _seql_out] == [li for li, line in enumerate(_seql_lines) for _ in line.split()], \
+    [(w.text, w.line_id) for w in _seql_out]
+print("OK: every word resolves to its own correct line, including the zero-pause 'heaven'->'tell' "
+      "transition between two lines that both start with the same word:",
+      [(w.text, w.line_id) for w in _seql_out if w.text in ("heaven", "tell", "me")])
+
+# No synced lyrics / not enough lines to calibrate -> None, caller falls back to the whole-song match.
+assert assign_lrc_line_ids_sequentially(_seql_words_all, "\n".join(
+    f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}" for t, txt in zip(_seql_line_times[:2], _seql_lines[:2]))) is None
+print("OK: too few LRC lines to calibrate returns None (caller falls back to the whole-song match)")
+
+print("\n--- phrasing.build_lines: a held/melisma note never gets split from its own word by a line "
+      "break, regardless of which line the WORD is assigned to -- a break can only ever be considered "
+      "before an is_word_start=True syllable, and every continuation syllable of a word shares that "
+      "SAME word's line_id, so 'Stars~~~' can never become 'Stars' / '~~~' on two different lines ---")
+_melisma_syls = [
+    Syllable("He", 0.0, 0.2, 4, True, line_id=0),
+    # "Stars" sung as one word with 3 held continuation notes, all line_id=0 (same word).
+    Syllable("Stars", 0.2, 0.4, 4, True, line_id=0),
+    Syllable("~", 0.4, 1.0, 4, False, line_id=0),
+    Syllable("~", 1.0, 1.6, 4, False, line_id=0),
+    Syllable("~", 1.6, 2.2, 4, False, line_id=0),
+    # a real line_id change right after -- must break BEFORE "But", never inside "Stars"'s own holds.
+    Syllable("But", 2.2, 2.4, 4, True, line_id=1),
+]
+_melisma_entries = build_lines(_melisma_syls, strict_reference_lines=True)
+_melisma_kinds = [type(e).__name__ for e in _melisma_entries]
+assert _melisma_kinds.count("LineBreak") == 1, _melisma_kinds
+_break_idx = _melisma_kinds.index("LineBreak")
+# Everything before the break must be "He", "Stars", and its 3 holds -- 5 syllables, no split.
+assert _melisma_kinds[:_break_idx] == ["Syllable"] * 5, _melisma_kinds
+assert [e.text for e in _melisma_entries[:_break_idx]] == ["He", "Stars", "~", "~", "~"], \
+    [getattr(e, "text", None) for e in _melisma_entries[:_break_idx]]
+print("OK: 'Stars' and its 3 held continuation notes all stay together before the break:",
+      [getattr(e, "text", type(e).__name__) for e in _melisma_entries])
 
 print("\n--- lyrics_lookup.align_words_to_reference: synced_lyrics_text integration -- with no synced "
       "lyrics at all, behavior is byte-identical to the 2-arg call; a real per-song run only reaches "
@@ -1990,6 +2020,39 @@ assert all(type(e).__name__ == "Syllable" for e in same_line_entries), \
     [type(e).__name__ for e in same_line_entries]
 print("OK: no break inserted despite the long gap, since line_id confirmed it's still one line:",
       [type(e).__name__ for e in same_line_entries])
+
+print("\n--- phrasing.build_lines(strict_reference_lines=True): removes the implausible-length safety "
+      "net entirely -- real confirmed case (Trixie Mattel - Video Games, 2026-08-14): a long, "
+      "melisma-heavy reference line (many held '~' notes per word) was still getting split by the old "
+      "MAX_SYLLABLES_PER_LINE*1.5 safety net even though its line_id was confidently, correctly "
+      "tracked throughout via calibrated LRC timing -- user's explicit directive: when using LRC, "
+      "match it 100%, no exceptions. Real-audio validated as a clear net improvement (line-break "
+      "agreement 81.7%->87.8%, spurious breaks 29->7), not just a wash ---")
+_long_line_syls = [Syllable(f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0) for i in range(20)]
+_strict_entries = build_lines(_long_line_syls, strict_reference_lines=True)
+assert all(type(e).__name__ == "Syllable" for e in _strict_entries), \
+    [type(e).__name__ for e in _strict_entries]
+print(f"OK: {len(_long_line_syls)} syllables (>> MAX_SYLLABLES_PER_LINE*1.5={int(_config_mod.MAX_SYLLABLES_PER_LINE * 1.5)}), "
+      f"all one confirmed reference line, zero breaks inserted in strict mode")
+# ...but the SAME data in default (non-strict) mode still gets the safety-net break, confirming
+# strict_reference_lines is what actually changed the outcome, not a coincidence.
+_default_entries = build_lines(_long_line_syls, strict_reference_lines=False)
+assert any(type(e).__name__ == "LineBreak" for e in _default_entries), \
+    "expected the default mode's own safety net to still fire on this same data"
+print("OK: default (non-strict) mode still applies the safety net on the identical data, confirming "
+      "the flag is what changed the outcome")
+# A REAL line_id change must still break in strict mode -- strict only removes the EXTRA heuristics,
+# it doesn't stop tracking real reference line transitions.
+_strict_two_lines = [
+    Syllable("He", 0.0, 0.2, 4, True, line_id=0),
+    Syllable(" knows", 0.2, 0.4, 4, True, line_id=0),
+    Syllable("But", 0.4, 0.6, 4, True, line_id=1),
+    Syllable(" mine", 0.6, 0.8, 4, True, line_id=1),
+]
+_strict_two_entries = build_lines(_strict_two_lines, strict_reference_lines=True)
+assert [type(e).__name__ for e in _strict_two_entries].count("LineBreak") == 1, \
+    [type(e).__name__ for e in _strict_two_entries]
+print("OK: a real line_id change still forces a break in strict mode")
 
 print("\n--- BUG REGRESSION (round 6): a bad interior ASR timestamp no longer swallows a whole line's notes ---")
 # Reproduces the reported "Stars" bug directly: within a matched

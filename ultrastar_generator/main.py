@@ -43,8 +43,9 @@ from .note_detection import detect_notes
 from .alignment import align_words
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
-                             alignment_diff_summary, reference_match_ratio, largest_unmatched_reference_run,
-                             recover_dropped_reference_words, fetch_lrclib_by_id, load_lrc_file)
+                             is_lrc_line_tracking_confident, alignment_diff_summary, reference_match_ratio,
+                             largest_unmatched_reference_run, recover_dropped_reference_words,
+                             fetch_lrclib_by_id, load_lrc_file)
 from .musicxml_reference import apply_musicxml_references
 from .mxl_lrc_generator import try_mxl_lrc_primary
 from .lrc_timing import apply_lrc_timing_check
@@ -663,6 +664,17 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     syllables = None
     ref_lines = None
     synced_lyrics_text = None
+    # Set True only by the standard fallback path below, when
+    # lyrics_lookup.is_lrc_line_tracking_confident trusted real LRC line
+    # timing against this song's own audio -- NOT simply whenever
+    # synced_lyrics_text is set (that also happens on the unrelated
+    # MXL+LRC primary path, which has its own separate word-placement
+    # logic and was never validated against phrasing.py's strict mode).
+    # Tells build_lines to trust every word's line_id completely (break
+    # IFF the reference line changed, no other heuristic) instead of the
+    # default gap/length-based safety net -- user's explicit directive:
+    # when using LRC, match it 100%, no exceptions. See phrasing.py.
+    strict_line_breaks_from_lrc = False
     # Tracks whichever model's transcription `words` currently holds --
     # NOT always opts.whisper_model, since a low-quality-ASR retry below
     # may have already swapped `words` for a config.RETRY_ASR_MODEL
@@ -911,6 +923,11 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         words, ref_lines,
                         synced_lyrics_text=synced_lyrics_text if opts.time_based_line_assignment else None,
                     )
+                    if opts.time_based_line_assignment and synced_lyrics_text:
+                        strict_line_breaks_from_lrc = is_lrc_line_tracking_confident(words, synced_lyrics_text)
+                        if strict_line_breaks_from_lrc:
+                            log("  Confidently trusted LRC line tracking -- line breaks will match it "
+                                "exactly (no gap/length heuristics).")
                     diffs = alignment_diff_summary(words, corrected)
                     # corrected is always the same length as words now --
                     # a dropped word is flagged via Word.dropped, not
@@ -1016,7 +1033,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         except UsdxParseError as e:
             log(f"  Could not parse existing file ({e}) -- generating fresh.")
 
-    entries = build_lines(syllables)
+    entries = build_lines(syllables, strict_reference_lines=strict_line_breaks_from_lrc)
 
     # --- 8. GAP = start of the first syllable --------------------------------
     first_syllable = next((e for e in entries if isinstance(e, Syllable)), None)
