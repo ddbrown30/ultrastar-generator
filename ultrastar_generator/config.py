@@ -235,67 +235,17 @@ MIN_NOTE_GAP_SEC = 0.01
 # pipeline only).
 MERGE_CONNECTED_MELISMA_TAILS = True
 
-# CREPE (torchcrepe) runs alongside pYIN as a second, independent pitch
-# estimate per frame -- CREPE is a learned model and is generally more
-# robust than pYIN's DSP-based approach when there's accompaniment bleed
-# in the isolated vocal stem. Where the two agree (within
-# CREPE_AGREEMENT_SEMITONES), CREPE's pitch is trusted and used with a
-# confidence boost. Where they disagree, that frame's pitch is kept from
-# pYIN (unchanged from pre-CREPE behavior) but downweighted -- NOT marked
-# unvoiced, since forcing unvoiced would itself create a spurious note
-# boundary at exactly the frames we're least sure about; downweighting
-# instead means disagreement can suppress a frame's influence on a note's
-# final reported pitch without being able to fabricate a boundary.
-ENABLE_CREPE = True
-DEFAULT_CREPE_MODEL = "full"  # "full" (more accurate) or "tiny" (faster)
-CREPE_AGREEMENT_SEMITONES = 1.0
-CREPE_AGREEMENT_CONFIDENCE_BOOST = 1.5
-CREPE_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
-
-# RMVPE (rmvpe_onnx) is an optional THIRD independent pitch estimate,
-# purpose-built for vocal pitch in POLYPHONIC music (i.e. explicitly
-# trained to be robust to the exact kind of residual accompaniment bleed
-# a Demucs-separated vocal stem can still have) -- unlike pYIN (general
-# DSP-based) or CREPE (general-purpose learned model, not vocal-specific).
-# Cross-checked against the current primary pitch the same way CREPE is
-# (see CREPE_* above and _cross_check's docstring): agreement within
-# RMVPE_AGREEMENT_SEMITONES trusts RMVPE's pitch with a confidence boost;
-# disagreement keeps the current pitch but downweights it. Never marks a
-# frame unvoiced, for the same reason as CREPE.
-#
-# OFF by default. Briefly switched on (2026-08-09) alongside
-# `pitch_primary="rmvpe"` on the strength of RMVPE being the best single
-# ISOLATED raw source all session -- REVERTED the same day after real
-# end-to-end validation (actual production pipeline, not isolation mode)
-# showed the switch was a net REGRESSION (-3.3pp average across the
-# 4-song set, losses on 3 of 4 songs, no gain on the 4th). See CLAUDE.md
-# for the full numbers and `pitch_primary`'s own comment in
-# note_detection.detect_notes(). Don't re-flip this back to True in a
-# future session on the strength of isolation-mode numbers alone --
-# that's exactly the reasoning that was already tried and disproven here.
-ENABLE_RMVPE = False
-
-# main.py's real pipeline default for WHICH pitch source(s) pass 1 uses --
-# "rmvpe" (isolation_source="rmvpe": RMVPE alone, its own voicing
-# decision, zero cross-check with any other source) or "ensemble"
-# (the original pyin-primary + CREPE/RMVPE-as-cross-check architecture,
-# `isolation_source=None`, `--no-crepe`/`--crepe-model` apply). Switched
-# to "rmvpe" 2026-08-09 after real end-to-end validation, run TWICE per
-# song specifically to rule out RMVPE's own documented non-determinism
-# (both runs were IDENTICAL): +1.7pp average across the 4-song set
-# (wins on 3 of 4 songs, loses only on stars), and simpler/faster than
-# the ensemble (no CREPE, no cross-check math) -- see CLAUDE.md item 0d
-# for the full numbers and the two REJECTED attempts that came before
-# this one (plain pitch_primary="rmvpe" with the ensemble's cross-checks
-# still attached was a real regression; disabling just the cross-check
-# while keeping pyin's own voicing was only a wash -- RMVPE's OWN voicing
-# decision, only present in true isolation, turned out to be where the
-# actual advantage lives). NOT the same as `detect_notes()`'s own
-# `isolation_source` parameter default, which stays `None` on purpose --
-# changing THAT would silently change behavior for test_dry_run.py and
-# every validation script from this whole session that calls
-# detect_notes() directly without passing isolation_source; this constant
-# only drives main.py's real CLI pipeline call site.
+# Pass 1's pitch source: "rmvpe" or "swiftf0" -- see
+# note_detection.PITCH_SOURCES. Exactly ONE source supplies both the
+# pitch value and the voicing decision, exclusively -- no cross-check, no
+# ensemble, no consensus vote between sources. pYIN, CREPE, PENN, and the
+# whole cross-check/consensus-override machinery that used to sit on top
+# of a source were all removed (2026-08-14, user's explicit request) --
+# see CLAUDE.md's "Removed / rejected approaches": a single well-chosen
+# source in true isolation had already outperformed the old pyin-primary
+# + CREPE/RMVPE-cross-check ensemble on real end-to-end validation
+# (+1.7pp average across the 4-song set, run twice per song to rule out
+# RMVPE's own documented non-determinism -- both runs were IDENTICAL).
 DEFAULT_PITCH_SOURCE = "rmvpe"
 
 RMVPE_DEVICE = "cpu"  # onnxruntime CUDA build requires CUDA 13 + cuDNN 9,
@@ -305,30 +255,13 @@ RMVPE_DEVICE = "cpu"  # onnxruntime CUDA build requires CUDA 13 + cuDNN 9,
                        # at ~5s for a full ~3min song -- fast enough that
                        # GPU acceleration isn't worth chasing further
                        # unless this graduates from prototype.
-RMVPE_AGREEMENT_SEMITONES = 1.0
-RMVPE_AGREEMENT_CONFIDENCE_BOOST = 1.5
-RMVPE_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
-
-# SwiftF0/PENN cross-check tuning (2026-08-09, for the "how much of the
-# pyin/CREPE/RMVPE/SwiftF0/PENN ensemble is actually pulling its weight"
-# experiment -- see note_detection.detect_notes()'s `extra_cross_check_
-# sources` param). Mirrors CREPE/RMVPE's own values exactly -- no
-# evidence yet to justify different per-source tuning, and tuning these
-# separately would be its own, much bigger undertaking not attempted
-# here; this experiment is about WHICH sources to keep, not how to tune
-# the ones that stay.
-SWIFTF0_AGREEMENT_SEMITONES = 1.0
-SWIFTF0_AGREEMENT_CONFIDENCE_BOOST = 1.5
-SWIFTF0_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
-PENN_AGREEMENT_SEMITONES = 1.0
-PENN_AGREEMENT_CONFIDENCE_BOOST = 1.5
-PENN_DISAGREEMENT_CONFIDENCE_SCALE = 0.3
 
 # A frame this many dB quieter than the track's own "loud" reference level
 # (the 90th percentile of RMS energy, not the absolute peak, so one loud
 # transient doesn't skew the reference) is treated as silence/noise,
-# REGARDLESS of what pYIN's own pitch/voicing decision says. This matters
-# because pYIN detects periodicity, not loudness -- near-silent audio can
+# REGARDLESS of what the pitch source's own voicing decision says. This
+# matters because a pitch/periodicity detector detects periodicity, not
+# loudness -- near-silent audio can
 # still contain quantization noise, resampling ringing, or a faint hum
 # with enough incidental periodicity to read as a confident, real-sounding
 # pitch. Without this gate, a silent instrumental intro (or the silent gap
@@ -380,40 +313,6 @@ TRAILING_ARTIFACT_MIN_PRECEDING_DURATION_SEC = 0.5  # the note being
                                             # trailed must itself be a
                                             # real sustained note, not
                                             # another short fragment.
-
-# Consensus-based pitch override (final pass-1 stage, after all other
-# segmentation/merge stages -- pitch only, never touches note timing).
-# Diagnosed on 4 validated songs (batb, stars, sleeping_beauty, gaston):
-# an ISOLATED per-note diagnostic (bypassing the real shipped pipeline --
-# comparing each of {pyin, rmvpe, swiftf0, penn}'s own note-level vote
-# directly to ground truth) found that unanimous agreement among
-# >= CONSENSUS_MIN_AGREEING_SOURCES of them is a reliable signal (61-70%
-# correct) while a vote among DISAGREEING sources is not (34-46%, worse
-# than trusting a single source) -- so this deliberately never resolves
-# disagreement via a vote, only overrides on unanimous agreement, leaving
-# the pipeline's own decision alone otherwise.
-#
-# REAL end-to-end validation (actual shipped pipeline -- pyin primary +
-# CREPE cross-check -- with this override applied on top, real audio, not
-# the isolated diagnostic above) told a different, MIXED story: batb -0.7,
-# stars -3.3 (a real regression on the song where the baseline pipeline
-# was already BEST, 61.5%), sleeping_beauty +2.8, gaston +2.8 -- net
-# average only +0.4pp, not the clean win the isolated diagnostic
-# suggested. Likely explanation: the override only fires where an
-# isolated-source vote disagrees with the CURRENT pipeline's answer, and
-# on a song where the base ensemble is already resolving things well
-# (stars), second-guessing it with a simpler vote (that doesn't have
-# access to the base pipeline's own smoothing/merge context) does more
-# harm than good; the benefit is concentrated on songs where the baseline
-# is already weak. Also adds real compute cost (+15-30s/song, loading
-# RMVPE/SwiftF0/PENN fresh every call). **OFF by default** -- same
-# category as CONFIDENCE_FLOOR_PERCENTILE/REARTICULATION_RECONCILE_ENABLED
-# above (mechanistically sound, doesn't generalize on real end-to-end
-# validation). See note_detection.py's _consensus_pitch_override and
-# project memory for the full validation writeup.
-CONSENSUS_OVERRIDE_ENABLED = False
-CONSENSUS_MIN_AGREEING_SOURCES = 2
-CONSENSUS_SOURCES = ("pyin", "rmvpe", "swiftf0", "penn")
 
 # Word-level timestamp source. "whisperx" uses forced alignment (wav2vec2
 # CTC) for much more accurate word boundaries than Whisper's own decoder
@@ -1203,8 +1102,6 @@ class PipelineOptions:
     spike_max_duration: float = SPIKE_MAX_DURATION_SEC
     spike_jump_semitones: float = SPIKE_MIN_JUMP_SEMITONES
     pitch_source: str = DEFAULT_PITCH_SOURCE
-    use_crepe: bool = ENABLE_CREPE
-    crepe_model: str = DEFAULT_CREPE_MODEL
     no_pass1_debug: bool = False
     no_debug_log: bool = False
     quiet: bool = False

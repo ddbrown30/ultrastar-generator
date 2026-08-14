@@ -39,8 +39,8 @@ scope and defaults rather than the main pipeline's:
     themselves stay at their own off/0.0 default, since that's the MAIN
     pipeline's separate, still-unvalidated-there decision; this module's
     own defaults below are independent of them) plus `voicing_threshold`
-    (raises `_rmvpe_source`'s/`_crepe_source`'s own internal voicing gate
-    above its 0.5 default) and `key_nudge` (see `_KeyNudge` below) are
+    (raises `_rmvpe_source`'s own internal voicing gate above its 0.5
+    default) and `key_nudge` (see `_KeyNudge` below) are
     all DEFAULT-ON here at the exact values real grid-search tuning
     found on Trixie Mattel - Gold (`attack_trim_sec=0.04`,
     `confidence_floor_percentile=50.0`, `voicing_threshold=0.58`,
@@ -244,7 +244,7 @@ def compute_pitch_class_predictions(
     source_kwargs = {}
     if pitch_source == "rmvpe":
         source_kwargs["device"] = config.RMVPE_DEVICE
-    if pitch_source in ("rmvpe", "crepe") and voicing_threshold is not None:
+    if pitch_source == "rmvpe" and voicing_threshold is not None:
         source_kwargs["voicing_threshold"] = voicing_threshold
 
     midi, conf, voiced = PITCH_SOURCES[pitch_source](
@@ -500,7 +500,7 @@ def build_arg_parser():
                          "-- see --attack-trim-sec's own help for the same validation note.")
     p.add_argument("--voicing-threshold", type=float, default=DEFAULT_VOICING_THRESHOLD,
                     help="Raises the pitch source's own internal voicing-confidence gate above its default "
-                         "(only affects 'rmvpe'/'crepe', which expose this knob). Default: this module's "
+                         "(only affects 'rmvpe', which exposes this knob). Default: this module's "
                          f"own tuned recipe ({DEFAULT_VOICING_THRESHOLD}).")
     p.add_argument("--key-nudge", dest="key_nudge", action="store_true", default=DEFAULT_KEY_NUDGE,
                     help="Apply a conservative +-1-semitone pseudo-key nudge (usp-inspired) after "

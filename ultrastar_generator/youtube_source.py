@@ -1,7 +1,7 @@
 """Downloads a YouTube video as the primary source for a song folder
 (feature 7), via `yt-dlp` -- an optional dependency, only ever imported
 when `--youtube-url` is actually used, same "gracefully degrade if
-missing" convention as `whisperx`/`torchcrepe` elsewhere in this project.
+missing" convention as `whisperx`/`rmvpe_onnx` elsewhere in this project.
 
 Deliberately does NOT name the downloaded file from the video's own
 title -- YouTube titles aren't a reliable "Artist - Title" source, which

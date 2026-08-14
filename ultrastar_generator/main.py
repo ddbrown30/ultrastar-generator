@@ -14,10 +14,9 @@ from __future__ import annotations
 import os
 # Must be set before any CUDA context is created (i.e. before torch is
 # imported anywhere, even transitively) for torch.use_deterministic_
-# algorithms(True) to have full effect on cuBLAS ops -- see
-# note_detection.py's _crepe_pitch, which scopes deterministic algorithm
-# selection to CREPE's own inference (confirmed non-deterministic
-# run-to-run on identical audio otherwise).
+# algorithms(True) to have full effect on cuBLAS ops -- confirmed
+# non-deterministic run-to-run on identical audio otherwise for CUDA
+# inference elsewhere in the pipeline (e.g. WhisperX).
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import argparse
@@ -336,23 +335,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--spike-jump-semitones", type=float, default=config.SPIKE_MIN_JUMP_SEMITONES,
                     help=f"Minimum pitch jump (semitones) from both neighbors for a short note to "
                          f"be treated as a spike/glitch (default: {config.SPIKE_MIN_JUMP_SEMITONES})")
-    p.add_argument("--pitch-source", default=config.DEFAULT_PITCH_SOURCE, choices=["rmvpe", "ensemble"],
-                    help="Which pass-1 pitch source(s) to use (default: "
-                         f"{config.DEFAULT_PITCH_SOURCE!r}). 'rmvpe': RMVPE alone, its own voicing "
-                         "decision, no cross-check with any other source -- validated 2026-08-09 as "
-                         "a real, reproducible +1.7pp average improvement over the old ensemble "
-                         "default, and faster (no CREPE inference, no cross-check math). 'ensemble': "
-                         "the original pyin-primary + CREPE/RMVPE-cross-check architecture -- "
-                         "--no-crepe/--crepe-model only have any effect in this mode.")
-    p.add_argument("--no-crepe", dest="use_crepe", action="store_false", default=config.ENABLE_CREPE,
-                    help="(--pitch-source ensemble only) Don't cross-check pYIN against CREPE "
-                         "(torchcrepe) per-frame (default: cross-check is on). Where they agree, "
-                         "CREPE's pitch is used (generally more robust against accompaniment bleed); "
-                         "where they disagree, pYIN's pitch is kept but downweighted rather than "
-                         "discarded.")
-    p.add_argument("--crepe-model", default=config.DEFAULT_CREPE_MODEL, choices=["full", "tiny"],
-                    help=f"(--pitch-source ensemble only) torchcrepe model size -- 'full' is more "
-                         f"accurate, 'tiny' is much faster (default: {config.DEFAULT_CREPE_MODEL})")
+    p.add_argument("--pitch-source", default=config.DEFAULT_PITCH_SOURCE, choices=["rmvpe", "swiftf0"],
+                    help="Which pass-1 pitch source to use (default: "
+                         f"{config.DEFAULT_PITCH_SOURCE!r}). The chosen source alone supplies both "
+                         "the pitch value and the voicing decision -- no cross-check, no ensemble "
+                         "with any other source. 'rmvpe': validated 2026-08-09 as a real, "
+                         "reproducible +1.7pp average improvement over the old pyin-primary + "
+                         "CREPE/RMVPE-cross-check ensemble (since removed). 'swiftf0': lightweight "
+                         "CNN pitch detector with a real native voicing decision of its own.")
     p.add_argument("--no-pass1-debug", action="store_true",
                     help="Don't write the '[PASS1 DEBUG]' .txt (pass-1 notes only, no lyrics) "
                          "that's written by default into <input-folder>/.ultrastar_work -- load it "
@@ -777,7 +767,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         log("Pass 1: detecting notes from audio (pitch + timing only)...")
         notes = detect_notes(
             y, sr, bpm=bpm,
-            isolation_source="rmvpe" if opts.pitch_source == "rmvpe" else None,
+            pitch_source=opts.pitch_source,
             smooth_window_sec=opts.pitch_smooth_window,
             pitch_jump_semitones=opts.note_split_semitones,
             min_note_beats_fraction=opts.min_note_beat_fraction,
@@ -785,8 +775,6 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             silence_absolute_floor_db=opts.silence_floor_db,
             spike_max_duration_sec=opts.spike_max_duration,
             spike_min_jump_semitones=opts.spike_jump_semitones,
-            use_crepe=opts.use_crepe,
-            crepe_model=opts.crepe_model,
             verbose=not opts.quiet,
             debug_log=debug_log,
         )
@@ -1143,7 +1131,6 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         min_note_beat_fraction=args.min_note_beat_fraction, silence_threshold_db=args.silence_threshold_db,
         silence_floor_db=args.silence_floor_db, spike_max_duration=args.spike_max_duration,
         spike_jump_semitones=args.spike_jump_semitones, pitch_source=args.pitch_source,
-        use_crepe=args.use_crepe, crepe_model=args.crepe_model,
         no_pass1_debug=args.no_pass1_debug,
         no_debug_log=args.no_debug_log, quiet=args.quiet,
         existing_txt_check=args.existing_txt_check, existing_txt_path=args.existing_txt_path,

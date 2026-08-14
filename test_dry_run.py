@@ -359,10 +359,38 @@ midi_contour = base_midi + wobble
 f0_contour = 440.0 * 2 ** ((midi_contour - 69) / 12)
 
 fake_librosa = _types.ModuleType("librosa")
-fake_librosa.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
-    f0_contour, np.ones(n_frames, dtype=bool), np.full(n_frames, 0.95)
-)
-fake_librosa.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
+
+
+def _make_fake_pitch_source(f0_hz, voiced, conf):
+    """Registers a note_detection.PITCH_SOURCES entry that returns fixed
+    midi/conf/voiced arrays (pad/truncated to whatever n_frames the real
+    detect_notes() asks for, same convention as the real _*_source
+    functions) -- replaces the old approach of mocking librosa.pyin, since
+    pyin/CREPE/PENN and the whole ensemble/cross-check architecture were
+    removed and detect_notes() now always goes through exactly one
+    PITCH_SOURCES entry. Pass pitch_source="_fake_test_source" to
+    detect_notes() to use it."""
+    f0_hz = np.asarray(f0_hz, dtype=float)
+    voiced = np.asarray(voiced, dtype=bool)
+    conf = np.asarray(conf, dtype=float)
+    midi = np.where(f0_hz > 0, 69 + 12 * np.log2(np.clip(f0_hz, 1e-6, None) / 440.0), np.nan)
+
+    def _fit(arr, fill, n):
+        arr = np.asarray(arr)
+        if len(arr) < n:
+            arr = np.pad(arr, (0, n - len(arr)), mode="edge") if len(arr) else np.full(n, fill)
+        elif len(arr) > n:
+            arr = arr[:n]
+        return arr
+
+    def _source(y, sr, hop_length, frame_length, fmin, fmax, n_frames):
+        return (
+            _fit(midi, np.nan, n_frames),
+            _fit(conf, 0.0, n_frames),
+            _fit(voiced.astype(float), 0.0, n_frames) >= 0.5,
+        )
+
+    return _source
 
 
 class _FakeOnset:
@@ -398,8 +426,16 @@ _sys.modules["librosa"] = fake_librosa
 import importlib
 import ultrastar_generator.note_detection as note_detection_mod
 importlib.reload(note_detection_mod)
+# importlib.reload() re-executes the module top level, which recreates
+# PITCH_SOURCES fresh -- so the fake source must be (re-)registered AFTER
+# every reload, not before, in every block below.
+note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
+    f0_contour, np.ones(n_frames, dtype=bool), np.full(n_frames, 0.95)
+)
 
-notes = note_detection_mod.detect_notes(np.zeros(1000), sr, bpm=105.47)
+notes = note_detection_mod.detect_notes(
+    np.zeros((n_frames - 1) * hop), sr, bpm=105.47, pitch_source="_fake_test_source"
+)
 print(f"Detected {len(notes)} note(s) for a {dur_s}s vibrato-wobbling tone:")
 for n in notes:
     print(f"    {n.start:.3f}-{n.end:.3f}  pitch={n.pitch}")
@@ -409,21 +445,14 @@ assert (notes[0].end - notes[0].start) > dur_s * 0.8, "merged note lost too much
 print("OK: vibrato collapsed into a single sustained note")
 
 print("\n--- BUG REGRESSION (round 5): silence must not produce hallucinated notes ---")
-# Reproduces the reported bug directly: pYIN can report confident,
-# real-looking pitch on audio that's actually silent (quantization noise,
-# resampling artifacts, a faint hum all have enough incidental
-# periodicity to fool a pure pitch/periodicity detector). The energy gate
-# must reject these regardless of what pYIN's voicing flag says.
+# Reproduces the reported bug directly: the pitch source can report
+# confident, real-looking pitch on audio that's actually silent
+# (quantization noise, resampling artifacts, a faint hum all have enough
+# incidental periodicity to fool a pure pitch/periodicity detector). The
+# energy gate must reject these regardless of what the source's own
+# voicing flag says.
 n_frames_silent = 200
 fake_librosa_silent = _types.ModuleType("librosa")
-# pYIN confidently reports a real-looking pitch (G#3) as "voiced" for the
-# ENTIRE clip, exactly like the reported bug.
-fake_librosa_silent.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
-    np.full(n_frames_silent, 440.0 * 2 ** ((56 - 69) / 12)),  # G#3
-    np.ones(n_frames_silent, dtype=bool),
-    np.full(n_frames_silent, 0.95),
-)
-fake_librosa_silent.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
 fake_librosa_silent.onset = _FakeOnset()
 
 
@@ -438,11 +467,20 @@ class _FakeFeatureSilent:
 fake_librosa_silent.feature = _FakeFeatureSilent()
 _sys.modules["librosa"] = fake_librosa_silent
 importlib.reload(note_detection_mod)
+# The pitch source confidently reports a real-looking pitch (G#3) as
+# "voiced" for the ENTIRE clip, exactly like the reported bug.
+note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
+    np.full(n_frames_silent, 440.0 * 2 ** ((56 - 69) / 12)),
+    np.ones(n_frames_silent, dtype=bool),
+    np.full(n_frames_silent, 0.95),
+)
 
-silent_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=True)
-print(f"Detected {len(silent_notes)} note(s) in genuinely silent audio (pYIN said 100% voiced)")
+silent_notes = note_detection_mod.detect_notes(
+    np.zeros((n_frames_silent - 1) * hop), 22050, bpm=105.47, pitch_source="_fake_test_source", verbose=True
+)
+print(f"Detected {len(silent_notes)} note(s) in genuinely silent audio (pitch source said 100% voiced)")
 assert len(silent_notes) == 0, f"energy gate failed to reject hallucinated notes on silence: {silent_notes}"
-print("OK: silence correctly produced zero notes despite pYIN reporting confident voicing")
+print("OK: silence correctly produced zero notes despite the pitch source reporting confident voicing")
 
 print("\n--- energy gate: real (loud) singing still passes through untouched ---")
 # A track with a silent intro (matching the real "Stars" bug report:
@@ -453,12 +491,6 @@ n_silent = 80
 n_loud = 80
 n_frames_mixed = n_silent + n_loud
 fake_librosa_mixed = _types.ModuleType("librosa")
-fake_librosa_mixed.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
-    np.full(n_frames_mixed, 440.0 * 2 ** ((56 - 69) / 12)),  # G#3 throughout
-    np.ones(n_frames_mixed, dtype=bool),
-    np.full(n_frames_mixed, 0.95),
-)
-fake_librosa_mixed.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
 fake_librosa_mixed.onset = _FakeOnset()
 
 
@@ -471,8 +503,15 @@ class _FakeFeatureMixed:
 fake_librosa_mixed.feature = _FakeFeatureMixed()
 _sys.modules["librosa"] = fake_librosa_mixed
 importlib.reload(note_detection_mod)
+note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
+    np.full(n_frames_mixed, 440.0 * 2 ** ((56 - 69) / 12)),  # G#3 throughout
+    np.ones(n_frames_mixed, dtype=bool),
+    np.full(n_frames_mixed, 0.95),
+)
 
-mixed_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+mixed_notes = note_detection_mod.detect_notes(
+    np.zeros((n_frames_mixed - 1) * hop), 22050, bpm=105.47, pitch_source="_fake_test_source", verbose=False
+)
 assert len(mixed_notes) == 1, f"expected exactly the loud section as one note, got {mixed_notes}"
 silent_duration_sec = n_silent * (256 / 22050)
 assert mixed_notes[0].start >= silent_duration_sec - 0.05, \
@@ -2242,10 +2281,6 @@ contour = np.concatenate([
 f0_spike_test = 440.0 * 2 ** ((contour - 69) / 12)
 
 fake_librosa_spike = _types.ModuleType("librosa")
-fake_librosa_spike.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
-    f0_spike_test, np.ones(n_frames_spike_test, dtype=bool), np.full(n_frames_spike_test, 0.9),
-)
-fake_librosa_spike.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
 fake_librosa_spike.onset = _FakeOnset()
 
 
@@ -2258,8 +2293,13 @@ class _FakeFeatureSpike:
 fake_librosa_spike.feature = _FakeFeatureSpike()
 _sys.modules["librosa"] = fake_librosa_spike
 importlib.reload(note_detection_mod)
+note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
+    f0_spike_test, np.ones(n_frames_spike_test, dtype=bool), np.full(n_frames_spike_test, 0.9)
+)
 
-spike_pipeline_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+spike_pipeline_notes = note_detection_mod.detect_notes(
+    np.zeros((n_frames_spike_test - 1) * hop), 22050, bpm=105.47, pitch_source="_fake_test_source", verbose=False
+)
 print(f"Detected {len(spike_pipeline_notes)} note(s) for a base-spike-base contour "
       f"({n_spike * frame_dur_test * 1000:.0f}ms spike)")
 assert len(spike_pipeline_notes) == 1, f"expected full end-to-end collapse to 1 note, got {spike_pipeline_notes}"
@@ -2276,10 +2316,6 @@ same_midi = 60.0  # C4 throughout -- no pitch change at all
 f0_rearticulate = np.full(n_frames_rearticulate, 440.0 * 2 ** ((same_midi - 69) / 12))
 
 fake_librosa_rearticulate = _types.ModuleType("librosa")
-fake_librosa_rearticulate.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
-    f0_rearticulate, np.ones(n_frames_rearticulate, dtype=bool), np.full(n_frames_rearticulate, 0.9),
-)
-fake_librosa_rearticulate.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
 
 
 class _FakeOnsetRearticulate:
@@ -2310,8 +2346,13 @@ class _FakeFeatureRearticulate:
 fake_librosa_rearticulate.feature = _FakeFeatureRearticulate()
 _sys.modules["librosa"] = fake_librosa_rearticulate
 importlib.reload(note_detection_mod)
+note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
+    f0_rearticulate, np.ones(n_frames_rearticulate, dtype=bool), np.full(n_frames_rearticulate, 0.9)
+)
 
-rearticulate_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+rearticulate_notes = note_detection_mod.detect_notes(
+    np.zeros((n_frames_rearticulate - 1) * hop), 22050, bpm=105.47, pitch_source="_fake_test_source", verbose=False
+)
 print(f"Detected {len(rearticulate_notes)} note(s) for a same-pitch re-articulation:", rearticulate_notes)
 assert len(rearticulate_notes) == 2, \
     f"expected the strong onset to split same-pitch re-articulation into 2 notes, got {rearticulate_notes}"
@@ -2343,108 +2384,24 @@ class _FakeOnsetWeak:
 fake_librosa_rearticulate.onset = _FakeOnsetWeak()
 _sys.modules["librosa"] = fake_librosa_rearticulate
 importlib.reload(note_detection_mod)
+note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
+    f0_rearticulate, np.ones(n_frames_rearticulate, dtype=bool), np.full(n_frames_rearticulate, 0.9)
+)
 
-weak_onset_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=False)
+weak_onset_notes = note_detection_mod.detect_notes(
+    np.zeros((n_frames_rearticulate - 1) * hop), 22050, bpm=105.47, pitch_source="_fake_test_source", verbose=False
+)
 print(f"Detected {len(weak_onset_notes)} note(s) for a same-pitch run with a uniformly weak onset:",
       weak_onset_notes)
 assert len(weak_onset_notes) == 1, \
     f"a uniformly weak onset (no strength signal to distinguish it) should NOT split, got {weak_onset_notes}"
 print("OK: weak/undifferentiated onset did not spuriously split a sustained note")
 
-print("\n--- CREPE cross-check: agreement uses CREPE's (more accurate) pitch ---")
-import torch as _torch
-
-n_frames_crepe = 40
-
-
-class _FakeOnsetNone:
-    @staticmethod
-    def onset_detect(y, sr, hop_length, backtrack, units):
-        return np.array([])
-
-    @staticmethod
-    def onset_strength(y, sr, hop_length):
-        return np.zeros(n_frames_crepe)
-
-
-def _make_fake_librosa_crepe(pyin_midi: float):
-    f0 = np.full(n_frames_crepe, 440.0 * 2 ** ((pyin_midi - 69) / 12))
-    fake = _types.ModuleType("librosa")
-    fake.pyin = lambda y, fmin, fmax, sr, frame_length, hop_length, fill_na=np.nan: (
-        f0, np.ones(n_frames_crepe, dtype=bool), np.full(n_frames_crepe, 0.9),
-    )
-    fake.times_like = lambda x, sr, hop_length: np.arange(len(x)) * (hop_length / sr)
-    fake.onset = _FakeOnsetNone()
-
-    class _Feat:
-        @staticmethod
-        def rms(y, frame_length, hop_length):
-            return np.full((1, n_frames_crepe), 0.2)
-
-    fake.feature = _Feat()
-    return fake
-
-
-# pYIN says midi 60.4 (rounds to 60) throughout; CREPE agrees closely
-# (61.0, within config.CREPE_AGREEMENT_SEMITONES) -- final pitch should
-# follow CREPE's value (61), not pYIN's.
-_sys.modules["librosa"] = _make_fake_librosa_crepe(60.4)
-fake_torchcrepe_agree = _types.ModuleType("torchcrepe")
-_crepe_hz_agree = 440.0 * 2 ** ((61.0 - 69) / 12)
-fake_torchcrepe_agree.predict = lambda audio, sr, hop_length, fmin, fmax, model, batch_size, device, return_periodicity: (
-    _torch.full((1, n_frames_crepe), _crepe_hz_agree), _torch.full((1, n_frames_crepe), 0.9),
-)
-_sys.modules["torchcrepe"] = fake_torchcrepe_agree
-importlib.reload(note_detection_mod)
-
-crepe_agree_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=True, use_crepe=True)
-print(f"Detected {len(crepe_agree_notes)} note(s):", crepe_agree_notes)
-assert len(crepe_agree_notes) == 1, crepe_agree_notes
-assert crepe_agree_notes[0].pitch == 1, f"expected CREPE's pitch (61 -> relative 1) to be used, got {crepe_agree_notes[0].pitch}"
-print("OK: CREPE's pitch used over pYIN's when they agree")
-
-print("\n--- CREPE cross-check: disagreement keeps pYIN's pitch, downweights confidence, "
-      "and does NOT fabricate a note split ---")
-_sys.modules["librosa"] = _make_fake_librosa_crepe(60.0)
-fake_torchcrepe_disagree = _types.ModuleType("torchcrepe")
-_crepe_hz_agree_part = 440.0 * 2 ** ((60.0 - 69) / 12)
-_crepe_hz_disagree_part = 440.0 * 2 ** ((75.0 - 69) / 12)  # 15 semitones off pYIN -- clear disagreement
-
-
-def _predict_disagree(audio, sr, hop_length, fmin, fmax, model, batch_size, device, return_periodicity):
-    pitch = _torch.full((1, n_frames_crepe), _crepe_hz_agree_part)
-    pitch[0, 30:] = _crepe_hz_disagree_part
-    periodicity = _torch.full((1, n_frames_crepe), 0.9)
-    return pitch, periodicity
-
-
-fake_torchcrepe_disagree.predict = _predict_disagree
-_sys.modules["torchcrepe"] = fake_torchcrepe_disagree
-importlib.reload(note_detection_mod)
-
-crepe_disagree_notes = note_detection_mod.detect_notes(np.zeros(4410), 22050, bpm=105.47, verbose=True, use_crepe=True)
-print(f"Detected {len(crepe_disagree_notes)} note(s):", crepe_disagree_notes)
-assert len(crepe_disagree_notes) == 1, \
-    f"disagreement alone must not fabricate a note boundary, got {crepe_disagree_notes}"
-assert crepe_disagree_notes[0].pitch == 0, \
-    f"disagreeing frames should keep pYIN's pitch (majority vote still 0), got {crepe_disagree_notes[0].pitch}"
+# pYIN/CREPE cross-check machinery was removed entirely (2026-08-14) --
+# detect_notes() now always uses exactly one PITCH_SOURCES entry, no
+# cross-check/ensemble/agree-disagree logic to test here anymore. Kept
+# import (used by several later tests further down the file).
 import ultrastar_generator.config as config_mod
-# First 30 frames AGREE with CREPE too (both at pYIN's own pitch), so
-# they get the confidence BOOST just like the all-agreeing test above;
-# only the last 10 frames disagree and get downweighted relative to that
-# -- so the mixed case's overall confidence should land measurably below
-# the all-agreeing case's (1.35, asserted above), not because agreement
-# "helps" less here but because 10/40 frames dropped from boosted to
-# downweighted.
-assert crepe_disagree_notes[0].confidence < crepe_agree_notes[0].confidence, \
-    (crepe_disagree_notes[0].confidence, crepe_agree_notes[0].confidence)
-_downweighted = 0.9 * config_mod.CREPE_DISAGREEMENT_CONFIDENCE_SCALE
-assert crepe_disagree_notes[0].confidence > _downweighted, \
-    "mixed confidence should sit above the fully-downweighted floor (some frames still boosted)"
-print(f"OK: disagreement kept pYIN's pitch and stayed one note, but confidence "
-      f"({crepe_disagree_notes[0].confidence:.3f}) was measurably lower than the all-agreeing "
-      f"case ({crepe_agree_notes[0].confidence:.3f})")
-del _sys.modules["torchcrepe"]
 
 print("\n--- lyric_alignment flags suspicious words: any word whose own ASR span gets zero note pieces ---")
 susp_words = [

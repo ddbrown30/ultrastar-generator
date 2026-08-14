@@ -767,11 +767,13 @@ class App(tk.Tk):
         Tooltip(whisper_entry, "ASR model size, e.g. small.en (default), medium.en, large-v3. "
                                 "Bigger is more accurate but slower.")
         ttk.Label(opts_frame, text="Pitch source:").grid(row=3, column=1, sticky="w", padx=8, pady=2)
-        pitch_combo = ttk.Combobox(opts_frame, textvariable=self.pitch_source, values=["rmvpe", "ensemble"],
+        pitch_combo = ttk.Combobox(opts_frame, textvariable=self.pitch_source, values=sorted(PITCH_SOURCES.keys()),
                                     state="readonly", width=12)
         pitch_combo.grid(row=3, column=1, sticky="e", padx=8)
-        Tooltip(pitch_combo, "rmvpe (default): RMVPE's own isolation-mode pitch/voicing, fastest and "
-                              "most accurate on average. ensemble: pYIN + CREPE cross-check instead.")
+        Tooltip(pitch_combo, "rmvpe (default): RMVPE's own pitch/voicing decision, fastest and most "
+                              "accurate on average. swiftf0: lightweight CNN pitch detector with a "
+                              "real native voicing decision of its own. Whichever is chosen supplies "
+                              "both pitch and voicing exclusively -- no cross-check with any other source.")
 
         c6 = ttk.Checkbutton(opts_frame, text="Delete work files after generating",
                               variable=self.delete_work_files)

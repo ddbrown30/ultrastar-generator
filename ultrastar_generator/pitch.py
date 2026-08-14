@@ -9,6 +9,8 @@ from typing import Optional
 
 import numpy as np
 
+from . import config
+
 
 def hz_to_ultrastar_pitch(hz: float) -> int:
     midi = 69 + 12 * np.log2(hz / 440.0)
@@ -30,29 +32,44 @@ def ultrastar_pitch_to_note_name(pitch: int) -> str:
 def median_pitch_in_span(
     y: np.ndarray, sr: int, start: float, end: float,
     fmin: float = 65.0, fmax: float = 1046.5,
+    pitch_source: Optional[str] = None,
 ) -> Optional[float]:
-    """Best-effort pYIN median pitch (Hz) over a short, specific time span.
+    """Best-effort median pitch (Hz) over a short, specific time span, using
+    whichever pitch source pass 1 itself uses (see
+    note_detection.PITCH_SOURCES; defaults to config.DEFAULT_PITCH_SOURCE).
 
     Used only as a fallback for words that the primary, whole-track note
     detector didn't find any note for (e.g. very short/quiet function
-    words). Less reliable than the whole-track pass since pYIN has less
-    context to work with on a short clip.
+    words) AND that have no neighboring note anywhere in the whole song to
+    borrow a pitch from instead (see lyric_alignment.py's
+    _nearest_note_pitch, which is tried first). Less reliable than the
+    whole-track pass since the pitch source has far less context to work
+    with on a short, isolated clip (see CLAUDE.md's "never run inference
+    on a tiny isolated clip" lesson) -- this is a last-resort fallback,
+    not a general-purpose short-clip pitch detector.
     """
-    import librosa
+    from .note_detection import PITCH_SOURCES
+
+    if pitch_source is None:
+        pitch_source = config.DEFAULT_PITCH_SOURCE
 
     i0 = max(0, int(start * sr))
     i1 = min(len(y), int(end * sr))
     if i1 - i0 < int(0.02 * sr):
         return None
     segment = y[i0:i1]
+    hop_length = 256
+    n_frames = 1 + len(segment) // hop_length
     try:
-        f0, voiced_flag, _voiced_prob = librosa.pyin(
-            segment, sr=sr, fmin=fmin, fmax=fmax, frame_length=1024
+        midi, _conf, voiced = PITCH_SOURCES[pitch_source](
+            segment, sr, hop_length, 1024, fmin, fmax, n_frames,
         )
     except Exception:
         return None
-    voiced = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
-    voiced = voiced[~np.isnan(voiced)]
-    if len(voiced) == 0:
+    voiced = np.asarray(voiced, dtype=bool)
+    voiced_midi = np.asarray(midi, dtype=float)[voiced]
+    voiced_midi = voiced_midi[~np.isnan(voiced_midi)]
+    if len(voiced_midi) == 0:
         return None
-    return float(np.median(voiced))
+    median_midi = float(np.median(voiced_midi))
+    return 440.0 * 2 ** ((median_midi - 69) / 12)

@@ -54,11 +54,11 @@ class DebugLog:
         audio, so this is large -- a full song is several thousand lines).
         `rows` are pre-formatted strings (one per frame, caller controls
         exact columns); this just wraps them in a section so the raw
-        pYIN/CREPE output (before any smoothing, merging, or energy-gating)
-        is directly inspectable instead of only visible as post-processed
-        notes -- exists specifically to distinguish "pass 1's underlying
-        pitch tracker got this frame wrong" from "a later merge/cleanup
-        pass distorted an originally-correct reading." """
+        pitch-source output (before any smoothing, merging, or
+        energy-gating) is directly inspectable instead of only visible as
+        post-processed notes -- exists specifically to distinguish "pass
+        1's underlying pitch tracker got this frame wrong" from "a later
+        merge/cleanup pass distorted an originally-correct reading." """
         if self._f is None:
             return
         self.section(header)

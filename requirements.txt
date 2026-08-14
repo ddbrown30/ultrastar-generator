@@ -23,11 +23,12 @@ whisperx>=3.1
 # Syllable hyphenation
 pyphen>=0.15
 
-# CREPE (learned pitch estimator), cross-checked against pYIN per-frame
-# in note_detection.py -- generally more robust than pYIN against
-# accompaniment bleed in the isolated vocal stem. Falls back to pYIN
-# alone (with a console warning) if not installed; --no-crepe disables.
-torchcrepe>=0.0.23
+# Pass-1 pitch source (--pitch-source, note_detection.PITCH_SOURCES) --
+# exactly one of these supplies BOTH the pitch value and the voicing
+# decision, exclusively (no cross-check, no ensemble). "rmvpe" is the
+# default.
+rmvpe-onnx
+swift-f0
 
 # MusicXML parsing for pass 4's reference-score pitch correction
 # (--musicxml-reference) and MusicXML companion-file auto-detection.
@@ -41,7 +42,7 @@ requests>=2.31
 
 # Optional: YouTube download source (--youtube-url). Only imported when
 # that flag is actually used -- same "gracefully degrade if missing"
-# convention as whisperx/torchcrepe above.
+# convention as whisperx above.
 yt-dlp>=2024.1
 
 # --- PyTorch ---------------------------------------------------------------

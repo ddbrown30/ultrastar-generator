@@ -57,7 +57,18 @@ to the gui at the same time.
   ASR data** — they answer different questions and diagnosing from the
   wrong one produces confidently-wrong conclusions (real incident: a
   user-pasted per-word trace was mistaken for raw ASR, leading nowhere
-  until the raw-ASR section was actually read).
+  until the raw-ASR section was actually read). Also has, for pass 1:
+  a RAW PASS-1 FRAMES section (per-frame direct output of whichever
+  single `pitch_source` ran — raw pitch/confidence/voicing BEFORE any
+  smoothing, segmentation, or merge pass, vs. the same frame's value
+  AFTER contour smoothing — isolates "the pitch tracker got this frame
+  wrong" from "a later pass distorted an originally-correct reading"),
+  a per-stage RAW NOTES dump (note list snapshotted after each
+  segmentation/merge/cleanup stage), and inline per-decision lines for
+  the note-shaping passes that make individual judgment calls (`[spike-
+  removed]`, `[trailing-artifact-absorbed]`, `[rearticulation-
+  reconcile]`) — each names the specific note(s)/timestamps involved and
+  why, not just a before/after count.
 
 ## Lessons learned (do not reintroduce)
 
@@ -145,8 +156,24 @@ to the gui at the same time.
 - **RMVPE as cross-checked primary pitch source**: reverted — net
   regression end-to-end despite winning in isolation-mode comparisons.
   Isolation-mode accuracy does NOT reliably predict end-to-end impact.
-  (What *did* ship: `isolation_source="rmvpe"`, RMVPE's own voicing, no
-  cross-check at all — see Shipped Defaults below.)
+  (What *did* ship, and what the whole pass-1 architecture below was
+  simplified down to entirely: a single pitch source with its own
+  voicing, no cross-check at all.)
+- **pYIN, CREPE, PENN, and the whole pitch cross-check/ensemble/
+  consensus-override architecture** (2026-08-14, user's explicit
+  request, fully removed): `note_detection.py` used to run a primary
+  source (pYIN by default) plus up to several other sources (CREPE,
+  RMVPE, PENN, SwiftF0) as agree/disagree cross-checks
+  (`_cross_check`), with an optional final unanimous-consensus pitch
+  override (`_consensus_pitch_override`) on top. All of it is gone —
+  `detect_notes()` now always runs through exactly ONE `PITCH_SOURCES`
+  entry (`pitch_source` param, `"rmvpe"` or `"swiftf0"`), which supplies
+  both the pitch value and the voicing decision, exclusively. This was
+  already the better-performing real shipped path (see above); the
+  ensemble code was dead weight duplicating the isolation branch, not a
+  live alternative. `pitch.median_pitch_in_span` (lyric_alignment.py's
+  last-resort fallback for a word with no note anywhere nearby) also
+  switched from raw `librosa.pyin` to the same `PITCH_SOURCES` registry.
 - **`--verify-placement`** (expand-search re-transcription to fix note
   boundaries): fixed individual real cases but was a net regression on
   every pitch/timing metric end-to-end on every tested song, confirmed
@@ -213,11 +240,17 @@ to the gui at the same time.
   **Fully removed from the codebase** (user's explicit "reject, don't
   keep the functionality around").
 
-## Shipped defaults / current config (as of 2026-08-10)
+## Shipped defaults / current config (as of 2026-08-14)
 
-- `isolation_source="rmvpe"` is the real pitch-source default (RMVPE's
-  own voicing, no cross-check, no CREPE) — reproducible, faster, and a
-  real average +1.7pp accuracy win across the 4-song core set.
+- `pitch_source="rmvpe"` (`config.DEFAULT_PITCH_SOURCE`, `--pitch-source
+  {rmvpe,swiftf0}` on the CLI, same dropdown in the GUI) is the real
+  pitch-source default — RMVPE's own pitch AND voicing decision,
+  exclusively, no cross-check with any other source — reproducible,
+  faster, and a real average +1.7pp accuracy win across the 4-song core
+  set over the old pyin-primary + CREPE/RMVPE-cross-check ensemble
+  (since fully removed — see "Removed / rejected approaches" above).
+  `"swiftf0"` (lightweight CNN pitch detector, own native voicing
+  decision) is the only other supported source.
 - `ENABLE_MUSICXML_FORCE_CALIBRATION = True`: when a user supplies (or
   auto-detects) a MusicXML reference and normal pass-4 calibration can't
   clear its confidence bar, apply the best available pitch-class offset
@@ -254,8 +287,6 @@ to the gui at the same time.
   reference line wins outright even over a long gap.
 - CUDA is the only supported device; `--device`/CPU fallback removed
   entirely, pipeline aborts at startup if CUDA unavailable.
-- CREPE runs alongside pYIN (`--no-crepe` to disable) as a cross-check
-  where relevant, but note: RMVPE isolation mode above bypasses this.
 - `BPM_WRITE_MULTIPLIER = 2`: written `#BPM` is 2x the detected tempo
   for finer beat-grid resolution (display/write-time only, not fed into
   `detect_notes()`'s own segmentation).
