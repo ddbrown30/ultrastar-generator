@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List
 
 from . import config
+from .file_discovery import sanitize_filename
 from .models import Song, Syllable, LineBreak
 from .note_detection import NoteEvent
 from .pitch import ultrastar_pitch_to_note_name
@@ -80,7 +81,7 @@ def write_notes_debug_file(
     from .usdx_writer import write_song
 
     song = build_notes_debug_song(notes, artist, title, mp3, bpm, gap_ms, label)
-    out_path = Path(output_dir) / f"{artist} - {title} [{label}].txt"
+    out_path = Path(output_dir) / sanitize_filename(f"{artist} - {title} [{label}].txt")
     write_song(song, out_path)
     return out_path
 

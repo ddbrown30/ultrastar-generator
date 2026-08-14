@@ -57,6 +57,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 from . import config
 from .debug_log import DebugLog
+from .file_discovery import sanitize_filename
 from .models import LineBreak, Song, Syllable, Word
 from .usdx_parser import ParsedSong, UsdxParseError, parse_usdx_file
 from .usdx_writer import write_song
@@ -1717,7 +1718,8 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
 
     artist = opts.artist or existing.artist
     title = opts.title or existing.title
-    debug_log_path = None if opts.no_debug_log else (work_dir / f"{artist} - {title} [DEBUG LOG].txt")
+    debug_log_path = (None if opts.no_debug_log else
+                       (work_dir / sanitize_filename(f"{artist} - {title} [DEBUG LOG].txt")))
     debug_log = DebugLog(debug_log_path)
     if debug_log_path is not None:
         log(f"Writing debug log to: {debug_log_path}")

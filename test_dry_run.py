@@ -2640,12 +2640,12 @@ with _tempfile.TemporaryDirectory() as root:
                                          mp3_src=mp3, video_src=video, cover_src=cover, background_src=bg)
     assert staged.mp3 == "Some Artist - Some Song.mp3", staged.mp3
     assert staged.video == "Some Artist - Some Song.mp4", staged.video
-    assert staged.cover == "Some Artist - Some Song[CO].jpg", staged.cover
-    assert staged.background == "Some Artist - Some Song[BG].png", staged.background
+    assert staged.cover == "Some Artist - Some Song [CO].jpg", staged.cover
+    assert staged.background == "Some Artist - Some Song [BG].png", staged.background
     assert (out_dir / "Some Artist - Some Song.mp3").read_bytes() == b"mp3-bytes"
     assert (out_dir / "Some Artist - Some Song.mp4").read_bytes() == b"video-bytes"
-    assert (out_dir / "Some Artist - Some Song[CO].jpg").read_bytes() == b"cover-bytes"
-    assert (out_dir / "Some Artist - Some Song[BG].png").read_bytes() == b"bg-bytes"
+    assert (out_dir / "Some Artist - Some Song [CO].jpg").read_bytes() == b"cover-bytes"
+    assert (out_dir / "Some Artist - Some Song [BG].png").read_bytes() == b"bg-bytes"
 print("OK: every companion is renamed to '<Artist> - <Title>[.ext]' in the output folder regardless "
       "of its own name in the input folder; separate cover/background images each keep their own "
       "'[CO]'/'[BG]' tag")

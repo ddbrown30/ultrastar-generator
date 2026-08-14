@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .file_discovery import sanitize_filename
+
 
 @dataclass
 class StagedCompanions:
@@ -58,7 +60,7 @@ def stage_companions_to_output(output_dir: Path, artist: str, title: str, *, mp3
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    base = f"{artist} - {title}"
+    base = sanitize_filename(f"{artist} - {title}")
 
     mp3_name = _copy_as(mp3_src, output_dir, f"{base}{mp3_src.suffix}")
     if video_src == mp3_src:
@@ -72,9 +74,9 @@ def stage_companions_to_output(output_dir: Path, artist: str, title: str, *, mp3
         cover_name = _copy_as(cover_src, output_dir, f"{base}{cover_src.suffix}")
         background_name = cover_name
     else:
-        cover_name = (_copy_as(cover_src, output_dir, f"{base}[CO]{cover_src.suffix}")
+        cover_name = (_copy_as(cover_src, output_dir, f"{base} [CO]{cover_src.suffix}")
                       if cover_src else None)
-        background_name = (_copy_as(background_src, output_dir, f"{base}[BG]{background_src.suffix}")
+        background_name = (_copy_as(background_src, output_dir, f"{base} [BG]{background_src.suffix}")
                             if background_src else None)
 
     return StagedCompanions(mp3=mp3_name, video=video_name, cover=cover_name, background=background_name)

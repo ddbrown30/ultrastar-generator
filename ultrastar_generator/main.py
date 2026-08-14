@@ -29,7 +29,8 @@ from typing import Callable, Optional
 
 from . import config
 from .models import Song, Syllable
-from .file_discovery import resolve_artist_title, headline_case, AmbiguousInputError, NoAudioSourceFoundError
+from .file_discovery import (resolve_artist_title, headline_case, sanitize_filename,
+                              AmbiguousInputError, NoAudioSourceFoundError)
 from .song_input import resolve_song_folder
 from .output_staging import stage_companions_to_output
 from .usdx_parser import parse_usdx_file, UsdxParseError
@@ -493,7 +494,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     # Optional; defaults to <input folder>\Output as that parent.
     if output_dir is None:
         output_dir = input_dir / "Output"
-    output_dir = output_dir / f"{artist} - {title}"
+    output_dir = output_dir / sanitize_filename(f"{artist} - {title}")
 
     # Checked here (not earlier) since it needs the FINAL folder, which
     # needs artist/title -- a given/defaulted PARENT equalling input_dir
@@ -517,7 +518,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     if opts.existing_txt_path:
         existing_txt_path = Path(opts.existing_txt_path)
     elif opts.existing_txt_check:
-        candidate = input_dir / f"{artist} - {title}.txt"
+        candidate = input_dir / sanitize_filename(f"{artist} - {title}.txt")
         if candidate.is_file():
             existing_txt_path = candidate
 
@@ -538,7 +539,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
 
     log(f"== {artist} - {title} ==")
 
-    debug_log_path = None if opts.no_debug_log else (work_dir / f"{artist} - {title} [DEBUG LOG].txt")
+    debug_log_path = (None if opts.no_debug_log else
+                       (work_dir / sanitize_filename(f"{artist} - {title} [DEBUG LOG].txt")))
     debug_log = DebugLog(debug_log_path)
     if debug_log_path is not None:
         log(f"Writing debug log to: {debug_log_path}")
@@ -1038,7 +1040,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     # with). Companion staging above already ran either way -- an
     # output_dir != input_dir still needs to be self-contained even when
     # verification passes.
-    out_name = f"{artist} - {title}.txt"
+    out_name = sanitize_filename(f"{artist} - {title}.txt")
     out_path = output_dir / out_name
     regenerated = True
 

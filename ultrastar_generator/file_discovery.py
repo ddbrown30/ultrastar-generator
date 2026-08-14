@@ -291,6 +291,20 @@ def _capitalize_first_letter(word: str) -> str:
     return word
 
 
+_WINDOWS_ILLEGAL_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+def sanitize_filename(text: str) -> str:
+    """Strips characters Windows forbids in a file/folder name (e.g. the
+    "?" in a real title like "Shall We Dance?") plus trailing dots/spaces
+    (also illegal as a Windows filename's last character) -- for use ONLY
+    when turning an artist/title into an actual filesystem path component.
+    Never apply this to a #ARTIST/#TITLE tag's own value, which should
+    keep the real, unmodified text."""
+    out = "".join(c for c in text if c not in _WINDOWS_ILLEGAL_FILENAME_CHARS)
+    return out.rstrip(" .")
+
+
 def headline_case(text: str) -> str:
     """Title-cases `text` for display in output folder/file names (e.g.
     "Beauty And The Beast" -> "Beauty and the Beast") -- minor words
