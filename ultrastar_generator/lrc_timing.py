@@ -176,6 +176,20 @@ def _normalize_line(text: str) -> str:
     return " ".join(n for n in (_normalize(tok) for tok in text.split()) if n)
 
 
+def lrc_line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float, float]:
+    """The real-time window [line's own start, next line's own start) an
+    LRC line's own words are expected to fall within -- the LAST line has
+    no next line to bound it, so it gets a flat +5.0s fallback width
+    instead. Shared by every mechanism that needs to bound a per-LRC-line
+    search/estimate by real time (`mxl_lrc_generator.place_words_via_asr`,
+    `realign.match_words_to_asr_windowed`, and `reconcile_line_structure`
+    above, all identical 3-line copies before this was extracted
+    2026-08-16)."""
+    t0 = lrc_lines[li][0]
+    t1 = lrc_lines[li + 1][0] if li + 1 < len(lrc_lines) else t0 + 5.0
+    return t0, t1
+
+
 # Ad-lib/filler and connector words that different transcribers (an LRC's
 # own author vs. whoever wrote our existing .txt) commonly add or drop
 # without it meaning the LINE is actually different content -- user's own
@@ -609,8 +623,7 @@ def reconcile_line_structure(
             i += 1
             j += 1
         elif kind == "lrc_merge":
-            t_start = lrc_lines[j][0]
-            t_next = lrc_lines[j + 1][0] if j + 1 < n_j else t_start + 5.0
+            t_start, t_next = lrc_line_window(lrc_lines, j)
             word_counts = [max(1, len(our_norm[i + m2].split())) for m2 in range(k)]
             total_words = sum(word_counts) or 1
             cumulative = 0

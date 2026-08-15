@@ -62,7 +62,7 @@ from .usdx_parser import ParsedSong, UsdxParseError, parse_usdx_file
 from .usdx_writer import write_song
 from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id, load_lrc_file
 from .lrc_timing import (match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure,
-                          reconcile_line_structure, find_cursor_window_match)
+                          reconcile_line_structure, find_cursor_window_match, lrc_line_window)
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
 from .text_normalize import normalize_word as _normalize
 
@@ -623,12 +623,6 @@ def seed_from_prep(existing_words: List[ExistingWord], prep: "LrcPrep",
     return result
 
 
-def _line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float, float]:
-    t0 = lrc_lines[li][0]
-    t1 = lrc_lines[li + 1][0] if li + 1 < len(lrc_lines) else t0 + 5.0
-    return t0, t1
-
-
 def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: List[Optional[int]],
                                  lrc_lines: List[Tuple[float, str]], asr_words: List[Word]
                                  ) -> Tuple[List[Optional[float]], List[Optional[float]], List[bool]]:
@@ -664,7 +658,7 @@ def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: 
 
     for li, idxs in line_word_idxs.items():
         idxs = sorted(idxs)
-        t0, t1 = _line_window(lrc_lines, li)
+        t0, t1 = lrc_line_window(lrc_lines, li)
         asr_in_window = [w for w in asr_words if t0 - 0.5 <= w.start <= t1 + 0.5]
         asr_norm = [_normalize(w.text) for w in asr_in_window]
         existing_norm_line = [existing_words[i].norm for i in idxs]

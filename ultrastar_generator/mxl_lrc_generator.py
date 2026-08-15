@@ -54,7 +54,7 @@ from typing import Callable, List, Optional, Tuple
 
 from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib, effective_lrc_duration
-from .lrc_timing import parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines
+from .lrc_timing import parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines, lrc_line_window
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
 from .text_normalize import normalize_word as _normalize
@@ -460,12 +460,6 @@ class MxlLrcQuality:
         return self.n_asr_placed / self.n_words if self.n_words else 0.0
 
 
-def _line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float, float]:
-    t0 = lrc_lines[li][0]
-    t1 = lrc_lines[li + 1][0] if li + 1 < len(lrc_lines) else t0 + 5.0
-    return t0, t1
-
-
 def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lines: List[Tuple[float, str]],
                          asr_words: List[Word],
                          word_clean_text: Optional[List[Optional[str]]] = None) -> Tuple[List[float], List[float], MxlLrcQuality]:
@@ -542,7 +536,7 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
     # --- Pass 1: confident ASR matches only. ---
     for li, idxs in line_word_idxs.items():
         idxs = sorted(idxs)
-        t0, t1 = _line_window(lrc_lines, li)
+        t0, t1 = lrc_line_window(lrc_lines, li)
         asr_in_window = [w for w in asr_words if t0 - 0.5 <= w.start <= t1 + 0.5]
         asr_norm = [_normalize(w.text) for w in asr_in_window]
         mxl_norm_line = [_normalize(word_clean_text[i]) if word_clean_text and word_clean_text[i]
@@ -631,7 +625,7 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
         if confident[i]:
             continue
         li = word_lines[i]
-        t0, t1 = _line_window(lrc_lines, li)
+        t0, t1 = lrc_line_window(lrc_lines, li)
         w = mxl_words[i]
         word_qtr_dur = sum(s[1] for s in w.syllables)
 

@@ -1186,6 +1186,17 @@ all of them.
   Bowie - Absolute Beginners' "I’ve", and confirm it now normalizes
   identically to its straight-apostrophe equivalent) rather than a full
   pipeline re-run.
+- **`lrc_timing.lrc_line_window`** (added 2026-08-16): trivial
+  `[line's own start, next line's own start)` helper (last line gets a
+  flat +5.0s fallback width) — was 3 byte-identical copies
+  (`mxl_lrc_generator.place_words_via_asr`, `realign.
+  match_words_to_asr_windowed`, and an inlined copy inside
+  `reconcile_line_structure`'s `"lrc_merge"` branch) before
+  consolidation. Low-risk (pure arithmetic, no judgment calls), but kept
+  in this list since it's still a real 3x-duplicated pattern.
+  Re-test: `test_dry_run.py` in full — no dedicated test targets this
+  helper in isolation, it's exercised transitively through all 3
+  callers' own existing test coverage.
 
 ## Environment
 
