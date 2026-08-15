@@ -383,7 +383,7 @@ class App(tk.Tk):
         # artist/title lookup either) -- a much smaller option surface than
         # either generate or realign.
         self.pitch_refresh_source = tk.StringVar(value=config.DEFAULT_PITCH_SOURCE)
-        self.pitch_refresh_isolate_vocals = tk.BooleanVar(value=False)
+        self.pitch_refresh_isolate_vocals = tk.BooleanVar(value=True)
         self.pitch_refresh_key_nudge = tk.BooleanVar(value=DEFAULT_KEY_NUDGE)
         self.pitch_refresh_delete_work_files = tk.BooleanVar(value=False)
 
@@ -710,10 +710,10 @@ class App(tk.Tk):
         pr_isolate_check = ttk.Checkbutton(pr_options_frame, text="Isolate vocals with Demucs first",
                                             variable=self.pitch_refresh_isolate_vocals)
         pr_isolate_check.grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=2)
-        Tooltip(pr_isolate_check, "Off by default -- runs pitch detection on the ORIGINAL mixed audio instead, "
-                                   "matching the external reference tool (usp) this mode is modeled on. Real "
-                                   "testing found this was at least as accurate as isolating vocals first, "
-                                   "sometimes more so -- see CLAUDE.md / project memory.")
+        Tooltip(pr_isolate_check, "On by default -- a 9-song regression test found the original mixed-audio "
+                                   "default didn't generalize (coin flip for rmvpe, a clear regression for "
+                                   "swiftf0). Requires CUDA. Uncheck to detect pitch from the original mixed "
+                                   "audio instead (no CUDA needed) -- see CLAUDE.md / project memory.")
         pr_key_nudge_check = ttk.Checkbutton(pr_options_frame,
                                               text="Key nudge (conservative +-1-semitone correction)",
                                               variable=self.pitch_refresh_key_nudge)

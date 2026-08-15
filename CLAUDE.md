@@ -262,8 +262,48 @@ to the gui at the same time.
   already absorbs a raw-word-level "fix"), one safe decline, zero wins.
   **Fully removed from the codebase** (user's explicit "reject, don't
   keep the functionality around").
+- **Mixed (non-isolated) audio for pass 1's own segmentation, and a
+  hybrid isolated-segmentation/mixed-pitch-class variant** (investigated
+  2026-08-15, nothing shipped to `main.py`/`note_detection.py`): motivated
+  by a real single-song finding (Trixie Mattel - Gold: RMVPE pitch-class
+  86.3% mixed vs. 83.2% isolated, GIVEN GROUND-TRUTH TIMING — see
+  `pitch_refresh.py`'s own history below) that was explicitly flagged as
+  untested beyond Gold. Real-tested across the full 9-song roster (BATB,
+  Tarzan, Little Mermaid, Ordinary Day, Gold, plus Pink Pony Club/Heroes/
+  OLP/Video Games — the last 4 with less-certain ground truth), both
+  RMVPE and SwiftF0, via `note_detection.detect_notes()` run directly on
+  each audio source (no given timing, matching pass 1's own from-scratch
+  task) and scored against ground truth by best-time-overlap matching
+  (no text/lyrics involved). **Running pass 1 itself on mixed audio is a
+  clear net loss for both pitch sources**: coverage (did ANY detected
+  note overlap a given GT note at all — a voicing/segmentation signal the
+  Gold-only given-timing test couldn't see) drops 14-24pp on most songs
+  for RMVPE, and even more severely for SwiftF0 (up to -55pp); pitch-
+  class accuracy given ISOLATED's own segmentation is a small, inconsistent
+  edge for RMVPE (roughly a wash) and a clear loss for SwiftF0. A hybrid
+  that keeps isolated's segmentation/voicing but re-samples each note's
+  pitch CLASS from a mixed-audio contour computed once over the whole
+  track (reusing `pitch_refresh.compute_pitch_class_predictions`
+  unmodified, never a tiny isolated clip) was also tried: coverage is
+  preserved exactly by construction, but pitch-class accuracy nets out to
+  a wash-to-slightly-negative for RMVPE (3 wins/4 losses/1 tie across the
+  9 songs, one bad outlier at -5.1pp on Heroes) and a clear regression for
+  SwiftF0 (losses up to -30pp). **Conclusion: pass 1 stays on isolated
+  vocals for both pitch sources** — same "well-motivated but doesn't
+  survive contact with real data" pattern as `--verify-placement`/
+  `--zone-boundary-snap` above. Also surfaced, independent of this
+  question: **Video Games' ground-truth `.txt` has a systematic pitch
+  offset** (near-0%, below 1/12 random chance, pitch-class accuracy
+  across every combination of audio source/pitch source/recipe tested) —
+  a `truth.txt` the user initially pointed at as a possibly-cleaner
+  ground truth turned out to be byte-identical to the same file, then was
+  removed; the systematic offset itself is still unresolved and Video
+  Games should stay excluded from any future pitch-accuracy comparison
+  until it is. All investigation scripts kept in `scratchpad/` (not
+  committed): `mixed_vs_isolated_pass1.py`, `hybrid_pitch_prototype.py`
+  (both runnable with an optional `rmvpe`/`swiftf0` CLI arg).
 
-## Shipped defaults / current config (as of 2026-08-14)
+## Shipped defaults / current config (as of 2026-08-15)
 
 - `pitch_source="rmvpe"` (`config.DEFAULT_PITCH_SOURCE`, `--pitch-source
   {rmvpe,swiftf0}` on the CLI, same dropdown in the GUI) is the real
@@ -274,6 +314,19 @@ to the gui at the same time.
   (since fully removed — see "Removed / rejected approaches" above).
   `"swiftf0"` (lightweight CNN pitch detector, own native voicing
   decision) is the only other supported source.
+- **`pitch_refresh.py`'s `isolate_vocals` default flipped to `True`
+  (2026-08-15)**, reversing its original mixed-audio-by-default design —
+  see the "Removed / rejected approaches" entry above for the full
+  9-song real-data finding that motivated it (the single-song Gold result
+  that justified mixed audio doesn't generalize: a coin flip for RMVPE,
+  a clear regression for SwiftF0 on 8/9 songs). `--no-isolate-vocals`/
+  unchecking the GUI box opts back into the old mixed-audio, no-CUDA-
+  needed behavior. **This makes CUDA required by pitch_refresh.py's
+  default invocation** (`separation.isolate_vocals` hardcodes Demucs to
+  `-d cuda`) — previously the one fully-CPU-only tool in this project;
+  `--no-isolate-vocals` is now the only way back to that footprint. Full
+  design rationale lives in `pitch_refresh.py`'s own module docstring,
+  not duplicated here.
 - `ENABLE_MUSICXML_FORCE_CALIBRATION = True`: when a user supplies (or
   auto-detects) a MusicXML reference and normal pass-4 calibration can't
   clear its confidence bar, apply the best available pitch-class offset

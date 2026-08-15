@@ -15,23 +15,30 @@ existing_file`, the exact same guarantee, not a re-implementation).
 Design choices that diverge from the rest of this project's pipelines,
 deliberately, because this module's whole point is mirroring usp's own
 scope and defaults rather than the main pipeline's:
-  - Runs on the audio's ORIGINAL MIXED signal by default, NOT Demucs-
-    isolated vocals (`isolate_vocals=False`). This matches usp's own
-    default (it uses Spleeter only optionally) and a real, direct
-    finding on Trixie Mattel - Gold this session: both usp AND our own
-    RMVPE scored BETTER on the original mix than on isolated vocals for
-    that song (see [[project-usp-comparison-gold]]'s "mixed-vs-isolated"
-    section). Not yet validated on other songs -- this default may need
-    revisiting once regression-tested more broadly, but starting from
-    "match usp's own real input" is the more defensible default than
-    silently assuming isolation always helps, which this project's own
-    long-standing assumption turned out to be wrong about at least once.
-  - No CUDA requirement. Unlike the main/realign pipelines (which abort
-    at startup without CUDA because WhisperX needs it), this module never
-    calls WhisperX -- the default pitch source (RMVPE, `config.
-    RMVPE_DEVICE = "cpu"`) already runs on CPU by design. Vocal isolation
-    is optional and off by default, so most invocations never touch a GPU
-    at all, matching usp's own lightweight footprint.
+  - Runs on Demucs-ISOLATED vocals by default (`isolate_vocals=True`,
+    flipped 2026-08-15). The original mixed-audio default was based on a
+    single-song finding (Trixie Mattel - Gold: both usp and our own
+    RMVPE scored better on the mix than on isolated vocals, see
+    [[project-usp-comparison-gold]]'s "mixed-vs-isolated" section) that
+    was flagged there as "not yet validated on other songs." Broader
+    9-song regression testing (this module's own `refresh_song_pitch`,
+    both `rmvpe` and `swiftf0`, both this module's `default` and
+    `gold_tuned` recipes) found that result does NOT generalize: for
+    `rmvpe`, mixed vs. isolated is a coin flip (4/9 songs favor mixed,
+    5/9 favor isolated, swings up to +-12pp with no consistent pattern);
+    for `swiftf0`, mixed is a clear regression on 8/9 songs, sometimes by
+    50+pp. Isolated is the safer default for either source -- roughly
+    neutral for rmvpe, a real win for swiftf0. `--no-isolate-vocals`
+    opts back into the old mixed-audio behavior (still matches usp's own
+    default, which uses Spleeter only optionally).
+  - CUDA is now required by DEFAULT (changed by the isolate_vocals flip
+    above, 2026-08-15): `separation.isolate_vocals` invokes Demucs with a
+    hardcoded `-d cuda`, and vocal isolation now runs by default. This
+    module still never calls WhisperX, and the pitch source itself
+    (RMVPE, `config.RMVPE_DEVICE = "cpu"`) still runs on CPU regardless --
+    `--no-isolate-vocals` is the only way back to this module's original
+    fully-CPU, no-CUDA-needed footprint (matching usp's own lightweight
+    default).
   - `attack_trim_sec`/`confidence_floor_percentile` (existing, real,
     evidence-backed but still-unshipped-ELSEWHERE prototypes from
     2026-08-07, see `config.ATTACK_TRIM_SEC`/`CONFIDENCE_FLOOR_
@@ -333,7 +340,7 @@ class PitchRefreshOptions:
     argparse -- same shape/purpose as `RealignPipelineOptions`."""
     audio_file: Optional[str] = None
     work_dir: Optional[str] = None
-    isolate_vocals: bool = False
+    isolate_vocals: bool = True
     demucs_model: str = config.DEFAULT_DEMUCS_MODEL
     pitch_source: str = config.DEFAULT_PITCH_SOURCE
     attack_trim_sec: float = DEFAULT_ATTACK_TRIM_SEC
@@ -481,12 +488,17 @@ def build_arg_parser():
                          "read-only -- refuses to run if --output resolves to that same path.")
     p.add_argument("--audio-file", default=None, help="Same as the main pipeline's --audio-file.")
     p.add_argument("--work-dir", default=None, help="Same as the main pipeline's --work-dir.")
-    p.add_argument("--isolate-vocals", action="store_true",
+    p.add_argument("--isolate-vocals", dest="isolate_vocals", action="store_true", default=True,
                     help="Run Demucs vocal isolation and detect pitch from the isolated vocals instead of "
-                         "the original mixed audio. Default: OFF -- matches usp's own default (Spleeter is "
-                         "optional there too) and a real finding that the original mix outperformed "
-                         "isolated vocals for both usp and our own pitch detection on the one song tested "
-                         "so far (Gold) -- not yet validated as a general rule.")
+                         "the original mixed audio. Default: ON (flipped 2026-08-15) -- the single-song "
+                         "Gold finding that originally justified a mixed-audio default did not generalize "
+                         "on a 9-song regression test: for rmvpe, mixed vs. isolated is a coin flip; for "
+                         "swiftf0, mixed is a clear regression on 8/9 songs (up to -54pp). Requires CUDA "
+                         "(Demucs runs with -d cuda) -- use --no-isolate-vocals for this module's original "
+                         "fully-CPU, usp-matching behavior.")
+    p.add_argument("--no-isolate-vocals", dest="isolate_vocals", action="store_false",
+                    help="Detect pitch from the original mixed audio instead (the old default) -- matches "
+                         "usp's own default and needs no CUDA.")
     p.add_argument("--demucs-model", default=config.DEFAULT_DEMUCS_MODEL)
     p.add_argument("--pitch-source", choices=sorted(PITCH_SOURCES.keys()), default=config.DEFAULT_PITCH_SOURCE)
     p.add_argument("--attack-trim-sec", type=float, default=DEFAULT_ATTACK_TRIM_SEC,
