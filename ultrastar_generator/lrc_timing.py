@@ -167,24 +167,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from . import config
 from .models import Syllable, Word
+from .text_normalize import normalize_word as _normalize
 
 _LRC_TAG_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
-
-
-def _normalize(s: str) -> str:
-    # Real bug found via reconcile_line_structure's own real-audio
-    # validation (2026-08-15, David Bowie - I'm Afraid of Americans):
-    # our own file's apostrophes are curly (U+2019, e.g. "Johnny's"),
-    # LRCLIB's are straight ASCII ('). The old regex below only ever kept
-    # straight apostrophes, silently DELETING every curly one -- "Johnny's"
-    # normalized to "johnnys" on our side but "johnny's" on the LRC side,
-    # so EVERY line containing an apostrophe failed to match at all, even
-    # an otherwise byte-identical line. realign.py/mxl_lrc_generator.py's
-    # own _normalize already had this exact fix; this module's copy (and
-    # lyrics_lookup.py's) had drifted out of sync with it.
-    s = s.lower()
-    s = s.replace("’", "'").replace("‘", "'")
-    return re.sub(r"[^a-z0-9']", "", s)
 
 
 def _normalize_line(text: str) -> str:

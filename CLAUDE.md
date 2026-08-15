@@ -1164,6 +1164,28 @@ all of them.
   `scan_mwta_regression.py`-style replay of a cached `[DEBUG LOG].txt`'s
   `RAW ASR TRANSCRIPT` section for at least Chicago, Video Games, and
   Our Lady Peace.
+- **`text_normalize.normalize_word`** (added 2026-08-16): lowercase +
+  curly-to-straight-apostrophe fold + strip everything except
+  letters/digits/apostrophes. Was 6 independent per-module copies
+  (`lyrics_lookup.py`, `lrc_timing.py`, `mxl_lrc_generator.py`,
+  `realign.py`, `musicxml_reference.py`, `verify_existing_song.py`)
+  before consolidation; the curly-apostrophe fix (see the 2026-08-15
+  "reconcile_line_structure" entry below) had already been independently
+  applied to the first 4 and had silently drifted out of sync with the
+  last 2, which still carried the original bug (a real hand-authored
+  file's curly `'` desyncing against a straight-ASCII `'` on the other
+  side of a comparison) until this consolidation folded them onto the
+  same fixed implementation too. `verification.py`'s OWN `_normalize`
+  (strips only leading/trailing punctuation, keeps internal characters)
+  is deliberately NOT part of this — genuinely different semantics for a
+  genuinely different comparison, not another drifted copy.
+  Re-test: `test_dry_run.py` in full (this function is exercised
+  transitively by nearly every text-matching test in the suite); for the
+  2 previously-unfixed callers specifically, a targeted real-lyric check
+  (parse a real sandbox `.txt` with a known curly apostrophe, e.g. David
+  Bowie - Absolute Beginners' "I’ve", and confirm it now normalizes
+  identically to its straight-apostrophe equivalent) rather than a full
+  pipeline re-run.
 
 ## Environment
 

@@ -44,6 +44,7 @@ from typing import Callable, List, Optional, Tuple
 from . import config
 from .models import Word
 from .syllables import hyphenate
+from .text_normalize import normalize_word as _normalize
 
 # Lines that are pure section/annotation markers (e.g. "[Chorus]",
 # "[Verse 2]") or a source's occasional trailing credit line, not actual
@@ -508,18 +509,6 @@ def parse_lyrics_lines(raw_lyrics: str) -> List[str]:
         lines.append(line)
     return lines
 
-
-def _normalize(s: str) -> str:
-    # Curly apostrophes (U+2019, e.g. a real hand-authored existing file's
-    # own "Johnny's") must normalize the same as straight ones -- the old
-    # regex below only ever kept straight apostrophes, silently deleting
-    # every curly one, which desyncs otherwise-identical text (real bug
-    # found via lrc_timing.reconcile_line_structure's own real-audio
-    # validation, 2026-08-15 -- see that module's identical fix).
-    # realign.py/mxl_lrc_generator.py's own _normalize already had this.
-    s = s.lower()
-    s = s.replace("’", "'").replace("‘", "'")
-    return re.sub(r"[^a-z0-9']", "", s)
 
 
 def _tokenize_lines(lines: List[str]) -> Tuple[List[str], List[str], List[int]]:

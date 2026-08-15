@@ -57,12 +57,7 @@ from .lyrics_lookup import LrcLibCandidate, search_lrclib, effective_lrc_duratio
 from .lrc_timing import parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
-
-
-def _normalize(s: str) -> str:
-    s = s.lower()
-    s = s.replace("’", "'").replace("‘", "'")
-    return re.sub(r"[^a-z0-9']", "", s)
+from .text_normalize import normalize_word as _normalize
 
 
 @dataclass

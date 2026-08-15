@@ -34,17 +34,13 @@ data (see CLAUDE.md's 0i/0o for the numbers) rather than reinventing them:
 from __future__ import annotations
 
 import difflib
-import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from . import config
 from .models import Syllable
 from .usdx_parser import ParsedSong
-
-
-def _normalize(s: str) -> str:
-    return re.sub(r"[^a-z0-9']", "", s.lower())
+from .text_normalize import normalize_word as _normalize
 
 
 @dataclass

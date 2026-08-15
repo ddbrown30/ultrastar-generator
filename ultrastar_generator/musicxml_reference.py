@@ -52,11 +52,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import difflib
-import re
 from collections import Counter, defaultdict
 
 from . import config
 from .models import Syllable
+from .text_normalize import normalize_word as _normalize
 
 
 @dataclass
@@ -87,9 +87,6 @@ class MusicXMLStats:
         if self.corrections is None:
             self.corrections = []
 
-
-def _normalize(s: str) -> str:
-    return re.sub(r"[^a-z0-9']", "", s.lower())
 
 
 def load_vocal_notes(

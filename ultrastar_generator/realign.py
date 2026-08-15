@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import copy
 import difflib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
@@ -65,12 +64,7 @@ from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id, load_lrc_file
 from .lrc_timing import (match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure,
                           reconcile_line_structure, find_cursor_window_match)
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
-
-
-def _normalize(s: str) -> str:
-    s = s.lower()
-    s = s.replace("’", "'").replace("‘", "'")
-    return re.sub(r"[^a-z0-9']", "", s)
+from .text_normalize import normalize_word as _normalize
 
 
 @dataclass
