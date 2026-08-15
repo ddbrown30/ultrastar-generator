@@ -982,7 +982,7 @@ RETRY_ASR_MIN_UNCONFIDENT_RUN = 5
 # text-search rematch (re-searches ASR's OWN already-decoded words in a
 # window -- useless if the decoder produced zero words there at all,
 # which is exactly this failure mode; tried as `realign.
-# rematch_local_gaps`, removed 2026-08-16, see CLAUDE.md's "Removed /
+# rematch_local_gaps`, removed 2026-08-15, see CLAUDE.md's "Removed /
 # rejected approaches" -- net regression, this forced-alignment approach
 # is the one that actually works for this failure mode). Forced alignment
 # doesn't care whether the decoder ever produced these words; it directly

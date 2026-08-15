@@ -184,7 +184,7 @@ def lrc_line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float,
     search/estimate by real time (`mxl_lrc_generator.place_words_via_asr`,
     `realign.match_words_to_asr_windowed`, and `reconcile_line_structure`
     above, all identical 3-line copies before this was extracted
-    2026-08-16)."""
+    2026-08-14)."""
     t0 = lrc_lines[li][0]
     t1 = lrc_lines[li + 1][0] if li + 1 < len(lrc_lines) else t0 + 5.0
     return t0, t1
@@ -195,10 +195,10 @@ def words_in_time_window(words: List[Word], t0: float, t1: float, slack: float =
     order preserved. Trivial (a single filtered list comprehension), but
     was 2 separately-written copies (`mxl_lrc_generator.
     place_words_via_asr`, `realign.match_words_to_asr_windowed`) before
-    this was extracted 2026-08-16 -- kept as its own function so both
+    this was extracted 2026-08-14 -- kept as its own function so both
     stay in sync if the slop convention ever changes, not because the
     logic itself is complex. (A third former caller, `realign.
-    rematch_local_gaps`, was removed 2026-08-16 as a net regression --
+    rematch_local_gaps`, was removed 2026-08-15 as a net regression --
     see CLAUDE.md's "Removed / rejected approaches".)"""
     return [w for w in words if t0 - slack <= w.start <= t1 + slack]
 
@@ -227,7 +227,7 @@ def match_block_to_candidates(
     explicit non-contiguous index list) -- that mapping is caller-
     specific and deliberately not part of this function's job.
 
-    Extracted 2026-08-16: `mxl_lrc_generator.place_words_via_asr`'s own
+    Extracted 2026-08-14: `mxl_lrc_generator.place_words_via_asr`'s own
     Pass 1 and `realign.match_words_to_asr_windowed` had independently
     implemented this exact same opcode-walk (confirmed by
     `match_words_to_asr_windowed`'s own docstring: "mirroring
@@ -240,7 +240,7 @@ def match_block_to_candidates(
     forward cursor to advance by, neither of which apply to these 2
     callers (each an independent, non-cursored, per-block/per-line
     match). (A third former caller, `realign.rematch_local_gaps`, was
-    removed 2026-08-16 as a net regression -- see CLAUDE.md's "Removed /
+    removed 2026-08-15 as a net regression -- see CLAUDE.md's "Removed /
     rejected approaches".)"""
     if fuzzy_min_ratio is None:
         fuzzy_min_ratio = config.MXL_LRC_FUZZY_TEXT_MIN_RATIO
@@ -1145,7 +1145,7 @@ def find_cursor_window_match(
     """The forward-only CURSOR-based window search shared by every "find
     `target_tokens` somewhere after `cursor` in `haystack_norm`" mechanism
     in this codebase (`match_asr_to_lrc_lines` below, `realign.
-    match_words_to_asr`) -- extracted 2026-08-16 specifically because the
+    match_words_to_asr`) -- extracted 2026-08-14 specifically because the
     SAME three real bugs kept needing independent re-discovery and
     re-fixing in each caller's own copy of this logic (user's own
     observation, after the second time it happened): a fix landing in
@@ -1227,7 +1227,7 @@ def find_cursor_window_match(
         # (or "at least `lenient_min_matches`") -- accept its single token
         # either way. Anything longer needs at least `lenient_min_matches`
         # real matched tokens even in lenient (non-strict) mode -- real bug
-        # found consolidating this logic (2026-08-16): an unconditional
+        # found consolidating this logic (2026-08-14): an unconditional
         # 1-token floor let a single coincidentally-shared word validate a
         # multi-word target on its own, the exact risk the fraction gate
         # exists to prevent (caught by `match_asr_to_lrc_lines`'s own

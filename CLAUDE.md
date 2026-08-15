@@ -202,7 +202,7 @@ to the gui at the same time.
   all 5 real songs tested. Kept off-by-default/dead-but-present for a
   while (still had a real CLI flag and GUI checkbox, unlike the other
   entries in this section); **fully removed from the codebase
-  2026-08-16** (user's explicit request): `lyric_alignment.
+  2026-08-15** (user's explicit request): `lyric_alignment.
   _snap_boundary_to_note_onset`, the `snap_boundaries`/`snap_radius_sec`
   params threaded through `_assign_notes_to_groups`/
   `_split_notes_by_word_boundaries`/`align_words_to_notes`/
@@ -241,7 +241,7 @@ to the gui at the same time.
   rematch — and a local rematch can lock onto the wrong nearby repeat
   just as easily as a whole-song search can. Shipped OFF, code kept (not
   CLI/GUI-wired) for a while; **fully removed from the codebase
-  2026-08-16** (user's explicit request, same treatment as
+  2026-08-15** (user's explicit request, same treatment as
   `--verify-placement`/split-rewindow above — don't re-attempt without a
   way to distinguish "original timing is wrong here" from "ASR is just
   sparse here").
@@ -251,7 +251,7 @@ to the gui at the same time.
   separately scored WORSE than whole-block alignment on every attempted
   case — the "don't run inference on a tiny isolated clip" failure class
   again. Kept off-by-default/dead for a while; **fully removed from the
-  codebase 2026-08-16** (user's explicit request, same treatment as
+  codebase 2026-08-15** (user's explicit request, same treatment as
   `--verify-placement`/LRC-line-anchored recovery below — don't
   re-attempt without new evidence).
 - **LRC-line-anchored recovery** (used LRC line timing as independent
@@ -1150,7 +1150,7 @@ below, re-run/re-validate every listed caller, not just the one you were
 working in — a fix or regression in the shared function silently affects
 all of them.
 
-- **`lrc_timing.find_cursor_window_match`** (added 2026-08-16): the
+- **`lrc_timing.find_cursor_window_match`** (added 2026-08-14): the
   forward-only cursor/tight-vs-wide window search + its two quality
   guards (min-match-count floor, span guard) used by every "find these
   target tokens somewhere after `cursor` in a haystack word stream"
@@ -1177,7 +1177,7 @@ all of them.
   `scan_mwta_regression.py`-style replay of a cached `[DEBUG LOG].txt`'s
   `RAW ASR TRANSCRIPT` section for at least Chicago, Video Games, and
   Our Lady Peace.
-- **`text_normalize.normalize_word`** (added 2026-08-16): lowercase +
+- **`text_normalize.normalize_word`** (added 2026-08-14): lowercase +
   curly-to-straight-apostrophe fold + strip everything except
   letters/digits/apostrophes. Was 6 independent per-module copies
   (`lyrics_lookup.py`, `lrc_timing.py`, `mxl_lrc_generator.py`,
@@ -1199,7 +1199,7 @@ all of them.
   Bowie - Absolute Beginners' "I’ve", and confirm it now normalizes
   identically to its straight-apostrophe equivalent) rather than a full
   pipeline re-run.
-- **`lrc_timing.lrc_line_window`** (added 2026-08-16): trivial
+- **`lrc_timing.lrc_line_window`** (added 2026-08-14): trivial
   `[line's own start, next line's own start)` helper (last line gets a
   flat +5.0s fallback width) — was 3 byte-identical copies
   (`mxl_lrc_generator.place_words_via_asr`, `realign.
@@ -1210,7 +1210,7 @@ all of them.
   Re-test: `test_dry_run.py` in full — no dedicated test targets this
   helper in isolation, it's exercised transitively through all 3
   callers' own existing test coverage.
-- **`lrc_timing.match_block_to_candidates`** (added 2026-08-16): given a
+- **`lrc_timing.match_block_to_candidates`** (added 2026-08-14): given a
   target block's own normalized words and a caller-bounded candidate
   `Word` list, runs ONE whole-block `difflib.SequenceMatcher` and returns
   `{target_local_index: matched Word}` — an "equal" opcode matches
@@ -1229,12 +1229,12 @@ all of them.
   second) and returns a candidate-side offset for its own forward
   cursor, neither of which apply to these 2 independent, non-cursored
   callers. (A third former caller, `realign.rematch_local_gaps`, was
-  removed 2026-08-16 as a net regression — see "Removed / rejected
+  removed 2026-08-15 as a net regression — see "Removed / rejected
   approaches" above.)
   Re-test: `test_dry_run.py`'s `place_words_via_asr` block (esp. the
   "favors"~"favorites" fuzzy-mishearing and next-line-spillover cases)
   and `match_words_to_asr_windowed`'s own block.
-- **`lrc_timing.words_in_time_window`** (added 2026-08-16): trivial
+- **`lrc_timing.words_in_time_window`** (added 2026-08-14): trivial
   `[t0 - slack, t1 + slack]` ASR-word filter — was 2 copies (same 2
   callers as `match_block_to_candidates` above, since each builds its
   own `asr_in_window` right before calling it). Purely mechanical, kept

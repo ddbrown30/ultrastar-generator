@@ -159,7 +159,7 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
     wav2vec2 CTC forced alignment, not a guess. Unlike a local text-search
     rematch (searches ASR's own already-decoded words in the window --
     useless if the decoder produced none there; tried as `realign.
-    rematch_local_gaps`, removed 2026-08-16 as a net regression, see
+    rematch_local_gaps`, removed 2026-08-15 as a net regression, see
     CLAUDE.md), this doesn't depend on ASR having transcribed anything at
     all in the gap.
 

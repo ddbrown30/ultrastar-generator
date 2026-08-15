@@ -1,7 +1,7 @@
 """Word-text normalization shared by every text-matching mechanism in
 this codebase (LRC/ASR/reference-lyrics/ground-truth comparison).
 
-Extracted 2026-08-16: the exact same normalization logic had drifted into
+Extracted 2026-08-14: the exact same normalization logic had drifted into
 6 independent per-module copies (`lyrics_lookup.py`, `lrc_timing.py`,
 `mxl_lrc_generator.py`, `realign.py`, `musicxml_reference.py`,
 `verify_existing_song.py`). A real bug -- curly apostrophes (U+2019, e.g.
