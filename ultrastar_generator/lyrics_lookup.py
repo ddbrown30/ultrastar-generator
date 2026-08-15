@@ -87,6 +87,32 @@ class LrcLibCandidate:
         return LyricsResult(plain_lyrics=self.plain_lyrics, synced_lyrics=self.synced_lyrics, source="lrclib")
 
 
+def effective_lrc_duration(c: "LrcLibCandidate") -> Optional[float]:
+    """LRCLIB's own `duration` field is unverified metadata -- don't trust
+    it blindly for candidate filtering/scoring. Cross-checks it against
+    the candidate's OWN synced lyrics: if the last line with real text
+    (not just a bare timestamp) already occurs AT OR AFTER the claimed
+    duration, the claimed value is internally inconsistent (a song can't
+    have lyrics ending after it ends) and untrustworthy -- use that last
+    real lyric's own timestamp as the effective duration instead. The
+    normal case (last lyric genuinely before the claimed duration -- there's
+    usually a trailing instrumental outro after the final line) keeps the
+    claimed duration unchanged, since a last-lyric timestamp alone
+    UNDERSTATES real duration far more often than `duration` overstates
+    it. A candidate with no synced lyrics to check against, or no
+    duration at all, is returned as-is -- nothing to cross-check."""
+    if c.duration is None or not c.synced_lyrics:
+        return c.duration
+    from .lrc_timing import parse_lrc
+    last_lyric_time = None
+    for t, text in parse_lrc(c.synced_lyrics):
+        if text.strip():
+            last_lyric_time = t
+    if last_lyric_time is not None and last_lyric_time >= c.duration:
+        return last_lyric_time
+    return c.duration
+
+
 def search_lrclib(artist: str = "", title: str = "", q: str = "") -> List[LrcLibCandidate]:
     """Raw LRCLIB search -- returns EVERY result LRCLIB gives back,
     unfiltered (including instrumental/lyric-less candidates, clearly
@@ -205,8 +231,9 @@ def _real_lrclib_candidates(candidates: List[LrcLibCandidate],
     for c in candidates:
         if c.instrumental or not c.plain_lyrics:
             continue
-        if duration_sec is not None and c.duration:
-            if abs(c.duration - duration_sec) > 3 * config.LRCLIB_DURATION_TOLERANCE_SEC:
+        c_duration = effective_lrc_duration(c)
+        if duration_sec is not None and c_duration:
+            if abs(c_duration - duration_sec) > 3 * config.LRCLIB_DURATION_TOLERANCE_SEC:
                 continue
         real.append(c)
     return real
@@ -219,8 +246,9 @@ def _score_lrclib_candidate(c: LrcLibCandidate, duration_sec: Optional[float]) -
     if c.instrumental or not c.plain_lyrics:
         return -1.0
     s = 0.0
-    if duration_sec is not None and c.duration:
-        diff = abs(c.duration - duration_sec)
+    c_duration = effective_lrc_duration(c)
+    if duration_sec is not None and c_duration:
+        diff = abs(c_duration - duration_sec)
         s += max(0.0, 1.0 - diff / config.LRCLIB_DURATION_TOLERANCE_SEC)
     if c.synced_lyrics:
         s += 0.1

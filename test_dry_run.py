@@ -1412,6 +1412,65 @@ del _sys.modules["requests"]
 assert slc_match2 is not None and slc_match2.candidate.artist_name == "Cast Member B", slc_match2  # closer duration
 print("OK: no artist match anywhere -> falls back to duration-then-ratio ranking as before")
 
+print("\n--- lyrics_lookup.effective_lrc_duration: don't trust LRCLIB's own `duration` metadata blindly -- "
+      "cross-check it against the candidate's OWN synced lyrics (user's own request, 2026-08-15: a song "
+      "can't have real lyrics ending after it supposedly ends, so that's a sign the metadata is wrong) ---")
+from ultrastar_generator.lyrics_lookup import effective_lrc_duration
+
+eld_consistent = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=100.0,
+    plain_lyrics="hello world", synced_lyrics="[00:01.00]hello\n[01:30.00]world",
+    instrumental=False, id=1,
+)
+assert effective_lrc_duration(eld_consistent) == 100.0, effective_lrc_duration(eld_consistent)
+print("  OK: last real lyric (90s) genuinely before the claimed duration (100s, the normal case -- a "
+      "trailing instrumental outro) -> claimed duration kept unchanged")
+
+eld_inconsistent = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=50.0,
+    plain_lyrics="hello world", synced_lyrics="[00:01.00]hello\n[01:38.00]world",
+    instrumental=False, id=2,
+)
+assert effective_lrc_duration(eld_inconsistent) == 98.0, effective_lrc_duration(eld_inconsistent)
+print("  OK: last real lyric (98s) occurs AFTER the claimed duration (50s) -- claimed value is internally "
+      "inconsistent and untrustworthy, so the last real lyric's own timestamp is used instead")
+
+eld_blank_lines = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=50.0,
+    plain_lyrics="hello world", synced_lyrics="[00:01.00]hello\n[01:38.00]world\n[01:45.00]",
+    instrumental=False, id=3,
+)
+assert effective_lrc_duration(eld_blank_lines) == 98.0, effective_lrc_duration(eld_blank_lines)
+print("  OK: a trailing blank/instrumental-marker LRC line (no real text) is correctly ignored -- the "
+      "last line WITH WORDS (98s) is what's used, not the last timestamp of any kind (105s)")
+
+eld_no_synced = LrcLibCandidate(
+    track_name="T", artist_name="A", album_name="", duration=50.0,
+    plain_lyrics="hello world", synced_lyrics=None, instrumental=False, id=4,
+)
+assert effective_lrc_duration(eld_no_synced) == 50.0, effective_lrc_duration(eld_no_synced)
+print("  OK: no synced lyrics to cross-check against -> claimed duration returned as-is")
+
+print("  select_lrc_candidate: a candidate with a wrong (too-short) reported duration -- which would "
+      "otherwise fail the duration-tolerance filter outright -- is correctly kept once its OWN last real "
+      "lyric timestamp (close to our real audio length) is used instead:")
+slc_bad_duration_candidates = [
+    # Reported duration (50s) is 50s off from our own audio (100s) -- would
+    # fail MXL_LRC_DURATION_TOLERANCE_SEC (15s) if trusted as-is. But its
+    # own last real lyric line is at 98s, only 2s off -- well within tolerance.
+    {"trackName": "Song", "artistName": "Right Artist", "duration": 50,
+     "instrumental": False, "plainLyrics": "hello world this is a song",
+     "syncedLyrics": "[00:01.00]hello world\n[01:38.00]this is a song"},
+]
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=slc_bad_duration_candidates)
+slc_bad_duration_match = select_lrc_candidate("Right Artist", "Song", slc_our_words, audio_duration=100.0)
+del _sys.modules["requests"]
+assert slc_bad_duration_match is not None, \
+    "an untrustworthy too-short reported duration must not blindly filter out an otherwise-good candidate"
+assert abs(slc_bad_duration_match.duration_delta - 2.0) < 1e-6, slc_bad_duration_match.duration_delta
+print("  OK: candidate survived the duration filter and scoring using its own real last-lyric timestamp "
+      "(98s, 2s off), not its untrustworthy reported duration (50s, 50s off, would have failed the filter)")
+
 print("\n--- lyrics_lookup._fetch_from_lrclib: on_ambiguous callback (GUI disambiguation path) ---")
 # Dedicated fixture (config.LRCLIB_DURATION_TOLERANCE_SEC == 60.0, so the
 # ambiguity filter's 3x-tolerance cutoff is 180s): duration_sec=100 makes

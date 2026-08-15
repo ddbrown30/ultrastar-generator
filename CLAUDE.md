@@ -277,6 +277,26 @@ to the gui at the same time.
   block) instead of confidently asserting a wrong syllable. The
   syllable-cursor for repeat-clamped blocks under the cap also wraps
   (not freezes) across repeats.
+- `lyrics_lookup.effective_lrc_duration` (2026-08-15, user's explicit
+  request, used everywhere an `LrcLibCandidate.duration` is compared
+  against real audio length — `mxl_lrc_generator.select_lrc_candidate`'s
+  filter/scoring/`duration_delta`, `lyrics_lookup._real_lrclib_candidates`
+  /`_score_lrclib_candidate`): don't trust LRCLIB's own `duration` field
+  blindly — cross-check it against the candidate's OWN synced lyrics. If
+  the last line with real text (not just a timestamp) already occurs AT
+  OR AFTER the claimed duration, the claimed value is internally
+  inconsistent (lyrics can't end after the song does) and untrustworthy —
+  use that last real lyric's own timestamp as the effective duration
+  instead. Real-network validation across the whole `sandbox/` roster
+  found several genuinely wrong real durations this now catches/corrects
+  (Chicago's Queen Latifah candidate: reported 3.0s vs. a real last lyric
+  at 181.9s; several Magic Dance and Les Misérables "Stars" candidates
+  reporting durations 40-241s off their own real last-lyric timestamp).
+  Confirmed no regression on both known-good validation candidates
+  (Great Big Sea - Ordinary Day id 6210269: already-accurate duration,
+  unaffected; David Bowie - Magic Dance: no real LRCLIB candidate passes
+  the duration filter either before or after this fix, consistent with
+  it being a known no-valid-candidate case).
 - `verification.py`'s no-reference fallback no longer blindly replaces
   correct ASR text with an isolated recheck's guess — keeps
   full-context text when nothing can confirm the recheck (same

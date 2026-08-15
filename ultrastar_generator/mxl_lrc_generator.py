@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from . import config
-from .lyrics_lookup import LrcLibCandidate, search_lrclib
+from .lyrics_lookup import LrcLibCandidate, search_lrclib, effective_lrc_duration
 from .lrc_timing import parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
@@ -211,7 +211,18 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
     (difflib ratio of MXL words vs the candidate's plain lyrics) clearing
     `config.MXL_LRC_MIN_CONTENT_MATCH_RATIO`. This bar is intentionally
     permissive -- see this module's docstring for why the real validity
-    gate is downstream, not here.
+    gate is downstream, not here. All duration comparisons here (filter,
+    scoring, `duration_delta`) use `effective_lrc_duration`, not `c.duration`
+    directly -- LRCLIB's own duration metadata isn't verified against the
+    synced lyrics it ships with, and gets cross-checked/corrected against
+    the candidate's own last real lyric timestamp (see that function's own
+    docstring).
+
+    Duration ranking above content ratio (see below) makes this metadata
+    trust matter beyond just the upfront filter -- an untrustworthy
+    `duration` could otherwise outrank the genuinely correct candidate
+    on a fabricated tie or push a good candidate outside the tolerance
+    filter entirely.
 
     Among candidates clearing those bars, ranks by (1) whether the
     candidate's own credited artist plausibly matches ours
@@ -248,7 +259,8 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
         lrc_norm = [_normalize(t) for t in (forced.plain_lyrics or "").split()]
         lrc_norm = [w for w in lrc_norm if w]
         ratio = difflib.SequenceMatcher(None, mxl_norm_words, lrc_norm, autojunk=False).ratio() if lrc_norm else 0.0
-        delta = abs(forced.duration - audio_duration) if forced.duration is not None else None
+        forced_duration = effective_lrc_duration(forced)
+        delta = abs(forced_duration - audio_duration) if forced_duration is not None else None
         return LrcMatch(candidate=forced, lrc_lines=lrc_lines, content_match_ratio=ratio, duration_delta=delta)
 
     candidates = search_lrclib(artist, title) + search_lrclib(q=title)
@@ -265,7 +277,8 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
     for c in deduped:
         if c.instrumental or not c.synced_lyrics or c.duration is None:
             continue
-        delta = abs(c.duration - audio_duration)
+        c_duration = effective_lrc_duration(c)
+        delta = abs(c_duration - audio_duration)
         if delta > config.MXL_LRC_DURATION_TOLERANCE_SEC:
             continue
         lrc_norm = [_normalize(t) for t in (c.plain_lyrics or "").split()]
