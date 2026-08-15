@@ -1075,30 +1075,106 @@ def match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, s
     `mxl_lrc_generator.py`; factored out here (its data shape never
     depended on MXL at all) once `realign.py` needed the exact same
     ASR-vs-LRC-line calibration step -- don't reimplement this a third
-    time."""
-    lrc_flat: List[Tuple[int, str]] = []
-    for li, (_, text) in enumerate(lrc_lines):
-        for tok in text.split():
-            n = _normalize(tok)
-            if n:
-                lrc_flat.append((li, n))
-    lrc_norm = [n for _, n in lrc_flat]
-    asr_norm = [_normalize(w.text) for w in asr_words]
-    sm = difflib.SequenceMatcher(None, asr_norm, lrc_norm, autojunk=False)
-    first_asr_for_line: dict = {}
-    for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if tag != "equal":
-            continue
-        for k in range(a2 - a1):
-            li = lrc_flat[b1 + k][0]
-            if li not in first_asr_for_line:
-                first_asr_for_line[li] = a1 + k
+    time.
 
+    Forward-only CURSOR-based matching (rewritten 2026-08-15, real bug
+    found via real-audio validation on Chappell Roan - "Pink Pony Club",
+    a song whose chorus repeats 3 full times): the OLD implementation
+    ran a single GLOBAL, non-chronological `difflib.SequenceMatcher`
+    over the WHOLE ASR word stream vs. the WHOLE LRC word stream (every
+    line's words concatenated together, all repeats included) -- exactly
+    this project's own recurring "repeated-phrase disambiguation"
+    failure class (see CLAUDE.md's "Lessons learned"), just never fixed
+    in THIS mechanism before. Real confirmed failure: a whole ~130s
+    middle stretch of the song (where ASR text didn't cleanly match, an
+    ad-lib/bridge section) got ZERO anchors at all under the global diff,
+    and every line after that gap was then anchored ~134-135s TOO EARLY
+    -- matched against an earlier occurrence of the same repeated chorus
+    instead of its own real, later one.
+
+    Same cursor principle already validated and shipped for this exact
+    "ASR words vs. one reference line's text" shape in `lyrics_lookup.
+    assign_lrc_line_ids_sequentially` (and for "our lines vs. LRC lines"
+    in `reconcile_line_structure`): walk LRC lines in order, search only
+    a BOUNDED window of ASR words starting where the PREVIOUS line's own
+    match left off. A repeated phrase later in the song can never be
+    confused with an earlier occurrence, because the cursor has already
+    advanced past the earlier occurrence's own words by the time a later
+    line's search begins -- the earlier occurrence is simply
+    unreachable. This is deliberately NOT the same risk class as this
+    project's rejected TIME-windowed search attempts (`--verify-
+    placement`, `realign.py`'s old `"windowed"` local-rematch): those
+    searched a window that could still contain more than one real
+    occurrence of a repeated phrase with no way to disambiguate; a
+    monotonic SEQUENCE-POSITION cursor cannot reach an earlier occurrence
+    at all, by construction.
+
+    The window size is NOT fixed per line -- it accumulates the word
+    count of every line skipped (no match found) since the cursor last
+    actually advanced, so a real multi-line garbled/ad-lib stretch (the
+    Pink Pony Club case) doesn't permanently strand the cursor: the
+    window for the line that finally matches again naturally covers all
+    the skipped lines' content too, not just its own few words. Capped
+    (`MAX_PENDING_WORDS`) so this growth can't run away indefinitely --
+    real bug found via the SAME Pink Pony Club validation: an uncapped
+    window that grows large enough can accidentally contain a SHORT,
+    coincidental match (a common word like "the"/"I" appearing far
+    ahead, unrelated to this line) that `difflib` still reports as an
+    "equal" opcode -- accepting that as a real anchor jumped the cursor
+    forward past a huge stretch of genuinely NOT-yet-transcribed real
+    content, corrupting every subsequent line's delta the same way the
+    original global-diff bug did, just in the opposite (too-LATE, not
+    too-early) direction. Fixed with a MINIMUM-MATCH-QUALITY gate
+    (`MIN_MATCH_TOKEN_FRACTION`): a candidate match must cover a real
+    fraction of the line's OWN tokens, not just one coincidentally-
+    shared common word, before it's trusted enough to advance the
+    cursor at all."""
+    WINDOW_WORD_MULTIPLIER = 3
+    WINDOW_WORD_SLACK = 10
+    MAX_PENDING_WORDS = 60
+    MIN_MATCH_TOKEN_FRACTION = 0.5
+
+    asr_norm = [_normalize(w.text) for w in asr_words]
+    n = len(asr_words)
+    cursor = 0
+    pending_word_count = 0
     candidates = []
-    for li, asr_idx in first_asr_for_line.items():
-        lrc_start = lrc_lines[li][0]
+    for li, (lrc_start, text) in enumerate(lrc_lines):
+        line_tokens = [t for t in (_normalize(tok) for tok in text.split()) if t]
+        if not line_tokens:
+            continue
+        pending_word_count = min(pending_word_count + len(line_tokens), MAX_PENDING_WORDS)
+        window_end = min(cursor + pending_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n)
+        window = asr_norm[cursor:window_end]
+        if not window:
+            continue
+        sm = difflib.SequenceMatcher(None, window, line_tokens, autojunk=False)
+        first_offset = None
+        last_offset = None
+        matched_token_count = 0
+        for tag, a1, a2, _b1, _b2 in sm.get_opcodes():
+            if tag != "equal":
+                continue
+            if first_offset is None:
+                first_offset = a1
+            last_offset = a2 - 1
+            matched_token_count += a2 - a1
+        # A genuine 1-word line has no way to require "half" of itself --
+        # accept its single token. Anything longer still needs at least 2
+        # real matched tokens (not just 1, which `round(.. * 0.5)` alone
+        # would allow for a 2-word line) -- a lone coincidentally-shared
+        # common word must never be trusted as a real anchor on its own.
+        min_needed = 1 if len(line_tokens) == 1 else max(2, round(len(line_tokens) * MIN_MATCH_TOKEN_FRACTION))
+        if first_offset is None or matched_token_count < min_needed:
+            # No match (or only a weak, likely-coincidental one) anywhere
+            # in this (accumulated) window -- don't advance the cursor;
+            # the NEXT line's own search starts from the same position,
+            # its window growing to cover this line's skipped content too.
+            continue
+        asr_idx = cursor + first_offset
         candidates.append((li, lrc_start, asr_words[asr_idx].start - lrc_start))
-    candidates.sort(key=lambda c: c[0])
+        cursor += last_offset + 1
+        pending_word_count = 0
     return candidates
 
 

@@ -227,54 +227,249 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
     return promoted
 
 
-def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
+def _line_chunks(line_of_word: List[int]) -> List[Tuple[int, int]]:
+    """Groups consecutive existing-word indices sharing the same real
+    line index into (start, end) chunk bounds, in order -- the natural
+    unit `match_words_to_asr` chunks by when real line info is given
+    (see its own docstring for why a real line beats an arbitrary
+    fixed-size chunk)."""
+    chunks: List[Tuple[int, int]] = []
+    if not line_of_word:
+        return chunks
+    start = 0
+    cur = line_of_word[0]
+    for idx in range(1, len(line_of_word)):
+        if line_of_word[idx] != cur:
+            chunks.append((start, idx))
+            start = idx
+            cur = line_of_word[idx]
+    chunks.append((start, len(line_of_word)))
+    return chunks
+
+
+def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word],
+                        line_of_word: Optional[List[int]] = None
                         ) -> Tuple[List[Optional[float]], List[Optional[float]], List[bool]]:
     """Whole-song, order-preserving text match of the existing file's own
-    words against real ASR words -- deliberately NOT time-windowed (see
+    words against real ASR words -- deliberately NOT TIME-windowed (see
     module docstring for why: this mode can't trust the input file's own
-    timing enough to window a search with it). Same matching technique as
-    `mxl_lrc_generator.place_words_via_asr` (exact match, plus a
-    fuzzy-ratio "replace" fallback for ASR's own mishearing of a word),
-    just applied once across the whole word sequence instead of per-line.
+    timing enough to window a search with it).
+
+    Forward-only CURSOR-based matching over CHUNKS of existing words
+    (rewritten 2026-08-15, real bug found via real-audio validation on
+    Chappell Roan - "Pink Pony Club", a song whose chorus repeats 3 full
+    times, found DURING validation of the `lrc_timing.match_asr_to_lrc_
+    lines` fix -- see CLAUDE.md): the OLD implementation ran ONE global,
+    non-chronological `difflib.SequenceMatcher` over the WHOLE existing-
+    word sequence vs. the WHOLE ASR word sequence -- the same "repeated-
+    phrase disambiguation" failure class documented in CLAUDE.md's
+    "Lessons learned", just never fixed in THIS mechanism (which places
+    the BULK of individual word timings, not just line anchors). Real
+    confirmed failure, straight from a real per-word trace: the "I'm"
+    starting each of two repeated "...Pink Pony Club" verses landed
+    within ~0.5s of its true position (correctly, confidently matched),
+    but every word IN BETWEEN those two correct anchors -- itself
+    genuinely repeated content -- was confidently matched ~104-136
+    SECONDS too early, to an EARLIER occurrence of the same repeated
+    phrase elsewhere in the song. Being marked "confident" (a real,
+    if wrong, difflib "equal"/"replace" match), those words were never
+    handed to `interpolate_fallback`, which would otherwise have
+    smoothly placed them between the two correctly-anchored words
+    around them.
+
+    This is NOT time-windowing (the thing this function's docstring
+    already rules out) -- it's SEQUENCE-POSITION windowing with a
+    forward-only cursor into the ASR stream, which only relies on the
+    existing file's own WORD ORDER being correct (already assumed
+    everywhere else in this module), never its timing. Same principle
+    as `lrc_timing.match_asr_to_lrc_lines`/`reconcile_line_structure`/
+    `lyrics_lookup.assign_lrc_line_ids_sequentially`: a repeated phrase
+    later in the song can never be confused with an earlier occurrence,
+    because the cursor has already advanced past the earlier
+    occurrence's own ASR words by the time a later chunk's search
+    begins.
+
+    Processes existing words in CHUNKS, not one at a time -- a single
+    common word (e.g. "the"/"a") has almost no power to disambiguate ITS
+    OWN position in a repeat-heavy song on its own; a several-word chunk
+    does. `line_of_word` (`_word_line_indices`, when the caller has real
+    entries to derive it from), when given, chunks by REAL LYRIC LINES
+    -- the same unit `reconcile_line_structure`/`match_asr_to_lrc_lines`
+    already use successfully for this exact failure class -- rather than
+    an arbitrary fixed word count. This mattered in practice: an EARLIER
+    version of this fix used fixed-size 6-word chunks and, even after
+    several rounds of tightening the guards below, still occasionally
+    accepted a wrong match on the SAME real repeated-chorus stretch --
+    an arbitrary chunk boundary can slice a real line in half, leaving
+    neither half enough distinctive content to reliably self-disambiguate.
+    A real line varies its own length to match real content and rarely
+    straddles a phrase boundary, which made the difference. Falls back
+    to a fixed-size chunk (`CHUNK_SIZE`) when `line_of_word` isn't given
+    (e.g. a caller/test with no entries to derive real lines from) --
+    still real cursor-based matching, just without the line-boundary
+    quality improvement.
+
+    The chunk's own required-match-fraction gate (`MIN_MATCH_TOKEN_
+    FRACTION`, only applied once the search window has actually grown
+    beyond this chunk's own natural size from earlier skips -- a FRESH
+    chunk trusts even a single genuine match, since real songs very
+    often only confidently transcribe a few words per line and that's
+    not a coincidence risk) means a chunk that's mostly NOT confirmable
+    by ASR is left entirely unmatched (safe, lets `interpolate_fallback`
+    handle it) rather than accepting a weak, likely-coincidental partial
+    match. A second, independent guard bounds how far apart the matched
+    tokens themselves are allowed to be (relative to how much real
+    evidence was actually found, `matched_token_count`, not just the
+    chunk's nominal size) -- real bug found via the same validation: a
+    borderline match whose few real tokens were scattered across almost
+    an entire large (inflated) window could still legitimately clear the
+    fraction gate while remaining wrong, and advancing the cursor by
+    that much dragged it far ahead of the existing-word index's own true
+    position, corrupting every later chunk's own search too. The cursor
+    itself only ever advances to just past the last ACTUALLY CONFIRMED
+    match's own real ASR position (never a raw, unconfirmed opcode
+    boundary -- a `"replace"` block's own span is just wherever difflib
+    decided the mismatched region ends, not a real match).
+
+    The window is NOT fixed-size per chunk -- it accumulates the word
+    count of every chunk skipped (no match found) since the cursor last
+    actually advanced (capped at `MAX_PENDING_WORDS`), so a real
+    multi-chunk garbled/ad-lib stretch doesn't permanently strand the
+    cursor once real content resumes.
 
     Returns (starts, ends, confident), parallel to `existing_words` --
     unmatched/low-confidence words are None/False."""
+    CHUNK_SIZE = 6
+    WINDOW_WORD_MULTIPLIER = 3
+    WINDOW_WORD_SLACK = 10
+    MAX_PENDING_WORDS = 60
+    MIN_MATCH_TOKEN_FRACTION = 0.5
+
     n = len(existing_words)
     starts: List[Optional[float]] = [None] * n
     ends: List[Optional[float]] = [None] * n
     confident: List[bool] = [False] * n
 
-    a = [w.norm for w in existing_words]
-    b = [_normalize(w.text) for w in asr_words]
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if tag == "equal":
-            for k in range(a2 - a1):
-                asr_w = asr_words[b1 + k]
-                if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                    starts[a1 + k] = asr_w.start
-                    ends[a1 + k] = asr_w.end
-                    confident[a1 + k] = True
-        elif tag == "replace" and (a2 - a1) == 1:
-            # A single unmatched existing word against one or more ASR
-            # words in this block (the ASR side isn't always exactly one
-            # word -- a neighboring word can ride along) -- try every
-            # candidate, keep the best fuzzy match, same technique
-            # mxl_lrc_generator.place_words_via_asr already validated for
-            # exactly this failure mode (ASR mishearing a word
-            # differently than the reference text).
-            best_ratio = 0.0
-            best_asr_w = None
-            for bk in range(b1, b2):
-                ratio = difflib.SequenceMatcher(None, a[a1], b[bk]).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_asr_w = asr_words[bk]
-            if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
-                if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                    starts[a1] = best_asr_w.start
-                    ends[a1] = best_asr_w.end
-                    confident[a1] = True
+    a_norm = [w.norm for w in existing_words]
+    b_norm = [_normalize(w.text) for w in asr_words]
+    n_b = len(asr_words)
+
+    if line_of_word is not None and len(line_of_word) == n:
+        chunks = _line_chunks(line_of_word)
+    else:
+        chunks = [(i, min(i + CHUNK_SIZE, n)) for i in range(0, n, CHUNK_SIZE)]
+
+    cursor = 0
+    pending_word_count = 0
+    for chunk_start, chunk_end in chunks:
+        i = chunk_start
+        chunk_tokens = a_norm[chunk_start:chunk_end]
+        pending_word_count = min(pending_word_count + len(chunk_tokens), MAX_PENDING_WORDS)
+        window_end = min(cursor + pending_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n_b)
+        window = b_norm[cursor:window_end]
+        if not window:
+            continue
+
+        sm = difflib.SequenceMatcher(None, window, chunk_tokens, autojunk=False)
+        opcodes = sm.get_opcodes()
+        equal_wa = [(wa1, wa2) for tag, wa1, wa2, _ca1, _ca2 in opcodes if tag == "equal"]
+        matched_token_count = sum(wa2 - wa1 for wa1, wa2 in equal_wa)
+        # The fraction gate only matters once the window has actually
+        # GROWN beyond this chunk's own natural size (accumulated skips
+        # from earlier chunks) -- that's the specific situation that can
+        # make a single coincidentally-shared common word look like a
+        # real match (the Pink Pony Club case). A FRESH chunk (no prior
+        # skips) searches only its own tightly-bounded window, where even
+        # a single genuine match is trustworthy -- gating that too would
+        # reject perfectly normal SPARSE ASR coverage (real songs very
+        # often only confidently transcribe a few words per chunk; that's
+        # not a coincidence risk, just incomplete transcription).
+        window_is_inflated = pending_word_count > len(chunk_tokens)
+        min_needed = 1 if not window_is_inflated else (
+            1 if len(chunk_tokens) == 1 else max(2, round(len(chunk_tokens) * MIN_MATCH_TOKEN_FRACTION)))
+        # A SECOND, independent guard on top of the fraction gate -- real
+        # bug found via the SAME Pink Pony Club real-audio validation: a
+        # borderline chunk (exactly meeting the fraction gate) can still
+        # have its matched tokens SCATTERED across almost the entire
+        # (inflated) window -- one coincidental match right at the far
+        # edge of a 45-word window advanced the cursor there directly,
+        # permanently exhausting the ASR stream and stranding every
+        # subsequent chunk for the REST of the song (an empty window
+        # forever after). A real match's own tokens should cluster within
+        # roughly the chunk's own size, not spread across the whole
+        # accumulated window -- reject (same as failing the fraction
+        # gate) when they don't.
+        # Bounded relative to the EVIDENCE actually found (matched_token_
+        # count), not just the chunk's nominal size -- real bug found via
+        # the SAME real-audio validation: a chunk-size-relative cap (e.g.
+        # a 6-word chunk always allowed up to a 28-word span) was still
+        # loose enough for a borderline 3-of-6-token match to legitimately
+        # clear it while still being wrong, and each such over-wide accept
+        # dragged the cursor far ahead of where the existing-word index
+        # actually was -- causing EVERY subsequent chunk to search a
+        # window that no longer corresponded to its own true position at
+        # all (compounding, not just a single bad word). 3 real matched
+        # tokens should span at most a handful of extra (skipped/
+        # hallucinated) ASR words each, not a quarter of a 45-word window.
+        match_span = (max(wa2 for _wa1, wa2 in equal_wa) - min(wa1 for wa1, _wa2 in equal_wa)) if equal_wa else 0
+        max_span = matched_token_count * 3 + 3
+        if matched_token_count < min_needed or match_span > max_span:
+            # This whole chunk isn't confirmable in the (accumulated)
+            # window -- don't advance the cursor; the NEXT chunk's own
+            # search starts from the same position, its window growing
+            # to cover this chunk's skipped content too. Every word in
+            # this chunk stays None/False for interpolate_fallback.
+            continue
+
+        # The cursor only ever advances to just past the last ACTUALLY
+        # CONFIRMED match's own real ASR position -- never to a raw
+        # opcode boundary (`wa2`). Real bug found via the SAME Pink Pony
+        # Club validation: a "replace" opcode's own (wa1, wa2) span is
+        # just wherever difflib decided the mismatched region ends --
+        # unrelated to any confirmed match -- and could reach all the way
+        # to the edge of a large (inflated) window even though the single
+        # fuzzy match actually found within it sat much earlier. Using
+        # that raw boundary to advance the cursor jumped it there
+        # directly, permanently exhausting the ASR stream (an empty
+        # window forever after) for the rest of the song.
+        last_confirmed_offset: Optional[int] = None
+        for tag, wa1, wa2, ca1, ca2 in opcodes:
+            if tag == "equal":
+                for k in range(wa2 - wa1):
+                    asr_w = asr_words[cursor + wa1 + k]
+                    ex_idx = i + ca1 + k
+                    if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
+                        starts[ex_idx] = asr_w.start
+                        ends[ex_idx] = asr_w.end
+                        confident[ex_idx] = True
+                        last_confirmed_offset = max(last_confirmed_offset or 0, wa1 + k)
+            elif tag == "replace" and (ca2 - ca1) == 1:
+                # A single unmatched existing word against one or more ASR
+                # words in this window slice -- try every candidate, keep
+                # the best fuzzy match, same technique `mxl_lrc_generator.
+                # place_words_via_asr` already validated for exactly this
+                # failure mode (ASR mishearing a word differently than the
+                # reference text).
+                best_ratio = 0.0
+                best_asr_w = None
+                best_wk = None
+                for wk in range(wa1, wa2):
+                    ratio = difflib.SequenceMatcher(None, chunk_tokens[ca1], window[wk]).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_asr_w = asr_words[cursor + wk]
+                        best_wk = wk
+                if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
+                    if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
+                        ex_idx = i + ca1
+                        starts[ex_idx] = best_asr_w.start
+                        ends[ex_idx] = best_asr_w.end
+                        confident[ex_idx] = True
+                        last_confirmed_offset = max(last_confirmed_offset or 0, best_wk)
+
+        if last_confirmed_offset is not None:
+            cursor += last_confirmed_offset + 1
+        pending_word_count = 0
 
     return starts, ends, confident
 
@@ -953,11 +1148,11 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     words = extract_words(entries)
     if not words:
         return RealignResult(success=False, error="Existing file has no words to realign.")
+    our_line_of_word = _word_line_indices(entries, words)
 
     lrc_prep = None
     if use_lrc and audio_duration is not None:
         our_lines = _reconstruct_our_lines(entries)
-        our_line_of_word = _word_line_indices(entries, words)
         lrc_prep = prepare_lrc(words, asr_words, artist or existing.artist, title or existing.title,
                                 audio_duration, forced_candidate=forced_lrc_candidate,
                                 our_lines=our_lines, our_line_of_word=our_line_of_word, log=log)
@@ -996,7 +1191,7 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
             f"time calibration ({lrc_prep.calibration_kind}) offset {lrc_prep.calibration_offset:+.1f}s "
             f"({lrc_prep.calibration_confidence:.0%} agreement)")
     else:
-        starts, ends, confident = match_words_to_asr(words, asr_words)
+        starts, ends, confident = match_words_to_asr(words, asr_words, line_of_word=our_line_of_word)
         quality = RealignQuality(n_words=len(words), n_asr_matched=sum(confident))
         if use_lrc and audio_duration is not None:
             if lrc_prep is not None and lrc_confident:
@@ -1146,7 +1341,8 @@ class GapCalibration:
     correction_fn: Optional[Callable[[float], float]] = None
 
 
-def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[Word]) -> GapCalibration:
+def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[Word],
+                             line_of_word: Optional[List[int]] = None) -> GapCalibration:
     """FIRST PASS: checks whether the whole file can be explained by a
     single constant real-time offset (or slow linear drift) from its OWN
     original timing -- i.e. #GAP (or a slow drift) is the only real
@@ -1169,7 +1365,7 @@ def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[
     for GAP calibration -- only "refine" (tier 1/2 already found some
     real support) -- which is the safe, correct default for this call
     site, not a missing feature."""
-    starts, ends, confident = match_words_to_asr(existing_words, asr_words)
+    starts, ends, confident = match_words_to_asr(existing_words, asr_words, line_of_word=line_of_word)
     candidates = [(i, w.orig_start, starts[i] - w.orig_start)
                   for i, w in enumerate(existing_words) if confident[i]]
     offset, slope, confidence, kind, skipped_reason, correction_fn, _holdout = two_tier_time_calibration(candidates)
@@ -1257,10 +1453,11 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
     words = extract_words(entries)
     if not words:
         return RealignResult(success=False, error="Existing file has no words to realign.")
+    our_line_of_word = _word_line_indices(entries, words)
 
     quality = ValidateQuality(n_words=len(words))
 
-    gap = compute_gap_calibration(words, asr_words)
+    gap = compute_gap_calibration(words, asr_words, line_of_word=our_line_of_word)
     if gap.offset is not None:
         drift_desc = f", drift {gap.slope:+.4f}s/s" if gap.kind == "drift" else ""
         rep_desc = " (representative only, see correction_fn)" if gap.kind in ("piecewise", "isotonic") else ""
@@ -1278,7 +1475,6 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
     lrc_seed = None
     if use_lrc and audio_duration is not None:
         our_lines = _reconstruct_our_lines(entries)
-        our_line_of_word = _word_line_indices(entries, words)
         prep = prepare_lrc(words, asr_words, artist or existing.artist, title or existing.title,
                             audio_duration, forced_candidate=forced_lrc_candidate,
                             our_lines=our_lines, our_line_of_word=our_line_of_word, log=log)
@@ -1562,14 +1758,16 @@ def build_arg_parser():
                          "local-rematch. Adapted from UltraStarKaraokeMaker. Only applies to --strategy "
                          "replace. See CLAUDE.md.")
     p.add_argument("--no-force-align-gaps", dest="force_align_gaps", action="store_false")
-    p.add_argument("--strategy", choices=["replace", "validate"], default="replace",
-                    help="PROTOTYPE, not GUI-exposed yet (default: replace). 'replace': a word confidently "
-                         "matched to ASR has its timing REPLACED with ASR's own value (shipped behavior). "
-                         "'validate': first checks whether the whole file is explained by a single global "
-                         "GAP/drift correction, then a word whose (GAP-corrected) original position is "
-                         "independently CONFIRMED by ASR is left completely untouched -- position and "
-                         "length both -- instead of being overwritten; only words that don't validate are "
-                         "repositioned. See CLAUDE.md.")
+    p.add_argument("--strategy", choices=["replace", "validate"], default="validate",
+                    help="(default: validate). 'validate': first checks whether the whole file is explained "
+                         "by a single global GAP/drift correction, then a word whose (GAP-corrected) original "
+                         "position is independently CONFIRMED by ASR is left completely untouched -- position "
+                         "and length both -- instead of being overwritten; only words that don't validate are "
+                         "repositioned. Automatically falls back to whole-song ASR-primary matching (the same "
+                         "mechanism 'replace' uses) when too few words validate (see "
+                         "MXL_LRC_MIN_ASR_PLACEMENT_RATE), since that means the file's own timing can't be "
+                         "trusted enough for 'validate' to be safe. 'replace': a word confidently matched to "
+                         "ASR has its timing REPLACED with ASR's own value directly. See CLAUDE.md.")
     return p
 
 
@@ -1604,15 +1802,17 @@ class RealignPipelineOptions:
     # retry itself is gated on this (set by run() from args.batch, and by
     # gui.py's _build_realign_opts from its own _is_batch()).
     batch: bool = False
-    # "replace" (default, shipped): realign_song, a matched word's timing
-    # is REPLACED with ASR's own value. "validate" (PROTOTYPE -- real-
-    # validated but only helps when the file is already mostly accurate,
-    # see CLAUDE.md -- kept off by default, selectable via CLI --strategy
-    # or the GUI's Strategy dropdown): realign_song_validate -- a word
-    # whose original position (after a single global GAP/drift correction)
-    # is independently confirmed by ASR is left completely untouched
-    # instead.
-    strategy: str = "replace"
+    # "validate" (DEFAULT as of 2026-08-15, see CLAUDE.md): realign_song_
+    # validate -- a word whose original position (after a single global
+    # GAP/drift correction) is independently confirmed by ASR is left
+    # completely untouched instead of being overwritten; automatically
+    # falls back to whole-song ASR-primary matching (the same mechanism
+    # "replace" uses) when too few words validate, so it's safe even on
+    # a file whose own timing turns out not to be trustworthy at all.
+    # "replace": realign_song, a matched word's timing is REPLACED with
+    # ASR's own value directly -- selectable via CLI --strategy or the
+    # GUI's Strategy dropdown.
+    strategy: str = "validate"
 
 
 @dataclass

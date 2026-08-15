@@ -130,18 +130,28 @@ to the gui at the same time.
   match ratio at 89-90% (Gold). Any future "does this look good enough"
   gate should consider a local/run-based signal (longest unmatched run,
   etc.), not just an aggregate ratio.
-- **Repeated-phrase/occurrence disambiguation is an unsolved, recurring
-  failure class**, not a one-off bug — hit independently in at least 5
-  different mechanisms across this project's history (`--verify-
-  placement`'s expand-search, `realign.py`'s `"windowed"` and `"seed"`
-  matching, both rejected rewindow follow-up prototypes). A search/match
-  window containing more than one real occurrence of a repeated word or
-  phrase has no way to pick the right one on its own, and confidently
-  returns whichever it finds — sometimes far away. No aggregate
-  confidence signal reliably catches this; only a real disambiguation
-  mechanism (not yet built) would. Don't re-propose "just search a
-  window and check if the text is there" as a fix for a placement bug
-  without addressing this directly.
+- **Repeated-phrase/occurrence disambiguation is a recurring failure
+  class**, not a one-off bug — hit independently in at least 6 different
+  mechanisms across this project's history (`--verify-placement`'s
+  expand-search, `realign.py`'s `"windowed"` and `"seed"` matching, both
+  rejected rewindow follow-up prototypes, and `lrc_timing.
+  match_asr_to_lrc_lines`, see below). A TIME- or plain SEARCH-window
+  containing more than one real occurrence of a repeated word or phrase
+  has no way to pick the right one on its own, and confidently returns
+  whichever it finds — sometimes far away. No aggregate confidence
+  signal reliably catches this. Don't re-propose "just search a window
+  and check if the text is there" as a fix for a placement bug without
+  addressing this directly. **A real fix pattern now exists and is
+  shipped in multiple places** (`reconcile_line_structure`, `lyrics_
+  lookup.assign_lrc_line_ids_sequentially`, `match_asr_to_lrc_lines`):
+  a forward-only SEQUENCE-POSITION cursor, never a time/search window —
+  walk both sequences forward together, search only the NOT-YET-
+  CONSUMED remainder on each step. This is a structurally different
+  category from the rejected time-windowed attempts: a repeated phrase
+  later in a sequence is provably unreachable once the cursor has
+  already advanced past its earlier occurrence, rather than merely
+  unlikely to be picked. Still worth defaulting to for any NEW placement
+  mechanism hitting this class, rather than re-inventing a window-search.
 
 ## Removed / rejected approaches (don't re-attempt without new evidence)
 
@@ -785,15 +795,142 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   deliberate, not a gap: the user's own words were "basically never
   allow the wrong artist unless there is literally nothing available for
   the correct artist."
+- `lrc_timing.match_asr_to_lrc_lines` rewritten to a forward-only CURSOR
+  (2026-08-15, user's explicit request after reporting a real failure on
+  Chappell Roan - "Pink Pony Club", a song whose chorus repeats 3 full
+  times): used by BOTH `realign.py` and `mxl_lrc_generator.py`'s primary
+  MXL+LRC generation path to find, per LRC line, a real ASR anchor
+  BEFORE trusting LRC line timestamps for calibration (`two_tier_time_
+  calibration`). The OLD implementation ran one global, non-chronological
+  `difflib.SequenceMatcher` over the WHOLE ASR word stream vs. the WHOLE
+  LRC word stream (every line's words concatenated, all repeats
+  included) — the same "repeated-phrase disambiguation" failure class
+  documented above, just never fixed in this mechanism. Real confirmed
+  failure: a genuine ~130s garbled/ad-lib stretch in the middle of the
+  song got ZERO anchors under the global diff, and every line after that
+  gap was then anchored ~134-135s TOO EARLY — matched against an earlier
+  occurrence of the same repeated chorus instead of its own real, later
+  one; `two_tier_time_calibration` then correctly refused to calibrate
+  at all (confidence 0%), leaving the whole LRC candidate unused and
+  producing the "only 16%/35% of words validated or got an anchor"
+  warning even though the user's own LRC file was, by their own report,
+  an exact match never more than ~1s off. Fixed with the same forward-
+  only cursor principle as `reconcile_line_structure`/`assign_lrc_line_
+  ids_sequentially`: walk LRC lines in order, search only a window of
+  ASR words starting where the PREVIOUS line's own match left off — a
+  repeated phrase later in the song can never be confused with an
+  earlier occurrence, because the cursor has already advanced past it.
+  The window is NOT fixed-size per line: it accumulates the word count
+  of every skipped (no-match) line since the cursor last actually
+  advanced (`pending_word_count`, capped at `MAX_PENDING_WORDS = 60`),
+  so a real multi-line garbled stretch doesn't permanently strand the
+  cursor once real content resumes. A real second bug was found DURING
+  this same real-audio validation and fixed before shipping: an
+  uncapped/too-permissive window let a single coincidentally-shared
+  common word (e.g. "the") register as a false anchor once the window
+  grew large — fixed with a minimum-match-quality gate
+  (`MIN_MATCH_TOKEN_FRACTION = 0.5`: at least half of a line's own
+  tokens, minimum 2 for anything longer than 1 word, must actually
+  match before a candidate is trusted enough to advance the cursor).
+  Real validation: the exact reported song now calibrates successfully
+  (offset +1.0s, 50% agreement, 80/87 reconciled lines anchored — up
+  from 0 confident calibration, 34/87 anchored) confirmed via a real
+  end-to-end `realign.py` run; a broader real-data comparison (OLD vs
+  NEW, using cached real ASR transcripts, both reconciled and raw-
+  candidate-line inputs) found zero regressions elsewhere and one more
+  real win (Trixie Mattel - "Video Games": calibration confidence
+  52%→82-84%, matched-line count 21-23/51-57→51-57/51-57, i.e. every
+  line). **This fix alone was NOT sufficient** — the user reported the
+  SAME song still misplacing words after this shipped; see `realign.
+  match_words_to_asr` below for the deeper, separate bug this surfaced.
+- `realign.match_words_to_asr` rewritten to a forward-only CURSOR over
+  REAL LINES (2026-08-15, found immediately after the `match_asr_to_lrc_
+  lines` fix above, when the user reported the SAME Pink Pony Club file
+  still misplacing words after that fix shipped): this is the function
+  that places the BULK of individual word timings (not just LRC line
+  anchors) for realign.py's whole "replace"/"seed"/GAP-check pipeline —
+  it had the exact same "repeated-phrase disambiguation" vulnerability,
+  just never fixed. Confirmed via a real per-word trace: the "I'm"
+  starting each of two repeated "...Pink Pony Club" verses landed within
+  ~0.5s of its true position (correct), but every word BETWEEN those two
+  correct anchors — itself repeated content — was confidently matched
+  104-136 SECONDS too early, to an earlier occurrence of the same
+  repeated phrase; being marked "confident", those words were never
+  handed to `interpolate_fallback`, which would otherwise have smoothly
+  placed them.
+
+  **Three real, escalating bugs were found and fixed while validating
+  this rewrite against the SAME real file** (the project's own
+  "iterative bugfix protocol" 3-strikes convention was hit here — after
+  the third attempt still failed on the real data, the fix was
+  redesigned around real line boundaries rather than tuned further):
+  1. First attempt: fixed-size 6-word chunks with a forward cursor
+     (mirroring `match_asr_to_lrc_lines`'s own shape) + a match-fraction
+     gate. Broke a real, legitimate case immediately: the gate applied
+     even to a FRESH (non-inflated) chunk rejected normal SPARSE ASR
+     coverage (most real chunks only confidently transcribe a few of
+     their own words — not a coincidence risk, just incomplete
+     transcription). Fixed: the fraction gate only applies once the
+     search window has actually grown from accumulated skipped chunks,
+     not on a chunk's own first attempt.
+  2. Second: a borderline chunk (exactly meeting the fraction gate) had
+     its few real matched tokens SCATTERED across nearly the entire
+     width of a large accumulated window — advancing the cursor to that
+     match's own raw opcode boundary jumped it all the way to the very
+     END of the ASR stream, permanently stranding every later chunk for
+     the REST OF THE SONG (an empty search window forever after). Fixed
+     with two changes: (a) a span guard rejecting a match whose tokens
+     are scattered further than the actual EVIDENCE found justifies
+     (`matched_token_count`-relative, not chunk-size-relative); (b) the
+     cursor only ever advances to just past the last ACTUALLY CONFIRMED
+     match position, never a raw (possibly much further) opcode
+     boundary — a `"replace"` block's own span is just wherever
+     `difflib` decided the mismatched region ends, not a real match.
+  3. Third: even with both guards above, the fixed-6-word-chunk version
+     STILL occasionally mismatched the same real repeated-chorus
+     stretch (wrong-but-plausible-looking deltas of +8 to +36s) —
+     traced to the root cause: an ARBITRARY chunk boundary can slice a
+     real line in half, leaving neither half enough distinctive content
+     to reliably self-disambiguate against a nearby repeat. Fixed by
+     abandoning fixed-size chunks entirely: `match_words_to_asr` gained
+     an optional `line_of_word` param (from `_word_line_indices`, real
+     line boundaries the caller already has) and now chunks by REAL
+     LYRIC LINES when given — the same unit `reconcile_line_structure`/
+     `match_asr_to_lrc_lines` already use successfully for this exact
+     failure class. Falls back to the old fixed-size chunking only when
+     `line_of_word` isn't given (kept for callers/tests with no entries
+     to derive real lines from). This was the change that actually
+     fixed the real reported case cleanly, confirming the two-tier
+     "match_asr_to_lrc_lines then match_words_to_asr, both by real
+     line" pattern is the right general answer to this failure class,
+     not just a per-mechanism workaround.
+
+  Real end-to-end validation on the exact reported song after all three
+  fixes: GAP-check agreement 49%→96%, and the previously-broken
+  repeated-chorus stretch (deltas of -104s to -136s) now lands within
+  0.1-0.8s, with zero warnings on the final run. A broader real-data
+  check against two other real songs' cached ASR transcripts (Chicago,
+  Trixie Mattel - "Video Games") found high confident-match rates
+  (93.8%, 88.7%) with median deltas near zero and no catastrophic
+  outliers, confirming this generalizes beyond the one reported song.
 - `force_align_gaps` and `retry_low_quality_asr` (see below) default ON.
   `rewindow_long_segments` (see below) defaults ON, independently of the
   shared `config.REWINDOW_ENABLED` used elsewhere.
-- Strategy: `"replace"` (default, shipped) vs. `"validate"`
-  (`--strategy validate`, GUI-selectable, trusts the original position
-  when ASR confirms it's close) — validate only helps when the input
-  file is ALREADY accurate, which defeats the point for the real
-  problem (files that don't match the audio well); kept as an explicit,
-  non-default option, not pursued as the general solution.
+- Strategy: `"validate"` (DEFAULT as of 2026-08-15, user's explicit
+  request — previously an explicit non-default `--strategy validate`
+  option; `"replace"` was the default before this) vs. `"replace"`
+  (`--strategy replace`, GUI-selectable). `"validate"` trusts the
+  original position when ASR confirms it's close (keeps a confirmed
+  word's position AND length completely untouched, rather than
+  overwriting with ASR's own value) and automatically falls back to
+  whole-song ASR-primary matching (the same mechanism `"replace"` uses)
+  when too few words validate — see `realign_song_validate`'s own
+  `MXL_LRC_MIN_ASR_PLACEMENT_RATE` fallback. This fallback (already
+  shipped, not new) is what makes `"validate"` safe as the default even
+  on a file whose own timing turns out not to be trustworthy at all —
+  the earlier reasoning for keeping `"replace"` default ("validate only
+  helps when the input is already accurate") is superseded by this
+  fallback existing.
 
 ### Real bugs found & fixed — root causes worth remembering
 

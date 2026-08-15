@@ -1914,6 +1914,41 @@ print("OK: match_asr_to_lrc_lines recovers a per-line real-ASR-vs-LRC delta stra
       "word stream, and two_tier_time_calibration confidently calibrates the constant +3.0s offset from it "
       "(correction_fn agrees: 10.0 -> 13.0)")
 
+print("  BUG REGRESSION (real case, Chappell Roan - Pink Pony Club, 2026-08-15, a song whose chorus repeats "
+      "3 full times): match_asr_to_lrc_lines rewritten to a forward-only CURSOR (mirroring reconcile_line_"
+      "structure/assign_lrc_line_ids_sequentially) instead of one global, non-chronological SequenceMatcher "
+      "diff over the whole song -- the global diff let a later line get anchored to an EARLIER occurrence of "
+      "a repeated phrase whenever a real garbled/ad-lib stretch broke up clean matching, corrupting every "
+      "delta after that point by the same ~135s. Also confirms the window-growth SAFETY NET this rewrite "
+      "needed (found in the SAME real validation): a long real garbled stretch must still let the cursor "
+      "recover once real content resumes, without a coincidentally-shared common word being mistaken for a "
+      "real anchor along the way:")
+mall_lrc_lines = [(0.0, "start marker")]
+for _i in range(25):
+    mall_lrc_lines.append((5.0 + _i, f"zzq{_i:03d} zzr{_i:03d}"))  # 25 unique, never-in-ASR garbled lines
+mall_lrc_lines.append((40.0, "the end"))
+
+mall_asr_no_recovery = [
+    _Word(text="start", start=0.3, end=0.5), _Word(text="marker", start=0.6, end=0.8),
+    _Word(text="the", start=1.0, end=1.1),  # a lone, unrelated stray "the" -- must NOT be trusted alone
+]
+mall_no_recovery = match_asr_to_lrc_lines(mall_asr_no_recovery, mall_lrc_lines)
+assert mall_no_recovery == [(0, 0.0, 0.3)], mall_no_recovery
+print("  OK: a lone coincidentally-shared common word ('the', only 1 of 'the end''s 2 tokens) is correctly "
+      "declined as too weak a match to trust, even after 25 skipped lines grew the search window -- "
+      "'the end' correctly gets NO candidate rather than a spurious, wildly-wrong one")
+
+mall_asr_with_recovery = mall_asr_no_recovery + [
+    _Word(text="the", start=40.3, end=40.5), _Word(text="end", start=40.6, end=40.8),  # the REAL later match
+]
+mall_with_recovery = match_asr_to_lrc_lines(mall_asr_with_recovery, mall_lrc_lines)
+assert len(mall_with_recovery) == 2, mall_with_recovery
+assert mall_with_recovery[0] == (0, 0.0, 0.3), mall_with_recovery
+assert mall_with_recovery[1][0] == 26 and abs(mall_with_recovery[1][2] - 0.3) < 1e-6, mall_with_recovery
+print("  OK: once genuine matching content resumes ('the end', both real tokens present), the cursor's "
+      "accumulated (not permanently capped-out) window still finds it despite the 25 skipped lines in "
+      "between -- a long real garbled stretch doesn't permanently strand the cursor")
+
 print("\n--- lrc_timing: THIRD tier (piecewise/isotonic) -- a DISCONTINUOUS drift (real edit difference "
       "between recordings, e.g. a chorus removed/bridge shortened) that neither tier 1 (constant) nor "
       "tier 2 (single linear slope) can fit ---")
@@ -3244,6 +3279,57 @@ mwa_unrelated_asr = [_Word(text="hello", start=10.0, end=10.3), _Word(text="xyz"
 _, _, mwa_unrelated_confident = match_words_to_asr(mwa_existing, mwa_unrelated_asr)
 assert mwa_unrelated_confident == [True, False, True], mwa_unrelated_confident
 print("  OK: a genuinely unrelated ASR word ('xyz' for 'favors') is correctly rejected, not fuzzy-matched")
+
+print("  BUG REGRESSION (real case, Chappell Roan - Pink Pony Club, 2026-08-15, a song whose chorus repeats "
+      "3 full times): match_words_to_asr rewritten to a forward-only CURSOR over REAL LINES (via a new "
+      "line_of_word param, from _word_line_indices) instead of one global, non-chronological SequenceMatcher "
+      "diff over the whole song -- the global diff let a REPEATED line get matched to an EARLIER occurrence "
+      "than a correctly-placed line right next to it, confidently mis-marking the words wrong instead of "
+      "leaving them for interpolate_fallback. Real end-to-end validation on the actual reported song: GAP "
+      "check agreement 49%->96%, and the previously-broken repeated-chorus stretch (deltas of -104s to -136s) "
+      "now lands within 0.1-0.8s. An earlier fixed-size-6-word-chunk version of this same rewrite was tried "
+      "first and, even after several rounds of tightening its own guards, still occasionally mismatched this "
+      "exact stretch -- an arbitrary chunk boundary can slice a real line in half; real LINE boundaries (this "
+      "final design) fixed it cleanly:")
+from ultrastar_generator.realign import _word_line_indices as _mwa_word_line_indices
+
+mwa_rep_entries = []
+for _t in ["same", "start"]:
+    mwa_rep_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_rep_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["chorus", "one", "two", "three"]:
+    mwa_rep_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_rep_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["bridge", "unrelated", "content", "here"]:  # never appears in ASR at all
+    mwa_rep_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_rep_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["chorus", "one", "two", "three"]:  # SAME text as the earlier line -- a real repeat
+    mwa_rep_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_rep_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["same", "end"]:
+    mwa_rep_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_rep_entries.append(LineBreak(start=1.0, end=1.1))
+mwa_rep_existing = extract_words(mwa_rep_entries)
+mwa_rep_line_of_word = _mwa_word_line_indices(mwa_rep_entries, mwa_rep_existing)
+
+mwa_rep_asr = [
+    _Word(text="same", start=0.3, end=0.5), _Word(text="start", start=0.6, end=0.8),
+    _Word(text="chorus", start=5.3, end=5.5), _Word(text="one", start=5.6, end=5.8),
+    _Word(text="two", start=5.9, end=6.1), _Word(text="three", start=6.2, end=6.4),  # FIRST real occurrence
+    # (the bridge line has NO matching ASR content anywhere -- simulates a real garbled/ad-lib stretch)
+    _Word(text="chorus", start=15.3, end=15.5), _Word(text="one", start=15.6, end=15.8),
+    _Word(text="two", start=15.9, end=16.1), _Word(text="three", start=16.2, end=16.4),  # SECOND real occurrence
+    _Word(text="same", start=20.3, end=20.5), _Word(text="end", start=20.6, end=20.8),
+]
+mwa_rep_starts, _mwa_rep_ends, mwa_rep_confident = match_words_to_asr(
+    mwa_rep_existing, mwa_rep_asr, line_of_word=mwa_rep_line_of_word)
+assert mwa_rep_confident == [True, True, True, True, True, True, False, False, False, False,
+                              True, True, True, True, True, True], mwa_rep_confident
+assert mwa_rep_starts[2:6] == [5.3, 5.6, 5.9, 6.2], mwa_rep_starts  # first "chorus one two three" -> FIRST occurrence
+assert mwa_rep_starts[10:14] == [15.3, 15.6, 15.9, 16.2], mwa_rep_starts  # second (repeated) line -> SECOND occurrence
+print("  OK: the repeated 'chorus one two three' line correctly matched its OWN (second, later) real ASR "
+      "occurrence, never re-matching the first line's already-claimed occurrence; the unmatchable bridge "
+      "line in between correctly stayed unconfident rather than guessing")
 
 print("  interpolate_fallback: two-sided rate interpolation, one-sided constant shift, degenerate-original "
       "-offset fallback, and identity fallback when no anchor exists anywhere:")
