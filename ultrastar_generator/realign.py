@@ -62,7 +62,8 @@ from .usdx_parser import ParsedSong, UsdxParseError, parse_usdx_file
 from .usdx_writer import write_song
 from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id, load_lrc_file
 from .lrc_timing import (match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure,
-                          reconcile_line_structure, find_cursor_window_match, lrc_line_window)
+                          reconcile_line_structure, find_cursor_window_match, lrc_line_window,
+                          match_block_to_candidates)
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
 from .text_normalize import normalize_word as _normalize
 
@@ -660,26 +661,9 @@ def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: 
         idxs = sorted(idxs)
         t0, t1 = lrc_line_window(lrc_lines, li)
         asr_in_window = [w for w in asr_words if t0 - 0.5 <= w.start <= t1 + 0.5]
-        asr_norm = [_normalize(w.text) for w in asr_in_window]
         existing_norm_line = [existing_words[i].norm for i in idxs]
 
-        sm = difflib.SequenceMatcher(None, existing_norm_line, asr_norm, autojunk=False)
-        matched_local: dict = {}
-        for tag, a1, a2, b1, b2 in sm.get_opcodes():
-            if tag == "equal":
-                for k in range(a2 - a1):
-                    asr_w = asr_in_window[b1 + k]
-                    if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        matched_local[a1 + k] = asr_w
-            elif tag == "replace" and (a2 - a1) == 1:
-                best_ratio, best_asr_w = 0.0, None
-                for bk in range(b1, b2):
-                    ratio = difflib.SequenceMatcher(None, existing_norm_line[a1], asr_norm[bk]).ratio()
-                    if ratio > best_ratio:
-                        best_ratio, best_asr_w = ratio, asr_in_window[bk]
-                if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
-                    if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        matched_local[a1] = best_asr_w
+        matched_local = match_block_to_candidates(existing_norm_line, asr_in_window)
 
         for local_i, global_i in enumerate(idxs):
             if local_i not in matched_local:
@@ -733,24 +717,7 @@ def rematch_local_gaps(existing_words: List[ExistingWord], asr_words: List[Word]
             continue
 
         block_norm = [existing_words[k].norm for k in range(lo, hi)]
-        asr_norm = [_normalize(w.text) for w in asr_in_window]
-        sm = difflib.SequenceMatcher(None, block_norm, asr_norm, autojunk=False)
-        matched_local: dict = {}
-        for tag, a1, a2, b1, b2 in sm.get_opcodes():
-            if tag == "equal":
-                for k in range(a2 - a1):
-                    asr_w = asr_in_window[b1 + k]
-                    if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        matched_local[a1 + k] = asr_w
-            elif tag == "replace" and (a2 - a1) == 1:
-                best_ratio, best_asr_w = 0.0, None
-                for bk in range(b1, b2):
-                    ratio = difflib.SequenceMatcher(None, block_norm[a1], asr_norm[bk]).ratio()
-                    if ratio > best_ratio:
-                        best_ratio, best_asr_w = ratio, asr_in_window[bk]
-                if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
-                    if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        matched_local[a1] = best_asr_w
+        matched_local = match_block_to_candidates(block_norm, asr_in_window)
 
         for local_i, asr_w in matched_local.items():
             global_i = lo + local_i

@@ -1197,6 +1197,29 @@ all of them.
   Re-test: `test_dry_run.py` in full — no dedicated test targets this
   helper in isolation, it's exercised transitively through all 3
   callers' own existing test coverage.
+- **`lrc_timing.match_block_to_candidates`** (added 2026-08-16): given a
+  target block's own normalized words and a caller-bounded candidate
+  `Word` list, runs ONE whole-block `difflib.SequenceMatcher` and returns
+  `{target_local_index: matched Word}` — an "equal" opcode matches
+  directly (gated on the candidate's own confidence); a "replace" opcode
+  where the TARGET side is exactly one token tries every candidate token
+  in that slice for the best fuzzy-ratio match (ASR mishearing a word,
+  e.g. "favors" transcribed as "favorites"), gated on both the fuzzy
+  ratio and the candidate's confidence. Callers: `mxl_lrc_generator.
+  place_words_via_asr`'s own Pass 1, `realign.
+  match_words_to_asr_windowed`, `realign.rematch_local_gaps` — all 3 had
+  independently implemented this exact opcode-walk (confirmed by
+  `match_words_to_asr_windowed`'s own docstring: "mirroring
+  mxl_lrc_generator.place_words_via_asr's Pass 1 exactly"). Deliberately
+  NOT shared with `realign.match_words_to_asr`'s own `_apply_match` —
+  that one is built on `find_cursor_window_match` (REVERSED
+  SequenceMatcher argument order: candidate first, target second) and
+  returns a candidate-side offset for its own forward cursor, neither of
+  which apply to these 3 independent, non-cursored callers.
+  Re-test: `test_dry_run.py`'s `place_words_via_asr` block (esp. the
+  "favors"~"favorites" fuzzy-mishearing and next-line-spillover cases),
+  `rematch_local_gaps`'s own block, and `match_words_to_asr_windowed`'s
+  own block.
 
 ## Environment
 

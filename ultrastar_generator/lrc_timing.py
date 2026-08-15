@@ -190,6 +190,68 @@ def lrc_line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float,
     return t0, t1
 
 
+def match_block_to_candidates(
+    target_norm: List[str],
+    candidate_words: List[Word],
+    *,
+    fuzzy_min_ratio: Optional[float] = None,
+    min_candidate_confidence: Optional[float] = None,
+) -> Dict[int, Word]:
+    """Matches a target block's own normalized words against a caller-
+    bounded candidate `Word` list (already narrowed by time window or
+    proximity -- this function has no time/window concept of its own) via
+    ONE whole-block `difflib.SequenceMatcher` call: an "equal" opcode
+    matches directly (gated on the candidate's own confidence, so a
+    low-confidence ASR word never anchors anything); a "replace" opcode
+    where the TARGET side is exactly one token tries every candidate
+    token in that slice for the best fuzzy-ratio match (real, necessary
+    case: ASR mishears a word differently than its true text -- e.g.
+    "favors" transcribed as "favorites" -- independent of any upstream
+    OCR/text issue), gated on BOTH the fuzzy ratio and the candidate's own
+    confidence. Returns `{target_local_index: matched Word}` -- keyed by
+    the TARGET's own local index (not the candidate's), so a caller maps
+    local -> global however it needs to (a contiguous offset, or an
+    explicit non-contiguous index list) -- that mapping is caller-
+    specific and deliberately not part of this function's job.
+
+    Extracted 2026-08-16: `mxl_lrc_generator.place_words_via_asr`'s own
+    Pass 1, `realign.match_words_to_asr_windowed`, and `realign.
+    rematch_local_gaps` had all independently implemented this exact
+    same opcode-walk (confirmed by `match_words_to_asr_windowed`'s own
+    docstring: "mirroring mxl_lrc_generator.place_words_via_asr's Pass 1
+    exactly"). Deliberately NOT shared with `realign.match_words_to_asr`'s
+    own `_apply_match` -- that one uses a REVERSED SequenceMatcher
+    argument order (candidate first, target second, since it's built on
+    top of the caller-agnostic `find_cursor_window_match` above, which
+    searches a haystack for a target) and returns a candidate-side offset
+    for the caller's own forward cursor to advance by, neither of which
+    apply to these 3 callers (each an independent, non-cursored, per-
+    block/per-line match)."""
+    if fuzzy_min_ratio is None:
+        fuzzy_min_ratio = config.MXL_LRC_FUZZY_TEXT_MIN_RATIO
+    if min_candidate_confidence is None:
+        min_candidate_confidence = config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE
+    candidate_norm = [_normalize(w.text) for w in candidate_words]
+    sm = difflib.SequenceMatcher(None, target_norm, candidate_norm, autojunk=False)
+    matched: Dict[int, Word] = {}
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(a2 - a1):
+                w = candidate_words[b1 + k]
+                if w.confidence >= min_candidate_confidence:
+                    matched[a1 + k] = w
+        elif tag == "replace" and (a2 - a1) == 1:
+            best_ratio, best_w = 0.0, None
+            for bk in range(b1, b2):
+                ratio = difflib.SequenceMatcher(None, target_norm[a1], candidate_norm[bk]).ratio()
+                if ratio > best_ratio:
+                    best_ratio, best_w = ratio, candidate_words[bk]
+            if best_ratio >= fuzzy_min_ratio and best_w is not None \
+                    and best_w.confidence >= min_candidate_confidence:
+                matched[a1] = best_w
+    return matched
+
+
 # Ad-lib/filler and connector words that different transcribers (an LRC's
 # own author vs. whoever wrote our existing .txt) commonly add or drop
 # without it meaning the LINE is actually different content -- user's own

@@ -54,7 +54,8 @@ from typing import Callable, List, Optional, Tuple
 
 from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib, effective_lrc_duration
-from .lrc_timing import parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines, lrc_line_window
+from .lrc_timing import (parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines, lrc_line_window,
+                          match_block_to_candidates)
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
 from .text_normalize import normalize_word as _normalize
@@ -538,57 +539,18 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
         idxs = sorted(idxs)
         t0, t1 = lrc_line_window(lrc_lines, li)
         asr_in_window = [w for w in asr_words if t0 - 0.5 <= w.start <= t1 + 0.5]
-        asr_norm = [_normalize(w.text) for w in asr_in_window]
         mxl_norm_line = [_normalize(word_clean_text[i]) if word_clean_text and word_clean_text[i]
                           else mxl_words[i].norm for i in idxs]
-        sm = difflib.SequenceMatcher(None, mxl_norm_line, asr_norm, autojunk=False)
-        matched_local = {}
-        for tag, a1, a2, b1, b2 in sm.get_opcodes():
-            if tag == "equal":
-                for k in range(a2 - a1):
-                    asr_w = asr_in_window[b1 + k]
-                    if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        matched_local[a1 + k] = asr_w
-                    # else: leave unmatched -- falls through to pass 2.
-            elif tag == "replace" and (a2 - a1) == 1:
-                # A single unmatched MXL word against one or more ASR words
-                # difflib's own alignment already anchored here, between
-                # correct matches on both sides -- if one of them is merely
-                # CLOSE (not identical) to the MXL word, trust it the same
-                # way assign_words_to_lines already does for display text.
-                # Confirmed real, necessary case: ASR itself mishears a word
-                # ("favors" transcribed as "favorites") independently of any
-                # MXL OCR issue -- an exact-only match (even against the
-                # already-cleaned text) still misses this, since ASR's own
-                # error is the mismatch here, not the MXL's.
-                #
-                # The ASR side of the block isn't always exactly one word:
-                # `asr_in_window` is time-bounded, not line-bounded (a
-                # deliberate +-0.5s slop so a confident match isn't missed
-                # just for landing slightly outside the LRC line's own
-                # window) -- so a single spilled-over word from the
-                # NEXT line (e.g. "I'm") can tag along in the same replace
-                # block as the real mismatch ("favorites"). Real confirmed
-                # case: block was ['favors'] vs ['favorites', "i'm"], a 1:2
-                # replace that the old code's exact `(b2-b1)==1` check
-                # rejected outright even though the correct candidate
-                # ("favorites") was sitting right there at the block's own
-                # start. Only a single MXL word is unresolved here, so it
-                # can only ever correspond to at most one real ASR word --
-                # try each candidate in the block and keep the best-scoring
-                # one that clears the threshold, rather than requiring the
-                # block to already be exactly 1:1.
-                best_ratio = 0.0
-                best_asr_w = None
-                for bk in range(b1, b2):
-                    ratio = difflib.SequenceMatcher(None, mxl_norm_line[a1], asr_norm[bk]).ratio()
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_asr_w = asr_in_window[bk]
-                if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
-                    if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        matched_local[a1] = best_asr_w
-                # else: genuinely different words -- leave unmatched.
+        # matched_local: see lrc_timing.match_block_to_candidates -- ASR
+        # mishearing a word (e.g. "favors" transcribed as "favorites") is
+        # tolerated via a fuzzy-ratio fallback on a single-word replace
+        # block; `asr_in_window`'s own +-0.5s time slop (not line-bounded)
+        # means that block isn't always exactly 1:1 against the ASR side
+        # (real confirmed case: a spilled-over next-line word "I'm" rode
+        # along with the real mismatch "favorites" in the same block) --
+        # match_block_to_candidates tries every candidate in the block and
+        # keeps the best-scoring one, not just an already-1:1 slice.
+        matched_local = match_block_to_candidates(mxl_norm_line, asr_in_window)
 
         for local_i, global_i in enumerate(idxs):
             if local_i not in matched_local:
