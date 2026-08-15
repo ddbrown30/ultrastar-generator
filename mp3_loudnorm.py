@@ -107,10 +107,13 @@ Usage
 import argparse
 import filecmp
 import json
+import os
 import shutil
 import stat
 import subprocess
 import sys
+import time
+import uuid
 import zlib
 from pathlib import Path
 
@@ -251,14 +254,42 @@ def load_crc_registry(root: Path) -> dict:
 
 def save_crc_registry(root: Path, registry: dict):
     """Write the CRC log atomically (write to a temp file, then replace).
-    Called after every file, not batched, so a mid-run cancellation
-    doesn't lose progress already made."""
+    Called after every file, not batched, so a mid-run cancellation doesn't
+    lose progress already made.
+
+    do_normalize is single-threaded, so two saves never literally run at
+    once from our own code -- but on network shares (UNC paths, mapped
+    drives) something external -- antivirus, the SMB server itself, a
+    sync/backup agent -- can transiently hold the freshly-written temp
+    file open for a moment, and since skips are fast, saves can land close
+    enough together to hit that window. So: use a unique temp filename per
+    attempt (never reuses a name a lingering lock could be holding), retry
+    briefly on failure, and never let a save error crash the run -- since
+    we always write the FULL current registry, the next successful save
+    (from the next file) naturally includes whatever this one failed to
+    persist."""
     log_path = root / CRC_LOG_FILENAME
-    tmp_path = log_path.with_suffix(log_path.suffix + ".tmp")
-    ensure_writable(log_path)
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(registry, f, indent=2, sort_keys=True)
-    tmp_path.replace(log_path)
+    data = json.dumps(registry, indent=2, sort_keys=True)
+
+    last_error = None
+    for attempt in range(5):
+        tmp_path = log_path.with_name(f"{log_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        try:
+            ensure_writable(log_path)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(data)
+            tmp_path.replace(log_path)
+            return
+        except OSError as e:
+            last_error = e
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            time.sleep(0.25 * (attempt + 1))
+
+    print(f"WARNING: could not save the CRC log after several attempts ({last_error}). "
+          f"Continuing -- this update will be retried on the next save.")
 
 
 def find_legacy_backup(root: Path, rel: Path):
