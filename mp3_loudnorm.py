@@ -118,7 +118,7 @@ import zlib
 from pathlib import Path
 
 BACKUP_DIRNAME = r"Z:\.loudnorm_backups"  # fixed location, not relative to the processed root
-CRC_LOG_FILENAME = ".loudnorm_crc.json"
+CRC_LOG_FILENAME = r"Z:\.loudnorm_crc.json"  # fixed location, not relative to the processed root
 DURATION_ABORT_TOLERANCE = 0.5    # seconds; skip replacing file if exceeded
 DURATION_VERIFY_TOLERANCE = 0.05  # seconds; flagged in --verify
 LOUDNESS_VERIFY_TOLERANCE = 1.0   # LUFS
@@ -237,19 +237,50 @@ def compute_crc32(path: Path) -> str:
     return format(crc & 0xFFFFFFFF, "08x")
 
 
+def crc_key_for(path: Path, root: Path) -> str:
+    """Registry key for a file: its path relative to its own drive (e.g.
+    "Songs/Foo/track.mp3"), not relative to whatever subfolder was passed
+    as root. Needed because the CRC log is a single shared file rather
+    than one per root -- keys have to mean the same thing regardless of
+    which subfolder the script was pointed at for a given run."""
+    return path.relative_to(root.anchor).as_posix()
+
+
 def load_crc_registry(root: Path) -> dict:
-    """Load the {relative_path: crc32} log. Missing or unreadable -> {}."""
-    log_path = root / CRC_LOG_FILENAME
-    if not log_path.exists():
-        return {}
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
+    """Load the {drive_relative_path: crc32} log from its fixed location.
+    Also merges in a legacy per-root log (<root>\\.loudnorm_crc.json, from
+    before the log became a single shared file), re-keying its entries
+    from root-relative to drive-relative so they still match correctly.
+    New-location entries win if a key exists in both. Missing/unreadable
+    files are simply skipped -> {}."""
+    registry = {}
+
+    log_path = Path(CRC_LOG_FILENAME)
+    if log_path.exists():
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                registry.update(data)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    legacy_log_path = root / log_path.name
+    if legacy_log_path != log_path and legacy_log_path.exists():
+        try:
+            with open(legacy_log_path, "r", encoding="utf-8") as f:
+                legacy_data = json.load(f)
+            if isinstance(legacy_data, dict):
+                for old_key, crc in legacy_data.items():
+                    try:
+                        new_key = crc_key_for(root / old_key, root)
+                    except ValueError:
+                        continue
+                    registry.setdefault(new_key, crc)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return registry
 
 
 def save_crc_registry(root: Path, registry: dict):
@@ -267,8 +298,12 @@ def save_crc_registry(root: Path, registry: dict):
     briefly on failure, and never let a save error crash the run -- since
     we always write the FULL current registry, the next successful save
     (from the next file) naturally includes whatever this one failed to
-    persist."""
-    log_path = root / CRC_LOG_FILENAME
+    persist.
+
+    root is accepted but unused -- the log now lives at a fixed location
+    regardless of root -- kept only for symmetry with load_crc_registry,
+    which still needs root to locate/merge a legacy per-root log."""
+    log_path = Path(CRC_LOG_FILENAME)
     data = json.dumps(registry, indent=2, sort_keys=True)
 
     last_error = None
@@ -520,7 +555,7 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
 
     for path in files:
         rel = path.relative_to(root)
-        rel_key = rel.as_posix()
+        rel_key = crc_key_for(path, root)
         backup_path = backup_root / rel
         backup_exists = backup_path.exists()
 
@@ -754,7 +789,7 @@ def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failu
             if restore_on_failure:
                 try:
                     restore_file(backup_path, current_path)
-                    rel_key = rel.as_posix()
+                    rel_key = crc_key_for(current_path, root)
                     if crc_registry.pop(rel_key, None) is not None:
                         save_crc_registry(root, crc_registry)
                     print(f"    -> restored from backup")
@@ -799,7 +834,7 @@ def do_restore(root: Path):
         current_path = root / rel
         try:
             restore_file(backup_path, current_path)
-            rel_key = rel.as_posix()
+            rel_key = crc_key_for(current_path, root)
             if crc_registry.pop(rel_key, None) is not None:
                 save_crc_registry(root, crc_registry)
             print(f"Restored: {rel}")
