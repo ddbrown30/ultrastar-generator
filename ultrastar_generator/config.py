@@ -32,12 +32,16 @@ IMAGE_EXTS = (".jpg", ".jpeg")
 # first; see media_extract.extract_audio_track).
 AVI_EXTRACTED_MP3_QUALITY = 2  # ffmpeg libmp3lame VBR scale, 0=best/largest .. 9=worst/smallest
 
-# Embedded cover-art extraction (mutagen, cover_extract.py) only runs when
-# no .jpg/.jpeg companion was already found next to the resolved audio
-# source. Matches file_discovery.find_companions' own "[CO]"/"[BG]" tag
-# naming convention, so a later find_companions call on the same folder
-# reads an extracted cover identically to a hand-placed one.
-EMBEDDED_COVER_TAG_SUFFIX = " [CO]"
+# Cover-art fallback tag suffix -- shared by cover_extract.py (embedded
+# audio-tag extraction) and cover_fetch.py (online download), both of
+# which only ever run when no .jpg/.jpeg companion was already found next
+# to the resolved audio source. Matches file_discovery.find_companions'
+# own "[CO]"/"[BG]" tag naming convention, so a later find_companions
+# call on the same folder reads a synthesized cover identically to a
+# hand-placed one -- including on a re-run, which is what makes this a
+# real cache, not just a naming nicety (a previously downloaded/extracted
+# "<name> [CO].jpg" is found and reused, never re-fetched).
+COVER_TAG_SUFFIX = " [CO]"
 
 # --- Pipeline defaults ------------------------------------------------------
 DEFAULT_LANGUAGE = "English"
@@ -1013,6 +1017,7 @@ class PipelineOptions:
     skip_separation: bool = False
     vocals_path: Optional[str] = None
     fetch_lyrics: bool = True
+    fetch_cover: bool = True
     no_video_sync: bool = False
     no_whisperx: bool = False
     no_transcribe: bool = False  # DIAGNOSTIC (default off): skip the WhisperX

@@ -2862,6 +2862,122 @@ with _tempfile.TemporaryDirectory() as d:
     assert out_path.read_bytes() == _JPEG_BYTES
 print(f"OK: extracted cover written with find_companions' own [CO] tag convention: {out_path.name}")
 
+print("\n--- cover_fetch: online cover download (MusicBrainz/CAA -> iTunes -> Deezer), "
+      "adapted from UltraStarKaraokeMaker's own cascade (see CLAUDE.md/project memory) ---")
+from ultrastar_generator import cover_fetch
+
+
+class _FakeCoverResponse:
+    def __init__(self, payload, status_code=200, is_json=True):
+        self._payload = payload
+        self.status_code = status_code
+        self.content = payload if not is_json else b""
+
+    def json(self):
+        return self._payload
+
+
+class _FakeCoverRequestsModule:
+    """Routes by URL substring to whichever fake endpoint response was
+    configured -- MusicBrainz recording search, Cover Art Archive image,
+    iTunes search, Deezer search. Any endpoint not configured 404s, same
+    as a real "nothing found" response."""
+    def __init__(self, mb_search=None, caa_image=None, itunes_search=None,
+                 itunes_image=None, deezer_search=None, deezer_image=None):
+        self._mb_search = mb_search
+        self._caa_image = caa_image
+        self._itunes_search = itunes_search
+        self._itunes_image = itunes_image
+        self._deezer_search = deezer_search
+        self._deezer_image = deezer_image
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        if "musicbrainz.org" in url:
+            return (_FakeCoverResponse(self._mb_search) if self._mb_search is not None
+                    else _FakeCoverResponse(None, status_code=404))
+        if "coverartarchive.org" in url:
+            return (_FakeCoverResponse(self._caa_image, is_json=False) if self._caa_image is not None
+                    else _FakeCoverResponse(None, status_code=404))
+        if "itunes.apple.com" in url:
+            return (_FakeCoverResponse(self._itunes_search) if self._itunes_search is not None
+                    else _FakeCoverResponse(None, status_code=404))
+        if "600x600" in url:
+            return (_FakeCoverResponse(self._itunes_image, is_json=False) if self._itunes_image is not None
+                    else _FakeCoverResponse(None, status_code=404))
+        if "api.deezer.com" in url:
+            return (_FakeCoverResponse(self._deezer_search) if self._deezer_search is not None
+                    else _FakeCoverResponse(None, status_code=404))
+        if "deezer" in url:  # the cover image URL itself
+            return (_FakeCoverResponse(self._deezer_image, is_json=False) if self._deezer_image is not None
+                    else _FakeCoverResponse(None, status_code=404))
+        return _FakeCoverResponse(None, status_code=404)
+
+
+# MusicBrainz release selection: among several candidate releases, the
+# one with the EARLIEST known date wins (the original release, not a
+# later reissue/compilation) -- a dateless candidate is only used as a
+# last-resort fallback.
+mb_recordings = {
+    "recordings": [{
+        "releases": [
+            {"id": "mbid-reissue", "date": "2010-01-01"},
+            {"id": "mbid-original", "date": "1999-06-15"},
+            {"id": "mbid-nodate"},
+        ],
+    }],
+}
+_sys.modules["requests"] = _FakeCoverRequestsModule(mb_search=mb_recordings, caa_image=_JPEG_BYTES)
+mbid = cover_fetch._mb_find_release_mbid("Some Artist", "Some Song")
+assert mbid == "mbid-original", mbid
+print("OK: _mb_find_release_mbid picks the EARLIEST-dated release, not the first one seen or the newest")
+
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    out_path = cover_fetch.fetch_cover_online("Some Artist", "Some Song", d, "Some Artist - Some Song")
+    assert out_path is not None and out_path.name == "Some Artist - Some Song [CO].jpg", out_path
+    assert out_path.read_bytes() == _JPEG_BYTES
+print("OK: fetch_cover_online succeeds via MusicBrainz+Cover Art Archive (first in the cascade)")
+
+# MusicBrainz/CAA find nothing -> falls through to iTunes.
+itunes_results = {"results": [{"artworkUrl100": "https://example.com/art/100x100bb.jpg"}]}
+_sys.modules["requests"] = _FakeCoverRequestsModule(itunes_search=itunes_results, itunes_image=_PNG_BYTES)
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    out_path = cover_fetch.fetch_cover_online("Some Artist", "Some Song", d, "Some Artist - Some Song")
+    assert out_path is not None and out_path.name == "Some Artist - Some Song [CO].png", out_path
+    assert out_path.read_bytes() == _PNG_BYTES
+print("OK: fetch_cover_online falls through to iTunes when MusicBrainz/CAA have nothing, "
+      "and correctly swaps '100x100' for '600x600' in the artwork URL")
+
+# MusicBrainz and iTunes both find nothing -> falls through to Deezer.
+deezer_results = {"data": [{"album": {"cover_xl": "https://cdn-images.deezer-static.test/cover_xl.jpg"}}]}
+_sys.modules["requests"] = _FakeCoverRequestsModule(deezer_search=deezer_results, deezer_image=_JPEG_BYTES)
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    out_path = cover_fetch.fetch_cover_online("Some Artist", "Some Song", d, "Some Artist - Some Song")
+    assert out_path is not None and out_path.name == "Some Artist - Some Song [CO].jpg", out_path
+print("OK: fetch_cover_online falls through all the way to Deezer when nothing else has it")
+
+# Nothing anywhere -> None, never raises.
+_sys.modules["requests"] = _FakeCoverRequestsModule()
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    out_path = cover_fetch.fetch_cover_online("Nobody", "Nothing", d, "Nobody - Nothing")
+    assert out_path is None, out_path
+print("OK: every source failing returns None, never raises")
+
+# A previously downloaded cover is reused directly -- no network call at
+# all (same check-then-fetch caching as separation.isolate_vocals).
+with _tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    pre_existing = d / "Some Artist - Some Song [CO].jpg"
+    pre_existing.write_bytes(_JPEG_BYTES)
+    _sys.modules["requests"] = _FakeCoverRequestsModule()  # would 404 everything if actually called
+    out_path = cover_fetch.fetch_cover_online("Some Artist", "Some Song", d, "Some Artist - Some Song")
+    assert out_path == pre_existing, out_path
+print("OK: a previously downloaded cover is reused directly, no network call needed")
+del _sys.modules["requests"]
+
 print("\n--- output_staging.stage_companions_to_output ---")
 from ultrastar_generator.output_staging import stage_companions_to_output
 

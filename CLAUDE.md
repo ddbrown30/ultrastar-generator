@@ -412,6 +412,27 @@ to the gui at the same time.
   FLAC picture list, OGG/Opus vorbis-comment picture), sniffed by magic
   bytes not claimed MIME type — used as fallback when no `.jpg`
   companion exists.
+- **Online cover-art download** (`cover_fetch.py`, `--fetch-cover`/
+  `--no-fetch-cover`, default ON, GUI checkbox), 2026-08-16: last-resort
+  fallback when NEITHER a companion file NOR an embedded audio tag
+  provided a cover. Adapted from UltraStarKaraokeMaker's own asset-fetch
+  cascade (see `reference-uskmaker` memory) — same source order
+  (MusicBrainz + Cover Art Archive, then iTunes, then Deezer), scoped
+  down to cover image only (USKM's own cascade also enriches #YEAR/
+  #GENRE and fetches a separate fanart.tv background; neither built
+  here) and to the three sources needing no API key/account setup (its
+  Last.fm/Discogs tiers are both gated behind a user-supplied env-var
+  key — skipped to keep this zero-configuration, consistent with this
+  project's other network lookups). Real-network-validated directly
+  (multiple real songs; MusicBrainz+CAA and iTunes both confirmed
+  answering correctly; a nonsense artist/title correctly returns `None`,
+  never raises). Results are cached under `work_dir/extracted/` by the
+  same check-then-fetch idiom `separation.isolate_vocals` uses, keyed by
+  the resolved audio's own filename stem plus `config.COVER_TAG_SUFFIX`
+  (renamed from `EMBEDDED_COVER_TAG_SUFFIX`, now shared by both this and
+  `cover_extract.py`) — a re-run against the same `work_dir` never
+  re-downloads. Runs in `main.py` only, after artist/title are resolved
+  (needed for the query) — not wired into `realign.py`.
 - **Existing-file verification** (`--existing-txt`/`--existing-txt-check`,
   **off by default** — the one deliberate exception to "default on",
   since it can result in NOT regenerating output the user expected):

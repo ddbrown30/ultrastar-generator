@@ -31,6 +31,7 @@ from .models import Song, Syllable
 from .file_discovery import (resolve_artist_title, headline_case, sanitize_filename,
                               AmbiguousInputError, NoAudioSourceFoundError)
 from .song_input import resolve_song_folder
+from .cover_fetch import fetch_cover_online
 from .output_staging import stage_companions_to_output
 from .usdx_parser import parse_usdx_file, UsdxParseError
 from .verify_existing_song import verify_existing_song
@@ -131,6 +132,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "ASR words and mark line breaks (default: on)")
     p.add_argument("--no-fetch-lyrics", dest="fetch_lyrics", action="store_false",
                     help="Disable online lyric lookup/correction")
+    p.add_argument("--fetch-cover", dest="fetch_cover", action="store_true", default=True,
+                    help="Download a cover image online (MusicBrainz/Cover Art Archive, then iTunes, then "
+                         "Deezer) when the input folder has no [CO]-tagged/embedded cover art of its own "
+                         "(default: on)")
+    p.add_argument("--no-fetch-cover", dest="fetch_cover", action="store_false",
+                    help="Disable online cover-art download")
     p.add_argument("--no-video-sync", action="store_true",
                     help="Don't attempt to auto-compute #VIDEOGAP from the video's own audio track")
     p.add_argument("--no-whisperx", action="store_true",
@@ -534,6 +541,14 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         log(f"Found video: {resolved.output_video_source.name}")
     if resolved.cover:
         log(f"Found cover: {resolved.cover.name}")
+    elif opts.fetch_cover:
+        downloaded_cover = fetch_cover_online(artist, title, work_dir / "extracted", resolved.analysis_audio.stem)
+        if downloaded_cover is not None:
+            resolved.cover = downloaded_cover
+            log(f"Downloaded cover art online -> {downloaded_cover.name}")
+        else:
+            log("  Could not find/download cover art online (not found on MusicBrainz/iTunes/Deezer, "
+                "or no network).")
     if resolved.background:
         log(f"Found background: {resolved.background.name}")
     # An explicit --musicxml-reference always wins; otherwise falls back to
@@ -1092,7 +1107,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         whisper_model=args.whisper_model,
         demucs_model=args.demucs_model, bpm_override=args.bpm,
         skip_separation=args.skip_separation, vocals_path=args.vocals_path,
-        fetch_lyrics=args.fetch_lyrics, no_video_sync=args.no_video_sync,
+        fetch_lyrics=args.fetch_lyrics, fetch_cover=args.fetch_cover, no_video_sync=args.no_video_sync,
         no_whisperx=args.no_whisperx, no_transcribe=args.no_transcribe, whisperx_no_vad=args.whisperx_no_vad,
         rewindow_long_segments=args.rewindow_long_segments,
         retry_low_quality_asr=args.retry_low_quality_asr,

@@ -390,6 +390,7 @@ class App(tk.Tk):
         # Curated main-surface options (see gui.py's own module docstring
         # for why only a subset of the ~30 CLI flags are exposed here).
         self.fetch_lyrics = tk.BooleanVar(value=True)
+        self.fetch_cover = tk.BooleanVar(value=True)
         self.existing_txt_check = tk.BooleanVar(value=config.ENABLE_EXISTING_TXT_CHECK)
         self.musicxml_force_calibration = tk.BooleanVar(value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.whisper_model = tk.StringVar(value=config.DEFAULT_WHISPER_MODEL)
@@ -738,6 +739,10 @@ class App(tk.Tk):
                     "mistranscribed words and force phrase breaks at real line breaks. If no valid "
                     "synced candidate is found, you'll be asked whether to continue with pure "
                     "transcription instead.")
+        c2 = ttk.Checkbutton(opts_frame, text="Fetch cover art", variable=self.fetch_cover)
+        c2.grid(row=0, column=1, sticky="w", padx=8, pady=2)
+        Tooltip(c2, "Download a cover image online (MusicBrainz/Cover Art Archive, then iTunes, then "
+                    "Deezer) when the input folder has no [CO]-tagged or embedded cover art of its own.")
         c4 = ttk.Checkbutton(opts_frame, text="Check existing .txt before overwriting", variable=self.existing_txt_check)
         c4.grid(row=1, column=0, sticky="w", padx=8, pady=2)
         Tooltip(c4, "If an existing '<Artist> - <Title>.txt' is found in the input folder, verify its "
@@ -1192,6 +1197,7 @@ class App(tk.Tk):
             title=None if is_batch else self.title_entry.effective_value(),
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             fetch_lyrics=self.fetch_lyrics.get(),
+            fetch_cover=self.fetch_cover.get(),
             existing_txt_check=self.existing_txt_check.get(),
             musicxml_force_calibration=self.musicxml_force_calibration.get(),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
