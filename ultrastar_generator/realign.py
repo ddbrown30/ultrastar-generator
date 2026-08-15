@@ -342,6 +342,7 @@ def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
     CHUNK_SIZE = 6
     WINDOW_WORD_MULTIPLIER = 3
     WINDOW_WORD_SLACK = 10
+    TIGHT_WORD_SLACK = 4
     MAX_PENDING_WORDS = 60
     MIN_MATCH_TOKEN_FRACTION = 0.5
 
@@ -359,85 +360,59 @@ def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
     else:
         chunks = [(i, min(i + CHUNK_SIZE, n)) for i in range(0, n, CHUNK_SIZE)]
 
-    cursor = 0
-    pending_word_count = 0
-    for chunk_start, chunk_end in chunks:
-        i = chunk_start
-        chunk_tokens = a_norm[chunk_start:chunk_end]
-        pending_word_count = min(pending_word_count + len(chunk_tokens), MAX_PENDING_WORDS)
-        window_end = min(cursor + pending_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n_b)
-        window = b_norm[cursor:window_end]
-        if not window:
-            continue
+    def _try_match(window: List[str], chunk_tokens: List[str], require_strict_fraction: bool):
+        """One SequenceMatcher attempt at this window size. Returns
+        `opcodes` if it clears both quality guards, else None.
 
+        The fraction gate (`require_strict_fraction`) only matters for a
+        WIDE/accumulated-window attempt -- that's the specific situation
+        that can make a single coincidentally-shared common word look
+        like a real match (the Pink Pony Club case). A TIGHT-window
+        attempt trusts even a single genuine match, since real songs very
+        often only confidently transcribe a few words per line and that's
+        not a coincidence risk, just incomplete transcription.
+
+        A SECOND, independent guard on top of the fraction gate -- real
+        bug found via the SAME Pink Pony Club validation: a borderline
+        chunk (exactly meeting the fraction gate) can still have its
+        matched tokens SCATTERED across almost the entire (inflated)
+        window -- one coincidental match right at the far edge of a
+        45-word window advanced the cursor there directly, permanently
+        exhausting the ASR stream and stranding every subsequent chunk
+        for the REST of the song. Bounded relative to the EVIDENCE
+        actually found (`matched_token_count`), not just the chunk's
+        nominal size -- a chunk-size-relative cap was still loose enough
+        for a borderline match to legitimately clear it while remaining
+        wrong."""
+        if not window:
+            return None, 0
         sm = difflib.SequenceMatcher(None, window, chunk_tokens, autojunk=False)
         opcodes = sm.get_opcodes()
         equal_wa = [(wa1, wa2) for tag, wa1, wa2, _ca1, _ca2 in opcodes if tag == "equal"]
         matched_token_count = sum(wa2 - wa1 for wa1, wa2 in equal_wa)
-        # The fraction gate only matters once the window has actually
-        # GROWN beyond this chunk's own natural size (accumulated skips
-        # from earlier chunks) -- that's the specific situation that can
-        # make a single coincidentally-shared common word look like a
-        # real match (the Pink Pony Club case). A FRESH chunk (no prior
-        # skips) searches only its own tightly-bounded window, where even
-        # a single genuine match is trustworthy -- gating that too would
-        # reject perfectly normal SPARSE ASR coverage (real songs very
-        # often only confidently transcribe a few words per chunk; that's
-        # not a coincidence risk, just incomplete transcription).
-        window_is_inflated = pending_word_count > len(chunk_tokens)
-        min_needed = 1 if not window_is_inflated else (
+        min_needed = 1 if not require_strict_fraction else (
             1 if len(chunk_tokens) == 1 else max(2, round(len(chunk_tokens) * MIN_MATCH_TOKEN_FRACTION)))
-        # A SECOND, independent guard on top of the fraction gate -- real
-        # bug found via the SAME Pink Pony Club real-audio validation: a
-        # borderline chunk (exactly meeting the fraction gate) can still
-        # have its matched tokens SCATTERED across almost the entire
-        # (inflated) window -- one coincidental match right at the far
-        # edge of a 45-word window advanced the cursor there directly,
-        # permanently exhausting the ASR stream and stranding every
-        # subsequent chunk for the REST of the song (an empty window
-        # forever after). A real match's own tokens should cluster within
-        # roughly the chunk's own size, not spread across the whole
-        # accumulated window -- reject (same as failing the fraction
-        # gate) when they don't.
-        # Bounded relative to the EVIDENCE actually found (matched_token_
-        # count), not just the chunk's nominal size -- real bug found via
-        # the SAME real-audio validation: a chunk-size-relative cap (e.g.
-        # a 6-word chunk always allowed up to a 28-word span) was still
-        # loose enough for a borderline 3-of-6-token match to legitimately
-        # clear it while still being wrong, and each such over-wide accept
-        # dragged the cursor far ahead of where the existing-word index
-        # actually was -- causing EVERY subsequent chunk to search a
-        # window that no longer corresponded to its own true position at
-        # all (compounding, not just a single bad word). 3 real matched
-        # tokens should span at most a handful of extra (skipped/
-        # hallucinated) ASR words each, not a quarter of a 45-word window.
         match_span = (max(wa2 for _wa1, wa2 in equal_wa) - min(wa1 for wa1, _wa2 in equal_wa)) if equal_wa else 0
         max_span = matched_token_count * 3 + 3
         if matched_token_count < min_needed or match_span > max_span:
-            # This whole chunk isn't confirmable in the (accumulated)
-            # window -- don't advance the cursor; the NEXT chunk's own
-            # search starts from the same position, its window growing
-            # to cover this chunk's skipped content too. Every word in
-            # this chunk stays None/False for interpolate_fallback.
-            continue
+            return None, matched_token_count
+        return opcodes, matched_token_count
 
-        # The cursor only ever advances to just past the last ACTUALLY
-        # CONFIRMED match's own real ASR position -- never to a raw
-        # opcode boundary (`wa2`). Real bug found via the SAME Pink Pony
-        # Club validation: a "replace" opcode's own (wa1, wa2) span is
-        # just wherever difflib decided the mismatched region ends --
-        # unrelated to any confirmed match -- and could reach all the way
-        # to the edge of a large (inflated) window even though the single
-        # fuzzy match actually found within it sat much earlier. Using
-        # that raw boundary to advance the cursor jumped it there
-        # directly, permanently exhausting the ASR stream (an empty
-        # window forever after) for the rest of the song.
+    def _apply_match(opcodes, window: List[str], chunk_tokens: List[str], chunk_start: int, cursor: int) -> Optional[int]:
+        """Marks every confirmed word from `opcodes` as matched. Returns
+        the offset (within `window`) of the last ACTUALLY CONFIRMED
+        match -- never a raw, unconfirmed opcode boundary (a `"replace"`
+        block's own span is just wherever difflib decided the mismatched
+        region ends, not a real match; real bug found via Pink Pony Club
+        validation: using that raw boundary to advance the cursor could
+        jump it all the way to the edge of a large window even though the
+        real match sat much earlier)."""
         last_confirmed_offset: Optional[int] = None
         for tag, wa1, wa2, ca1, ca2 in opcodes:
             if tag == "equal":
                 for k in range(wa2 - wa1):
                     asr_w = asr_words[cursor + wa1 + k]
-                    ex_idx = i + ca1 + k
+                    ex_idx = chunk_start + ca1 + k
                     if asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
                         starts[ex_idx] = asr_w.start
                         ends[ex_idx] = asr_w.end
@@ -461,12 +436,80 @@ def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
                         best_wk = wk
                 if best_ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO and best_asr_w is not None:
                     if best_asr_w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE:
-                        ex_idx = i + ca1
+                        ex_idx = chunk_start + ca1
                         starts[ex_idx] = best_asr_w.start
                         ends[ex_idx] = best_asr_w.end
                         confident[ex_idx] = True
                         last_confirmed_offset = max(last_confirmed_offset or 0, best_wk)
+        return last_confirmed_offset
 
+    cursor = 0
+    pending_word_count = 0
+    for chunk_start, chunk_end in chunks:
+        chunk_tokens = a_norm[chunk_start:chunk_end]
+        pending_word_count = min(pending_word_count + len(chunk_tokens), MAX_PENDING_WORDS)
+
+        # TIGHT-preferred-when-SUBSTANTIAL, WIDE otherwise: real bug found
+        # via real-audio validation on Our Lady Peace - "Somewhere Out
+        # There" (a song with several lines repeating back-to-back 3-4
+        # times in a row): even a completely FRESH chunk's base search
+        # window (multiplier 3 + slack 10 -- e.g. ~25 ASR words for a
+        # 5-word line) is already wide enough to reach PAST the
+        # immediately-following correct occurrence into a LATER repeat of
+        # the same line, with no prior skip needed to get there at all --
+        # the match-quality/span guards above don't catch this, since the
+        # wrong-but-later match can itself be perfectly clean and tightly
+        # clustered. A `difflib` search doesn't inherently prefer the
+        # NEAREST valid match over any other high-quality one it finds
+        # elsewhere in the window.
+        #
+        # Both a TIGHT window (barely more than this chunk's own size) and
+        # the normal WIDE window are tried; TIGHT wins whenever it covers
+        # at least HALF this chunk's own tokens (the same `MIN_MATCH_
+        # TOKEN_FRACTION` bar used elsewhere), regardless of what the wide
+        # search separately finds -- a near, mostly-complete match is
+        # trusted on its own local merits, not compared against whatever
+        # the wide window's own (possibly wrong, possibly further-away)
+        # optimization happens to prefer. Two thresholds were tried and
+        # rejected first, both found wanting against real data from TWO
+        # different real songs: requiring a fully COMPLETE tight match
+        # (every token) was too strict -- Our Lady Peace's own correct
+        # nearby match was missing 1-2 of 5 words to real ASR noise, and
+        # still lost to a wrong, farther-away wide match; comparing raw
+        # match COUNTS (prefer whichever side found more) was too
+        # unprincipled -- a wrong-but-farther wide match can trivially
+        # have a higher raw count than a correct-but-partial near one
+        # simply because it has more room to search in. A REQUIRE-ANY-
+        # PASSING-TIGHT-MATCH threshold (tried even earlier) was too
+        # loose the other direction -- it regressed a real song
+        # (Chicago), where a single coincidentally-found word in the
+        # tight window blocked the wide search from finding its own
+        # better, fuller answer.
+        tight_window_end = min(cursor + len(chunk_tokens) + TIGHT_WORD_SLACK, n_b)
+        tight_window = b_norm[cursor:tight_window_end]
+        tight_opcodes, tight_matched = _try_match(tight_window, chunk_tokens, require_strict_fraction=False)
+
+        wide_window_end = min(cursor + pending_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n_b)
+        wide_window = b_norm[cursor:wide_window_end]
+        window_is_inflated = pending_word_count > len(chunk_tokens)
+        wide_opcodes, _wide_matched = _try_match(wide_window, chunk_tokens, require_strict_fraction=window_is_inflated)
+
+        tight_preference_threshold = max(1, round(len(chunk_tokens) * MIN_MATCH_TOKEN_FRACTION))
+        if tight_opcodes is not None and tight_matched >= tight_preference_threshold:
+            opcodes, window = tight_opcodes, tight_window
+        elif wide_opcodes is not None:
+            opcodes, window = wide_opcodes, wide_window
+        elif tight_opcodes is not None:
+            opcodes, window = tight_opcodes, tight_window
+        else:
+            # Not confirmable in either window -- don't advance the
+            # cursor; the NEXT chunk's own search starts from the same
+            # position, its window growing to cover this chunk's skipped
+            # content too. Every word in this chunk stays None/False for
+            # interpolate_fallback.
+            continue
+
+        last_confirmed_offset = _apply_match(opcodes, window, chunk_tokens, chunk_start, cursor)
         if last_confirmed_offset is not None:
             cursor += last_confirmed_offset + 1
         pending_word_count = 0
@@ -1382,17 +1425,44 @@ def validate_words_against_asr(existing_words: List[ExistingWord], gap: GapCalib
     calibration was found -- validates against the ORIGINAL timing
     directly in that case). If a confident whole-song ASR match ALSO
     exists for this word and its own real START lands within
-    `tolerance_sec` of that expected position, the word's ORIGINAL timing
-    (shifted only by the single global correction) is trusted EXACTLY --
-    neither its position nor its length is touched beyond that one
-    uniform shift.
+    `tolerance_sec` of that expected position, the word VALIDATES -- but
+    its final position is ASR's OWN start (not the original/expected
+    one), on the same original duration. Length is never touched by ASR
+    either way (see below).
 
-    Only checks START proximity, never END: ASR is known-unreliable at
-    detecting the end of a sustained/held note (see CLAUDE.md's "Lessons
-    learned" -- "Don't trust individual ASR word timestamps for
+    Real bug found via real hand-timed ground truth (2026-08-15, Our Lady
+    Peace - "Somewhere Out There", user's own `truth.txt`): the ORIGINAL
+    version of this function kept the GAP-corrected ORIGINAL start
+    EXACTLY, discarding ASR's own (already-known-close, since it just
+    passed this exact check) position entirely. When the original file's
+    own timing carried a small systematic bias (~0.12s here, well inside
+    the default 0.3s tolerance), every validated word inherited that same
+    bias -- and so did every INTERPOLATED word between validated anchors,
+    since interpolation is relative to them. Real comparison against
+    `truth.txt`: only 27.6%/51.2% of words landed within 100ms/150ms
+    tolerance, vs. 51.9%/74.2% for `--strategy replace` on the identical
+    audio -- confirming ASR's own reading is measurably more precise here
+    once it clears the tolerance bar at all.
+
+    This is NOT equivalent to `replace` with extra steps: `replace`
+    (`match_words_to_asr`) trusts ANY confident ASR match unconditionally,
+    with no comparison to the word's own original position at all. This
+    function still requires ASR to already AGREE with the (GAP-corrected)
+    original within `tolerance_sec` before trusting it at all -- a word
+    where ASR found something wildly different (a real mismatch, e.g. the
+    wrong occurrence of a repeated phrase) is still correctly rejected
+    and left for `interpolate_fallback`, exactly as before. Only within
+    that already-validated agreement zone does this now prefer ASR's
+    reading over the original's for the small extra precision -- the
+    safety net `validate` exists for is unchanged.
+
+    Only ASR's START is ever used, never its END: ASR is known-unreliable
+    at detecting the end of a sustained/held note (see CLAUDE.md's
+    "Lessons learned" -- "Don't trust individual ASR word timestamps for
     fine-grained boundaries"), so a word's own already-correct LENGTH is
-    trusted from the input file rather than second-guessed by ASR's own,
-    less reliable, end timestamp.
+    always trusted from the input file, applied on top of ASR's start,
+    rather than second-guessed by ASR's own, less reliable, end
+    timestamp.
 
     Words that don't validate are left None/False for `interpolate_fallback`
     to resolve using validated neighbors (and, optionally, LRC anchors) as
@@ -1409,8 +1479,8 @@ def validate_words_against_asr(existing_words: List[ExistingWord], gap: GapCalib
             expected_start = w.orig_start + offset + gap.slope * w.orig_start
         if gap.asr_confident[i] and abs(gap.asr_starts[i] - expected_start) <= tolerance_sec:
             orig_dur = w.orig_end - w.orig_start
-            starts[i] = expected_start
-            ends[i] = expected_start + orig_dur
+            starts[i] = gap.asr_starts[i]
+            ends[i] = gap.asr_starts[i] + orig_dur
             validated[i] = True
     return starts, ends, validated
 
@@ -1498,8 +1568,8 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
         if not source[i]:
             source[i] = "interpolated" if had_any_anchor else "kept_original"
 
-    log(f"  {quality.n_validated}/{quality.n_words} word(s) validated as ALREADY CORRECT (kept exactly "
-        f"as-is -- position and length untouched beyond the single global GAP correction), "
+    log(f"  {quality.n_validated}/{quality.n_words} word(s) validated (ASR confirmed the original position "
+        f"within tolerance -- using ASR's own, more precise start on the word's own original length), "
         f"{quality.n_lrc_seeded} from LRC anchors, {quality.n_interpolated} repositioned by "
         f"interpolation, {quality.n_kept_original} kept at their original timing (no anchor nearby).")
     if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:

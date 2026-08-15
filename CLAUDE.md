@@ -913,24 +913,80 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   Trixie Mattel - "Video Games") found high confident-match rates
   (93.8%, 88.7%) with median deltas near zero and no catastrophic
   outliers, confirming this generalizes beyond the one reported song.
+
+  **A FOURTH bug in this same function was found immediately after
+  shipping the above**, from a real user report on a NEW song (Our Lady
+  Peace - "Somewhere Out There", 2026-08-15) with several lines
+  repeating BACK-TO-BACK 3-4 times in a row (denser repetition than Pink
+  Pony Club's, no bridge/skip needed to trigger it): even a completely
+  FRESH chunk's own base search window (multiplier 3 + slack 10 -- e.g.
+  ~25 ASR words for a 5-word line) is ALREADY wide enough to reach past
+  the immediately-following correct occurrence into a LATER repeat of
+  the same line, with no prior skip needed at all -- the match-quality/
+  span guards don't catch this, since the wrong-but-later match can
+  itself be perfectly clean and tightly clustered; `difflib` doesn't
+  inherently prefer the nearest valid match over any other high-quality
+  one it finds elsewhere in the window. Fixed with a genuinely TIGHT
+  window (barely more than the chunk's own size) tried ALONGSIDE the
+  normal wide one; tight wins whenever it covers at least HALF the
+  chunk's own tokens (`MIN_MATCH_TOKEN_FRACTION`, the same bar already
+  used elsewhere), regardless of what wide separately finds. Two
+  stricter/looser thresholds were tried first and rejected, both against
+  real data from two different real songs: requiring a FULLY complete
+  tight match was too strict (Our Lady Peace's own correct nearby match
+  was missing 1-2 of 5 words to real ASR noise, and still lost to a
+  wrong, farther-away wide match); letting ANY passing tight match win
+  outright (even a single coincidentally-found word) was too loose --
+  regressed Chicago, where the wide window's own fuller context found a
+  better answer than the tight window's sparse one could. Real
+  validation with the final (half-or-more) threshold: Our Lady Peace's
+  GAP-check agreement 84%→93%, `validate` strategy succeeds outright
+  (zero warnings, no fallback to `"seed"` needed) where it previously
+  warned and fell back; Chicago and Video Games both confirmed back to
+  their own original (pre-regression) confident-match rates.
 - `force_align_gaps` and `retry_low_quality_asr` (see below) default ON.
   `rewindow_long_segments` (see below) defaults ON, independently of the
   shared `config.REWINDOW_ENABLED` used elsewhere.
 - Strategy: `"validate"` (DEFAULT as of 2026-08-15, user's explicit
   request — previously an explicit non-default `--strategy validate`
   option; `"replace"` was the default before this) vs. `"replace"`
-  (`--strategy replace`, GUI-selectable). `"validate"` trusts the
-  original position when ASR confirms it's close (keeps a confirmed
-  word's position AND length completely untouched, rather than
-  overwriting with ASR's own value) and automatically falls back to
-  whole-song ASR-primary matching (the same mechanism `"replace"` uses)
-  when too few words validate — see `realign_song_validate`'s own
-  `MXL_LRC_MIN_ASR_PLACEMENT_RATE` fallback. This fallback (already
-  shipped, not new) is what makes `"validate"` safe as the default even
-  on a file whose own timing turns out not to be trustworthy at all —
-  the earlier reasoning for keeping `"replace"` default ("validate only
-  helps when the input is already accurate") is superseded by this
-  fallback existing.
+  (`--strategy replace`, GUI-selectable). `"validate"` only ever trusts
+  ASR's own start when it's already CONFIRMED close to the (GAP-
+  corrected) original — a real safety net `"replace"` doesn't have, and
+  the reason `"validate"` exists at all — but, once confirmed, uses
+  ASR's own start value (not the original's), keeping only the word's
+  own original LENGTH. Automatically falls back to whole-song ASR-
+  primary matching (the same mechanism `"replace"` uses) when too few
+  words validate — see `realign_song_validate`'s own `MXL_LRC_MIN_ASR_
+  PLACEMENT_RATE` fallback. This fallback (already shipped, not new) is
+  what makes `"validate"` safe as the default even on a file whose own
+  timing turns out not to be trustworthy at all.
+
+  **`validate_words_against_asr` real bug fixed via real hand-timed
+  ground truth** (2026-08-15, user's own `truth.txt` for Our Lady Peace -
+  "Somewhere Out There"): the ORIGINAL version kept the GAP-corrected
+  ORIGINAL start EXACTLY once confirmed, discarding ASR's own
+  already-known-close reading entirely — reasonable-sounding ("don't fix
+  what isn't broken"), but wrong in practice: when the original file's
+  own timing carried a small systematic bias (~0.12s here, comfortably
+  inside the default 0.3s tolerance), every validated word inherited
+  that bias, and so did every INTERPOLATED word between validated
+  anchors (interpolation is relative to them). Real comparison against
+  `truth.txt`: only 27.6%/51.2% of words landed within 100ms/150ms
+  under the old logic — WORSE than `--strategy replace` on the identical
+  audio (51.9%/74.2%), the opposite of what `"validate"` is supposed to
+  achieve. Fixed by using ASR's own start (not the original's) once
+  validated — user's own proposed design, explicitly confirmed NOT
+  equivalent to `"replace"` before implementing: `"replace"` trusts any
+  confident ASR match unconditionally; this still requires ASR to
+  already agree with the original within tolerance FIRST, so a real
+  mismatch (wrong occurrence of a repeated phrase, hallucination, etc.)
+  is still correctly rejected and left for `interpolate_fallback`, same
+  guardrail as before. After the fix, re-compared against the same
+  `truth.txt`: 62.9%/88.7% within 100ms/150ms — beats BOTH the old
+  `"validate"` AND `"replace"` at every meaningful tolerance, combining
+  ASR's own precision with `"validate"`'s safety net against wild
+  mismatches.
 
 ### Real bugs found & fixed — root causes worth remembering
 

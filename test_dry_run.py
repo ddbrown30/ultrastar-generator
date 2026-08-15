@@ -3331,6 +3331,49 @@ print("  OK: the repeated 'chorus one two three' line correctly matched its OWN 
       "occurrence, never re-matching the first line's already-claimed occurrence; the unmatchable bridge "
       "line in between correctly stayed unconfident rather than guessing")
 
+print("  BUG REGRESSION (real case, Our Lady Peace - 'Somewhere Out There', 2026-08-15, a song with several "
+      "lines repeating BACK-TO-BACK 3-4 times in a row): even a FRESH chunk's own base search window is "
+      "already wide enough to reach past a nearby but only PARTIALLY-transcribed correct occurrence into a "
+      "LATER, more COMPLETE repeat of the same line -- a difflib search doesn't inherently prefer the "
+      "nearest valid match over a fuller one it finds further away. Fixed with a tight-preferred-when-"
+      "substantial window tried before the normal (wider) one -- two rejected threshold designs are also "
+      "covered by this same test: requiring a FULLY complete tight match was too strict (this exact case's "
+      "correct near occurrence is only 2 of 4 words, ASR having missed the other 2), while letting ANY "
+      "passing tight match win outright was too loose (regressed a different real song, Chicago):")
+mwa_dense_entries = []
+for _t in ["same", "start"]:
+    mwa_dense_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_dense_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["wa", "wb", "wc", "wd"]:
+    mwa_dense_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_dense_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["wa", "wb", "wc", "wd"]:  # SAME text, repeated immediately -- back-to-back, like the real case
+    mwa_dense_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_dense_entries.append(LineBreak(start=1.0, end=1.1))
+for _t in ["same", "end"]:
+    mwa_dense_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
+mwa_dense_entries.append(LineBreak(start=1.0, end=1.1))
+mwa_dense_existing = extract_words(mwa_dense_entries)
+mwa_dense_line_of_word = _mwa_word_line_indices(mwa_dense_entries, mwa_dense_existing)
+
+mwa_dense_asr = [
+    _Word(text="same", start=0.3, end=0.5), _Word(text="start", start=0.6, end=0.8),
+    _Word(text="wc", start=5.9, end=6.1), _Word(text="wd", start=6.2, end=6.4),  # 1st occurrence, wa/wb missed by ASR
+] + [_Word(text=f"filler{_k}", start=8.0 + _k, end=8.2 + _k) for _k in range(6)] + [
+    _Word(text="wa", start=15.3, end=15.5), _Word(text="wb", start=15.6, end=15.8),
+    _Word(text="wc", start=15.9, end=16.1), _Word(text="wd", start=16.2, end=16.4),  # 2nd occurrence, fully transcribed
+    _Word(text="same", start=20.3, end=20.5), _Word(text="end", start=20.6, end=20.8),
+]
+mwa_dense_starts, _mwa_dense_ends, mwa_dense_confident = match_words_to_asr(
+    mwa_dense_existing, mwa_dense_asr, line_of_word=mwa_dense_line_of_word)
+assert mwa_dense_confident == [True, True, False, False, True, True, True, True, False, False, True, True], \
+    mwa_dense_confident
+assert mwa_dense_starts[4] == 5.9 and mwa_dense_starts[5] == 6.2, mwa_dense_starts  # 1st line -> its OWN (near) occurrence
+assert mwa_dense_starts[6] == 15.3 and mwa_dense_starts[7] == 15.6, mwa_dense_starts  # 2nd line -> its OWN (later) occurrence
+print("  OK: each repeated line matched its OWN respective real occurrence (first line stayed at its own "
+      "near, partially-transcribed position; second line correctly picked up the later, fuller one) -- "
+      "neither line's words got cross-assigned to the other's occurrence")
+
 print("  interpolate_fallback: two-sided rate interpolation, one-sided constant shift, degenerate-original "
       "-offset fallback, and identity fallback when no anchor exists anywhere:")
 if_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=float(i), orig_end=float(i) + 0.5)
@@ -4187,27 +4230,34 @@ assert gc.confidence == 1.0, gc.confidence
 print("  OK: a uniform +5.0s shift across all 5 words is recovered as one confident constant GAP "
       "offset, using the SAME robust two-tier calibration already validated for LRC line timing")
 
-print("  validate_words_against_asr: a word whose (GAP-corrected) original position is confirmed by "
-      "ASR is kept EXACTLY as original -- position AND length -- not replaced by ASR's own (slightly "
-      "different) timestamp; a word ASR disagrees with is left unvalidated:")
+print("  validate_words_against_asr: a word whose (GAP-corrected) original START is CONFIRMED by ASR "
+      "(within tolerance) validates using ASR's OWN start (more precise than the original -- real bug "
+      "found via real hand-timed ground truth, 2026-08-15, Our Lady Peace - 'Somewhere Out There': keeping "
+      "the original's own start exactly, discarding ASR's already-known-close reading entirely, let a "
+      "small systematic bias in the original file's own timing propagate through every validated word AND "
+      "every interpolated word between them -- real comparison against hand-timed truth.txt: only 27.6%/"
+      "51.2% of words within 100ms/150ms, vs. 51.9%/74.2% for --strategy replace on the SAME audio). The "
+      "word's own ORIGINAL LENGTH is still always kept (ASR's end timestamp is never trusted -- see the "
+      "function's own docstring); a word ASR disagrees with beyond tolerance is left unvalidated, same "
+      "safety net as before -- this is NOT the same as --strategy replace, which has no such guardrail:")
 gc_words2 = extract_words([
     Syllable(text="alpha", start=10.0, end=10.5, midi_note=0, is_word_start=True),
     Syllable(text="bravo", start=11.0, end=11.5, midi_note=0, is_word_start=True),
 ])
 # A pre-built GapCalibration (bypassing compute_gap_calibration's own
 # >=5-sample minimum, tested separately above) with a known +5.0s offset --
-# alpha's ASR match (15.0) is within tolerance of its expected (10.0+5.0=
-# 15.0); bravo's ASR match is deliberately way off (30.0, not 16.0) and
-# must NOT validate.
+# alpha's ASR match (15.05) is CLOSE to but not exactly its expected
+# (10.0+5.0=15.0), still well within tolerance; bravo's ASR match is
+# deliberately way off (30.0, not 16.0) and must NOT validate.
 gc2 = GapCalibration(offset=5.0, slope=0.0, confidence=1.0, kind="constant", skipped_reason=None,
-                      asr_starts=[15.0, 30.0], asr_ends=[15.6, 30.6], asr_confident=[True, True])
+                      asr_starts=[15.05, 30.0], asr_ends=[15.65, 30.6], asr_confident=[True, True])
 vw_starts, vw_ends, vw_validated = validate_words_against_asr(gc_words2, gc2)
 assert vw_validated == [True, False], vw_validated
-assert vw_starts[0] == 15.0 and vw_ends[0] == 15.5, (vw_starts[0], vw_ends[0])  # ORIGINAL 0.5s length kept,
-                                                                                  # NOT ASR's own 0.6s span
-print("  OK: 'alpha' validated with its OWN original 0.5s length (10.0-10.5, shifted to 15.0-15.5), "
-      "NOT overwritten by ASR's own slightly-different 15.0-15.6 span; 'bravo' (ASR disagrees) is "
-      "correctly left unvalidated")
+assert vw_starts[0] == 15.05 and vw_ends[0] == 15.55, (vw_starts[0], vw_ends[0])  # ASR's own (more precise)
+                                                                                    # start, ORIGINAL 0.5s length
+print("  OK: 'alpha' validated using ASR's own (more precise) start (15.05, not the original's own "
+      "expected 15.0), keeping its OWN original 0.5s length (15.05-15.55), NOT ASR's own slightly "
+      "different 15.05-15.65 span; 'bravo' (ASR disagrees beyond tolerance) is correctly left unvalidated")
 
 print("  compute_gap_calibration + validate_words_against_asr: a DISCONTINUOUS whole-file drift (tier 3) "
       "is calibrated and applied via correction_fn, not the offset+slope fallback (which would badly "
