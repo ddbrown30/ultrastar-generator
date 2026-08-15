@@ -3559,6 +3559,96 @@ print("  OK: prepare_lrc succeeded using the reconciled 6-line subset (matching 
 print("  OK: prepare_lrc itself rejects the candidate (returns None, same as 'no candidate found') and "
       "logs the specific reason when our_lines/log are provided")
 
+print("  BUG REGRESSION (real case, Trixie Mattel - Video Games, 2026-08-15): reconcile_line_structure's "
+      "equality check must compare WHITESPACE-FLATTENED text, not space-joined tokens -- our own file had "
+      "a genuine typo ('livin'if' for 'livin' if', a missing space) that made an otherwise byte-identical "
+      "line fail to match at all (different token count/boundaries):")
+from ultrastar_generator.lrc_timing import _flat_fuzzy_equal
+
+rls_typo = reconcile_line_structure(
+    ["before the typo", "livin'if this is the good life", "after the typo"],
+    [(0.0, "before the typo"), (5.0, "livin' if this is the good life"), (10.0, "after the typo")],
+)
+assert rls_typo is not None and rls_typo.n_matched == 3 and rls_typo.n_our_unmatched == 0, rls_typo
+print("  OK: a missing/extra space no longer desyncs an otherwise byte-identical line")
+
+print("  reconcile_line_structure: a JOINT (p, q) recovery search -- a stretch where BOTH sides have "
+      "genuinely DIFFERENT content before the next shared line needs BOTH cursors to move together to "
+      "find the resync point; single-axis-only search (only ever drop from one side) can never reach it "
+      "(real case, Video Games: our own repeated ad-lib has no exact counterpart in the candidate's "
+      "differently-worded lines just before the same chorus repeat):")
+rls_joint_our = ["same start", "our extra A", "our extra B", "shared resync", "same end"]
+rls_joint_lrc = [
+    (0.0, "same start"), (1.0, "lrc extra 1"), (2.0, "lrc extra 2"),
+    (3.0, "lrc extra 3"), (4.0, "shared resync"), (5.0, "same end"),
+]
+rls_joint = reconcile_line_structure(rls_joint_our, rls_joint_lrc)
+assert rls_joint is not None, rls_joint
+assert rls_joint.n_matched == 3 and rls_joint.n_our_unmatched == 2, rls_joint  # "our extra A"/"B" never resolved
+assert rls_joint.n_lrc_dropped == 3, rls_joint  # the candidate's 3 unrelated extra lines
+assert [t for _t, t in rls_joint.lrc_lines] == ["same start", "shared resync", "same end"], rls_joint.lrc_lines
+print("  OK: neither side alone (p=0 or q=0) ever matches 'shared resync' -- only the joint p=2,q=3 jump "
+      "finds it, correctly dropping the 3 candidate-only lines while leaving our own 2 unmatched lines as-is")
+
+print("  _flat_fuzzy_equal / fuzzy _consume_as_merge (user's own request, 2026-08-15): tolerate a common "
+      "lyric-transcription spelling variant -- a dropped/elided letter marked with an apostrophe -- as the "
+      "SAME line, not a genuinely different one ('Ev'rything' for 'Everything', 'livin'' for 'living'):")
+assert _flat_fuzzy_equal("ev'rythingido", "everythingido") is True
+assert _flat_fuzzy_equal("livin'ontheedge", "livingontheedge") is True
+assert _flat_fuzzy_equal("livin'ontheedge", "dancinginthedark") is False, \
+    "fuzzy tolerance must not approve genuinely different text"
+rls_fuzzy = reconcile_line_structure(
+    ["It's you, it's you, it's all for you,", "Ev'rything I do", "livin' on the edge"],
+    [(10.0, "It's you, it's you, it's all for you,"), (12.0, "Everything I do"), (14.0, "living on the edge")],
+)
+assert rls_fuzzy is not None and rls_fuzzy.n_matched == 3 and rls_fuzzy.n_our_unmatched == 0, rls_fuzzy
+print("  OK: 'Ev'rything'/'Everything' and 'livin''/'living' both matched via bounded character-level "
+      "fuzzy tolerance; genuinely different text still correctly declines")
+
+print("  BUG REGRESSION (real case, Trixie Mattel - Video Games, 2026-08-15): prepare_lrc's word_lines "
+      "must be built DIRECTLY from reconcile_line_structure's own our_line_index (via our_line_of_word), "
+      "not re-derived by calling assign_words_to_lines -- its own independent whole-song WORD-level diff "
+      "has no line-boundary information and can disagree with (and corrupt) the already-correct line-level "
+      "correspondence. Critically, a genuinely-unmatched our-own-line's words must come out as None, not "
+      "silently inherit the nearest PRECEDING matched line's index:")
+from ultrastar_generator.realign import _word_line_indices
+
+wlow_entries = [
+    Syllable(text="shared", start=0.0, end=1.0, midi_note=0, is_word_start=True),
+    Syllable(text="start", start=1.0, end=2.0, midi_note=0, is_word_start=True),
+    LineBreak(start=2.0, end=2.1),
+    Syllable(text="our", start=2.1, end=3.0, midi_note=0, is_word_start=True),
+    Syllable(text="only", start=3.0, end=4.0, midi_note=0, is_word_start=True),
+    Syllable(text="line", start=4.0, end=5.0, midi_note=0, is_word_start=True),
+    LineBreak(start=5.0, end=5.1),
+    Syllable(text="shared", start=5.1, end=6.0, midi_note=0, is_word_start=True),
+    Syllable(text="end", start=6.0, end=7.0, midi_note=0, is_word_start=True),
+    LineBreak(start=7.0, end=7.1),
+]
+wlow_words = extract_words(wlow_entries)
+wlow_our_lines = _reconstruct_our_lines(wlow_entries)
+assert wlow_our_lines == ["shared start", "our only line", "shared end"], wlow_our_lines
+wlow_line_of_word = _word_line_indices(wlow_entries, wlow_words)
+assert wlow_line_of_word == [0, 0, 1, 1, 1, 2, 2], wlow_line_of_word
+
+wlow_reconciled = reconcile_line_structure(wlow_our_lines, [(0.0, "shared start"), (5.0, "shared end")])
+assert wlow_reconciled is not None and wlow_reconciled.our_line_index == [0, 2], wlow_reconciled
+assert wlow_reconciled.n_our_unmatched == 1, wlow_reconciled  # "our only line" has no LRC counterpart
+
+wlow_forced = LrcLibCandidate(
+    track_name="T2", artist_name="A2", album_name="", duration=None,
+    plain_lyrics="shared start shared end",
+    synced_lyrics="[00:00.00]shared start\n[00:05.00]shared end",
+    instrumental=False, id=556,
+)
+wlow_prep = prepare_lrc(wlow_words, [], "A2", "T2", 100.0, forced_candidate=wlow_forced,
+                         our_lines=wlow_our_lines, our_line_of_word=wlow_line_of_word, log=lambda *_: None)
+assert wlow_prep is not None
+assert wlow_prep.word_lines == [0, 0, None, None, None, 1, 1], wlow_prep.word_lines
+print("  OK: word_lines built directly from our_line_index -- 'shared start'/'shared end' words map to "
+      "their real reconciled line, and 'our only line's words (no LRC counterpart) come out as None "
+      "rather than inheriting the previous matched line")
+
 print("  realign_song end-to-end with lrc_mode='windowed': same forced candidate, output stays consistent "
       "with the windowed matcher's own per-line window (not just whole-song ASR matching):")
 rsw_existing = ParsedSong(

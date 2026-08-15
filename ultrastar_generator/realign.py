@@ -324,6 +324,37 @@ def _reconstruct_our_lines(entries: List[Union[Syllable, LineBreak]]) -> List[st
     return lines
 
 
+def _word_line_indices(entries: List[Union[Syllable, LineBreak]],
+                        existing_words: List[ExistingWord]) -> List[int]:
+    """Parallel to `existing_words` -- which `_reconstruct_our_lines`
+    display-line index (SAME numbering, built from the SAME walk over
+    `entries`) each word belongs to. Exists so `prepare_lrc` can turn
+    `reconcile_line_structure`'s own `our_line_index` (which of OUR
+    lines each reconciled LRC entry came from) directly into a per-WORD
+    LRC-line mapping -- reusing the correspondence reconcile_line_
+    structure already established at the (more reliable) LINE level,
+    instead of re-deriving it via `assign_words_to_lines`'s own
+    independent whole-song WORD-level diff, which has no line-boundary
+    information at all and can disagree with reconcile_line_structure's
+    own answer (real confirmed case, 2026-08-15: Trixie Mattel - Video
+    Games -- see LineReconciliation's own docstring)."""
+    entry_line: List[int] = []
+    line_idx = 0
+    cur_has_content = False
+    for e in entries:
+        if isinstance(e, LineBreak):
+            if cur_has_content:
+                line_idx += 1
+                cur_has_content = False
+            entry_line.append(-1)  # never looked up -- a word's own
+                                     # entry_indices never include a
+                                     # LineBreak (extract_words skips them)
+            continue
+        entry_line.append(line_idx)
+        cur_has_content = True
+    return [entry_line[w.entry_indices[0]] for w in existing_words]
+
+
 # `check_repeat_structure` moved to lrc_timing.py, 2026-08-11 (re-exported
 # here unchanged so `from .realign import check_repeat_structure` --
 # including test_dry_run.py's own import -- keeps working) -- lrc_timing.
@@ -337,6 +368,7 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
                  artist: str, title: str, audio_duration: float,
                  forced_candidate: Optional[LrcLibCandidate] = None,
                  our_lines: Optional[List[str]] = None,
+                 our_line_of_word: Optional[List[int]] = None,
                  log: Optional[Callable[[str], None]] = None) -> Optional[LrcPrep]:
     """Selects an LRC candidate, calibrates its line timestamps against
     OUR audio's real ASR transcription, and assigns each existing word to
@@ -379,6 +411,7 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
         return None
 
     candidate_lrc_lines = lrc_match.lrc_lines
+    reconciliation = None
     if our_lines is not None:
         lrc_line_texts = [text for _t, text in candidate_lrc_lines]
         reconciliation = reconcile_line_structure(our_lines, candidate_lrc_lines)
@@ -418,7 +451,26 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
     if offset is not None:
         lrc_lines = [(correction_fn(t), text) for t, text in lrc_lines]
 
-    word_lines, _clean_text = assign_words_to_lines(fake_words, lrc_lines)
+    # Word-to-line assignment: when reconciliation ran AND the caller gave
+    # us a per-word line mapping (`our_line_of_word`, see
+    # `_word_line_indices`), build word_lines DIRECTLY from reconcile_
+    # line_structure's own `our_line_index` -- reusing the correspondence
+    # already established at the LINE level -- instead of calling
+    # assign_words_to_lines, whose own independent whole-song WORD-level
+    # diff has no line-boundary information at all and can disagree with
+    # reconcile_line_structure's own answer (real confirmed regression,
+    # 2026-08-15: Trixie Mattel - Video Games -- a 3x-repeated chorus
+    # correctly resolved by reconcile_line_structure was still placed
+    # ~30s off the real audio by assign_words_to_lines's own re-diff; see
+    # LineReconciliation's own docstring for the full case). Falls back
+    # to assign_words_to_lines when reconciliation wasn't used at all
+    # (`our_lines`/`our_line_of_word` not given -- e.g. seed_lrc_anchors's
+    # own standalone/test-only call path).
+    if reconciliation is not None and our_line_of_word is not None:
+        our_idx_to_li = {our_idx: li for li, our_idx in enumerate(reconciliation.our_line_index)}
+        word_lines = [our_idx_to_li.get(our_line) for our_line in our_line_of_word]
+    else:
+        word_lines, _clean_text = assign_words_to_lines(fake_words, lrc_lines)
 
     return LrcPrep(lrc_match=lrc_match, lrc_lines=lrc_lines, word_lines=word_lines,
                     calibration_offset=offset, calibration_kind=kind, calibration_confidence=confidence)
@@ -905,9 +957,10 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     lrc_prep = None
     if use_lrc and audio_duration is not None:
         our_lines = _reconstruct_our_lines(entries)
+        our_line_of_word = _word_line_indices(entries, words)
         lrc_prep = prepare_lrc(words, asr_words, artist or existing.artist, title or existing.title,
                                 audio_duration, forced_candidate=forced_lrc_candidate,
-                                our_lines=our_lines, log=log)
+                                our_lines=our_lines, our_line_of_word=our_line_of_word, log=log)
 
     # BOTH strategies require a CONFIDENT time calibration before an LRC
     # candidate is trusted at all -- real comparison (see CLAUDE.md, BATB/
@@ -1225,9 +1278,10 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
     lrc_seed = None
     if use_lrc and audio_duration is not None:
         our_lines = _reconstruct_our_lines(entries)
+        our_line_of_word = _word_line_indices(entries, words)
         prep = prepare_lrc(words, asr_words, artist or existing.artist, title or existing.title,
                             audio_duration, forced_candidate=forced_lrc_candidate,
-                            our_lines=our_lines, log=log)
+                            our_lines=our_lines, our_line_of_word=our_line_of_word, log=log)
         if prep is not None and prep.calibration_offset is not None:
             lrc_seed = seed_from_prep(words, prep, starts, ends, validated)
             quality.n_lrc_seeded = lrc_seed.n_seeded

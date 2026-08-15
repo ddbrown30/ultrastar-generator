@@ -281,6 +281,41 @@ class LineReconciliation:
                                           # matched something in our_lines,
                                           # in original LRC order/timing --
                                           # everything else was dropped.
+    our_line_index: List[int]            # parallel to lrc_lines -- which
+                                          # our_lines[i] each entry came
+                                          # from (a merge split contributes
+                                          # several consecutive entries,
+                                          # each its own our_lines index).
+                                          # This is the whole reason this
+                                          # dataclass exists rather than
+                                          # just returning lrc_lines alone:
+                                          # a caller with its own per-word
+                                          # line membership (e.g. realign.
+                                          # py's prepare_lrc) can build a
+                                          # word-to-LRC-line mapping
+                                          # DIRECTLY from this -- reusing
+                                          # the correspondence this walk
+                                          # already established at the
+                                          # (more reliable) LINE level --
+                                          # instead of re-deriving it via
+                                          # a separate whole-song WORD-
+                                          # level diff (assign_words_to_
+                                          # lines) that has no line-
+                                          # boundary information at all
+                                          # and can disagree with this
+                                          # walk's own answer. Real
+                                          # confirmed case (2026-08-15,
+                                          # Trixie Mattel - Video Games):
+                                          # this walk correctly resolved
+                                          # a 3x-repeated chorus, but
+                                          # assign_words_to_lines's own
+                                          # independent word-level diff
+                                          # still placed the third
+                                          # repeat ~30s off the real
+                                          # audio -- exactly the
+                                          # "repeated-phrase disambiguation"
+                                          # failure class this project has
+                                          # been burned by before.
     n_our_lines: int
     n_matched: int
     n_lrc_dropped: int    # candidate lines with no match in our_lines
@@ -288,27 +323,61 @@ class LineReconciliation:
     match_ratio: float    # n_matched / n_our_lines
 
 
-def _consume_as_merge(target_tokens: List[str], piece_token_lists: List[List[str]]) -> Optional[int]:
-    """Whether `target_tokens` is EXACTLY the back-to-back concatenation
-    of `piece_token_lists[0]`, `[1]`, ... in order -- word-level (not
-    string-level, so line-boundary punctuation/whitespace differences
-    never matter). Returns how many pieces were consumed (>=2, since
-    exactly 1 piece is just a normal single-line match, not a merge) once
-    `target_tokens` is used up EXACTLY, or None if no such split exists
-    (a partial consumption that never lands on an exact boundary is NOT a
-    match -- this only ever accepts an EXACT accounting of every token on
-    both sides, never a fuzzy/partial one)."""
-    if not target_tokens:
+FUZZY_LINE_MIN_RATIO = 0.85  # see _flat_fuzzy_equal
+
+
+def _flat_fuzzy_equal(a: str, b: str, min_ratio: float = FUZZY_LINE_MIN_RATIO) -> bool:
+    """Whether two whitespace-flattened normalized strings are the SAME
+    text modulo a common lyric-transcription variant -- a dropped/elided
+    letter marked with an apostrophe (real cases, user's own request,
+    2026-08-15: "Ev'rything" for "Everything", "livin'" for "living") --
+    not a genuinely different word. Exact equality is checked first and
+    is always preferred; this is only ever a FALLBACK for a candidate
+    pair the exact-structure walk already identified as the position to
+    compare (a fixed (i, j) or a merge-piece slice), never used to WIDEN
+    a search across many competing positions -- so this doesn't reopen
+    the "repeated-phrase disambiguation" risk class other fuzzy-matching
+    attempts in this codebase were rejected over (see CLAUDE.md): it's
+    comparing two already-fixed candidates, not picking one out of many.
+    `min_ratio` is deliberately high (character-level, not word-level) --
+    this should catch a single dropped/added letter on an otherwise
+    long, exact line, not a genuinely different line that merely shares
+    some words."""
+    if a == b:
+        return True
+    if not a or not b:
+        return False
+    return difflib.SequenceMatcher(None, a, b).ratio() >= min_ratio
+
+
+def _consume_as_merge(target_flat: str, piece_flats: List[str]) -> Optional[int]:
+    """Whether `target_flat` is the back-to-back concatenation of
+    `piece_flats[0]`, `[1]`, ... in order, ALLOWING `_flat_fuzzy_equal`'s
+    fallback tolerance per piece (not just exact equality) -- each
+    piece's OWN length still determines exactly how many characters of
+    `target_flat` it's compared against (a length-preserving letter
+    SUBSTITUTION, like both real cases above, keeps piece boundaries
+    aligned; this is not a general fuzzy alignment that could re-shuffle
+    boundaries on an insertion/deletion). Both sides are whitespace-
+    FLATTENED normalized text (see the call site, not just
+    `_normalize_line`'s single-space-joined form) -- deliberately, so a
+    stray missing/extra space at a line boundary (real confirmed case,
+    2026-08-15: our own file's own typo "livin'if" for "livin' if")
+    can't make an otherwise byte-identical line fail to match. Returns
+    how many pieces were consumed (>=2, since exactly 1 piece is just a
+    normal single-line match, not a merge) once `target_flat` is used up
+    EXACTLY (by length), or None if no such split exists."""
+    if not target_flat:
         return None
-    consumed = 0
-    for k, piece in enumerate(piece_token_lists, start=1):
+    pos = 0
+    for k, piece in enumerate(piece_flats, start=1):
         if not piece:
             return None
-        end = consumed + len(piece)
-        if end > len(target_tokens) or target_tokens[consumed:end] != piece:
+        end = pos + len(piece)
+        if end > len(target_flat) or not _flat_fuzzy_equal(target_flat[pos:end], piece):
             return None
-        consumed = end
-        if consumed == len(target_tokens):
+        pos = end
+        if pos == len(target_flat):
             return k if k >= 2 else None
     return None
 
@@ -404,75 +473,126 @@ def reconcile_line_structure(
     our_lines -- everything downstream (time calibration, per-word line
     assignment) should use THIS list instead of the candidate's raw,
     un-reconciled lines.
+
+    On a mismatch, the recovery search is a single JOINT, merge-aware
+    search over (p, q) offsets from the current (i, j) -- not two
+    independent single-axis searches (real bug found via real-audio
+    validation, 2026-08-15, the SAME Video Games case above): a stretch
+    where BOTH sides have real, genuinely DIFFERENT content before the
+    next shared line (confirmed real case: our own file's own repeated
+    ad-lib "But baby, now you do" / "Mm." has no exact counterpart in the
+    candidate's own differently-worded "...ooh" / "...mmm" lines just
+    before that same third chorus repeat) needs BOTH cursors to move
+    together to find the next real correspondence -- a single-axis search
+    (only ever drop from the LRC side, or only ever drop from OUR side,
+    never both) can never reach it, and worse, blindly advancing one
+    cursor while holding the other still can walk straight past a real,
+    perfectly matchable line (the chorus itself) as collateral damage
+    before ever finding a resync point. The joint search also checks for
+    a MERGE (not just an exact single-line match) at every candidate
+    (p, q) -- not only at the untouched, un-advanced (i, j) -- since the
+    real resync point is frequently a merge, not a plain line.
+    Increasing total offset (p+q) is tried in order, smallest first
+    (ties prefer growing q over p, i.e. dropping from the LRC side
+    first, the less-trusted external source, same tie-break as before);
+    within the `max_skip` bound on EACH axis independently. If nothing
+    aligns anywhere in that whole window, the current LRC line has no
+    plausible match nearby at all -- drop it (advance j by 1) and keep
+    walking, rather than aborting the whole reconciliation over one line.
     """
     our_norm = [_normalize_line(t) for t in our_lines]
     lrc_norm = [_normalize_line(t) for _t, t in lrc_lines]
-    our_tokens = [line.split() for line in our_norm]
-    lrc_tokens = [line.split() for line in lrc_norm]
+    # Equality/merge-consumption comparisons all use the FLATTENED (no
+    # inter-word space) form, not our_norm/lrc_norm directly -- real bug
+    # found via real-audio validation (2026-08-15, Trixie Mattel - Video
+    # Games): our own file had a genuine typo ("livin'if" for "livin' if",
+    # a missing space), which made an otherwise byte-identical line fail
+    # to match at all (different token count/boundaries), desyncing the
+    # whole walk from that point on with no recovery within max_skip.
+    # Flattening removes stray/missing-space differences as a possible
+    # cause of a false mismatch while still requiring an EXACT character
+    # sequence match -- no fuzzy tolerance for a real word difference.
+    our_flat = ["".join(t.split()) for t in our_norm]
+    lrc_flat = ["".join(t.split()) for t in lrc_norm]
     n_i, n_j = len(our_norm), len(lrc_norm)
+
+    def _match_kind(i2: int, j2: int) -> Optional[Tuple[str, int]]:
+        """(kind, k) if our_flat[i2]/lrc_flat[j2] align directly (a plain
+        match or a merge in either direction), else None. k is always 1
+        for a plain match, the piece-count for either merge kind."""
+        if i2 >= n_i or j2 >= n_j:
+            return None
+        if our_flat[i2] and _flat_fuzzy_equal(our_flat[i2], lrc_flat[j2]):
+            return ("match", 1)
+        lrc_k = _consume_as_merge(lrc_flat[j2], our_flat[i2:i2 + max_merge_lines])
+        if lrc_k is not None:
+            return ("lrc_merge", lrc_k)
+        our_k = _consume_as_merge(our_flat[i2], lrc_flat[j2:j2 + max_merge_lines])
+        if our_k is not None:
+            return ("our_merge", our_k)
+        return None
 
     i = j = 0
     kept: List[Tuple[float, str]] = []
+    our_line_index: List[int] = []
     our_matched = [False] * n_i
     lrc_used: set = set()
     while i < n_i and j < n_j:
-        if our_norm[i] and our_norm[i] == lrc_norm[j]:
+        found = None  # (p, q, kind, k)
+        for total in range(0, 2 * max_skip + 1):
+            for p in range(max(0, total - max_skip), min(total, max_skip) + 1):
+                q = total - p
+                if q > max_skip:
+                    continue
+                m = _match_kind(i + p, j + q)
+                if m is not None:
+                    found = (p, q, m[0], m[1])
+                    break
+            if found is not None:
+                break
+
+        if found is None:
+            j += 1
+            continue
+
+        p, q, kind, k = found
+        i, j = i + p, j + q
+        if kind == "match":
             kept.append(lrc_lines[j])
+            our_line_index.append(i)
             our_matched[i] = True
             lrc_used.add(j)
             i += 1
             j += 1
-            continue
-
-        lrc_merge_k = _consume_as_merge(lrc_tokens[j], our_tokens[i:i + max_merge_lines])
-        if lrc_merge_k is not None:
+        elif kind == "lrc_merge":
             t_start = lrc_lines[j][0]
             t_next = lrc_lines[j + 1][0] if j + 1 < n_j else t_start + 5.0
-            word_counts = [len(our_tokens[i + m]) for m in range(lrc_merge_k)]
+            word_counts = [max(1, len(our_norm[i + m2].split())) for m2 in range(k)]
             total_words = sum(word_counts) or 1
             cumulative = 0
-            for m in range(lrc_merge_k):
+            for m2 in range(k):
                 t_piece = t_start + (t_next - t_start) * (cumulative / total_words)
-                kept.append((t_piece, our_lines[i + m]))
-                our_matched[i + m] = True
-                cumulative += word_counts[m]
+                kept.append((t_piece, our_lines[i + m2]))
+                our_line_index.append(i + m2)
+                our_matched[i + m2] = True
+                cumulative += word_counts[m2]
             lrc_used.add(j)
-            i += lrc_merge_k
+            i += k
             j += 1
-            continue
-
-        our_merge_k = _consume_as_merge(our_tokens[i], lrc_tokens[j:j + max_merge_lines])
-        if our_merge_k is not None:
+        else:  # our_merge
             kept.append((lrc_lines[j][0], our_lines[i]))
+            our_line_index.append(i)
             our_matched[i] = True
-            lrc_used.update(range(j, j + our_merge_k))
+            lrc_used.update(range(j, j + k))
             i += 1
-            j += our_merge_k
-            continue
-
-        lrc_skip = next(
-            (k for k in range(1, max_skip + 1)
-             if j + k < n_j and our_norm[i] and our_norm[i] == lrc_norm[j + k]),
-            None,
-        )
-        our_skip = next(
-            (k for k in range(1, max_skip + 1)
-             if i + k < n_i and lrc_norm[j] and our_norm[i + k] == lrc_norm[j]),
-            None,
-        )
-        if lrc_skip is not None and (our_skip is None or lrc_skip <= our_skip):
-            j += lrc_skip
-        elif our_skip is not None:
-            i += our_skip
-        else:
-            j += 1
+            j += k
 
     n_matched = sum(our_matched)
     match_ratio = n_matched / n_i if n_i else 0.0
     if match_ratio < min_match_ratio:
         return None
     return LineReconciliation(
-        lrc_lines=kept, n_our_lines=n_i, n_matched=n_matched,
+        lrc_lines=kept, our_line_index=our_line_index, n_our_lines=n_i, n_matched=n_matched,
         n_lrc_dropped=n_j - len(lrc_used), n_our_unmatched=n_i - n_matched,
         match_ratio=match_ratio,
     )

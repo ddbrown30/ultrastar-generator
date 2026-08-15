@@ -643,37 +643,87 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   — see its own docstring/memory below. Once both were fixed,
   `check_repeat_structure` never even rejected the correct candidate
   (id 2958984) — it was only ever hitting the WRONG one. Against the
-  correct candidate, reconciliation matched 33/59 (56%) before line-merge
-  detection (below) shipped, and 41/59 (69%) after — the remaining gap is
-  a genuinely different wording difference in a later verse, not a
-  structural one.
+  correct candidate, reconciliation matched 33/59 (56%) initially. Four
+  more real bugs were found and fixed chasing this ONE song end-to-end
+  (2026-08-15, all user-directed — "run a real end-to-end generation on
+  Video Games to confirm" surfaced every one of these; none would have
+  been found by unit-testing `reconcile_line_structure` in isolation):
 
-  **Line-merge/split detection** (2026-08-15, user's own design):
-  `reconcile_line_structure` now also handles an LRC candidate that
-  writes several of our own lines as ONE combined line (or vice versa —
-  our own line written as several separate LRC lines), via
-  `_consume_as_merge` — before falling back to the skip-search above, a
-  mismatch is checked for whether one side's line text EXACTLY equals
-  the word-for-word concatenation of the other side's next 2-4 lines (an
-  EXACT check, never fuzzy, same caution as the rest of this module).
-  LRC-merged-K-of-ours: splits that one real timestamp into K synthetic
-  per-our-line entries, proportional to word count, bounded strictly
-  inside the real `[this LRC line's time, next LRC line's time)` window
-  — the first piece keeps the exact real timestamp, later pieces are
-  bounded estimates, never claiming precision the LRC format doesn't
-  have. Necessary, not cosmetic: `assign_words_to_lines` downstream
-  buckets every one of our own words to whichever ONE `lrc_lines` entry
-  its own whole-song word-diff lands on, so without a distinct entry per
-  piece only the FIRST of the merged lines could ever get a real anchor.
-  Our-line-split-into-K-LRC-lines: no interpolation needed at all, just
-  anchors to the first (already real) of the K timestamps. Real
-  validation: Video Games' own merged chorus line now correctly splits
-  into two real anchors (10.00s exact + ~14.36s bounded estimate, in a
-  real [10.0, 16.0) window) instead of neither line getting anchored at
-  all; re-scanning all of `sandbox/` after shipping this found ONLY
-  improvements, no regressions (Gaston 58%→70%, Heroes 0%→53% i.e.
-  swung from declined to accepted, Video Games 56%→69%; every other
-  song's match rate held steady).
+  1. **Whitespace-flattened comparison.** Our own existing file had a
+     real typo ("livin'if" for "livin' if", a missing space) that made
+     an otherwise byte-identical line fail to match at all (different
+     word-token boundaries), desyncing the whole walk from that point on
+     with no recovery within `max_skip`. Fixed by comparing lines with
+     ALL inter-word whitespace stripped (`our_flat`/`lrc_flat`, not
+     `our_norm`/`lrc_norm`'s single-space-joined form) — still an EXACT
+     character-sequence match, just immune to a stray/missing space at a
+     word boundary.
+  2. **Joint, merge-aware recovery search.** The original recovery
+     logic searched each axis independently (lrc_skip OR our_skip,
+     never both) and only checked for a merge at the CURRENT, untouched
+     position — real case: a stretch where BOTH sides have genuinely
+     different content right before the third chorus repeat (our own
+     file's own repeated ad-lib "But baby, now you do" / "Mm." vs the
+     candidate's differently-worded "...ooh" / "...mmm") needs BOTH
+     cursors to move together, and the real resync point was a MERGE
+     reachable only a few lines further in — a single-axis search could
+     never reach it, and worse, blindly dropping one side while holding
+     the other still walked straight past the (perfectly matchable)
+     chorus as collateral damage. Fixed: one unified search over (p, q)
+     offsets, increasing total distance first, checking BOTH a plain
+     match and a merge (either direction) at every candidate position,
+     within `max_skip` on each axis independently.
+  3. **Fuzzy character-level tolerance for elided-letter contractions**
+     (user's own explicit request — "Ev'rything" for "Everything",
+     "livin'" for "living"): `_flat_fuzzy_equal` (SequenceMatcher ratio
+     ≥ 0.85, exact match always checked first) as a fallback everywhere
+     lines are compared, including inside `_consume_as_merge`'s own
+     per-piece slice check (length-preserving, since both real examples
+     are same-length substitutions — an apostrophe standing in for the
+     elided letter, not an insertion/deletion). Deliberately NOT the
+     same risk class as this project's other rejected fuzzy-matching
+     attempts (`--verify-placement`, etc.): those widened a SEARCH across
+     many competing positions; this only ever relaxes the equality test
+     between two positions the exact-structure walk already identified
+     as the ones to compare.
+  4. **`assign_words_to_lines` bypass** (the deepest one — found only by
+     running the REAL pipeline end-to-end, not by testing reconciliation
+     in isolation): even with the three fixes above making
+     `reconcile_line_structure` itself correct (56/59, 95%), the actual
+     `[REALIGNED].txt` output STILL misplaced the third chorus repeat —
+     confirmed against the raw ASR transcript (real occurrence at
+     172.5s; written output at 140.3s). Root cause: `prepare_lrc` handed
+     the reconciled lines to `assign_words_to_lines`, which re-derives
+     word-to-line correspondence from scratch via its OWN independent
+     whole-song WORD-level diff — no line-boundary information at all,
+     and it disagreed with what `reconcile_line_structure` had already
+     correctly resolved at the (more reliable) LINE level. Exactly the
+     "repeated-phrase disambiguation" failure class this project has
+     been burned by repeatedly (see Lessons learned), just one level
+     downstream of where it was expected. Fixed architecturally, not by
+     patching the diff: `reconcile_line_structure` now also returns
+     `our_line_index` (which `our_lines[i]` each reconciled entry came
+     from — it already knows this, it just wasn't being surfaced), and
+     `prepare_lrc` (given a new `our_line_of_word` param, built by
+     `_word_line_indices`) uses that DIRECTLY to build `word_lines`,
+     completely bypassing `assign_words_to_lines` for the reconciled
+     case rather than re-deriving a potentially-different answer.
+     A word whose own line has no LRC counterpart now correctly gets
+     `None` (skipped by both "seed" and "windowed" downstream) instead
+     of silently inheriting the nearest PRECEDING matched line's index
+     (assign_words_to_lines's own old fallback) — which was the direct
+     mechanism putting words in the wrong time window. Confirmed fixed:
+     re-ran end-to-end after this change — all three chorus repeats and
+     all three "It's better than..." lines now land within ~0.1s of the
+     raw ASR transcript.
+
+  End state, real end-to-end run: 304/354 words matched directly to ASR
+  (up from 244/354 with reconciliation alone, before the
+  `assign_words_to_lines` bypass), longest unanchored run down to 9
+  words (from 82). Re-scanned all of `sandbox/` after shipping all four
+  fixes: zero regressions, several songs now at 100% (Chicago, Tarzan,
+  Gold) or very high match (Video Games 95%, Under The Sea 90%, Gaston
+  91%) that previously declined or matched partially.
 - `mxl_lrc_generator.select_lrc_candidate` ranking fixed (2026-08-15,
   real bug found via the Video Games investigation above): used to rank
   candidates by content-match ratio first, duration only as a tiebreaker
