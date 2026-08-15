@@ -2,8 +2,8 @@
 
 Without this, a single pipeline run could load the same model multiple
 times: once for the main transcription pass (transcription.py), again for
-verify_words (verification.py) -- each of which used to call
-whisperx.load_model()/load_align_model() or
+a later force-alignment call (lyrics_lookup.py/realign.py) -- each of
+which would otherwise call whisperx.load_model()/load_align_model() or
 faster_whisper.WhisperModel() fresh. Loading is a meaningful fraction of
 total runtime for a large model (e.g. --whisper-model large-v3), so this
 caches by (model_name, device, compute_type, ...) and hands back the

@@ -16,27 +16,29 @@
      it gets matched to, and phrasing.py forces a line break wherever an
      aligned word's line id changes.
 
-Two sources, tried in order:
-  - LRCLIB (lrclib.net, free, no key required) -- tried FIRST. Has a real
-    search API (artist_name/track_name query params, returns several
-    candidates to choose from) rather than lyrics.ovh's rigid single-shot
-    "/artist/title" path, and often has synced (per-line-timestamped)
-    lyrics (`LyricsResult.synced_lyrics`, LRC format) -- not consumed by
-    anything yet, but available for a future timing-anchored use.
-  - lyrics.ovh -- fallback, tried only if LRCLIB has nothing usable.
+ONE source: LRCLIB (lrclib.net, free, no key required) -- has a real
+search API (artist_name/track_name query params, returns several
+candidates to choose from) and, since 2026-08-15, a candidate is only
+ever considered valid if it has SYNCED (per-line-timestamped) lyrics
+(`LyricsResult.synced_lyrics`, LRC format) -- a plain-lyrics-only
+candidate is treated as no candidate at all, same as an empty search
+result. (lyrics.ovh was fully removed the same day -- it never had synced
+lyrics, so this requirement made it obsolete on its own; see CLAUDE.md's
+"Removed / rejected approaches".)
 
 This never touches note timing from the plain-lyrics path -- reference
 lyrics text has no timing information at all, only text and line
-structure. If both lookups fail (no network, song not found, etc.)
-everything downstream just falls back to ASR text and gap-based phrasing,
-same as if this were disabled.
+structure. If the lookup fails (no network, song not found, no synced
+candidate, etc.) everything downstream just falls back to ASR text and
+gap-based phrasing, same as if this were disabled -- `main.py`'s
+`no_lrc_fallback_callback` (GUI only) asks the user to confirm continuing
+that way before it happens, rather than doing it silently.
 """
 
 from __future__ import annotations
 
 import difflib
 import re
-import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -55,14 +57,19 @@ _CREDIT_LINE_RE = re.compile(r"^\s*(paroles|lyrics powered by|www\.)", re.IGNORE
 
 @dataclass
 class LyricsResult:
-    """A fetched reference-lyrics candidate, from whichever source
-    answered first."""
+    """A fetched reference-lyrics candidate. Always from LRCLIB (the only
+    remaining source, see this module's own docstring)."""
     plain_lyrics: str
     synced_lyrics: Optional[str] = None  # LRC format ("[mm:ss.xx]text" per
-                                          # line), LRCLIB only -- None from
-                                          # lyrics.ovh, or when LRCLIB has
-                                          # no synced version for this song.
-    source: str = ""  # "lrclib" or "lyrics.ovh", for diagnostics/logging.
+                                          # line) -- an automatic search/pick
+                                          # result always has this (see
+                                          # _score_lrclib_candidate); still
+                                          # Optional because an EXPLICIT
+                                          # override (--lrclib-id pinning a
+                                          # specific entry by hand) is exempt
+                                          # from that requirement and could
+                                          # legitimately have none.
+    source: str = ""  # "lrclib", for diagnostics/logging.
 
 
 @dataclass
@@ -224,13 +231,15 @@ def load_lrc_file(path, artist: str = "", title: str = "") -> Optional[LrcLibCan
 def _real_lrclib_candidates(candidates: List[LrcLibCandidate],
                              duration_sec: Optional[float]) -> List[LrcLibCandidate]:
     """Filters to candidates worth treating as genuine options for
-    ambiguity-prompt purposes: not instrumental, has real lyrics, and --
-    if both durations are known -- not wildly off from our own audio's
-    length (a generous 3x the normal scoring tolerance, just to exclude
-    obviously-different recordings, not to pick a winner)."""
+    ambiguity-prompt purposes: not instrumental, has real lyrics, HAS
+    SYNCED LYRICS (2026-08-15 -- a plain-lyrics-only candidate is not a
+    valid option at all, not even a worse one), and -- if both durations
+    are known -- not wildly off from our own audio's length (a generous
+    3x the normal scoring tolerance, just to exclude obviously-different
+    recordings, not to pick a winner)."""
     real = []
     for c in candidates:
-        if c.instrumental or not c.plain_lyrics:
+        if c.instrumental or not c.plain_lyrics or not c.synced_lyrics:
             continue
         c_duration = effective_lrc_duration(c)
         if duration_sec is not None and c_duration:
@@ -243,16 +252,16 @@ def _real_lrclib_candidates(candidates: List[LrcLibCandidate],
 def _score_lrclib_candidate(c: LrcLibCandidate, duration_sec: Optional[float]) -> float:
     """Same scoring `_fetch_from_lrclib` always used, factored out so
     both the automatic-pick path and (if it ever needs one) a caller can
-    share one definition of "best"."""
-    if c.instrumental or not c.plain_lyrics:
+    share one definition of "best". Synced lyrics are a HARD requirement
+    (2026-08-15, not just a tiebreaker bonus anymore) -- a plain-lyrics-
+    only candidate scores the same as an instrumental/lyric-less one."""
+    if c.instrumental or not c.plain_lyrics or not c.synced_lyrics:
         return -1.0
     s = 0.0
     c_duration = effective_lrc_duration(c)
     if duration_sec is not None and c_duration:
         diff = abs(c_duration - duration_sec)
         s += max(0.0, 1.0 - diff / config.LRCLIB_DURATION_TOLERANCE_SEC)
-    if c.synced_lyrics:
-        s += 0.1
     return s
 
 
@@ -263,22 +272,23 @@ def _fetch_from_lrclib(
     """Searches LRCLIB and picks the best candidate.
 
     LRCLIB can return multiple candidates for the same artist/title
-    (different recordings, albums, or -- same failure mode as lyrics.ovh
-    hit for Gaston this session -- an occasional wrong-language mistag).
-    Duration closeness to OUR OWN audio is the main automatic
-    disambiguator: an instrumental-only or lyric-less candidate is
-    excluded outright, and a candidate whose duration is far from ours is
-    heavily penalized (but not excluded -- still better than nothing if
-    it's the only candidate). A small bonus favors a candidate that also
-    has synced lyrics, since that's strictly more useful when a
-    duration-tie needs breaking.
+    (different recordings, albums, or -- same failure mode as the now-
+    removed lyrics.ovh hit for Gaston -- an occasional wrong-language
+    mistag). Duration closeness to OUR OWN audio is the main automatic
+    disambiguator among candidates that pass the hard requirements first:
+    instrumental, lyric-less, and NON-SYNCED candidates are all excluded
+    outright (2026-08-15 -- see `_score_lrclib_candidate`); among what's
+    left, a candidate whose duration is far from ours is heavily
+    penalized (but not excluded -- still better than nothing if it's the
+    only one left).
 
     `on_ambiguous`, if given, is called with the "real" (already
-    instrumental/no-lyrics/wildly-off-duration filtered) candidates
-    whenever there's more than one -- letting a human (the GUI's
-    ambiguity-prompt checkbox) pick instead of trusting the automatic
-    score. A returned candidate is used directly; returning None (user
-    cancelled) falls through to the normal automatic pick below.
+    instrumental/no-lyrics/non-synced/wildly-off-duration filtered)
+    candidates whenever there's more than one -- letting a human (the
+    GUI's ambiguity-prompt checkbox) pick instead of trusting the
+    automatic score. A returned candidate is used directly; returning
+    None (user cancelled) falls through to the normal automatic pick
+    below.
     """
     candidates = search_lrclib(artist, title)
     if not candidates:
@@ -297,49 +307,23 @@ def _fetch_from_lrclib(
     return best.to_lyrics_result()
 
 
-def _fetch_from_lyrics_ovh(artist: str, title: str) -> Optional[LyricsResult]:
-    """Fetches raw lyric text from the free lyrics.ovh API. Returns None
-    on any failure (network, not found, etc.) -- this is best-effort only.
-
-    Artist/title are percent-encoded (lyrics.ovh's own docs show this,
-    and it matters in practice: e.g. "Les Mis\u00e9rables" needs to become
-    "Les%20Mis%C3%A9rables" or the request 404s).
-    """
-    try:
-        import requests
-    except ImportError:
-        return None
-
-    url = f"https://api.lyrics.ovh/v1/{urllib.parse.quote(artist)}/{urllib.parse.quote(title)}"
-    try:
-        resp = requests.get(url, timeout=8)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        lyrics = data.get("lyrics")
-    except Exception:
-        return None
-    if not lyrics:
-        return None
-    return LyricsResult(plain_lyrics=lyrics, synced_lyrics=None, source="lyrics.ovh")
-
-
 def fetch_reference_lyrics(
         artist: str, title: str, duration_sec: Optional[float] = None,
         on_ambiguous: Optional[Callable[[List[LrcLibCandidate]], Optional[LrcLibCandidate]]] = None,
 ) -> Optional[LyricsResult]:
-    """Tries LRCLIB first, falls back to lyrics.ovh if LRCLIB has nothing
-    usable. `duration_sec` (our own audio's length) helps LRCLIB's search
+    """Searches LRCLIB (the only reference-lyrics source, see this
+    module's own docstring) for a candidate with synced lyrics.
+    `duration_sec` (our own audio's length) helps LRCLIB's search
     disambiguate between same-title candidates; pass it when available.
     `on_ambiguous`, if given, lets a human resolve a genuinely ambiguous
     LRCLIB result (see `_fetch_from_lrclib`'s own docstring) -- never set
     outside the GUI, so the CLI's own behavior is completely unchanged.
-    Returns None if neither source has anything -- best-effort only.
+    Returns None if no valid (synced) candidate was found -- best-effort
+    only; `main.py`'s `no_lrc_fallback_callback` (GUI only) is where a
+    None here gets surfaced to the user before silently continuing with
+    pure ASR transcription.
     """
-    result = _fetch_from_lrclib(artist, title, duration_sec, on_ambiguous=on_ambiguous)
-    if result is not None:
-        return result
-    return _fetch_from_lyrics_ovh(artist, title)
+    return _fetch_from_lrclib(artist, title, duration_sec, on_ambiguous=on_ambiguous)
 
 
 def reference_match_ratio(ref_lines: List[str], words: List[Word]) -> float:
@@ -491,8 +475,8 @@ def reference_matches_transcript(ref_lines: List[str], words: List[Word],
 
 def parse_lyrics_lines(raw_lyrics: str) -> List[str]:
     """Splits raw lyrics text into cleaned lines: strips blank lines,
-    section-annotation-only lines ("[Chorus]"), and lyrics.ovh's
-    occasional trailing credit line. Preserves original wording/casing
+    section-annotation-only lines ("[Chorus]"), and an occasional
+    trailing credit line. Preserves original wording/casing
     of everything else, and preserves line order (which is what phrase
     breaks are keyed on)."""
     if not raw_lyrics:

@@ -15,10 +15,10 @@ Algorithm:
      control ONLY where a '-' appears in the output, independently, in
      phrasing.py -- they must never influence which notes a word gets.
      This was a real, confirmed bug: the SAME sung phrase can come back
-     from lyrics.ovh split into a different number of lines in different
-     verses of the same song, and forcing a note-assignment zone boundary
-     at a line break with no real pause behind it swallowed one word
-     several beats too long and pushed everything after it late.
+     from reference lyrics split into a different number of lines in
+     different verses of the same song, and forcing a note-assignment zone
+     boundary at a line break with no real pause behind it swallowed one
+     word several beats too long and pushed everything after it late.
   2. The timeline is partitioned into one contiguous zone per GROUP, using
      boundaries at the midpoint between each group's ASR span and the
      next. Each detected note is assigned to whichever zone its midpoint
@@ -102,11 +102,13 @@ class AlignmentStats:
     words_in_word_boundary_split_lines: int = 0
     suspicious_word_indices: List[int] = field(default_factory=list)  # into the
                                                  # `words` list passed to
-                                                 # align_words_to_notes -- see
-                                                 # verification.py
+                                                 # align_words_to_notes -- a
+                                                 # word that got zero pass-1
+                                                 # notes (a fallback word)
     verification_results: List = field(default_factory=list)  # filled in by
-                                                 # alignment.build_entries after
-                                                 # running verification.py
+                                                 # alignment.align_words after
+                                                 # running verification.
+                                                 # apply_reference_text
 
 
 def _group_words_by_gap(words: List[Word], max_gap_sec: float) -> List[List[int]]:

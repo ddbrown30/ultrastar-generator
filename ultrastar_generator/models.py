@@ -17,16 +17,16 @@ class Word:
     end: float    # seconds
     confidence: float = 1.0
     line_id: Optional[int] = None  # which reference-lyrics line this word
-                                     # belongs to, if lyrics.ovh alignment
-                                     # found a match; None if unmatched or
-                                     # lyrics lookup wasn't used/available.
+                                     # belongs to, if reference-lyrics
+                                     # alignment found a match; None if
+                                     # unmatched or lyrics lookup wasn't
+                                     # used/available.
     reference_text: Optional[str] = None  # the specific reference-lyrics
                                      # word this ASR word was aligned to,
                                      # if any (see lyrics_lookup.py) -- used
-                                     # by verification.py to check a fresh
-                                     # re-transcription against what the
-                                     # reference actually expected here,
-                                     # not just self-consistency.
+                                     # by verification.apply_reference_text
+                                     # to force this word's own text to
+                                     # match it whenever they disagree.
     dropped: bool = False  # lyrics_lookup.align_words_to_reference found NO
                                      # real reference correspondence for this
                                      # word at all (decoder hallucination --

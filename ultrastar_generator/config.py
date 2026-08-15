@@ -481,30 +481,20 @@ ENABLE_TIME_BASED_LINE_ASSIGNMENT = True
 # of "drop any short note" territory.
 SLIVER_DROP_MAX_DURATION_SEC = 0.12
 
-# --- Chunk-based re-transcription verification (verification.py) ----------
-# A word that got zero pass-1 notes (a "fallback" word -- see
-# lyric_alignment.py) is always considered suspicious.
-# Padding (seconds) added on each side of a suspicious word's own ASR
-# span when cropping a fresh, isolated re-transcription window. Wide
-# enough to give the ASR model real context -- see "never run X on a
-# tiny, isolated clip" under Lessons learned in CLAUDE.md, the same
-# principle that applies to pYIN pitch analysis applies to ASR
-# confidence too -- narrow enough to stay unlikely to capture a
-# neighboring word's speech instead.
-RECHECK_PAD_SEC = 1.0
-# Text verification is on by default (--no-verify-words to disable): it
-# never touches note timing/pitch, only ever swaps in word TEXT, and a
-# reference-matched word is only ever replaced when the recheck actively
-# CONFIRMS a different answer than what's already there (see
-# verification.py's _resolve) -- low blast radius by construction.
-ENABLE_WORD_VERIFICATION = True
-# Verify every word, not just the ones pass 3 flagged suspicious -- the
-# extra recheck calls are cheap next to Demucs/WhisperX, and this catches
-# cases pass 3's own heuristics can't see (e.g. lyrics_lookup.py's
-# "uneven block" case, where a word gets a reference line tagged but its
-# text is deliberately left uncorrected pending a more confident check).
-# --verify-suspicious-only restricts back to just the flagged words.
-VERIFY_ALL_WORDS = True
+# --- Reference-text override (verification.py) -----------------------------
+# Used to be a chunk-based RE-TRANSCRIPTION verification step
+# (`ENABLE_WORD_VERIFICATION`/`VERIFY_ALL_WORDS`/`RECHECK_PAD_SEC`,
+# --verify-words/--verify-suspicious-only/--verify-whisper-model), removed
+# 2026-08-15 (user's explicit request) after discovering the recheck it ran
+# never actually gated anything: a reference-tagged word whose text
+# disagreed with its reference always ended up replaced with the reference
+# text regardless of what the recheck said, confirmed or not -- the whole
+# per-word Whisper re-transcription (by default, every word in the song)
+# was pure overhead for zero effect on output. `verification.
+# apply_reference_text` now does the same (correct, always-on, free)
+# text-override unconditionally, no flag needed -- see verification.py's
+# own docstring for the full story and CLAUDE.md's "Removed / rejected
+# approaches".
 
 # Pass 4 (optional, musicxml_reference.py): confirms/corrects pass-3
 # syllable PITCH CLASS (never octave, never timing) against a
@@ -744,10 +734,13 @@ EXISTING_TXT_MIN_COVERAGE = 0.85
 
 
 # --- Reference lyrics (lyrics_lookup.py) ------------------------------------
-# LRCLIB (lrclib.net) is tried first -- community-sourced, has a real search
-# API (artist_name/track_name, not lyrics.ovh's rigid /artist/title path),
-# and often has synced (per-line-timestamped) lyrics. lyrics.ovh is kept as
-# a fallback for whatever LRCLIB doesn't have.
+# LRCLIB (lrclib.net) is the ONLY reference-lyrics source (lyrics.ovh was
+# fully removed 2026-08-15, see CLAUDE.md's "Removed / rejected approaches" --
+# it never had synced lyrics, so a synced-only requirement made it obsolete
+# on its own). Community-sourced, has a real search API (artist_name/
+# track_name), and -- since 2026-08-15 -- a candidate is only ever
+# considered valid if it has synced (per-line-timestamped) lyrics; a
+# plain-lyrics-only candidate is treated the same as no candidate at all.
 #
 # LRCLIB's /api/search can return several same-title candidates (different
 # recordings/albums, or occasionally a wrong-language mistag). Preferred
@@ -756,11 +749,11 @@ EXISTING_TXT_MIN_COVERAGE = 0.85
 # outright excluded (still usable as a last resort if nothing better exists).
 LRCLIB_DURATION_TOLERANCE_SEC = 60.0
 
-# Real case that motivated this: Gaston's lyrics.ovh lookup silently
-# returned a SPANISH-language reference for an English song (same
-# artist/title string, wrong recording) -- verify_words then trusted it as
-# ground truth for TEXT and corrupted the whole song. Any reference source
-# can make this mistake, not just lyrics.ovh, so the gate lives here,
+# Real case that motivated this: Gaston's (now-removed) lyrics.ovh lookup
+# silently returned a SPANISH-language reference for an English song (same
+# artist/title string, wrong recording) -- downstream text-correction then
+# trusted it as ground truth for TEXT and corrupted the whole song. Any
+# reference source can make this mistake, not just lyrics.ovh, so the gate lives here,
 # independent of which source answered: the fetched reference's own word
 # vocabulary must overlap the ASR transcript's vocabulary by at least this
 # much (difflib.SequenceMatcher.ratio() over normalized word-token
@@ -1015,7 +1008,6 @@ class PipelineOptions:
     audio_file: Optional[str] = None  # disambiguates a folder with >1 real audio file
     work_dir: Optional[str] = None
     whisper_model: str = DEFAULT_WHISPER_MODEL
-    verify_whisper_model: str = DEFAULT_WHISPER_MODEL
     demucs_model: str = DEFAULT_DEMUCS_MODEL
     bpm_override: Optional[float] = None
     skip_separation: bool = False
@@ -1032,8 +1024,6 @@ class PipelineOptions:
     force_align_gaps: bool = FORCE_ALIGN_GAPS
     time_based_line_assignment: bool = ENABLE_TIME_BASED_LINE_ASSIGNMENT
     merge_connected_melisma: bool = MERGE_CONNECTED_MELISMA_TAILS
-    verify_words: bool = ENABLE_WORD_VERIFICATION
-    verify_all_words: bool = VERIFY_ALL_WORDS
     musicxml_reference: Optional[str] = None
     musicxml_part: Optional[str] = None
     musicxml_force_calibration: bool = ENABLE_MUSICXML_FORCE_CALIBRATION
@@ -1081,3 +1071,13 @@ class PipelineOptions:
     # continues with the standard audio-based fallback, False cancels the
     # whole run.
     mxl_lrc_fallback_callback: Optional[Callable[[str], bool]] = None
+    # GUI-only, never set by the CLI (same auto-fallback-with-a-warning
+    # convention as mxl_lrc_fallback_callback above). Called with a reason
+    # string whenever `fetch_reference_lyrics` finds no valid (synced-
+    # lyrics) LRCLIB candidate at all -- True continues with pure ASR
+    # transcription (no reference-lyrics correction or forced line
+    # breaks), False cancels the whole run. Never consulted when
+    # `pinned_lyrics`/`lrclib_id` already resolved a candidate directly,
+    # or when `fetch_lyrics` is off (a deliberate opt-out, nothing to ask
+    # about).
+    no_lrc_fallback_callback: Optional[Callable[[str], bool]] = None

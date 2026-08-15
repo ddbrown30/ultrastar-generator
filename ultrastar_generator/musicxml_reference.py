@@ -4,7 +4,7 @@ hand-downloaded from MuseScore -- see CLAUDE.md's "MuseScore reference
 data" section for why this isn't fetched automatically).
 
 No automatic INTERNET lookup/fetch exists, unlike lyrics_lookup.py's
-lyrics.ovh call -- MuseScore access was found to be actively blocked
+LRCLIB call -- MuseScore access was found to be actively blocked
 platform-side (see CLAUDE.md). But a file already sitting in the song's
 own folder IS auto-detected (file_discovery.find_companions, matched by
 extension: .mxl/.musicxml/.xml -- see that module for why basename

@@ -240,9 +240,10 @@ options:
 --bpm 120                      Override auto-detected tempo
 --whisper-model medium.en      Bigger/more accurate ASR model (default:
                                 small.en). Try large-v3 for better accuracy.
---fetch-lyrics                 Look up reference lyrics (lyrics.ovh) to
-                                correct mistranscribed words (whole-sequence
-                                alignment, not just low-confidence words)
+--fetch-lyrics                 Look up reference lyrics (LRCLIB, synced
+                                lyrics only) to correct mistranscribed
+                                words (whole-sequence alignment, not just
+                                low-confidence words)
                                 AND to force phrase breaks at every real
                                 line break in the lyrics (default: ON;
                                 use --no-fetch-lyrics to disable)
@@ -254,12 +255,6 @@ options:
                                 -- see section 4)
 --crepe-model full              torchcrepe model size: full (more
                                 accurate, default) or tiny (faster)
---no-verify-words               Disable chunk-based re-transcription
-                                verification against reference lyrics
-                                (default: ON -- see section 4)
---verify-suspicious-only        Only verify pass 2's flagged-suspicious
-                                words instead of every word (faster, catches
-                                less)
 --pitch-smooth-window 0.11     Vibrato-suppression filter window (sec);
                                 raise if notes still fragment, lower if
                                 fast runs get smeared together
@@ -321,8 +316,8 @@ short/quiet words, which is a real lead worth following up on via
 `--pitch-smooth-window`/`--note-split-semitones`), plus how many matched
 reference lines had their notes distributed by syllable count (see
 section 4 -- this is the mechanism that replaced trusting individual
-interior word timestamps). The lyrics.ovh step prints how many reference
-lines it found and every single word it corrected, e.g.
+interior word timestamps). The reference-lyrics step prints how many
+reference lines it found and every single word it corrected, e.g.
 `"is" -> "his" (at 143.60s)`, so you can see exactly what changed and
 cross-check it against the audio at that timestamp -- if you suspect
 phrase breaks aren't coming from the reference lyrics, this is the first
@@ -386,8 +381,9 @@ gap-based phrasing.
   lyrics.
 - Words are hyphenated into syllables (via `pyphen`) and then fitted onto
   the notes from pass 1 via a **monotonic timeline partition** -- but at
-  the LINE level, not the word level, whenever lyrics.ovh matched a word
-  to a reference line: consecutive words sharing the same reference line
+  the LINE level, not the word level, whenever reference-lyrics lookup
+  matched a word to a reference line: consecutive words sharing the same
+  reference line
   get grouped first, and it's that GROUP's overall span (first word's
   start to last word's end) that gets a zone, with boundaries at the
   midpoint between consecutive groups. Each detected note is assigned to
@@ -409,22 +405,16 @@ gap-based phrasing.
   with a `~` continuation when a syllable is held across multiple notes).
   **Note timing and pitch always come from pass 1**, never from the ASR
   word boundaries.
-- Chunk-based re-transcription verification (`--no-verify-words` to
-  disable; **on by default, every word** -- `--verify-suspicious-only`
-  restricts it back to just pass 2's flagged words: a "fallback" word
-  that got zero pass-1 notes, or a matched reference line whose
-  syllable count badly outnumbers its assigned note count): each word
-  gets a fresh, tightly-cropped, isolated re-transcription of just that
-  moment in the audio. The rechecked text is compared against the
-  word's specific `reference_text` (the reference-lyrics word it was
-  aligned to, if any -- see `lyrics_lookup.py`), not just against its
-  own current text: an already-correct word is left alone, a wrong word
-  gets corrected to the reference when the recheck confirms it, and the
-  reference is still trusted as the fallback when everything disagrees
-  (consistent with reference lyrics being the pipeline's source of truth
-  for text). With no reference at all (e.g. an ad-lib), the recheck is
-  the only second opinion available. Every decision is logged. This
-  never touches note timing or pitch.
+- Reference-text override (`verification.apply_reference_text`, always
+  on, no flag): a word's text is forced to match its specific
+  `reference_text` (the reference-lyrics word it was aligned to, if any
+  -- see `lyrics_lookup.py`) whenever they disagree; an already-correct
+  word is left alone, and a word with no reference at all (e.g. an
+  ad-lib) is untouched since there's nothing to compare against. Used to
+  be a per-word isolated re-transcription recheck gating this same
+  replacement -- removed after confirming the recheck never actually
+  changed the outcome (see CLAUDE.md). This never touches note timing or
+  pitch, only text.
 - Non-overlap is enforced twice: once in continuous seconds
   (`postprocess.enforce_monotonic`, which trusts word order and only
   pushes later notes forward -- it does NOT sort by timestamp, since
@@ -502,8 +492,9 @@ ultrastar_generator/
                         with vibrato-smoothing + merge passes + a hard
                         non-overlap guarantee
   transcription.py    WhisperX (preferred) / faster-whisper word timestamps
-  lyrics_lookup.py    lyrics.ovh fetch + whole-sequence word alignment
-                        (text correction + per-word reference line id)
+  lyrics_lookup.py    LRCLIB (synced-lyrics-only) fetch + whole-sequence
+                        word alignment (text correction + per-word
+                        reference line id)
   lyric_alignment.py Pass 3: fits words onto the pass-1 note grid,
                         propagates line id, reports AlignmentStats
   postprocess.py       Non-overlap enforcement (seconds-level, order-

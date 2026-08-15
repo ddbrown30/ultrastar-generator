@@ -1276,7 +1276,7 @@ model_cache_mod_fa.get_whisperx_align_model = _orig_align_model_fr
 del _sys_fa.modules["whisperx"]
 
 print("\n--- lyrics_lookup._fetch_from_lrclib: picks the best candidate by duration closeness, "
-      "excludes instrumental/lyric-less candidates, breaks ties toward a synced-lyrics candidate ---")
+      "excludes instrumental/lyric-less/non-synced candidates ---")
 from ultrastar_generator.lyrics_lookup import _fetch_from_lrclib, fetch_reference_lyrics
 
 
@@ -1292,13 +1292,13 @@ class _FakeLRCLIBResponse:
 class _FakeRequestsModule:
     """Deterministic fake for the `requests` module -- lyrics_lookup.py
     does `import requests` lazily inside each fetch function, so
-    installing this in sys.modules before calling is enough."""
-    def __init__(self, search_payload=None, search_status=200, ovh_payload=None, ovh_status=200,
+    installing this in sys.modules before calling is enough. LRCLIB is
+    the only source (lyrics.ovh removed 2026-08-15), so only its two
+    endpoints (/api/search, /api/get/<id>) are ever actually requested."""
+    def __init__(self, search_payload=None, search_status=200,
                  get_by_id_payload=None, get_by_id_status=200):
         self.search_payload = search_payload
         self.search_status = search_status
-        self.ovh_payload = ovh_payload
-        self.ovh_status = ovh_status
         self.get_by_id_payload = get_by_id_payload  # a single dict, for /api/get/<id> -- distinct
         self.get_by_id_status = get_by_id_status     # shape from /api/search's list response
         self.urls_requested = []
@@ -1307,9 +1307,7 @@ class _FakeRequestsModule:
         self.urls_requested.append(url)
         if "lrclib.net/api/get/" in url:
             return _FakeLRCLIBResponse(self.get_by_id_payload, self.get_by_id_status)
-        if "lrclib.net" in url:
-            return _FakeLRCLIBResponse(self.search_payload, self.search_status)
-        return _FakeLRCLIBResponse(self.ovh_payload, self.ovh_status)
+        return _FakeLRCLIBResponse(self.search_payload, self.search_status)
 
 
 lrclib_candidates = [
@@ -1317,8 +1315,8 @@ lrclib_candidates = [
      "instrumental": True, "plainLyrics": None, "syncedLyrics": None},  # excluded: instrumental
     {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 300,
      "instrumental": False, "plainLyrics": "way off duration", "syncedLyrics": None},  # far duration
-    {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 178,
-     "instrumental": False, "plainLyrics": "close duration, no sync", "syncedLyrics": None},
+    {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 180,
+     "instrumental": False, "plainLyrics": "exact duration, no sync", "syncedLyrics": None},
     {"trackName": "Gaston", "artistName": "Beauty and the Beast", "duration": 179,
      "instrumental": False, "plainLyrics": "close duration, synced",
      "syncedLyrics": "[00:01.00]line one\n[00:05.00]line two"},
@@ -1326,9 +1324,13 @@ lrclib_candidates = [
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=lrclib_candidates)
 best = _fetch_from_lrclib("Beauty and the Beast", "Gaston", duration_sec=180.0)
 assert best is not None and best.source == "lrclib"
+# The non-synced candidate has the EXACT duration match (would win on pure
+# duration-closeness scoring) but is invalid outright for lacking synced
+# lyrics -- the close-but-not-exact synced candidate must win instead.
 assert best.plain_lyrics == "close duration, synced", best.plain_lyrics
 assert best.synced_lyrics == "[00:01.00]line one\n[00:05.00]line two", best.synced_lyrics
-print("OK: correct candidate chosen among instrumental/far-duration/synced-tiebreak options")
+print("OK: a non-synced candidate loses even with a PERFECT duration match -- synced lyrics is a "
+      "hard requirement, not just a tiebreak")
 
 print("\n--- lyrics_lookup.search_lrclib: returns ALL raw candidates unfiltered (for the manual search UI) ---")
 from ultrastar_generator.lyrics_lookup import search_lrclib, LrcLibCandidate
@@ -1480,11 +1482,12 @@ ambiguous_candidates = [
     {"trackName": "Song", "artistName": "Artist", "duration": 30,
      "instrumental": True, "plainLyrics": None, "syncedLyrics": None},  # excluded: instrumental
     {"trackName": "Song", "artistName": "Artist", "duration": 350,
-     "instrumental": False, "plainLyrics": "wildly different recording", "syncedLyrics": None},  # excluded: duration
+     "instrumental": False, "plainLyrics": "wildly different recording",
+     "syncedLyrics": "[00:01.00]wildly different recording"},  # excluded: duration (synced doesn't save it)
     {"trackName": "Song", "artistName": "Artist", "duration": 105,
-     "instrumental": False, "plainLyrics": "candidate A", "syncedLyrics": None},
+     "instrumental": False, "plainLyrics": "candidate A", "syncedLyrics": "[00:01.00]candidate A"},
     {"trackName": "Song", "artistName": "Artist", "duration": 110,
-     "instrumental": False, "plainLyrics": "candidate B", "syncedLyrics": None},
+     "instrumental": False, "plainLyrics": "candidate B", "syncedLyrics": "[00:01.00]candidate B"},
 ]
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=ambiguous_candidates)
 seen_real_candidates = []
@@ -1523,14 +1526,24 @@ assert not was_called, "on_ambiguous must not fire when there's only one real ca
 print("OK: on_ambiguous is never invoked when there's only one real (non-instrumental) candidate")
 del _sys.modules["requests"]
 
-print("\n--- lyrics_lookup.fetch_reference_lyrics: falls back to lyrics.ovh when LRCLIB has nothing ---")
-_sys.modules["requests"] = _FakeRequestsModule(
-    search_payload=[], ovh_payload={"lyrics": "fallback lyrics text"},
-)
-fallback_result = fetch_reference_lyrics("Some Artist", "Some Title", duration_sec=120.0)
-assert fallback_result is not None and fallback_result.source == "lyrics.ovh", fallback_result
-assert fallback_result.plain_lyrics == "fallback lyrics text", fallback_result
-print("OK: empty LRCLIB search result correctly fell back to lyrics.ovh")
+print("\n--- lyrics_lookup.fetch_reference_lyrics: LRCLIB is the only source (lyrics.ovh removed "
+      "2026-08-15) -- an empty search returns None, no fallback source left to try ---")
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=[])
+empty_result = fetch_reference_lyrics("Some Artist", "Some Title", duration_sec=120.0)
+assert empty_result is None, empty_result
+print("OK: empty LRCLIB search result returns None (nothing to fall back to)")
+del _sys.modules["requests"]
+
+print("\n--- lyrics_lookup: a candidate with NO synced lyrics is invalid, same as no candidate at "
+      "all (2026-08-15, was previously just a small scoring tiebreak) ---")
+_sys.modules["requests"] = _FakeRequestsModule(search_payload=[
+    {"trackName": "Song", "artistName": "Artist", "duration": 100,
+     "instrumental": False, "plainLyrics": "plain only, no sync", "syncedLyrics": None},
+])
+no_sync_result = fetch_reference_lyrics("Artist", "Song", duration_sec=100.0)
+assert no_sync_result is None, no_sync_result
+print("OK: a plain-lyrics-only candidate (even a perfect duration match) is rejected outright, "
+      "not used as a worse-but-still-usable fallback")
 del _sys.modules["requests"]
 
 print("\n--- lyrics_lookup: id threads through search_lrclib, and fetch_lrclib_by_id fetches directly ---")
@@ -2503,76 +2516,31 @@ assert 2 not in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_i
 assert 0 not in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_indices
 print(f"OK: suspicious word indices correctly identified: {sorted(set(susp_stats.suspicious_word_indices))}")
 
-print("\n--- verification: chunk re-transcription resolves against reference lyrics, "
-      "not just self-consistency ---")
+print("\n--- verification.apply_reference_text: forces a word's text to match its reference "
+      "whenever they disagree -- no audio/ASR involved at all (removed the old re-transcription "
+      "recheck 2026-08-15, see verification.py's own docstring for why: it never actually gated "
+      "the replacement on anything the recheck said) ---")
 import ultrastar_generator.verification as verification_mod
 
-
-class _FakeSegment:
-    def __init__(self, text):
-        self.text = text
-
-
-class _SequencedFakeASRModel:
-    """Deterministic fake: returns a fixed sequence of 'rechecked' texts,
-    one per call, in the order verify_words() processes words (sorted
-    index order) -- lets the test drive each of _resolve()'s branches
-    independently."""
-    _responses = ["rumbled", "multitudinous", "totally different", "echo", "echo"]
-
-    def __init__(self, *a, **k):
-        self._iter = iter(self._responses)
-
-    def transcribe(self, audio, language=None, batch_size=None):
-        return {"segments": [{"text": next(self._iter), "start": 0.0, "end": 1.0}]}
-
-
-def _fake_load_model_verify_words(model_name, device=None, compute_type=None, language=None, vad_options=None):
-    return _SequencedFakeASRModel()
-
-
-fake_whisperx_verify_words = _types.ModuleType("whisperx")
-fake_whisperx_verify_words.load_model = _fake_load_model_verify_words
-_sys.modules["whisperx"] = fake_whisperx_verify_words
-verification_mod.model_cache.reset()
-# Earlier tests replaced sys.modules["librosa"] with note_detection-specific
-# fakes that don't implement .resample(); verification.py needs the real
-# thing, so drop the fake and let it re-import genuinely.
-_sys.modules.pop("librosa", None)
-
-verify_test_words = [
-    # 0: no reference at all; recheck disagrees with current text -> kept
-    # (an isolated recheck is a less reliable signal than the original
-    # full-context ASR text, and there's no reference to confirm the
-    # disagreement either way -- see verification.py's _resolve()).
+art_test_words = [
+    # 0: no reference at all -> left alone, nothing to compare against.
     Word(text="mumbled", start=0.0, end=0.3, confidence=0.9, line_id=None, reference_text=None),
-    # 1: current text does NOT match reference, but the recheck CONFIRMS the
-    # reference (case-insensitively) -> replaced with the reference's own text
-    # (not the recheck's raw casing), fixing lyrics_lookup's "uneven block" case.
+    # 1: current text does NOT match reference -> replaced with the
+    # reference's own text (not any recheck's casing/wording), fixing
+    # lyrics_lookup's "uneven block" case.
     Word(text="multitude", start=10.0, end=10.3, confidence=0.9, line_id=0, reference_text="Multitudinous"),
-    # 2: current text wrong, recheck ALSO doesn't match reference (3-way
-    # disagreement) -> falls back to trusting the reference anyway.
-    Word(text="Stray", start=20.0, end=20.3, confidence=0.9, line_id=0, reference_text="Stars"),
-    # 3: current text already matches reference -> left alone regardless of
-    # what the recheck (mock says "echo") hears.
+    # 2: current text already matches reference (case/punctuation aside) ->
+    # left alone.
     Word(text="Stars", start=30.0, end=30.3, confidence=0.9, line_id=0, reference_text="Stars"),
-    # 4: no reference; recheck agrees with current text -> left alone.
-    Word(text="echo", start=40.0, end=40.3, confidence=0.9, line_id=None, reference_text=None),
 ]
-y_fake = np.zeros(22050 * 42, dtype=np.float32)
-new_words, verify_results = verification_mod.verify_words(
-    verify_test_words, [0, 1, 2, 3, 4], y_fake, 22050, "small.en", verbose=True,
-)
-assert new_words[0].text == "mumbled", new_words[0]         # untouched -- no reference to confirm the recheck
-assert new_words[1].text == "Multitudinous", new_words[1]  # reference's own text, not the recheck's raw casing
-assert new_words[2].text == "Stars", new_words[2]           # forced to reference despite no confirmation
-assert new_words[3].text == "Stars", new_words[3]           # untouched -- already matched reference
-assert new_words[4].text == "echo", new_words[4]            # untouched -- recheck agreed
-assert [r.replaced for r in verify_results] == [False, True, True, False, False], verify_results
-print("OK: verification correctly resolved all 5 cases against reference lyrics:",
+new_words, override_results = verification_mod.apply_reference_text(art_test_words, [0, 1, 2])
+assert new_words[0].text == "mumbled", new_words[0]         # untouched -- no reference to compare against
+assert new_words[1].text == "Multitudinous", new_words[1]  # forced to the reference's own text
+assert new_words[2].text == "Stars", new_words[2]           # untouched -- already matched
+assert [r.word_index for r in override_results] == [1], override_results
+assert override_results[0].replaced is True, override_results
+print("OK: apply_reference_text correctly resolved all 3 cases against reference lyrics:",
       [w.text for w in new_words])
-del _sys.modules["whisperx"]
-verification_mod.model_cache.reset()
 
 print("\n--- musicxml_reference.apply_musicxml_reference: calibrates at the PITCH-CLASS level "
       "(absorbs a per-song transposition) and corrects only where confident ---")

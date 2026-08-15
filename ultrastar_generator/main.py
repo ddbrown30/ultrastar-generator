@@ -120,12 +120,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help=f"whisper model name for the main transcription pass (default: {config.DEFAULT_WHISPER_MODEL}). "
                          "This is what drives word timing accuracy feeding pass 3's note-zone assignment -- a bigger "
                          "model here is the lever worth pulling for accuracy.")
-    p.add_argument("--verify-whisper-model", default=config.DEFAULT_WHISPER_MODEL,
-                    help=f"whisper model name for verify_words's re-transcription re-checks "
-                         f"(default: {config.DEFAULT_WHISPER_MODEL}, independent of --whisper-model). This loop "
-                         "calls the model hundreds of times on tiny clips, where a big model's fixed per-call "
-                         "overhead dominates -- --whisper-model large-v3 for both made the verify pass alone "
-                         "take ~10x longer than a small model in one real run.")
     p.add_argument("--demucs-model", default=config.DEFAULT_DEMUCS_MODEL,
                     help=f"Demucs model name (default: {config.DEFAULT_DEMUCS_MODEL})")
     p.add_argument("--bpm", type=float, default=None, help="Override detected BPM")
@@ -133,7 +127,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Skip Demucs; use --vocals-path instead (e.g. you already have an isolated vocal stem)")
     p.add_argument("--vocals-path", help="Path to a pre-isolated vocal stem (wav), used with --skip-separation")
     p.add_argument("--fetch-lyrics", dest="fetch_lyrics", action="store_true", default=True,
-                    help="Fetch reference lyrics online (lyrics.ovh) to correct low-confidence ASR words (default: on)")
+                    help="Fetch reference lyrics online (LRCLIB, synced lyrics only) to correct low-confidence "
+                         "ASR words and mark line breaks (default: on)")
     p.add_argument("--no-fetch-lyrics", dest="fetch_lyrics", action="store_false",
                     help="Disable online lyric lookup/correction")
     p.add_argument("--no-video-sync", action="store_true",
@@ -213,19 +208,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "separate note -- chains, so several connected same-pitch '~' notes in a row all "
                          "collapse into one. See CLAUDE.md.")
     p.add_argument("--no-merge-connected-melisma", dest="merge_connected_melisma", action="store_false")
-    p.add_argument("--verify-words", dest="verify_words", action="store_true",
-                    default=config.ENABLE_WORD_VERIFICATION,
-                    help="Re-transcribe a tight, isolated audio crop around every word's own ASR "
-                         "timestamp and cross-check it against the reference lyrics (default: on). "
-                         "Never changes note timing/pitch, only swaps in text, and only when the "
-                         "recheck actively confirms a different answer than what's already there.")
-    p.add_argument("--no-verify-words", dest="verify_words", action="store_false",
-                    help="Disable the text re-transcription check")
-    p.add_argument("--verify-suspicious-only", dest="verify_all_words", action="store_false",
-                    default=config.VERIFY_ALL_WORDS,
-                    help="Only run enabled verification checks on words pass 3 flagged suspicious "
-                         "(fallback words that got zero note pieces) instead of every "
-                         "word -- faster, at the cost of catching fewer mistakes.")
     p.add_argument("--musicxml-reference", default=None,
                     help="Path to a MusicXML/.mxl file for this song (e.g. hand-downloaded sheet "
                          "music) -- pass 4, off unless given. Aligns by lyric text against pass 3's "
@@ -785,11 +767,22 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                     f"{forced_lrc_candidate.artist_name} (lrclib)")
                 reference = forced_lrc_candidate.to_lyrics_result()
             else:
-                log("Fetching reference lyrics (LRCLIB, falling back to lyrics.ovh)...")
+                log("Fetching reference lyrics (LRCLIB, synced lyrics only)...")
                 reference = fetch_reference_lyrics(
                     artist, title, duration_sec=audio_duration,
                     on_ambiguous=opts.lyrics_disambiguation_callback if opts.lyrics_ambiguity_prompt else None,
                 )
+                if reference is None:
+                    reason = (f"No valid synced-lyrics candidate was found on LRCLIB for "
+                              f"{artist!r} - {title!r}.")
+                    log(f"  {reason}")
+                    if opts.no_lrc_fallback_callback is not None:
+                        if not opts.no_lrc_fallback_callback(reason):
+                            return PipelineResult(success=False, error=(
+                                f"Cancelled: {reason} User declined to continue with pure "
+                                f"transcription."))
+                    log("  Continuing with pure transcription (no reference-lyrics correction or "
+                        "forced line breaks).")
             if reference:
                 candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
                 # PROTOTYPE force-align known gaps, see config.FORCE_ALIGN_GAPS's
@@ -921,20 +914,16 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         log("  ASR text already matched the reference; no corrections needed.")
                     debug_log.log_reference_corrections(diffs)
                     words = corrected
-            else:
-                log("  Could not fetch reference lyrics (not found on LRCLIB or lyrics.ovh, or no "
-                    "network); continuing with ASR text and gap-based phrasing only.")
+            # else: reference is None -- already logged (and, in the GUI,
+            # confirmed via no_lrc_fallback_callback) right after the fetch
+            # above; nothing further to do here but continue with ASR text
+            # and gap-based phrasing, same as if lyric lookup were disabled.
         else:
             log("Lyric lookup disabled (--no-fetch-lyrics); using ASR text and gap-based phrasing only.")
 
         # --- PASS 3: fit words onto the pass-1 note grid (timing untouched) --
         log("Pass 3: fitting words onto the pass-1 note grid...")
-        syllables, stats = align_words(words, notes, y, sr,
-                                        verify_words=opts.verify_words,
-                                        verify_all_words=opts.verify_all_words,
-                                        verify_whisper_model=opts.verify_whisper_model,
-                                        debug_log=debug_log,
-                                        verbose=not opts.quiet)
+        syllables, stats = align_words(words, notes, y, sr, debug_log=debug_log)
         log(f"  {stats.words_with_notes}/{stats.total_words} words matched to pass-1 notes directly "
             f"({stats.total_notes_consumed} notes consumed); "
             f"{stats.words_with_fallback} word(s) needed a fallback note (no pass-1 note in their zone).")
@@ -952,10 +941,9 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 f"({stats.words_in_word_boundary_split_lines} words) had their notes split by "
                 f"each word's own ASR start/end time")
         if stats.verification_results:
-            n_checked = len(stats.verification_results)
-            n_replaced = sum(1 for r in stats.verification_results if r.replaced)
-            log(f"    verification: re-transcribed {n_checked} suspicious word(s) in isolation, "
-                f"replaced {n_replaced}")
+            n_replaced = len(stats.verification_results)
+            log(f"    reference-text override: forced {n_replaced} word(s) to match reference "
+                f"lyrics exactly")
 
         # --- PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s).
         if mxl_paths:
@@ -1101,7 +1089,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
     return config.PipelineOptions(
         pinned_lyrics=pinned_lyrics,
         artist=args.artist, title=args.title, audio_file=args.audio_file, work_dir=args.work_dir,
-        whisper_model=args.whisper_model, verify_whisper_model=args.verify_whisper_model,
+        whisper_model=args.whisper_model,
         demucs_model=args.demucs_model, bpm_override=args.bpm,
         skip_separation=args.skip_separation, vocals_path=args.vocals_path,
         fetch_lyrics=args.fetch_lyrics, no_video_sync=args.no_video_sync,
@@ -1111,8 +1099,6 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         force_align_gaps=args.force_align_gaps,
         time_based_line_assignment=args.time_based_line_assignment,
         merge_connected_melisma=args.merge_connected_melisma,
-        verify_words=args.verify_words,
-        verify_all_words=args.verify_all_words,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,
         musicxml_force_calibration=args.musicxml_force_calibration,
         lrc_timing_check=args.lrc_timing_check,

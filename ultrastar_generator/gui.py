@@ -390,7 +390,6 @@ class App(tk.Tk):
         # Curated main-surface options (see gui.py's own module docstring
         # for why only a subset of the ~30 CLI flags are exposed here).
         self.fetch_lyrics = tk.BooleanVar(value=True)
-        self.verify_words = tk.BooleanVar(value=config.ENABLE_WORD_VERIFICATION)
         self.existing_txt_check = tk.BooleanVar(value=config.ENABLE_EXISTING_TXT_CHECK)
         self.musicxml_force_calibration = tk.BooleanVar(value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.whisper_model = tk.StringVar(value=config.DEFAULT_WHISPER_MODEL)
@@ -735,31 +734,28 @@ class App(tk.Tk):
         opts_frame.pack(fill="x", **pad)
         c1 = ttk.Checkbutton(opts_frame, text="Fetch reference lyrics", variable=self.fetch_lyrics)
         c1.grid(row=0, column=0, sticky="w", padx=8, pady=2)
-        Tooltip(c1, "Look up reference lyrics (LRCLIB, falling back to lyrics.ovh) to correct "
-                    "mistranscribed words and force phrase breaks at real line breaks.")
-        c2 = ttk.Checkbutton(opts_frame, text="Verify words", variable=self.verify_words)
-        c2.grid(row=1, column=0, sticky="w", padx=8, pady=2)
-        Tooltip(c2, "Re-transcribe each word in isolation and cross-check against reference lyrics. "
-                    "Never changes timing/pitch, only swaps in text when the recheck actively confirms "
-                    "a different answer.")
+        Tooltip(c1, "Look up reference lyrics (LRCLIB, synced lyrics only) to correct "
+                    "mistranscribed words and force phrase breaks at real line breaks. If no valid "
+                    "synced candidate is found, you'll be asked whether to continue with pure "
+                    "transcription instead.")
         c4 = ttk.Checkbutton(opts_frame, text="Check existing .txt before overwriting", variable=self.existing_txt_check)
-        c4.grid(row=2, column=0, sticky="w", padx=8, pady=2)
+        c4.grid(row=1, column=0, sticky="w", padx=8, pady=2)
         Tooltip(c4, "If an existing '<Artist> - <Title>.txt' is found in the input folder, verify its "
                     "pitch/timing first and only regenerate if problems are found.")
         c5 = ttk.Checkbutton(opts_frame, text="MusicXML force calibration", variable=self.musicxml_force_calibration)
-        c5.grid(row=2, column=1, sticky="w", padx=8, pady=2)
+        c5.grid(row=1, column=1, sticky="w", padx=8, pady=2)
         Tooltip(c5, "When a MusicXML reference file is found but our own pitch can't confidently "
                     "calibrate against it, use the best available offset anyway rather than skipping.")
 
-        ttk.Label(opts_frame, text="Whisper model:").grid(row=3, column=0, sticky="w", padx=8, pady=2)
+        ttk.Label(opts_frame, text="Whisper model:").grid(row=2, column=0, sticky="w", padx=8, pady=2)
         whisper_entry = ttk.Entry(opts_frame, textvariable=self.whisper_model, width=15)
-        whisper_entry.grid(row=3, column=0, sticky="e", padx=8)
+        whisper_entry.grid(row=2, column=0, sticky="e", padx=8)
         Tooltip(whisper_entry, "ASR model size, e.g. small.en (default), medium.en, large-v3. "
                                 "Bigger is more accurate but slower.")
-        ttk.Label(opts_frame, text="Pitch source:").grid(row=3, column=1, sticky="w", padx=8, pady=2)
+        ttk.Label(opts_frame, text="Pitch source:").grid(row=2, column=1, sticky="w", padx=8, pady=2)
         pitch_combo = ttk.Combobox(opts_frame, textvariable=self.pitch_source, values=sorted(PITCH_SOURCES.keys()),
                                     state="readonly", width=12)
-        pitch_combo.grid(row=3, column=1, sticky="e", padx=8)
+        pitch_combo.grid(row=2, column=1, sticky="e", padx=8)
         Tooltip(pitch_combo, "rmvpe (default): RMVPE's own pitch/voicing decision, fastest and most "
                               "accurate on average. swiftf0: lightweight CNN pitch detector with a "
                               "real native voicing decision of its own. Whichever is chosen supplies "
@@ -767,7 +763,7 @@ class App(tk.Tk):
 
         c6 = ttk.Checkbutton(opts_frame, text="Delete work files after generating",
                               variable=self.delete_work_files)
-        c6.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        c6.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=2)
         Tooltip(c6, "Deletes the entire .ultrastar_work directory (Demucs separation output, extracted "
                     "audio/covers, and debug files) once generation completes. Leave off if you'll re-run "
                     "this song again soon -- it avoids re-paying separation cost.")
@@ -1056,6 +1052,30 @@ class App(tk.Tk):
             return result_holder.get("continue", False)
         return callback
 
+    def _make_no_lrc_fallback_callback(self) -> Callable[[str], bool]:
+        """Returns a callback for PipelineOptions.no_lrc_fallback_callback.
+        Same thread-hop shape as `_make_mxl_lrc_fallback_callback` above --
+        shown by default whenever no valid (synced-lyrics) LRCLIB candidate
+        was found, no separate opt-in checkbox, same "ask what they want to
+        do" convention."""
+        def callback(reason: str) -> bool:
+            result_holder = {}
+            done_event = threading.Event()
+
+            def show_dialog():
+                result_holder["continue"] = messagebox.askyesno(
+                    "No valid lyrics found",
+                    f"{reason}\n\nContinue with pure transcription (no reference-lyrics correction "
+                    f"or forced line breaks)?",
+                    parent=self,
+                )
+                done_event.set()
+
+            self.after(0, show_dialog)
+            done_event.wait()
+            return result_holder.get("continue", False)
+        return callback
+
     # --- folder/file pickers (remember last-used folder; default to the
     # folder the program was launched from otherwise) ---------------------
 
@@ -1172,7 +1192,6 @@ class App(tk.Tk):
             title=None if is_batch else self.title_entry.effective_value(),
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             fetch_lyrics=self.fetch_lyrics.get(),
-            verify_words=self.verify_words.get(),
             existing_txt_check=self.existing_txt_check.get(),
             musicxml_force_calibration=self.musicxml_force_calibration.get(),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
@@ -1207,6 +1226,11 @@ class App(tk.Tk):
             # Batch mode always auto-falls-back silently with just the log
             # warning, same convention as the lyrics ambiguity prompt above.
             mxl_lrc_fallback_callback=self._make_mxl_lrc_fallback_callback() if not is_batch else None,
+            # No-valid-LRC fallback confirmation -- single-song-mode only,
+            # same shown-by-default convention as mxl_lrc_fallback_callback
+            # above (whenever fetch_reference_lyrics finds no valid synced
+            # candidate at all). Batch mode auto-falls-back silently.
+            no_lrc_fallback_callback=self._make_no_lrc_fallback_callback() if not is_batch else None,
         )
 
     def _effective_lrclib_id(self) -> Optional[int]:
