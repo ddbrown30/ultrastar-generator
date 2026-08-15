@@ -9,7 +9,6 @@ detector into config.MIN_BPM..MAX_BPM.
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import numpy as np
 

@@ -107,21 +107,6 @@ class AlignmentStats:
     verification_results: List = field(default_factory=list)  # filled in by
                                                  # alignment.build_entries after
                                                  # running verification.py
-    placement_warnings: List = field(default_factory=list)  # filled in by
-                                                 # alignment.align_words after running
-                                                 # verification.verify_placement -- a
-                                                 # word whose text is fine but whose FINAL
-                                                 # note-assigned position doesn't match
-                                                 # what's actually sung there, and where
-                                                 # the mismatch couldn't be confidently
-                                                 # auto-corrected (see placement_corrections)
-    placement_corrections: List = field(default_factory=list)  # filled in by
-                                                 # alignment.align_words after running
-                                                 # verification.verify_placement -- a word
-                                                 # whose FINAL note-assigned position was
-                                                 # confirmed wrong AND precisely re-located,
-                                                 # so its (start, end) was corrected and
-                                                 # pass 3 was re-run with the fix applied
 
 
 def _group_words_by_gap(words: List[Word], max_gap_sec: float) -> List[List[int]]:

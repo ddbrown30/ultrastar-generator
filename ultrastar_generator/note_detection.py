@@ -84,11 +84,6 @@ class NoteEvent:
                                      # the pitch happens to match.
 
 
-def _hz_to_ultrastar_pitch(hz: float) -> int:
-    midi = 69 + 12 * np.log2(hz / 440.0)
-    return int(round(midi)) - 60
-
-
 def _smooth_midi_contour(midi: np.ndarray, voiced: np.ndarray, window: int) -> np.ndarray:
     """Median-filters `midi` in-place per contiguous voiced run (never
     smoothing across a silence gap, which would blur real note

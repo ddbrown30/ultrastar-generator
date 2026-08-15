@@ -46,7 +46,7 @@ import numpy as np
 
 from . import config
 from . import model_cache
-from .models import Word, Syllable
+from .models import Word
 from .progress import ProgressReporter
 
 

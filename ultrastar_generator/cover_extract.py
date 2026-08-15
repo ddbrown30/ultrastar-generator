@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from . import config
 

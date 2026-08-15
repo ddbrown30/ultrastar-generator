@@ -50,7 +50,6 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from . import config
@@ -293,7 +292,7 @@ def select_lrc_candidate(artist: str, title: str, mxl_words: List[MxlWord], audi
     if not scored:
         return None
     scored.sort(key=lambda t: (not t[0], t[2], -t[1]))
-    artist_match, ratio, delta, best = scored[0]
+    _artist_match, ratio, delta, best = scored[0]
     lrc_lines = parse_lrc(best.synced_lyrics)
     if not lrc_lines:
         return None

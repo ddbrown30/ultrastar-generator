@@ -1320,7 +1320,7 @@ def two_tier_time_calibration(
                 f"drift fit " + (
                     f"only reached {fit[2]:.0%} inliers (need {min_drift_confidence:.0%})" if fit
                     else f"needs >= {min_drift_samples} matched lines"
-                ) + f", and piecewise/isotonic tier 3 also failed its own anchor-count/spacing gate"
+                ) + ", and piecewise/isotonic tier 3 also failed its own anchor-count/spacing gate"
             ), None, None
         offset, slope, confidence, _ = fit
         kind = "drift"

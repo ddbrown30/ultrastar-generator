@@ -1222,9 +1222,9 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     lrc_seed = None
     lrc_confident = lrc_prep is not None and lrc_prep.calibration_offset is not None
     if lrc_mode == "windowed" and lrc_prep is not None and not lrc_confident:
-        log(f"  LRC candidate found but no confident time calibration -- 'windowed' mode isn't safe to use "
-            f"here (would window the ENTIRE match against an uncalibrated signal), falling back to "
-            f"whole-song ASR matching instead.")
+        log("  LRC candidate found but no confident time calibration -- 'windowed' mode isn't safe to use "
+            "here (would window the ENTIRE match against an uncalibrated signal), falling back to "
+            "whole-song ASR matching instead.")
     if lrc_mode == "windowed" and lrc_confident:
         starts, ends, confident = match_words_to_asr_windowed(words, lrc_prep.word_lines, lrc_prep.lrc_lines,
                                                                 asr_words)

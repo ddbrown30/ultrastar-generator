@@ -28,7 +28,7 @@ from .batch import run_batch
 from .file_discovery import (AmbiguousInputError, NoAudioSourceFoundError, headline_case,
                               resolve_artist_title, resolve_primary_source)
 from .lyrics_lookup import LrcLibCandidate, search_lrclib, load_lrc_file
-from .main import PipelineResult, check_cuda_available, delete_work_files, run_pipeline
+from .main import check_cuda_available, delete_work_files, run_pipeline
 from .realign import RealignPipelineOptions, run_realign_batch, run_realign_pipeline
 from .pitch_refresh import (DEFAULT_KEY_NUDGE, PITCH_SOURCES, PitchRefreshOptions,
                              run_pitch_refresh_batch, run_pitch_refresh_pipeline)
@@ -238,16 +238,6 @@ class LrcLibSearchDialog(tk.Toplevel):
             self.selected_index = 0
             self._show_preview(0)
             self.use_button.config(state=tk.NORMAL)
-
-    @staticmethod
-    def _label_for(c: LrcLibCandidate) -> str:
-        dur = f"{int(c.duration // 60)}:{int(c.duration % 60):02d}" if c.duration else "?:??"
-        label = f"[{c.id}] " if c.id is not None else ""
-        label += f"{c.track_name} - {c.artist_name}"
-        if c.album_name:
-            label += f" ({c.album_name})"
-        label += f" [{dur}]"
-        return label
 
     def _on_select(self, event):
         line = int(self.listbox.index(f"@{event.x},{event.y}").split(".")[0])
@@ -1340,11 +1330,11 @@ class App(tk.Tk):
     def _run_worker(self, mode: str, is_batch: bool, input_dir: Path, output_dir: Optional[Path],
                      opts, q: "queue.Queue", existing_txt_path: Optional[Path] = None):
         class _QueueWriter:
-            def write(self_, s):
+            def write(self, s):
                 if s.strip():
                     q.put(s)
 
-            def flush(self_):
+            def flush(self):
                 pass
 
         try:

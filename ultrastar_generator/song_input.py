@@ -12,9 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from . import config
 from .cover_extract import extract_embedded_cover
-from .file_discovery import Companions, find_companions, resolve_primary_source, NoAudioSourceFoundError
+from .file_discovery import find_companions, resolve_primary_source, NoAudioSourceFoundError
 from .media_extract import extract_audio_track, has_audio_stream
 
 

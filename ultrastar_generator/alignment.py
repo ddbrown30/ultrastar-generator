@@ -29,7 +29,7 @@ import numpy as np
 from .models import Word
 from . import config
 from .note_detection import NoteEvent
-from .lyric_alignment import align_words_to_notes, AlignmentStats
+from .lyric_alignment import align_words_to_notes
 from .verification import verify_words as _verify_words_check
 
 
