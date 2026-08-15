@@ -1129,6 +1129,42 @@ Three concrete outcomes:
 All three, plus `retry_low_quality_asr`, validated together (not just in
 isolation) across 6 real gen+realign runs — zero regressions.
 
+## Shared cross-module functions (re-test every listed caller when touched)
+
+Logic genuinely identical across modules lives in ONE place instead of
+being re-derived (and re-buggy) per caller. When editing any function
+below, re-run/re-validate every listed caller, not just the one you were
+working in — a fix or regression in the shared function silently affects
+all of them.
+
+- **`lrc_timing.find_cursor_window_match`** (added 2026-08-16): the
+  forward-only cursor/tight-vs-wide window search + its two quality
+  guards (min-match-count floor, span guard) used by every "find these
+  target tokens somewhere after `cursor` in a haystack word stream"
+  mechanism. Callers: `lrc_timing.match_asr_to_lrc_lines` (one anchor per
+  LRC line) and `realign.match_words_to_asr` (every individual existing
+  word's own position, plus a fuzzy-ratio `"replace"`-block fallback for
+  ASR mishearing). Deliberately does NOT own opcode interpretation
+  (marking positions, advancing the caller's own cursor) — that stays
+  per-caller since the two callers want genuinely different things from
+  a match. The `lenient_min_matches` param exists because the two
+  callers need genuinely DIFFERENT floors for a non-strict (tight/fresh)
+  window match, discovered the same day this was extracted:
+  `match_asr_to_lrc_lines`'s own `mall_no_recovery` regression test needs
+  2 (a lone stray "the" must not validate the 2-word target "the end");
+  `match_words_to_asr`'s own `sla_confident` regression test needs 1 (a
+  single real match is sometimes the ONLY confident evidence available
+  at all, e.g. a chunk where only 1 of 4 words was ever transcribed, and
+  must still anchor). Don't assume one universal floor is correct if you
+  touch this — check both callers' own regression tests.
+  Re-test: `test_dry_run.py`'s `match_asr_to_lrc_lines`/
+  `two_tier_time_calibration` block AND its `realign: alignment-only
+  mode` block (esp. the Pink Pony Club / Our Lady Peace / `sla_confident`
+  regression tests); real-audio sanity check via
+  `scan_mwta_regression.py`-style replay of a cached `[DEBUG LOG].txt`'s
+  `RAW ASR TRANSCRIPT` section for at least Chicago, Video Games, and
+  Our Lady Peace.
+
 ## Environment
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.

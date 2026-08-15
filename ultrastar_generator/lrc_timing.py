@@ -1055,6 +1055,150 @@ def _piecewise_or_isotonic_calibration(
     return rep_offset, rep_slope, confidence, kind, correction_fn, holdout_residual_sec
 
 
+def find_cursor_window_match(
+    cursor: int,
+    haystack_norm: List[str],
+    target_tokens: List[str],
+    pending_word_count: int,
+    *,
+    tight_slack: int = 4,
+    wide_multiplier: int = 3,
+    wide_slack: int = 10,
+    min_match_fraction: float = 0.5,
+    lenient_min_matches: int = 2,
+) -> Optional[Tuple[List[Tuple[str, int, int, int, int]], List[str]]]:
+    """The forward-only CURSOR-based window search shared by every "find
+    `target_tokens` somewhere after `cursor` in `haystack_norm`" mechanism
+    in this codebase (`match_asr_to_lrc_lines` below, `realign.
+    match_words_to_asr`) -- extracted 2026-08-16 specifically because the
+    SAME three real bugs kept needing independent re-discovery and
+    re-fixing in each caller's own copy of this logic (user's own
+    observation, after the second time it happened): a fix landing in
+    one caller did nothing for the other until someone noticed the same
+    failure mode there too. This is now the ONE place this logic lives.
+
+    Only finds and validates a window match -- returns the winning
+    window's own `(opcodes, window)` (raw `difflib.SequenceMatcher`
+    opcodes, `None` if neither window confirms), NOT what to DO with a
+    match. Interpreting opcodes (marking matched positions, handling a
+    `"replace"` block as a possible fuzzy ASR-mishearing match, computing
+    how far to advance the caller's OWN cursor) stays caller-specific,
+    since callers want genuinely different things from a match (a single
+    per-line anchor vs. every individual word's own position) -- forcing
+    that into a shared shape would be the over-abstraction this project's
+    conventions warn against, for no real benefit (that part has never
+    been where the repeated bugs lived).
+
+    TIGHT-preferred-when-SUBSTANTIAL, WIDE otherwise (real bug found via
+    real-audio validation on Our Lady Peace - "Somewhere Out There", a
+    song with several lines repeating back-to-back 3-4 times in a row):
+    even a completely FRESH search's base (wide) window is already wide
+    enough to reach PAST the immediately-following correct occurrence
+    into a LATER repeat of the same content, with no prior skip needed to
+    get there at all -- a `difflib` search doesn't inherently prefer the
+    NEAREST valid match over any other high-quality one it finds
+    elsewhere in the window. Both a TIGHT window (barely more than
+    `target_tokens`' own size) and the normal WIDE window are tried;
+    TIGHT wins whenever it covers at least HALF `target_tokens`
+    (`min_match_fraction`), regardless of what the wide search separately
+    finds -- a near, mostly-complete match is trusted on its own local
+    merits, not compared against whatever the wide window's own
+    (possibly wrong, possibly further-away) optimization happens to
+    prefer. Two thresholds were tried and rejected first, both found
+    wanting against real data from TWO different real songs: requiring a
+    fully COMPLETE tight match was too strict (a real correct nearby
+    match can be missing 1-2 words to real ASR noise, and would still
+    lose to a wrong, farther-away wide match); comparing raw match COUNTS
+    (prefer whichever side found more) was too unprincipled -- a
+    wrong-but-farther wide match can trivially have a higher raw count
+    than a correct-but-partial near one simply because it has more room
+    to search in. A REQUIRE-ANY-PASSING-TIGHT-MATCH threshold (tried even
+    earlier) was too loose the other direction -- it regressed a
+    different real song (Chicago), where a single coincidentally-found
+    word in the tight window blocked the wide search from finding its
+    own better, fuller answer.
+
+    WIDE window is NOT fixed-size -- `pending_word_count` (the caller's
+    own running total of skipped/unmatched target tokens since the
+    cursor last actually advanced, capped by the caller) lets a real
+    multi-target garbled/ad-lib stretch recover once real content
+    resumes, without permanently stranding the cursor.
+
+    Both windows share the SAME two quality guards (found via real-audio
+    validation on Chappell Roan - "Pink Pony Club", a song whose chorus
+    repeats 3 full times): a MINIMUM-MATCH-COUNT gate (`min_needed`,
+    floored at `lenient_min_matches` even outside strict/fraction mode --
+    see its own comment in `_try` below for why this floor is caller-
+    tunable, not one universal constant: `match_asr_to_lrc_lines`'s own
+    `mall_no_recovery` test needs 2, `realign.match_words_to_asr`'s own
+    `sla_confident` test needs 1) rejects a coincidentally-shared common
+    word being mistaken for a real match; a SPAN guard (bounded relative
+    to the EVIDENCE actually found, not the window's own nominal size)
+    rejects a technically-passing match whose few real tokens are
+    scattered across almost the entire window -- letting such a match
+    through once let the caller's own cursor jump all the way to the
+    window's far edge, permanently stranding every later search for the
+    rest of the song."""
+    n = len(haystack_norm)
+
+    def _try(window: List[str], require_strict_fraction: bool) -> Tuple[Optional[List], int]:
+        if not window:
+            return None, 0
+        sm = difflib.SequenceMatcher(None, window, target_tokens, autojunk=False)
+        opcodes = sm.get_opcodes()
+        equal_wa = [(wa1, wa2) for tag, wa1, wa2, _ca1, _ca2 in opcodes if tag == "equal"]
+        matched = sum(wa2 - wa1 for wa1, wa2 in equal_wa)
+        # A genuine 1-word target has no way to require "half" of itself
+        # (or "at least `lenient_min_matches`") -- accept its single token
+        # either way. Anything longer needs at least `lenient_min_matches`
+        # real matched tokens even in lenient (non-strict) mode -- real bug
+        # found consolidating this logic (2026-08-16): an unconditional
+        # 1-token floor let a single coincidentally-shared word validate a
+        # multi-word target on its own, the exact risk the fraction gate
+        # exists to prevent (caught by `match_asr_to_lrc_lines`'s own
+        # `mall_no_recovery` regression test: a lone stray "the" must not
+        # validate the 2-word target "the end"). `lenient_min_matches`
+        # itself is caller-tunable, not one universal constant -- a real,
+        # deliberately DIFFERENT threshold is needed by `realign.
+        # match_words_to_asr`'s own pre-existing `sla_confident` regression
+        # test: a single real match (e.g. "alpha") is the ONLY confident
+        # evidence in the whole remaining ASR stream for a 4-word target,
+        # and must still anchor -- real per-word transcripts routinely
+        # confirm only a few of a chunk's words at a time, which isn't a
+        # coincidence risk the way a whole extra unmatched LRC line is.
+        # Strict mode additionally requires the full fraction on top, when
+        # that's a higher bar than the floor.
+        if len(target_tokens) == 1:
+            min_needed = 1
+        elif require_strict_fraction:
+            min_needed = max(lenient_min_matches, round(len(target_tokens) * min_match_fraction))
+        else:
+            min_needed = lenient_min_matches
+        span = (max(wa2 for _wa1, wa2 in equal_wa) - min(wa1 for wa1, _wa2 in equal_wa)) if equal_wa else 0
+        max_span = matched * 3 + 3
+        if matched < min_needed or span > max_span:
+            return None, matched
+        return opcodes, matched
+
+    tight_end = min(cursor + len(target_tokens) + tight_slack, n)
+    tight_window = haystack_norm[cursor:tight_end]
+    tight_opcodes, tight_matched = _try(tight_window, require_strict_fraction=False)
+
+    wide_end = min(cursor + pending_word_count * wide_multiplier + wide_slack, n)
+    wide_window = haystack_norm[cursor:wide_end]
+    window_is_inflated = pending_word_count > len(target_tokens)
+    wide_opcodes, _wide_matched = _try(wide_window, require_strict_fraction=window_is_inflated)
+
+    tight_preference_threshold = max(1, round(len(target_tokens) * min_match_fraction))
+    if tight_opcodes is not None and tight_matched >= tight_preference_threshold:
+        return tight_opcodes, tight_window
+    if wide_opcodes is not None:
+        return wide_opcodes, wide_window
+    if tight_opcodes is not None:
+        return tight_opcodes, tight_window
+    return None
+
+
 def match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, str]]
                             ) -> List[Tuple[int, float, float]]:
     """Matches ASR's own flat, time-ordered word stream against the LRC
@@ -1077,65 +1221,16 @@ def match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, s
     ASR-vs-LRC-line calibration step -- don't reimplement this a third
     time.
 
-    Forward-only CURSOR-based matching (rewritten 2026-08-15, real bug
-    found via real-audio validation on Chappell Roan - "Pink Pony Club",
-    a song whose chorus repeats 3 full times): the OLD implementation
-    ran a single GLOBAL, non-chronological `difflib.SequenceMatcher`
-    over the WHOLE ASR word stream vs. the WHOLE LRC word stream (every
-    line's words concatenated together, all repeats included) -- exactly
-    this project's own recurring "repeated-phrase disambiguation"
-    failure class (see CLAUDE.md's "Lessons learned"), just never fixed
-    in THIS mechanism before. Real confirmed failure: a whole ~130s
-    middle stretch of the song (where ASR text didn't cleanly match, an
-    ad-lib/bridge section) got ZERO anchors at all under the global diff,
-    and every line after that gap was then anchored ~134-135s TOO EARLY
-    -- matched against an earlier occurrence of the same repeated chorus
-    instead of its own real, later one.
-
-    Same cursor principle already validated and shipped for this exact
-    "ASR words vs. one reference line's text" shape in `lyrics_lookup.
-    assign_lrc_line_ids_sequentially` (and for "our lines vs. LRC lines"
-    in `reconcile_line_structure`): walk LRC lines in order, search only
-    a BOUNDED window of ASR words starting where the PREVIOUS line's own
-    match left off. A repeated phrase later in the song can never be
-    confused with an earlier occurrence, because the cursor has already
-    advanced past the earlier occurrence's own words by the time a later
-    line's search begins -- the earlier occurrence is simply
-    unreachable. This is deliberately NOT the same risk class as this
-    project's rejected TIME-windowed search attempts (`--verify-
-    placement`, `realign.py`'s old `"windowed"` local-rematch): those
-    searched a window that could still contain more than one real
-    occurrence of a repeated phrase with no way to disambiguate; a
-    monotonic SEQUENCE-POSITION cursor cannot reach an earlier occurrence
-    at all, by construction.
-
-    The window size is NOT fixed per line -- it accumulates the word
-    count of every line skipped (no match found) since the cursor last
-    actually advanced, so a real multi-line garbled/ad-lib stretch (the
-    Pink Pony Club case) doesn't permanently strand the cursor: the
-    window for the line that finally matches again naturally covers all
-    the skipped lines' content too, not just its own few words. Capped
-    (`MAX_PENDING_WORDS`) so this growth can't run away indefinitely --
-    real bug found via the SAME Pink Pony Club validation: an uncapped
-    window that grows large enough can accidentally contain a SHORT,
-    coincidental match (a common word like "the"/"I" appearing far
-    ahead, unrelated to this line) that `difflib` still reports as an
-    "equal" opcode -- accepting that as a real anchor jumped the cursor
-    forward past a huge stretch of genuinely NOT-yet-transcribed real
-    content, corrupting every subsequent line's delta the same way the
-    original global-diff bug did, just in the opposite (too-LATE, not
-    too-early) direction. Fixed with a MINIMUM-MATCH-QUALITY gate
-    (`MIN_MATCH_TOKEN_FRACTION`): a candidate match must cover a real
-    fraction of the line's OWN tokens, not just one coincidentally-
-    shared common word, before it's trusted enough to advance the
-    cursor at all."""
-    WINDOW_WORD_MULTIPLIER = 3
-    WINDOW_WORD_SLACK = 10
+    The window search itself (forward-only cursor, tight-vs-wide, quality
+    gates) is `find_cursor_window_match` above -- see its own docstring
+    for the full real-bug history. This function's only remaining job is
+    interpreting a winning match for THIS shape: the EARLIEST matched ASR
+    word's own start time becomes the line's anchor candidate, and the
+    cursor advances to just past the LAST matched word (never a raw,
+    unconfirmed opcode boundary)."""
     MAX_PENDING_WORDS = 60
-    MIN_MATCH_TOKEN_FRACTION = 0.5
 
     asr_norm = [_normalize(w.text) for w in asr_words]
-    n = len(asr_words)
     cursor = 0
     pending_word_count = 0
     candidates = []
@@ -1144,33 +1239,22 @@ def match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, s
         if not line_tokens:
             continue
         pending_word_count = min(pending_word_count + len(line_tokens), MAX_PENDING_WORDS)
-        window_end = min(cursor + pending_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n)
-        window = asr_norm[cursor:window_end]
-        if not window:
-            continue
-        sm = difflib.SequenceMatcher(None, window, line_tokens, autojunk=False)
-        first_offset = None
-        last_offset = None
-        matched_token_count = 0
-        for tag, a1, a2, _b1, _b2 in sm.get_opcodes():
-            if tag != "equal":
-                continue
-            if first_offset is None:
-                first_offset = a1
-            last_offset = a2 - 1
-            matched_token_count += a2 - a1
-        # A genuine 1-word line has no way to require "half" of itself --
-        # accept its single token. Anything longer still needs at least 2
-        # real matched tokens (not just 1, which `round(.. * 0.5)` alone
-        # would allow for a 2-word line) -- a lone coincidentally-shared
-        # common word must never be trusted as a real anchor on its own.
-        min_needed = 1 if len(line_tokens) == 1 else max(2, round(len(line_tokens) * MIN_MATCH_TOKEN_FRACTION))
-        if first_offset is None or matched_token_count < min_needed:
+        found = find_cursor_window_match(cursor, asr_norm, line_tokens, pending_word_count)
+        if found is None:
             # No match (or only a weak, likely-coincidental one) anywhere
             # in this (accumulated) window -- don't advance the cursor;
             # the NEXT line's own search starts from the same position,
             # its window growing to cover this line's skipped content too.
             continue
+        opcodes, _window = found
+        first_offset = None
+        last_offset = None
+        for tag, a1, a2, _b1, _b2 in opcodes:
+            if tag != "equal":
+                continue
+            if first_offset is None:
+                first_offset = a1
+            last_offset = a2 - 1
         asr_idx = cursor + first_offset
         candidates.append((li, lrc_start, asr_words[asr_idx].start - lrc_start))
         cursor += last_offset + 1
