@@ -44,10 +44,41 @@ Flags
   --restore-on-failure      With --verify: automatically restore the backup
                              for any file that fails verification.
 
-Backups are stored in a parallel directory tree, so they mirror your folder
-structure and are easy to find, verify against, restore, or delete:
+Backups are stored under a fixed location (not inside the directory being
+processed), mirroring each file's full path relative to its own drive --
+not relative to whatever subfolder you pointed the script at. For example,
+running the script on Z:\\Songs\\Foo\\ puts a file's backup at:
 
-    <directory>/.loudnorm_backups/<same relative path as original file>
+    Z:\\.loudnorm_backups\\Songs\\Foo\\<rest of the path as normal>
+
+Because backups are namespaced by full drive-relative path rather than a
+single flat folder, running the script against different subfolders of the
+same drive (e.g. Z:\\Songs\\Foo and Z:\\Songs\\Bar) never collides -- each
+gets its own spot under the shared backup root.
+
+A separate CRC log tracks which files have already been normalized,
+independent of the backups folder, so it survives a --cleanup:
+
+    <directory>/.loudnorm_crc.json
+
+On each run, a file's current checksum is compared against the log:
+  - Checksum matches the value recorded for this exact path -> already
+    normalized, skip it.
+  - Checksum matches a value recorded under a DIFFERENT path -> this is a
+    file that was already normalized and has since been moved or renamed.
+    The log entry is updated to the new path and the file is skipped
+    without being reprocessed.
+  - No matching checksum anywhere, but a backup already exists at this
+    path -> this file was processed before the CRC log existed (or before
+    --cleanup ran). The current checksum is recorded and the file is
+    skipped rather than normalizing it again.
+  - No matching checksum anywhere and no backup -> genuinely new file,
+    normalize it as usual, then record its resulting checksum.
+  - A checksum IS recorded for this exact path, but doesn't match -> the
+    file changed since it was last normalized (replaced, re-ripped, etc.),
+    so it's normalized again and any old backup is treated as stale and
+    replaced.
+--force bypasses all of the above and always reprocesses.
 
 Requirements
 ------------
@@ -70,7 +101,7 @@ Usage
   python mp3_loudnorm.py "C:\\Music" --verify                # check results
   python mp3_loudnorm.py "C:\\Music" --verify --restore-on-failure   # and auto-fix failures
   python mp3_loudnorm.py "C:\\Music" --restore               # undo normalization entirely
-  python mp3_loudnorm.py "C:\\Music" --cleanup                # delete backups
+  python mp3_loudnorm.py "C:\\Music" --cleanup                # delete backups (CRC log is kept)
 """
 
 import argparse
@@ -80,9 +111,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 
-BACKUP_DIRNAME = ".loudnorm_backups"
+BACKUP_DIRNAME = r"Z:\.loudnorm_backups"  # fixed location, not relative to the processed root
+CRC_LOG_FILENAME = ".loudnorm_crc.json"
 DURATION_ABORT_TOLERANCE = 0.5    # seconds; skip replacing file if exceeded
 DURATION_VERIFY_TOLERANCE = 0.05  # seconds; flagged in --verify
 LOUDNESS_VERIFY_TOLERANCE = 1.0   # LUFS
@@ -126,7 +159,10 @@ def find_files(root: Path):
         if p.is_file()
         and p.suffix.lower() in SUPPORTED_EXTENSIONS
         and not p.name.endswith(".tmp" + p.suffix)
-        and BACKUP_DIRNAME not in p.relative_to(root).parts
+        # Exclude a leftover original-layout backup folder nested inside
+        # root (<root>\.loudnorm_backups\...) -- find_legacy_backup() still
+        # looks inside it, but its contents are backups, not real songs.
+        and ".loudnorm_backups" not in p.relative_to(root).parts
     ]
 
     # An .mp4 is only a candidate if its folder has no "real" audio file
@@ -184,6 +220,63 @@ def restore_file(backup_path: Path, current_path: Path):
     ensure_writable(current_path)
     current_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(backup_path, current_path)
+
+
+def compute_crc32(path: Path) -> str:
+    """CRC32 checksum of a file's contents, as 8 hex digits."""
+    crc = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            crc = zlib.crc32(chunk, crc)
+    return format(crc & 0xFFFFFFFF, "08x")
+
+
+def load_crc_registry(root: Path) -> dict:
+    """Load the {relative_path: crc32} log. Missing or unreadable -> {}."""
+    log_path = root / CRC_LOG_FILENAME
+    if not log_path.exists():
+        return {}
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_crc_registry(root: Path, registry: dict):
+    """Write the CRC log atomically (write to a temp file, then replace).
+    Called after every file, not batched, so a mid-run cancellation
+    doesn't lose progress already made."""
+    log_path = root / CRC_LOG_FILENAME
+    tmp_path = log_path.with_suffix(log_path.suffix + ".tmp")
+    ensure_writable(log_path)
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(registry, f, indent=2, sort_keys=True)
+    tmp_path.replace(log_path)
+
+
+def find_legacy_backup(root: Path, rel: Path):
+    """Look for a backup made under an earlier version of this script's
+    backup layout, so a library that already has backups doesn't get
+    needlessly reprocessed just because BACKUP_DIRNAME's meaning changed.
+    Checked, oldest first:
+      - <root>\\.loudnorm_backups\\<rel>            (original layout)
+      - <BACKUP_DIRNAME>\\<rel>                     (flat fixed-drive layout)
+    Returns the found path, or None."""
+    candidates = [
+        root / ".loudnorm_backups" / rel,
+        Path(BACKUP_DIRNAME) / rel,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def ffprobe_json(path: Path):
@@ -373,7 +466,7 @@ def normalize_file(path: Path, target_lufs: float, target_tp: float, info: dict,
 def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool,
                   force: bool, stop_on_error: bool):
     check_tools()
-    backup_root = root / BACKUP_DIRNAME
+    backup_root = Path(BACKUP_DIRNAME) / root.relative_to(root.anchor)
     files = find_files(root)
     if not files:
         print("No mp3/ogg/mp4/m4a files found.")
@@ -384,19 +477,82 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
     if dry_run:
         print("(dry run -- no files will be changed)\n")
 
+    crc_registry = load_crc_registry(root)
+    # Reverse index (checksum -> path) so a file that's been moved or
+    # renamed since it was normalized can still be recognized by content,
+    # not just by its old path.
+    hash_to_path = {h: p for p, h in crc_registry.items()}
+
     processed = 0
     skipped = 0
     errors = 0
 
     for path in files:
         rel = path.relative_to(root)
+        rel_key = rel.as_posix()
         backup_path = backup_root / rel
         backup_exists = backup_path.exists()
 
-        if backup_exists and not force:
-            print(f"SKIP (backup already exists, looks already processed): {rel}")
-            skipped += 1
+        if not backup_exists and not dry_run:
+            legacy_backup = find_legacy_backup(root, rel)
+            if legacy_backup is not None:
+                try:
+                    backup_path.parent.mkdir(parents=True, exist_ok=True)
+                    ensure_writable(legacy_backup)
+                    shutil.move(str(legacy_backup), str(backup_path))
+                    backup_exists = True
+                    print(f"  (migrated backup from legacy location: {legacy_backup})")
+                except OSError as e:
+                    print(f"  WARNING: found a legacy backup for {rel} but could not "
+                          f"migrate it ({e}); treating as no backup.")
+
+        try:
+            current_hash = compute_crc32(path)
+        except OSError as e:
+            print(f"ERROR: could not read {rel} to compute its checksum: {e}")
+            errors += 1
+            if stop_on_error:
+                print("Stopping (--stop-on-error).")
+                break
             continue
+
+        recorded_hash = crc_registry.get(rel_key)
+
+        if not force:
+            if recorded_hash is not None and recorded_hash == current_hash:
+                print(f"SKIP (already normalized, CRC matches recorded value): {rel}")
+                skipped += 1
+                continue
+
+            moved_from = hash_to_path.get(current_hash)
+            if moved_from is not None and moved_from != rel_key:
+                # Same content, recorded under a different path -> this file
+                # was already normalized and has since been moved/renamed.
+                verb = "would update" if dry_run else "updating"
+                print(f"SKIP (already normalized -- matches {moved_from}, {verb} recorded path): {rel}")
+                if not dry_run:
+                    del crc_registry[moved_from]
+                    crc_registry[rel_key] = current_hash
+                    hash_to_path[current_hash] = rel_key
+                    save_crc_registry(root, crc_registry)
+                skipped += 1
+                continue
+
+            if recorded_hash is None and backup_exists:
+                verb = "would record" if dry_run else "recording"
+                print(f"SKIP (backup exists but no CRC recorded yet -- {verb} current CRC): {rel}")
+                if not dry_run:
+                    crc_registry[rel_key] = current_hash
+                    hash_to_path[current_hash] = rel_key
+                    save_crc_registry(root, crc_registry)
+                skipped += 1
+                continue
+
+            if recorded_hash is not None and recorded_hash != current_hash:
+                # File content changed since it was last normalized -- any
+                # existing backup belongs to that old content, so treat this
+                # like a fresh file and let a new backup be created below.
+                backup_exists = False
 
         print(f"Processing: {rel}")
         if dry_run:
@@ -443,9 +599,16 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
                         break
                     continue
 
+            new_hash = compute_crc32(tmp_out)
+
             ensure_writable(path)
             tmp_out.replace(path)
             tmp_out = None
+
+            crc_registry[rel_key] = new_hash
+            hash_to_path[new_hash] = rel_key
+            save_crc_registry(root, crc_registry)
+
             print(f"  Done. ({old_lufs:.1f} LUFS -> {target_lufs:.1f} LUFS target, "
                   f"{orig_duration:.3f}s)")
             processed += 1
@@ -477,10 +640,12 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
 
 def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failure: bool):
     check_tools()
-    backup_root = root / BACKUP_DIRNAME
+    backup_root = Path(BACKUP_DIRNAME) / root.relative_to(root.anchor)
     if not backup_root.exists():
         print("No backup directory found; nothing to verify.")
         return
+
+    crc_registry = load_crc_registry(root) if restore_on_failure else None
 
     backups = sorted(
         p for p in backup_root.rglob("*")
@@ -558,6 +723,9 @@ def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failu
             if restore_on_failure:
                 try:
                     restore_file(backup_path, current_path)
+                    rel_key = rel.as_posix()
+                    if crc_registry.pop(rel_key, None) is not None:
+                        save_crc_registry(root, crc_registry)
                     print(f"    -> restored from backup")
                     restored += 1
                 except Exception as e:
@@ -571,7 +739,7 @@ def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failu
 
 
 def do_restore(root: Path):
-    backup_root = root / BACKUP_DIRNAME
+    backup_root = Path(BACKUP_DIRNAME) / root.relative_to(root.anchor)
     if not backup_root.exists():
         print("No backup directory found; nothing to restore.")
         return
@@ -591,6 +759,8 @@ def do_restore(root: Path):
         print("Cancelled.")
         return
 
+    crc_registry = load_crc_registry(root)
+
     restored = 0
     errors = 0
     for backup_path in backups:
@@ -598,6 +768,9 @@ def do_restore(root: Path):
         current_path = root / rel
         try:
             restore_file(backup_path, current_path)
+            rel_key = rel.as_posix()
+            if crc_registry.pop(rel_key, None) is not None:
+                save_crc_registry(root, crc_registry)
             print(f"Restored: {rel}")
             restored += 1
         except Exception as e:
@@ -608,7 +781,7 @@ def do_restore(root: Path):
 
 
 def do_cleanup(root: Path):
-    backup_root = root / BACKUP_DIRNAME
+    backup_root = Path(BACKUP_DIRNAME) / root.relative_to(root.anchor)
     if not backup_root.exists():
         print("No backup directory found; nothing to clean up.")
         return
@@ -675,6 +848,17 @@ def main():
 
     if not root.is_dir():
         sys.exit(f"Error: {root} is not a directory.")
+
+    # Pointing the script at the backup store itself (or somewhere inside
+    # it) would make backup_root's path-relative-to-drive math nest the
+    # backup folder inside itself (e.g. ...\.loudnorm_backups\.loudnorm_backups\...).
+    # This is always a mistake -- point it at your actual library instead.
+    backup_dir = Path(BACKUP_DIRNAME)
+    if root == backup_dir or backup_dir in root.parents:
+        sys.exit(
+            f"Error: {root} is inside the backup directory ({backup_dir}) itself. "
+            f"Point this at your music library, not the backup folder."
+        )
 
     mode_flags = [args.cleanup, args.verify, args.restore]
     if sum(bool(x) for x in mode_flags) > 1:
