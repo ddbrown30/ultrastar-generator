@@ -3499,6 +3499,43 @@ rls_curly = reconcile_line_structure(
 assert rls_curly is not None and rls_curly.n_matched == 3 and rls_curly.n_our_unmatched == 0, rls_curly
 print("  OK: curly vs. straight apostrophes no longer block an otherwise-identical line from matching")
 
+print("  reconcile_line_structure: a real LRC line-MERGE (real case, Trixie Mattel - Video Games, "
+      "2026-08-15): the candidate writes TWO of our own lines as one combined LRC line. User's own "
+      "design: split the one real timestamp into per-our-line synthetic anchors (proportional to word "
+      "count, bounded within the real [this line, next line) window), so BOTH of our lines get a real "
+      "anchor instead of neither:")
+rls_merge_our = ["It's you, it's you, it's all for you,", "Everything I do", "Tell you all the time,"]
+rls_merge_lrc = [
+    (10.0, "It's you, it's you, it's all for you, everything I do"),
+    (16.0, "Tell you all the time,"),
+]
+rls_merged = reconcile_line_structure(rls_merge_our, rls_merge_lrc)
+assert rls_merged is not None and rls_merged.n_matched == 3 and rls_merged.n_our_unmatched == 0, rls_merged
+assert len(rls_merged.lrc_lines) == 3, rls_merged.lrc_lines
+(t0, text0), (t1, text1), (t2, text2) = rls_merged.lrc_lines
+assert text0 == "It's you, it's you, it's all for you," and text1 == "Everything I do", rls_merged.lrc_lines
+assert t0 == 10.0, "the FIRST split piece must keep the exact real timestamp, not an estimate"
+assert 10.0 < t1 < 16.0, f"the second split piece must be a bounded estimate strictly inside the real window, got {t1}"
+assert text2 == "Tell you all the time," and t2 == 16.0, rls_merged.lrc_lines  # untouched normal match after
+print(f"  OK: split into real anchors at {t0:.2f}s (exact) and {t1:.2f}s (interpolated, still inside the "
+      f"real {10.0}-{16.0}s window) -- both of our lines get real timing instead of neither")
+
+print("  reconcile_line_structure: the REVERSE merge direction -- our own file wrote ONE line that the "
+      "LRC candidate split across TWO separate (already-real, no interpolation needed) timestamped lines:")
+rls_split_our = ["Tell me all the things you wanna do", "I heard that you like the bad girls, is that true?"]
+rls_split_lrc = [
+    (20.0, "Tell me all the things"),
+    (22.0, "you wanna do"),
+    (25.0, "I heard that you like the bad girls, is that true?"),
+]
+rls_split = reconcile_line_structure(rls_split_our, rls_split_lrc)
+assert rls_split is not None and rls_split.n_matched == 2 and rls_split.n_our_unmatched == 0, rls_split
+assert len(rls_split.lrc_lines) == 2, rls_split.lrc_lines
+assert rls_split.lrc_lines[0] == (20.0, "Tell me all the things you wanna do"), rls_split.lrc_lines
+assert rls_split.lrc_lines[1] == (25.0, "I heard that you like the bad girls, is that true?"), rls_split.lrc_lines
+print("  OK: our own line anchored to the FIRST of the two real LRC timestamps it was split across "
+      "(no interpolation needed -- both pieces already had real timing)")
+
 print("  prepare_lrc: a repeat-structure-mismatched candidate is now RECONCILED (extras dropped) instead "
       "of rejected outright, even though it would otherwise be perfectly usable (forced candidate, so "
       "selection/duration/content filters don't apply):")

@@ -288,11 +288,37 @@ class LineReconciliation:
     match_ratio: float    # n_matched / n_our_lines
 
 
+def _consume_as_merge(target_tokens: List[str], piece_token_lists: List[List[str]]) -> Optional[int]:
+    """Whether `target_tokens` is EXACTLY the back-to-back concatenation
+    of `piece_token_lists[0]`, `[1]`, ... in order -- word-level (not
+    string-level, so line-boundary punctuation/whitespace differences
+    never matter). Returns how many pieces were consumed (>=2, since
+    exactly 1 piece is just a normal single-line match, not a merge) once
+    `target_tokens` is used up EXACTLY, or None if no such split exists
+    (a partial consumption that never lands on an exact boundary is NOT a
+    match -- this only ever accepts an EXACT accounting of every token on
+    both sides, never a fuzzy/partial one)."""
+    if not target_tokens:
+        return None
+    consumed = 0
+    for k, piece in enumerate(piece_token_lists, start=1):
+        if not piece:
+            return None
+        end = consumed + len(piece)
+        if end > len(target_tokens) or target_tokens[consumed:end] != piece:
+            return None
+        consumed = end
+        if consumed == len(target_tokens):
+            return k if k >= 2 else None
+    return None
+
+
 def reconcile_line_structure(
     our_lines: List[str],
     lrc_lines: List[Tuple[float, str]],
     max_skip: int = 8,
     min_match_ratio: float = 0.5,
+    max_merge_lines: int = 4,
 ) -> Optional[LineReconciliation]:
     """Reconciles an LRC candidate's own lines against OUR OWN file's
     lines when their REPEAT STRUCTURE doesn't match, instead of
@@ -338,6 +364,34 @@ def reconcile_line_structure(
         walking, rather than aborting the whole reconciliation over one
         bad line.
 
+    Before any of the above, a mismatch is first checked against a MERGE
+    in either direction (user's own design, 2026-08-15, real motivating
+    case: Trixie Mattel - "Video Games", where the candidate writes "It's
+    you, it's you, it's all for you," + "Everything I do" -- two of our
+    own lines -- as one combined LRC line) via `_consume_as_merge`: does
+    lrc_lines[j]'s own text EXACTLY equal our_lines[i], [i+1], ...
+    concatenated word-for-word (up to `max_merge_lines` pieces), or does
+    our_lines[i] EXACTLY equal lrc_lines[j], [j+1], ... concatenated the
+    same way? This is intentionally an EXACT-consumption check, not a
+    fuzzy one -- same "never guess across a real ambiguity" caution as
+    the rest of this module.
+      - LRC merged K of our lines into one: split lrc_lines[j]'s single
+        real timestamp across K synthetic entries (own text = each of
+        our_lines[i:i+K], own time = proportionally interpolated by word
+        count across [lrc_lines[j]'s own time, lrc_lines[j+1]'s own time)
+        -- the first piece keeps the EXACT real timestamp, later pieces
+        are estimates bounded within that real window, never claiming
+        precision the data doesn't have). Necessary, not cosmetic:
+        downstream `assign_words_to_lines` buckets every one of our own
+        words to whichever ONE lrc_lines entry its own whole-song word-
+        diff lands on, so without a distinct entry per piece, only the
+        FIRST of the K lines could ever get a real anchor -- the rest
+        would silently stay anchor-less, exactly the original problem.
+      - Our own line was written as K separate LRC lines: use
+        lrc_lines[j]'s own (first piece's, already exactly real, no
+        interpolation needed) timestamp directly for our_lines[i]'s one
+        entry, then advance j past all K real lrc lines consumed.
+
     Returns None (caller should fall back to the old outright-rejection
     behavior) if the fraction of OUR OWN lines that found a real match
     falls below `min_match_ratio` -- a genuinely different
@@ -345,24 +399,55 @@ def reconcile_line_structure(
     still show up as a low match rate here, not get silently patched
     together from whatever happens to align. Otherwise returns a
     `LineReconciliation` whose `lrc_lines` is the candidate's own lines
-    filtered down to only the ones that matched something in our_lines --
-    everything downstream (time calibration, per-word line assignment)
-    should use THIS list instead of the candidate's raw, un-reconciled
-    lines.
+    (or, for a merge, synthetic per-our-line entries derived from them --
+    see above) filtered down to only the ones that matched something in
+    our_lines -- everything downstream (time calibration, per-word line
+    assignment) should use THIS list instead of the candidate's raw,
+    un-reconciled lines.
     """
     our_norm = [_normalize_line(t) for t in our_lines]
     lrc_norm = [_normalize_line(t) for _t, t in lrc_lines]
+    our_tokens = [line.split() for line in our_norm]
+    lrc_tokens = [line.split() for line in lrc_norm]
     n_i, n_j = len(our_norm), len(lrc_norm)
 
     i = j = 0
     kept: List[Tuple[float, str]] = []
-    n_matched = 0
+    our_matched = [False] * n_i
+    lrc_used: set = set()
     while i < n_i and j < n_j:
         if our_norm[i] and our_norm[i] == lrc_norm[j]:
             kept.append(lrc_lines[j])
-            n_matched += 1
+            our_matched[i] = True
+            lrc_used.add(j)
             i += 1
             j += 1
+            continue
+
+        lrc_merge_k = _consume_as_merge(lrc_tokens[j], our_tokens[i:i + max_merge_lines])
+        if lrc_merge_k is not None:
+            t_start = lrc_lines[j][0]
+            t_next = lrc_lines[j + 1][0] if j + 1 < n_j else t_start + 5.0
+            word_counts = [len(our_tokens[i + m]) for m in range(lrc_merge_k)]
+            total_words = sum(word_counts) or 1
+            cumulative = 0
+            for m in range(lrc_merge_k):
+                t_piece = t_start + (t_next - t_start) * (cumulative / total_words)
+                kept.append((t_piece, our_lines[i + m]))
+                our_matched[i + m] = True
+                cumulative += word_counts[m]
+            lrc_used.add(j)
+            i += lrc_merge_k
+            j += 1
+            continue
+
+        our_merge_k = _consume_as_merge(our_tokens[i], lrc_tokens[j:j + max_merge_lines])
+        if our_merge_k is not None:
+            kept.append((lrc_lines[j][0], our_lines[i]))
+            our_matched[i] = True
+            lrc_used.update(range(j, j + our_merge_k))
+            i += 1
+            j += our_merge_k
             continue
 
         lrc_skip = next(
@@ -382,12 +467,13 @@ def reconcile_line_structure(
         else:
             j += 1
 
+    n_matched = sum(our_matched)
     match_ratio = n_matched / n_i if n_i else 0.0
     if match_ratio < min_match_ratio:
         return None
     return LineReconciliation(
         lrc_lines=kept, n_our_lines=n_i, n_matched=n_matched,
-        n_lrc_dropped=n_j - n_matched, n_our_unmatched=n_i - n_matched,
+        n_lrc_dropped=n_j - len(lrc_used), n_our_unmatched=n_i - n_matched,
         match_ratio=match_ratio,
     )
 

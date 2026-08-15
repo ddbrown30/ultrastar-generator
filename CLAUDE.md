@@ -643,10 +643,37 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   — see its own docstring/memory below. Once both were fixed,
   `check_repeat_structure` never even rejected the correct candidate
   (id 2958984) — it was only ever hitting the WRONG one. Against the
-  correct candidate, reconciliation matches 33/59 (56%, accepted) — held
-  back by a genuinely different, still-open problem: the candidate MERGES
-  two of our lines into one starting partway through (see "Open /
-  deferred" below), not a repeat-count issue.
+  correct candidate, reconciliation matched 33/59 (56%) before line-merge
+  detection (below) shipped, and 41/59 (69%) after — the remaining gap is
+  a genuinely different wording difference in a later verse, not a
+  structural one.
+
+  **Line-merge/split detection** (2026-08-15, user's own design):
+  `reconcile_line_structure` now also handles an LRC candidate that
+  writes several of our own lines as ONE combined line (or vice versa —
+  our own line written as several separate LRC lines), via
+  `_consume_as_merge` — before falling back to the skip-search above, a
+  mismatch is checked for whether one side's line text EXACTLY equals
+  the word-for-word concatenation of the other side's next 2-4 lines (an
+  EXACT check, never fuzzy, same caution as the rest of this module).
+  LRC-merged-K-of-ours: splits that one real timestamp into K synthetic
+  per-our-line entries, proportional to word count, bounded strictly
+  inside the real `[this LRC line's time, next LRC line's time)` window
+  — the first piece keeps the exact real timestamp, later pieces are
+  bounded estimates, never claiming precision the LRC format doesn't
+  have. Necessary, not cosmetic: `assign_words_to_lines` downstream
+  buckets every one of our own words to whichever ONE `lrc_lines` entry
+  its own whole-song word-diff lands on, so without a distinct entry per
+  piece only the FIRST of the merged lines could ever get a real anchor.
+  Our-line-split-into-K-LRC-lines: no interpolation needed at all, just
+  anchors to the first (already real) of the K timestamps. Real
+  validation: Video Games' own merged chorus line now correctly splits
+  into two real anchors (10.00s exact + ~14.36s bounded estimate, in a
+  real [10.0, 16.0) window) instead of neither line getting anchored at
+  all; re-scanning all of `sandbox/` after shipping this found ONLY
+  improvements, no regressions (Gaston 58%→70%, Heroes 0%→53% i.e.
+  swung from declined to accepted, Video Games 56%→69%; every other
+  song's match rate held steady).
 - `mxl_lrc_generator.select_lrc_candidate` ranking fixed (2026-08-15,
   real bug found via the Video Games investigation above): used to rank
   candidates by content-match ratio first, duration only as a tiebreaker
@@ -857,14 +884,3 @@ isolation) across 6 real gen+realign runs — zero regressions.
 - Repeated-phrase/occurrence disambiguation, generally (see "Lessons
   learned" above) — the single biggest recurring unsolved failure class
   in this codebase; no design proposed yet.
-- `lrc_timing.reconcile_line_structure` can't bridge a real LRC candidate
-  that MERGES two+ of our own lines into one (confirmed real case: Trixie
-  Mattel - "Video Games", id 2958984 — the correct, word-for-word-correct
-  candidate — merges our own lines "It's you, it's you, it's all for
-  you," + "Everything I do" into one combined LRC line partway through
-  the song; the current design only ever matches/skips whole lines 1:1,
-  so those specific words get no LRC anchor from this mechanism — not a
-  regression, since they fall through to whatever else already handles
-  unanchored words, but a real, known gap). User's explicit call
-  (2026-08-15): deferred, not attempted yet — tackle after other current
-  work finishes.
