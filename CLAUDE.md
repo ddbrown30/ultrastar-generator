@@ -77,9 +77,10 @@ to the gui at the same time.
   of re-running pYIN on ~0.1s clips. Same failure class shows up
   elsewhere too: forced-alignment (wav2vec2 CTC) also loses accuracy
   when forced to align a short, isolated chunk instead of a
-  longer-context window (confirmed for `REWINDOW_SPLIT_ENABLED`, see
-  below) — treat "don't run inference on a tiny isolated clip" as a
-  general rule, not a pYIN-specific one.
+  longer-context window (confirmed for the split-into-sub-phrases
+  rewindow prototype, see "Removed / rejected approaches" below) —
+  treat "don't run inference on a tiny isolated clip" as a general
+  rule, not a pYIN-specific one.
 - Don't trust individual ASR word timestamps for fine-grained
   boundaries — coarse anchoring only.
 - Don't sort notes by timestamp as "harmless" cleanup — trust given
@@ -193,15 +194,21 @@ to the gui at the same time.
   check can't disambiguate WHICH occurrence of a repeated word is
   correct when the window contains more than one — the general
   repeated-phrase disambiguation problem noted above. **Fully removed
-  from the codebase** (user's explicit request — different treatment
-  from `--zone-boundary-snap` below, which stays as dead-but-present
-  code): `verification.verify_placement`, `PlacementCorrection`/
+  from the codebase**: `verification.verify_placement`, `PlacementCorrection`/
   `PlacementWarning`, the CLI flags, the GUI checkbox, and its tests are
   all gone.
-- **`--zone-boundary-snap`** (snap zone/word boundaries to nearby pass-1
-  note onsets): synthetically verified, but flat-to-negative on all 5
-  real songs tested. Kept in codebase, off by default, not worth
-  further tuning.
+- **`--zone-boundary-snap`** (was: snap zone/word boundaries to nearby
+  pass-1 note onsets): synthetically verified, but flat-to-negative on
+  all 5 real songs tested. Kept off-by-default/dead-but-present for a
+  while (still had a real CLI flag and GUI checkbox, unlike the other
+  entries in this section); **fully removed from the codebase
+  2026-08-16** (user's explicit request): `lyric_alignment.
+  _snap_boundary_to_note_onset`, the `snap_boundaries`/`snap_radius_sec`
+  params threaded through `_assign_notes_to_groups`/
+  `_split_notes_by_word_boundaries`/`align_words_to_notes`/
+  `alignment.align_words`, `config.ENABLE_ZONE_BOUNDARY_SNAP`/
+  `ZONE_BOUNDARY_SNAP_RADIUS_SEC`, the CLI flags, the GUI checkbox, and
+  its tests are all gone.
 - **`lrc_timing.py`'s flagging as an auto-correction signal**: built as
   diagnostic-only (flags, never auto-corrects). Ground-truth
   cross-validation showed flagged lines are NOT reliably less accurate
@@ -225,22 +232,28 @@ to the gui at the same time.
   detection rule was validated against real data but the user decided
   to leave `phrasing.py` as-is and accept this as a known rare issue
   rather than add another mechanism.
-- **Local-rematch of unmatched word runs** (`realign.py`'s
-  `rematch_local_gaps`, retries a run of unmatched words against only
-  nearby-in-time ASR instead of the whole song): net regression across
-  a controlled 4-song A/B (BATB −24pp within 100ms). The reference
-  songs' existing local timing is already trustworthy, so
+- **Local-rematch of unmatched word runs** (was `realign.py`'s
+  `rematch_local_gaps`/`use_local_rematch`, retried a run of unmatched
+  words against only nearby-in-time ASR instead of the whole song): net
+  regression across a controlled 4-song A/B (BATB −24pp within 100ms).
+  The reference songs' existing local timing is already trustworthy, so
   `interpolate_fallback`'s proportional guess usually beats a local
   rematch — and a local rematch can lock onto the wrong nearby repeat
-  just as easily as a whole-song search can. Shipped OFF, code kept
-  (not CLI/GUI-wired); would need a way to distinguish "original timing
-  is wrong here" from "ASR is just sparse here" before it's safe.
-- **Split-into-sub-phrases rewindow** (`REWINDOW_SPLIT_ENABLED`,
-  `transcription._rewindow_split_segment`): breaking a long decoder
-  segment into pieces and windowing each separately scored WORSE than
-  whole-block alignment on every attempted case — the "don't run
-  inference on a tiny isolated clip" failure class again. Kept off by
-  default, dead code.
+  just as easily as a whole-song search can. Shipped OFF, code kept (not
+  CLI/GUI-wired) for a while; **fully removed from the codebase
+  2026-08-16** (user's explicit request, same treatment as
+  `--verify-placement`/split-rewindow above — don't re-attempt without a
+  way to distinguish "original timing is wrong here" from "ASR is just
+  sparse here").
+- **Split-into-sub-phrases rewindow** (was `REWINDOW_SPLIT_ENABLED`,
+  `transcription._rewindow_split_segment`/`_split_segment_text`):
+  breaking a long decoder segment into pieces and windowing each
+  separately scored WORSE than whole-block alignment on every attempted
+  case — the "don't run inference on a tiny isolated clip" failure class
+  again. Kept off-by-default/dead for a while; **fully removed from the
+  codebase 2026-08-16** (user's explicit request, same treatment as
+  `--verify-placement`/LRC-line-anchored recovery below — don't
+  re-attempt without new evidence).
 - **LRC-line-anchored recovery** (used LRC line timing as independent
   ground truth to re-align a whole flagged decoder-hallucinated line):
   real-tested on Chicago — one confirmed regression (moved an
@@ -1206,28 +1219,29 @@ all of them.
   in that slice for the best fuzzy-ratio match (ASR mishearing a word,
   e.g. "favors" transcribed as "favorites"), gated on both the fuzzy
   ratio and the candidate's confidence. Callers: `mxl_lrc_generator.
-  place_words_via_asr`'s own Pass 1, `realign.
-  match_words_to_asr_windowed`, `realign.rematch_local_gaps` — all 3 had
-  independently implemented this exact opcode-walk (confirmed by
-  `match_words_to_asr_windowed`'s own docstring: "mirroring
-  mxl_lrc_generator.place_words_via_asr's Pass 1 exactly"). Deliberately
-  NOT shared with `realign.match_words_to_asr`'s own `_apply_match` —
-  that one is built on `find_cursor_window_match` (REVERSED
-  SequenceMatcher argument order: candidate first, target second) and
-  returns a candidate-side offset for its own forward cursor, neither of
-  which apply to these 3 independent, non-cursored callers.
+  place_words_via_asr`'s own Pass 1 and `realign.
+  match_words_to_asr_windowed` — both had independently implemented this
+  exact opcode-walk (confirmed by `match_words_to_asr_windowed`'s own
+  docstring: "mirroring mxl_lrc_generator.place_words_via_asr's Pass 1
+  exactly"). Deliberately NOT shared with `realign.match_words_to_asr`'s
+  own `_apply_match` — that one is built on `find_cursor_window_match`
+  (REVERSED SequenceMatcher argument order: candidate first, target
+  second) and returns a candidate-side offset for its own forward
+  cursor, neither of which apply to these 2 independent, non-cursored
+  callers. (A third former caller, `realign.rematch_local_gaps`, was
+  removed 2026-08-16 as a net regression — see "Removed / rejected
+  approaches" above.)
   Re-test: `test_dry_run.py`'s `place_words_via_asr` block (esp. the
-  "favors"~"favorites" fuzzy-mishearing and next-line-spillover cases),
-  `rematch_local_gaps`'s own block, and `match_words_to_asr_windowed`'s
-  own block.
+  "favors"~"favorites" fuzzy-mishearing and next-line-spillover cases)
+  and `match_words_to_asr_windowed`'s own block.
 - **`lrc_timing.words_in_time_window`** (added 2026-08-16): trivial
-  `[t0 - slack, t1 + slack]` ASR-word filter — was 3 copies (same 3
+  `[t0 - slack, t1 + slack]` ASR-word filter — was 2 copies (same 2
   callers as `match_block_to_candidates` above, since each builds its
   own `asr_in_window` right before calling it). Purely mechanical, kept
   as its own function so the slop convention (currently a flat 0.5s
   default) can't drift between callers unnoticed.
   Re-test: `test_dry_run.py` in full — exercised transitively through
-  all 3 callers' own existing test coverage, same as `lrc_line_window`.
+  both callers' own existing test coverage, same as `lrc_line_window`.
 
 ## Environment
 

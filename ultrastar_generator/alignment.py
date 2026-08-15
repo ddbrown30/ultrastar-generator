@@ -41,8 +41,6 @@ def align_words(
     verify_words: bool = config.ENABLE_WORD_VERIFICATION,
     verify_all_words: bool = config.VERIFY_ALL_WORDS,
     verify_whisper_model: str = config.DEFAULT_WHISPER_MODEL,
-    snap_boundaries: bool = config.ENABLE_ZONE_BOUNDARY_SNAP,
-    snap_radius_sec: float = config.ZONE_BOUNDARY_SNAP_RADIUS_SEC,
     debug_log=None,
     verbose: bool = True,
 ) -> tuple:
@@ -67,10 +65,7 @@ def align_words(
     decisions -- pass None to skip (no-op either way if the DebugLog
     itself was constructed with path=None).
     """
-    syllables, stats = align_words_to_notes(
-        words, notes, y, sr, debug_log=debug_log,
-        snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
-    )
+    syllables, stats = align_words_to_notes(words, notes, y, sr, debug_log=debug_log)
     if verify_words:
         # Dropped words (lyrics_lookup.align_words_to_reference found no
         # real reference correspondence at all) are never re-transcribed
@@ -87,10 +82,7 @@ def align_words(
                 words = corrected_words
                 if debug_log is not None:
                     debug_log.section("RE-RUNNING PASS 3 -- verify_words corrected at least one word")
-                syllables, stats = align_words_to_notes(
-                    words, notes, y, sr, debug_log=debug_log,
-                    snap_boundaries=snap_boundaries, snap_radius_sec=snap_radius_sec,
-                )
+                syllables, stats = align_words_to_notes(words, notes, y, sr, debug_log=debug_log)
             stats.verification_results = verify_results
 
     return syllables, stats

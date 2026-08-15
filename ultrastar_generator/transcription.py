@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -101,103 +100,6 @@ def _find_best_window(segment: dict, align_model, metadata, audio, device: str,
     return t1, t2, False
 
 
-def _split_segment_text(text: str) -> List[str]:
-    """See config.REWINDOW_SPLIT_ENABLED's docstring. Splits a long
-    segment's own decoded text into sub-phrases for _rewindow_split_segment.
-    Primary: split on sentence-ending punctuation (. ! ?), kept attached to
-    the preceding word. Falls back to fixed word-count chunks
-    (config.REWINDOW_SPLIT_FALLBACK_WORDS) when that produces 0 or 1 pieces
-    -- e.g. a repeated chorus run with no punctuation between repeats,
-    which would otherwise stay one giant unsplit block."""
-    parts = [p for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
-    if len(parts) > 1:
-        return parts
-    words = text.strip().split()
-    n = config.REWINDOW_SPLIT_FALLBACK_WORDS
-    return [" ".join(words[i:i + n]) for i in range(0, len(words), n)]
-
-
-def _rewindow_split_segment(segment: dict, align_model, metadata, audio, device: str,
-                             debug_log=None) -> Optional[list]:
-    """PROTOTYPE (config.REWINDOW_SPLIT_ENABLED). Unlike _find_best_window
-    (one sliding window over the segment's ENTIRE text as a single block),
-    splits the segment's text into sub-phrases (_split_segment_text) and
-    finds each sub-phrase's own best window SEQUENTIALLY within the
-    segment's [start, end] span -- each subsequent sub-phrase's search
-    starts no earlier than where the previous one was found, so this can
-    fix misalignment INSIDE a segment, not just at its outer edges (which
-    the whole-block search structurally can't do). Total whisperx.align()
-    calls stay roughly the same order as _find_best_window's own search,
-    not multiplied by sub-phrase count, since each sub-phrase's own search
-    range is a shrinking suffix of the previous one's rather than a fresh
-    full-range sweep.
-
-    Returns a list of new segment dicts (one per sub-phrase, each with its
-    own text/start/end) if the split's combined (word-count-weighted) mean
-    score beats the segment's own whole-block baseline by at least
-    REWINDOW_MIN_SCORE_IMPROVEMENT, else None (caller should fall back to
-    _find_best_window's whole-block search, or keep the original segment
-    unchanged)."""
-    import whisperx
-
-    t1, t2 = segment["start"], segment["end"]
-    subphrases = _split_segment_text(segment["text"])
-    if len(subphrases) <= 1:
-        return None
-
-    width = config.REWINDOW_CANDIDATE_WIDTH_SEC
-    step = config.REWINDOW_STEP_SEC
-
-    new_segments: List[dict] = []
-    cursor = t1
-    total_weighted_score = 0.0
-    total_words = 0
-    for phrase in subphrases:
-        best_score = -1.0
-        best_window = None
-        offset = cursor
-        while offset < t2:
-            w0, w1 = offset, min(offset + width, t2)
-            if w1 <= w0:
-                break
-            cand_seg = dict(segment, start=w0, end=w1, text=phrase)
-            cand = whisperx.align([cand_seg], align_model, metadata, audio, device=device)
-            score = _mean_word_score(cand["word_segments"])
-            if score > best_score:
-                best_score = score
-                best_window = (w0, w1)
-            offset += step
-        if best_window is None:
-            if debug_log is not None:
-                debug_log.line(f"  split abandoned [{t1:.3f}-{t2:.3f}]: sub-phrase {phrase!r} had no "
-                                f"remaining search range left (cursor {cursor:.3f} >= segment end {t2:.3f}) "
-                                f"-- an earlier sub-phrase's own window consumed too much of the segment")
-            return None  # couldn't place this sub-phrase at all -- bail to the whole-block search
-        new_segments.append(dict(segment, start=best_window[0], end=best_window[1], text=phrase))
-        n_words = max(1, len(phrase.split()))
-        total_weighted_score += best_score * n_words
-        total_words += n_words
-        cursor = best_window[1]  # next sub-phrase can't start before this one's own window end
-
-    split_score = total_weighted_score / total_words if total_words else 0.0
-    baseline = whisperx.align([segment], align_model, metadata, audio, device=device)
-    baseline_score = _mean_word_score(baseline["word_segments"])
-
-    if split_score >= baseline_score + config.REWINDOW_MIN_SCORE_IMPROVEMENT:
-        if debug_log is not None:
-            debug_log.line(f"  SPLIT-REWINDOWED [{t1:.3f}-{t2:.3f}] into {len(subphrases)} sub-phrase(s): "
-                            f"baseline score {baseline_score:.3f} -> split mean score {split_score:.3f}")
-            for s in new_segments:
-                debug_log.line(f"    {s['start']:8.3f} - {s['end']:8.3f}  {s['text']!r}")
-        return new_segments
-
-    if debug_log is not None:
-        debug_log.line(f"  split kept baseline [{t1:.3f}-{t2:.3f}]: baseline score {baseline_score:.3f}, "
-                        f"split mean score {split_score:.3f} didn't clear the "
-                        f"+{config.REWINDOW_MIN_SCORE_IMPROVEMENT} improvement bar")
-    return None
-
-
 def _rewindow_long_segments(segments: list, align_model, metadata, audio, device: str,
                              debug_log=None) -> list:
     """Returns a NEW segment list with corrected (start, end) for any
@@ -230,12 +132,6 @@ def _rewindow_long_segments(segments: list, align_model, metadata, audio, device
             if duration < config.REWINDOW_MIN_SEGMENT_DURATION_SEC:
                 fixed.append(seg)
                 continue
-            if config.REWINDOW_SPLIT_ENABLED:
-                split_segments = _rewindow_split_segment(seg, align_model, metadata, audio, device,
-                                                          debug_log=debug_log)
-                if split_segments is not None:
-                    fixed.extend(split_segments)
-                    continue
             new_start, new_end, improved = _find_best_window(seg, align_model, metadata, audio, device,
                                                                debug_log=debug_log)
             fixed.append(dict(seg, start=new_start, end=new_end) if improved else seg)
@@ -259,8 +155,9 @@ def force_align_words_in_window(words_text: List[str], window_start: float, wind
     real-world testing found doesn't reliably recover a specific dropped
     passage even when it does help other parts of a song) or re-searching
     an ASR transcript that may never have had these words in it at all
-    (rejected in `realign.py`'s own `rematch_local_gaps` history for
-    exactly this reason).
+    (a text-search rematch was tried and rejected as `realign.
+    rematch_local_gaps` for exactly this reason -- see CLAUDE.md's
+    "Removed / rejected approaches").
 
     Approach and validation directly adapted from UltraStarKaraokeMaker's
     own `realign_gap_windows` (github.com/walterfr/UltraStarKaraokeMaker,

@@ -118,12 +118,11 @@ class RealignQuality:
     n_words: int = 0
     n_asr_matched: int = 0
     n_lrc_seeded: int = 0
-    n_local_rematched: int = 0
     n_force_aligned: int = 0  # see config.FORCE_ALIGN_GAPS
     n_interpolated: int = 0
     n_kept_original: int = 0
-    # Longest CONSECUTIVE run of words with no real anchor (asr/lrc/local-
-    # rematch/force-align) at all -- see config.RETRY_ASR_MIN_UNCONFIDENT_RUN.
+    # Longest CONSECUTIVE run of words with no real anchor (asr/lrc/
+    # force-align) at all -- see config.RETRY_ASR_MIN_UNCONFIDENT_RUN.
     # A per-PASSAGE signal, independent of anchor_rate: real case (David
     # Bowie - Magic Dance, small.en) had a song-wide anchor rate of 58%
     # (well above the retry bar) while one hallucinated decoder segment
@@ -134,7 +133,7 @@ class RealignQuality:
 
     @property
     def anchor_rate(self) -> float:
-        return ((self.n_asr_matched + self.n_lrc_seeded + self.n_local_rematched + self.n_force_aligned)
+        return ((self.n_asr_matched + self.n_lrc_seeded + self.n_force_aligned)
                  / self.n_words if self.n_words else 0.0)
 
 
@@ -157,10 +156,12 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
     OWN text for that run onto the audio window between the nearest
     CONFIDENT neighbors (or 0.0/audio-end at the edges), via
     `transcription.force_align_words_in_window` -- a real, measured
-    wav2vec2 CTC forced alignment, not a guess. Unlike `rematch_local_gaps`
-    (searches ASR's own already-decoded words in the window -- useless if
-    the decoder produced none there), this doesn't depend on ASR having
-    transcribed anything at all in the gap.
+    wav2vec2 CTC forced alignment, not a guess. Unlike a local text-search
+    rematch (searches ASR's own already-decoded words in the window --
+    useless if the decoder produced none there; tried as `realign.
+    rematch_local_gaps`, removed 2026-08-16 as a net regression, see
+    CLAUDE.md), this doesn't depend on ASR having transcribed anything at
+    all in the gap.
 
     Mutates `starts`/`ends`/`confident` in place for any run that
     succeeds; leaves a run untouched (falls through to
@@ -676,59 +677,6 @@ def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: 
     return starts, ends, confident
 
 
-def rematch_local_gaps(existing_words: List[ExistingWord], asr_words: List[Word],
-                        starts: List[Optional[float]], ends: List[Optional[float]],
-                        confident: List[bool],
-                        slack_sec: float = config.REALIGN_LOCAL_REMATCH_SLACK_SEC) -> int:
-    """SECOND PASS (see config.REALIGN_LOCAL_REMATCH_SLACK_SEC for the real
-    case this fixes): for every still-CONTIGUOUS-unmatched run of existing
-    words, retry the match locally against only the ASR words that fall
-    between the nearest confident anchors surrounding that run -- a much
-    smaller, less ambiguous search than `match_words_to_asr`'s whole-song
-    pass, so a repeated phrase elsewhere in the song can no longer steal the
-    match. Mutates `starts`/`ends`/`confident` in place for any word this
-    recovers; a run that still finds nothing (e.g. genuinely not sung, or
-    ASR really never picked it up) is left exactly as it was for
-    `interpolate_fallback` to handle same as before. Returns the count of
-    newly-matched words."""
-    n = len(existing_words)
-    n_matched = 0
-    i = 0
-    while i < n:
-        if confident[i]:
-            i += 1
-            continue
-        lo = i
-        while i < n and not confident[i]:
-            i += 1
-        hi = i  # run is [lo, hi), both boundaries (lo-1, hi) confident or absent
-
-        t0 = ends[lo - 1] if lo > 0 else None
-        t1 = starts[hi] if hi < n else None
-        if t0 is None and t1 is None:
-            continue  # no confident anchor anywhere in the song -- nothing to bound the search with
-        if t0 is None:
-            t0 = t1 - 30.0
-        if t1 is None:
-            t1 = t0 + 30.0
-
-        asr_in_window = words_in_time_window(asr_words, t0, t1, slack=slack_sec)
-        if not asr_in_window:
-            continue
-
-        block_norm = [existing_words[k].norm for k in range(lo, hi)]
-        matched_local = match_block_to_candidates(block_norm, asr_in_window)
-
-        for local_i, asr_w in matched_local.items():
-            global_i = lo + local_i
-            starts[global_i] = asr_w.start
-            ends[global_i] = asr_w.end
-            confident[global_i] = True
-            n_matched += 1
-
-    return n_matched
-
-
 def interpolate_fallback(existing_words: List[ExistingWord],
                           starts: List[Optional[float]], ends: List[Optional[float]],
                           confident: List[bool]) -> Tuple[int, int]:
@@ -919,7 +867,6 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                   audio_duration: Optional[float] = None,
                   use_lrc: bool = True, lrc_mode: str = "windowed",
                   forced_lrc_candidate: Optional[LrcLibCandidate] = None,
-                  use_local_rematch: bool = False,
                   force_align_gaps: bool = False, vocals_path: Optional[Path] = None,
                   log: Callable[[str], None] = print,
                   debug_log: Optional[DebugLog] = None) -> RealignResult:
@@ -967,34 +914,14 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     having degraded to "seed" behavior because calibration wasn't
     confident) is left as the final, if disappointing, answer.
 
-    `use_local_rematch` (OFF by default, PROTOTYPE, see config.
-    REALIGN_LOCAL_REMATCH_SLACK_SEC): when True, runs `rematch_local_gaps`
-    for any word still unmatched after the above, retrying the match
-    against only the ASR words bounded between its nearest confident
-    neighbors. Real, well-motivated case (David Bowie "I'm Afraid Of
-    Americans" -- see CLAUDE.md): recovers a genuinely-unmatched run
-    whose text was stolen by a repeat elsewhere in the song. BUT a real,
-    controlled (same-transcription) A/B across the 4-song validation set
-    found it's a NET REGRESSION on 3 of 4 songs (BATB -24pp within 100ms
-    being the worst) -- when the existing file's own local timing is
-    already trustworthy (true for all 4 validation songs, which is WHY
-    they're used as references) and ASR itself is sparse/ambiguous in a
-    region, `interpolate_fallback`'s own original-timing-proportional
-    guess is regularly BETTER than a forced local ASR rematch, which can
-    just as easily lock onto the wrong nearby repeat as the whole-song
-    pass did. Left off by default and NOT wired into the CLI/GUI pending
-    a way to distinguish "the original file is genuinely wrong here" from
-    "ASR is just sparse/ambiguous here, trust the original" -- don't flip
-    this on without addressing that.
-
-    `force_align_gaps` (default ON, see config.FORCE_ALIGN_GAPS): after
-    local-rematch, forces the existing file's OWN text for any STILL-
-    unconfident run onto the audio window between its nearest confident
-    neighbors via a real wav2vec2 CTC forced alignment (`transcription.
-    force_align_words_in_window`) -- unlike local-rematch, this doesn't
-    need ASR to have transcribed anything in the gap at all, since it
-    isn't searching a transcript, it's measuring where the GIVEN text
-    fits. Requires `vocals_path` (the loaded audio + align model are
+    `force_align_gaps` (default ON, see config.FORCE_ALIGN_GAPS): forces
+    the existing file's OWN text for any STILL-unconfident run (after the
+    above) onto the audio window between its nearest confident neighbors
+    via a real wav2vec2 CTC forced alignment (`transcription.
+    force_align_words_in_window`) -- unlike a text-search-based rematch,
+    this doesn't need ASR to have transcribed anything in the gap at all,
+    since it isn't searching a transcript, it's measuring where the GIVEN
+    text fits. Requires `vocals_path` (the loaded audio + align model are
     only paid for if there's an actual gap to try). Adapted from
     UltraStarKaraokeMaker's own `realign_gap_windows` -- see CLAUDE.md."""
     # A deep copy, not just a new list -- the Syllable/LineBreak objects
@@ -1076,15 +1003,6 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
 
     source = ["asr" if c else "" for c in confident]
 
-    if use_local_rematch:
-        quality.n_local_rematched = rematch_local_gaps(words, asr_words, starts, ends, confident)
-        if quality.n_local_rematched:
-            log(f"  Local-rematch second pass: recovered {quality.n_local_rematched} word(s) that the whole-song "
-                f"match missed, by retrying just the ASR words bounded between their nearest confident neighbors.")
-        for i in range(len(words)):
-            if confident[i] and not source[i]:
-                source[i] = "local_rematch"
-
     if force_align_gaps and vocals_path is not None:
         quality.n_force_aligned = _force_align_unconfident_runs(words, starts, ends, confident, vocals_path,
                                                                   debug_log=debug_log)
@@ -1104,8 +1022,8 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
             source[i] = "interpolated" if had_any_anchor else "kept_original"
 
     log(f"  {quality.n_asr_matched}/{quality.n_words} word(s) matched directly to real ASR transcription, "
-        f"{quality.n_lrc_seeded} from LRC line anchors, {quality.n_local_rematched} from the local-rematch "
-        f"second pass, {quality.n_force_aligned} from forced alignment of known gaps, "
+        f"{quality.n_lrc_seeded} from LRC line anchors, "
+        f"{quality.n_force_aligned} from forced alignment of known gaps, "
         f"{quality.n_interpolated} interpolated between anchors, {quality.n_kept_original} kept "
         f"at their original timing (no anchor found nearby).")
     if quality.anchor_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:
@@ -1118,14 +1036,14 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
             return realign_song(
                 existing, asr_words, artist=artist, title=title, audio_duration=audio_duration,
                 use_lrc=use_lrc, lrc_mode="seed", forced_lrc_candidate=forced_lrc_candidate,
-                use_local_rematch=use_local_rematch, force_align_gaps=force_align_gaps,
+                force_align_gaps=force_align_gaps,
                 vocals_path=vocals_path, log=log, debug_log=debug_log,
             )
 
     if debug_log is not None:
         debug_log.section("REALIGN SUMMARY (strategy=replace)")
         debug_log.line(f"  {quality.n_asr_matched}/{quality.n_words} matched directly to ASR, "
-                        f"{quality.n_lrc_seeded} from LRC anchors, {quality.n_local_rematched} from local-rematch, "
+                        f"{quality.n_lrc_seeded} from LRC anchors, "
                         f"{quality.n_force_aligned} from forced alignment of known gaps, "
                         f"{quality.n_interpolated} interpolated, {quality.n_kept_original} kept original.")
         if lrc_prep is not None:

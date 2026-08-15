@@ -281,17 +281,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-lrc-timing-check", dest="lrc_timing_check", action="store_false",
                     help="Disable the LRC timing check (no-op unless --lrc-timing-check or "
                          "config.ENABLE_LRC_TIMING_CHECK enabled it).")
-    p.add_argument("--zone-boundary-snap", dest="zone_boundary_snap", action="store_true",
-                    default=config.ENABLE_ZONE_BOUNDARY_SNAP,
-                    help="EXPERIMENTAL, off by default. Refines pass 3's zone/word boundaries (which "
-                         "are computed purely from ASR-timestamp midpoints) by snapping to a nearby "
-                         "pass-1 note onset when exactly one exists within "
-                         f"{config.ZONE_BOUNDARY_SNAP_RADIUS_SEC}s -- targets cases where an "
-                         "imprecise ASR timestamp places the boundary near, but not exactly at, "
-                         "where the audio actually starts a new note. Never adds/removes/moves a "
-                         "note, only chooses a different cut point. Not yet validated end-to-end.")
-    p.add_argument("--no-zone-boundary-snap", dest="zone_boundary_snap", action="store_false",
-                    help="Explicitly disable zone-boundary snapping (already off by default).")
     p.add_argument("--existing-txt", dest="existing_txt_path", default=None,
                     help="Path to an existing UltraStar .txt for this song -- if given, this always wins "
                          "over auto-detection (no filename-matching required, same convention as "
@@ -944,7 +933,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                                         verify_words=opts.verify_words,
                                         verify_all_words=opts.verify_all_words,
                                         verify_whisper_model=opts.verify_whisper_model,
-                                        snap_boundaries=opts.zone_boundary_snap, debug_log=debug_log,
+                                        debug_log=debug_log,
                                         verbose=not opts.quiet)
         log(f"  {stats.words_with_notes}/{stats.total_words} words matched to pass-1 notes directly "
             f"({stats.total_notes_consumed} notes consumed); "
@@ -1126,7 +1115,7 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         verify_all_words=args.verify_all_words,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,
         musicxml_force_calibration=args.musicxml_force_calibration,
-        lrc_timing_check=args.lrc_timing_check, zone_boundary_snap=args.zone_boundary_snap,
+        lrc_timing_check=args.lrc_timing_check,
         pitch_smooth_window=args.pitch_smooth_window, note_split_semitones=args.note_split_semitones,
         min_note_beat_fraction=args.min_note_beat_fraction, silence_threshold_db=args.silence_threshold_db,
         silence_floor_db=args.silence_floor_db, spike_max_duration=args.spike_max_duration,

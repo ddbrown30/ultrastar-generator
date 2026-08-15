@@ -398,7 +398,6 @@ class App(tk.Tk):
 
         # Advanced/experimental -- collapsed by default.
         self.lrc_timing_check = tk.BooleanVar(value=config.ENABLE_LRC_TIMING_CHECK)
-        self.zone_boundary_snap = tk.BooleanVar(value=config.ENABLE_ZONE_BOUNDARY_SNAP)
         self.time_based_line_assignment = tk.BooleanVar(value=config.ENABLE_TIME_BASED_LINE_ASSIGNMENT)
         self.no_video_sync = tk.BooleanVar(value=False)
         self.quiet = tk.BooleanVar(value=False)
@@ -781,21 +780,16 @@ class App(tk.Tk):
         a1.grid(row=0, column=0, sticky="w", padx=8, pady=2)
         Tooltip(a1, "Cross-checks line timing against LRCLIB synced lyrics and FLAGS (never corrects) "
                     "lines that disagree by more than a couple seconds. Diagnostic only.")
-        a2 = ttk.Checkbutton(self.advanced_frame, text="Zone-boundary snap (EXPERIMENTAL, not recommended -- see CLAUDE.md)",
-                              variable=self.zone_boundary_snap)
-        a2.grid(row=1, column=0, sticky="w", padx=8, pady=2)
-        Tooltip(a2, "Snaps word-zone boundaries to a nearby detected note onset. Real end-to-end testing "
-                    "found no net improvement -- kept as an opt-in experiment only.")
         a3 = ttk.Checkbutton(self.advanced_frame, text="Skip VIDEOGAP estimation", variable=self.no_video_sync)
-        a3.grid(row=2, column=0, sticky="w", padx=8, pady=2)
+        a3.grid(row=1, column=0, sticky="w", padx=8, pady=2)
         Tooltip(a3, "Skip auto-detecting #VIDEOGAP (the audio/video sync offset) even if a video is present.")
         a4 = ttk.Checkbutton(self.advanced_frame, text="Quiet (suppress verbose per-frame logging)", variable=self.quiet)
-        a4.grid(row=3, column=0, sticky="w", padx=8, pady=2)
+        a4.grid(row=2, column=0, sticky="w", padx=8, pady=2)
         Tooltip(a4, "Suppress the verbose [pass1] diagnostic logging (still prints the main pipeline "
                     "stage messages).")
         a5 = ttk.Checkbutton(self.advanced_frame, text="Time-based line assignment",
                               variable=self.time_based_line_assignment)
-        a5.grid(row=4, column=0, sticky="w", padx=8, pady=2)
+        a5.grid(row=3, column=0, sticky="w", padx=8, pady=2)
         Tooltip(a5, "When the reference lyrics have synced (LRC) timestamps, a word the text match "
                     "couldn't place at all gets its line break assigned by nearest calibrated LRC line "
                     "timestamp instead of blindly inheriting the nearest matched neighbor's -- fixes a "
@@ -1184,7 +1178,6 @@ class App(tk.Tk):
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
             pitch_source=self.pitch_source.get(),
             lrc_timing_check=self.lrc_timing_check.get(),
-            zone_boundary_snap=self.zone_boundary_snap.get(),
             time_based_line_assignment=self.time_based_line_assignment.get(),
             no_video_sync=self.no_video_sync.get(),
             quiet=self.quiet.get(),

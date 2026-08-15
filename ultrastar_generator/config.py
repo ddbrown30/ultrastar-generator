@@ -481,24 +481,6 @@ ENABLE_TIME_BASED_LINE_ASSIGNMENT = True
 # of "drop any short note" territory.
 SLIVER_DROP_MAX_DURATION_SEC = 0.12
 
-# Refines a zone/word boundary (both _assign_notes_to_groups and
-# _split_notes_by_word_boundaries use the same ASR-timestamp midpoint
-# technique) by snapping it to a nearby pass-1 NOTE ONSET when exactly one
-# exists within this radius -- ASR word timestamps are known-imprecise at
-# fine-grained boundaries (see CLAUDE.md's "Lessons learned"), while a
-# pass-1 note onset is a real acoustic event this project already treats
-# as ground truth everywhere else. Deliberately conservative: only snaps
-# when there's exactly one onset candidate in range (zero = nothing to
-# snap to, keep the ASR midpoint; more than one = ambiguous, which onset
-# is "the" boundary isn't clear, so also keep the ASR midpoint rather than
-# guess). EXPERIMENTAL, off by default pending real end-to-end validation
-# -- see CLAUDE.md and the verify_placement precedent this session of a
-# well-diagnosed, individually-correct fix that still regressed net
-# end-to-end; this needs the same real-audio, multi-song check before
-# being trusted, not just a fix on the one case it was designed for.
-ENABLE_ZONE_BOUNDARY_SNAP = False
-ZONE_BOUNDARY_SNAP_RADIUS_SEC = 0.5
-
 # --- Chunk-based re-transcription verification (verification.py) ----------
 # A word that got zero pass-1 notes (a "fallback" word -- see
 # lyric_alignment.py) is always considered suspicious.
@@ -873,26 +855,6 @@ MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3
 # TOLERANCE_SEC=0.5, MXL_LRC's own ASR-match acceptance), not measured.
 REALIGN_VALIDATE_TOLERANCE_SEC = 0.3
 
-# --- realign.py local-rematch second pass (2026-08-09) ---------------------
-# `match_words_to_asr`'s whole-song text match can leave a contiguous run of
-# existing words unmatched even though the audio really does contain them --
-# confirmed real case (David Bowie "I'm Afraid Of Americans": "Johnny wants a
-# brain, Johnny wants to suck on a coke" landed compressed into the wrong
-# span because none of those words got a whole-song match that run). Root
-# cause: the whole-song matcher has no time information at all, so when a
-# short phrase repeats several times nearby (as it does here -- "Johnny
-# wants" x4), it's easy for a DIFFERENT, non-adjacent repeat to steal the
-# text match, leaving the real local occurrence unmatched. Rather than
-# falling straight through to proportional interpolation (which has no way
-# to know a real silence/pause exists inside the gap), a second, LOCAL pass
-# retries the match for any still-unmatched run using ONLY the ASR words
-# whose own timestamp falls between the nearest confident anchors before and
-# after that run (+/- this slack) -- much less ambiguous than a whole-song
-# search since it's bounded to roughly where the run actually has to be.
-# Only ever fills in words that were otherwise going to be interpolated --
-# can't make an already-good match worse.
-REALIGN_LOCAL_REMATCH_SLACK_SEC = 1.0
-
 # --- transcription.py long-segment re-windowing (PROTOTYPE, 2026-08-09) ----
 # Real bug (David Bowie - Magic Dance): a whisper DECODER segment can
 # declare a much longer span than its own text plausibly needs (real case:
@@ -931,26 +893,6 @@ REWINDOW_MIN_SEGMENT_DURATION_SEC = 10.0
 REWINDOW_CANDIDATE_WIDTH_SEC = 10.0
 REWINDOW_STEP_SEC = 1.0
 REWINDOW_MIN_SCORE_IMPROVEMENT = 0.10
-
-# --- Split-segment re-windowing (PROTOTYPE, 2026-08-10, OFF by default) -----
-# User's idea: instead of _find_best_window's single sliding window over a
-# long segment's ENTIRE text treated as one block, split the segment's own
-# text into sub-phrases and find EACH sub-phrase's own best window
-# SEQUENTIALLY within the segment's [start, end] span -- each subsequent
-# sub-phrase's search is constrained to start no earlier than where the
-# previous one was found (never searches backward). This can fix
-# misalignment INSIDE a segment, not just at its outer edges, which the
-# whole-block search structurally can't do. Total whisperx.align() calls
-# stay roughly the same order as the existing whole-block search (not
-# multiplied by sub-phrase count), since each sub-phrase's search range is
-# a shrinking suffix of the previous one's, not a fresh full-range sweep.
-# Splitting strategy (_split_segment_text): primary split on sentence-
-# ending punctuation (. ! ?), which whisper's decoder often still emits
-# even within one long VAD-merged region; falls back to fixed word-count
-# chunks (REWINDOW_SPLIT_FALLBACK_WORDS) for punctuation-less text (e.g. a
-# repeated chorus run with no periods between repeats).
-REWINDOW_SPLIT_ENABLED = False
-REWINDOW_SPLIT_FALLBACK_WORDS = 8
 
 
 # --- ASR quality retry (PROTOTYPE, 2026-08-10) -------------------------------
@@ -1036,12 +978,15 @@ RETRY_ASR_MIN_UNCONFIDENT_RUN = 5
 # things already in this codebase: `RETRY_ASR_MODEL` (retries the WHOLE
 # song with a bigger model, probabilistic -- confirmed on a real Gold run
 # that the retry can be accepted for improving the aggregate while NOT
-# actually fixing the specific passage that triggered it) and realign.py's
-# own `rematch_local_gaps` (re-searches ASR's OWN already-decoded words in
-# a window -- useless if the decoder produced zero words there at all,
-# which is exactly this failure mode). Forced alignment doesn't care
-# whether the decoder ever produced these words; it directly measures
-# where the GIVEN text best fits.
+# actually fixing the specific passage that triggered it) and a local
+# text-search rematch (re-searches ASR's OWN already-decoded words in a
+# window -- useless if the decoder produced zero words there at all,
+# which is exactly this failure mode; tried as `realign.
+# rematch_local_gaps`, removed 2026-08-16, see CLAUDE.md's "Removed /
+# rejected approaches" -- net regression, this forced-alignment approach
+# is the one that actually works for this failure mode). Forced alignment
+# doesn't care whether the decoder ever produced these words; it directly
+# measures where the GIVEN text best fits.
 # See `transcription.force_align_words_in_window` for the primitive
 # (validation logic ported directly from USKMaker's own function) --
 # used by `realign.py` (on gaps in an existing file's own text) and
@@ -1093,7 +1038,6 @@ class PipelineOptions:
     musicxml_part: Optional[str] = None
     musicxml_force_calibration: bool = ENABLE_MUSICXML_FORCE_CALIBRATION
     lrc_timing_check: bool = ENABLE_LRC_TIMING_CHECK
-    zone_boundary_snap: bool = ENABLE_ZONE_BOUNDARY_SNAP
     pitch_smooth_window: float = PITCH_SMOOTH_WINDOW_SEC
     note_split_semitones: float = NOTE_SPLIT_SEMITONES
     min_note_beat_fraction: float = MIN_NOTE_BEATS_FRACTION

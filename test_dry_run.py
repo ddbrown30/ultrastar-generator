@@ -2284,62 +2284,6 @@ assert counts_by_word.get("multitudes", 0) >= counts_by_word.get("Stars", 0), co
 assert sum(counts_by_word.values()) >= 12
 print("OK: line notes split by each word's own ASR boundary, not swallowed by one bad interior timestamp")
 
-print("\n--- zone-boundary snapping (EXPERIMENTAL, config.ENABLE_ZONE_BOUNDARY_SNAP): a real pass-1 "
-      "note onset near the raw ASR-midpoint boundary reassigns a note to the correct word when enabled, "
-      "and is a no-op (matches current default behavior) when disabled -- reproduces the sleeping_beauty_"
-      "wonder 'I' bug shape: a real sustained note starts before the crude ASR-gap-midpoint suggests ---")
-snap_words = [
-    Word(text="Odd", start=0.0, end=2.0, confidence=0.9, line_id=20),
-    Word(text="I", start=6.0, end=6.5, confidence=0.9, line_id=21),
-]
-# Raw boundary = midpoint(2.0, 6.0) = 4.0. A real note starts at 3.6s (the
-# genuine, pass-1-detected onset of "I"'s singing) -- its own MIDPOINT
-# (3.85) falls on the WRONG side of the raw 4.0 boundary, so without
-# snapping it's misassigned to "Odd" instead of "I".
-snap_notes = [
-    NoteEvent(start=0.0, end=1.0, pitch=5),
-    NoteEvent(start=1.0, end=2.0, pitch=5),
-    NoteEvent(start=3.6, end=4.1, pitch=7),   # the ambiguous one -- real onset for "I"
-    NoteEvent(start=4.6, end=6.3, pitch=7),   # unambiguously "I" either way
-]
-
-
-def _counts_by_word(words, syllables):
-    counts = {}
-    word_idx = -1
-    for s in syllables:
-        if s.is_word_start:
-            word_idx += 1
-        counts[words[word_idx].text] = counts.get(words[word_idx].text, 0) + 1
-    return counts
-
-
-unsnapped, _ = align_words_to_notes(snap_words, snap_notes, np.zeros(16000), 16000, snap_boundaries=False)
-unsnapped_counts = _counts_by_word(snap_words, unsnapped)
-assert unsnapped_counts == {"Odd": 3, "I": 1}, unsnapped_counts
-print("OK: snapping disabled (default) -- unchanged from current behavior:", unsnapped_counts)
-
-snapped, _ = align_words_to_notes(snap_words, snap_notes, np.zeros(16000), 16000,
-                                   snap_boundaries=True, snap_radius_sec=0.5)
-snapped_counts = _counts_by_word(snap_words, snapped)
-assert snapped_counts == {"Odd": 2, "I": 2}, snapped_counts
-print("OK: snapping enabled -- boundary snapped to the real 3.6s note onset, "
-      "correctly reassigning it to \"I\":", snapped_counts)
-
-# --- ambiguity guard: TWO onset candidates in range -> no snap (can't tell which is "the" boundary) ---
-ambig_notes = [
-    NoteEvent(start=0.0, end=1.0, pitch=5),
-    NoteEvent(start=1.0, end=2.0, pitch=5),
-    NoteEvent(start=3.6, end=4.1, pitch=7),
-    NoteEvent(start=4.3, end=6.3, pitch=7),   # a SECOND onset candidate within 0.5s of the 4.0 boundary
-]
-ambig_snapped, _ = align_words_to_notes(snap_words, ambig_notes, np.zeros(16000), 16000,
-                                         snap_boundaries=True, snap_radius_sec=0.5)
-ambig_counts = _counts_by_word(snap_words, ambig_snapped)
-assert ambig_counts == {"Odd": 3, "I": 1}, ambig_counts
-print("OK: two competing onset candidates in range -> left the raw ASR-midpoint boundary alone "
-      "(ambiguous, not confidently correctable):", ambig_counts)
-
 print("\n--- BUG REGRESSION (round 7): isolated pitch spike gets removed ---")
 from ultrastar_generator.note_detection import _remove_pitch_spikes
 # Reproduces the reported "The" bug's shape directly: a brief, isolated
@@ -3447,52 +3391,11 @@ print("  OK: confident words w2/w3/w4 keep their own real values exactly, comple
       "still remain -- one of the two confident ANCHORS is itself wrong here, which this pass can't "
       "resolve -- but it no longer drags w2/w3/w4 down with it")
 
-print("  BUG REGRESSION (real case: David Bowie - I'm Afraid Of Americans, 'Johnny wants a brain, Johnny "
-      "wants to suck on a coke' -- a repeated phrase elsewhere in the song stole the whole-song match, "
-      "leaving this real run unmatched and landing compressed/wrong via blind interpolation): "
-      "rematch_local_gaps retries an unmatched run using ONLY the ASR words bounded between its nearest "
-      "confident neighbors, so a same-text decoy far outside that window can't be picked instead:")
-from ultrastar_generator.realign import rematch_local_gaps
-rlg_words = extract_words([
-    Syllable(text="hello", start=0.0, end=0.5, midi_note=0, is_word_start=True),
-    Syllable(text="echo", start=1.0, end=1.5, midi_note=0, is_word_start=True),
-    Syllable(text="echo", start=2.0, end=2.5, midi_note=0, is_word_start=True),
-    Syllable(text="world", start=3.0, end=3.5, midi_note=0, is_word_start=True),
-])
-rlg_asr = [
-    _Word(text="echo", start=100.0, end=100.3),   # decoy: same text, way outside the [10.5, 20.0] window
-    _Word(text="hello", start=10.0, end=10.5),
-    _Word(text="echo", start=12.0, end=12.3),      # real first 'echo', inside the window
-    _Word(text="echo", start=15.0, end=15.3),      # real second 'echo', inside the window
-    _Word(text="world", start=20.0, end=20.5),
-]
-rlg_starts = [10.0, None, None, 20.0]
-rlg_ends = [10.5, None, None, 20.5]
-rlg_confident = [True, False, False, True]
-rlg_n = rematch_local_gaps(rlg_words, rlg_asr, rlg_starts, rlg_ends, rlg_confident)
-assert rlg_n == 2, rlg_n
-assert rlg_confident == [True, True, True, True], rlg_confident
-assert rlg_starts == [10.0, 12.0, 15.0, 20.0], rlg_starts
-print("  OK: both 'echo' occurrences recovered from their real, IN-WINDOW ASR timestamps (12.0/15.0) -- "
-      "the far-away same-text decoy at t=100 was never a candidate")
-
-rlg2_words = extract_words([
-    Syllable(text="mystery", start=1.0, end=1.5, midi_note=0, is_word_start=True),
-    Syllable(text="hello", start=2.0, end=2.5, midi_note=0, is_word_start=True),
-])
-rlg2_asr = [_Word(text="hello", start=10.0, end=10.5)]  # 'mystery' genuinely never transcribed at all
-rlg2_starts = [None, 10.0]
-rlg2_ends = [None, 10.5]
-rlg2_confident = [False, True]
-rlg2_n = rematch_local_gaps(rlg2_words, rlg2_asr, rlg2_starts, rlg2_ends, rlg2_confident)
-assert rlg2_n == 0 and rlg2_confident == [False, True], (rlg2_n, rlg2_confident)
-print("  OK: a word genuinely absent from the ASR window is left unmatched (for interpolate_fallback), "
-      "not force-matched to something implausible")
-
 print("  _force_align_unconfident_runs (PROTOTYPE, 2026-08-10, adapted from UltraStarKaraokeMaker): forces "
       "the EXISTING file's own text for a still-unconfident run onto the audio window between its nearest "
-      "confident neighbors -- unlike rematch_local_gaps, doesn't need ASR to have transcribed anything there "
-      "at all, so it can recover a run rematch_local_gaps genuinely can't (real case: 'mystery' above):")
+      "confident neighbors via a real forced alignment -- doesn't need ASR to have transcribed anything "
+      "there at all, so it can recover a run a text-search-based rematch genuinely can't (real case: "
+      "'mystery' below, never transcribed by ASR at all):")
 from ultrastar_generator.realign import _force_align_unconfident_runs
 import ultrastar_generator.transcription as transcription_mod_rg
 import ultrastar_generator.model_cache as model_cache_mod_rg
@@ -4527,30 +4430,6 @@ print("OK: realign.py's build_arg_parser() builds and parses without error")
 from ultrastar_generator.pitch_refresh import build_arg_parser as _pitch_refresh_build_arg_parser
 _pitch_refresh_build_arg_parser().parse_args(["dummy_input_dir"])
 print("OK: pitch_refresh.py's build_arg_parser() builds and parses without error")
-
-print("\n--- transcription._split_segment_text (PROTOTYPE, 2026-08-10, config.REWINDOW_SPLIT_ENABLED): "
-      "splits a long decoder segment's own text into sub-phrases for split-rewindowing ---")
-from ultrastar_generator.transcription import _split_segment_text
-
-punct_split = _split_segment_text(" Johnny's in America. Johnny wants a brain! Johnny wants to know?")
-assert punct_split == ["Johnny's in America.", "Johnny wants a brain!", "Johnny wants to know?"], punct_split
-print("OK: splits cleanly on sentence-ending punctuation:", punct_split)
-
-single_sentence = _split_segment_text(" Just one short sentence.")
-assert single_sentence == ["Just one short sentence."], single_sentence
-print("OK: a single sentence (no internal punctuation split, under the word-count fallback "
-      "threshold) is returned as one whole piece")
-
-# No punctuation at all (a repeated-chorus run, the real motivating case) -- falls back
-# to fixed word-count chunks (config.REWINDOW_SPLIT_FALLBACK_WORDS, default 8).
-no_punct = "I'm afraid of Americans I'm afraid of the world I'm afraid I can't help it I'm afraid I can't"
-no_punct_split = _split_segment_text(no_punct)
-assert len(no_punct_split) > 1, no_punct_split
-reconstructed = " ".join(no_punct_split)
-assert reconstructed == no_punct, (reconstructed, no_punct)
-assert all(len(p.split()) <= config_mod.REWINDOW_SPLIT_FALLBACK_WORDS for p in no_punct_split), no_punct_split
-print("OK: punctuation-less repeated text falls back to fixed word-count chunks, "
-      "reconstructing the original text exactly:", no_punct_split)
 
 print("\n--- pitch_refresh: pitch-only refresh of an existing usdx timing base (same basic idea as "
       "the external ultrastar_pitch/usp tool, see CLAUDE.md/project memory) ---")

@@ -193,11 +193,13 @@ def lrc_line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float,
 def words_in_time_window(words: List[Word], t0: float, t1: float, slack: float = 0.5) -> List[Word]:
     """Every `Word` whose own start falls in `[t0 - slack, t1 + slack]`,
     order preserved. Trivial (a single filtered list comprehension), but
-    was 3 separately-written copies (`mxl_lrc_generator.
-    place_words_via_asr`, `realign.match_words_to_asr_windowed`, `realign.
-    rematch_local_gaps`) before this was extracted 2026-08-16 -- kept as
-    its own function so all 3 stay in sync if the slop convention ever
-    changes, not because the logic itself is complex."""
+    was 2 separately-written copies (`mxl_lrc_generator.
+    place_words_via_asr`, `realign.match_words_to_asr_windowed`) before
+    this was extracted 2026-08-16 -- kept as its own function so both
+    stay in sync if the slop convention ever changes, not because the
+    logic itself is complex. (A third former caller, `realign.
+    rematch_local_gaps`, was removed 2026-08-16 as a net regression --
+    see CLAUDE.md's "Removed / rejected approaches".)"""
     return [w for w in words if t0 - slack <= w.start <= t1 + slack]
 
 
@@ -226,18 +228,20 @@ def match_block_to_candidates(
     specific and deliberately not part of this function's job.
 
     Extracted 2026-08-16: `mxl_lrc_generator.place_words_via_asr`'s own
-    Pass 1, `realign.match_words_to_asr_windowed`, and `realign.
-    rematch_local_gaps` had all independently implemented this exact
-    same opcode-walk (confirmed by `match_words_to_asr_windowed`'s own
-    docstring: "mirroring mxl_lrc_generator.place_words_via_asr's Pass 1
-    exactly"). Deliberately NOT shared with `realign.match_words_to_asr`'s
-    own `_apply_match` -- that one uses a REVERSED SequenceMatcher
-    argument order (candidate first, target second, since it's built on
-    top of the caller-agnostic `find_cursor_window_match` above, which
-    searches a haystack for a target) and returns a candidate-side offset
-    for the caller's own forward cursor to advance by, neither of which
-    apply to these 3 callers (each an independent, non-cursored, per-
-    block/per-line match)."""
+    Pass 1 and `realign.match_words_to_asr_windowed` had independently
+    implemented this exact same opcode-walk (confirmed by
+    `match_words_to_asr_windowed`'s own docstring: "mirroring
+    mxl_lrc_generator.place_words_via_asr's Pass 1 exactly"). Deliberately
+    NOT shared with `realign.match_words_to_asr`'s own `_apply_match` --
+    that one uses a REVERSED SequenceMatcher argument order (candidate
+    first, target second, since it's built on top of the caller-agnostic
+    `find_cursor_window_match` above, which searches a haystack for a
+    target) and returns a candidate-side offset for the caller's own
+    forward cursor to advance by, neither of which apply to these 2
+    callers (each an independent, non-cursored, per-block/per-line
+    match). (A third former caller, `realign.rematch_local_gaps`, was
+    removed 2026-08-16 as a net regression -- see CLAUDE.md's "Removed /
+    rejected approaches".)"""
     if fuzzy_min_ratio is None:
         fuzzy_min_ratio = config.MXL_LRC_FUZZY_TEXT_MIN_RATIO
     if min_candidate_confidence is None:
