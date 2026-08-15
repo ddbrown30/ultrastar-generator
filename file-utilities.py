@@ -90,13 +90,13 @@ def main() -> None:
     mode_group = parser.add_mutually_exclusive_group(required=True)
 
     mode_group.add_argument(
-        "--realignment-replace",
+        "--realign-replace",
         action="store_true",
         help="Replace original files with [REALIGNED] files",
     )
 
     mode_group.add_argument(
-        "--realignment-reverse",
+        "--realign-reverse",
         action="store_true",
         help="Reverse the realignment replacement",
     )
@@ -139,10 +139,10 @@ def main() -> None:
         print(f"Error: directory does not exist: {root}")
         raise SystemExit(1)
 
-    if args.realignment_replace:
+    if args.realign_replace:
         process_folder(root, reverse=False)
 
-    elif args.realignment_reverse:
+    elif args.realign_reverse:
         process_folder(root, reverse=True)
 
     elif args.clean_work:
