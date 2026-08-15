@@ -3664,6 +3664,54 @@ assert rls_fuzzy is not None and rls_fuzzy.n_matched == 3 and rls_fuzzy.n_our_un
 print("  OK: 'Ev'rything'/'Everything' and 'livin''/'living' both matched via bounded character-level "
       "fuzzy tolerance; genuinely different text still correctly declines")
 
+print("  reconcile_line_structure: FILLER-WORD tolerance (user's own explicit request, 2026-08-15) -- "
+      "an LRC's own author and our existing file's own author may each choose differently whether to "
+      "write an ad-lib ('ooh'/'mmm') or a filler connector ('yeah'/'and'/'but'); that's a transcription "
+      "choice, not the line actually being different content, and is specifically common in realignment:")
+from ultrastar_generator.lrc_timing import _strip_filler_flat
+
+assert _strip_filler_flat("yeah i love you") == "iloveyou", _strip_filler_flat("yeah i love you")
+assert _strip_filler_flat("but i don't know") == "idon'tknow", _strip_filler_flat("but i don't know")
+assert _strip_filler_flat("ooh baby ooh") == "baby", _strip_filler_flat("ooh baby ooh")
+assert _strip_filler_flat("ooh ooh ooh") == "", _strip_filler_flat("ooh ooh ooh")  # all-filler line -> empty
+
+rls_filler_connectors = reconcile_line_structure(
+    ["Yeah, I love you", "But I don't know"],
+    [(10.0, "I love you"), (12.0, "I don't know")],
+)
+assert rls_filler_connectors is not None and rls_filler_connectors.n_matched == 2 \
+    and rls_filler_connectors.n_our_unmatched == 0, rls_filler_connectors
+print("  OK: 'Yeah,'/'But' -- filler connectors OUR file added that the LRC candidate doesn't have -- "
+      "no longer block an otherwise-identical line from matching")
+
+rls_filler_adlibs = reconcile_line_structure(
+    ["Ooh baby ooh", "Mmm that feels right"],
+    [(10.0, "baby"), (12.0, "that feels right")],
+)
+assert rls_filler_adlibs is not None and rls_filler_adlibs.n_matched == 2 \
+    and rls_filler_adlibs.n_our_unmatched == 0, rls_filler_adlibs
+print("  OK: 'Ooh'/'Mmm' ad-libs OUR file has that the LRC candidate doesn't transcribe at all also match")
+
+rls_all_filler = reconcile_line_structure(["Ooh ooh ooh"], [(5.0, "Yeah but and")])
+assert rls_all_filler is None, rls_all_filler
+print("  OK: two lines that are BOTH entirely filler words, but DIFFERENT filler words, correctly still "
+      "decline -- the empty-after-stripping guard prevents them from fuzzy-matching via a false empty tie")
+
+rls_merge_filler = reconcile_line_structure(
+    ["It's you, it's you, it's all for you,", "Yeah, everything I do"],
+    [(10.0, "It's you, it's you, it's all for you, everything I do")],
+)
+assert rls_merge_filler is not None and rls_merge_filler.n_matched == 2 \
+    and rls_merge_filler.n_our_unmatched == 0, rls_merge_filler
+assert len(rls_merge_filler.lrc_lines) == 2, rls_merge_filler.lrc_lines
+(fm_t0, fm_text0), (fm_t1, fm_text1) = rls_merge_filler.lrc_lines
+assert fm_text0 == "It's you, it's you, it's all for you," and fm_text1 == "Yeah, everything I do", \
+    rls_merge_filler.lrc_lines  # kept OUTPUT text is our own original wording, filler word included verbatim
+assert fm_t0 == 10.0 and 10.0 < fm_t1 < 15.0, (fm_t0, fm_t1)
+print("  OK: LRC-merge detection also tolerates a filler word ('Yeah,') present on our own line's side "
+      "but absent from the candidate's merged line -- still resolves as a real merge, and the kept output "
+      "text keeps our own original wording (filler word included), only the COMPARISON ignored it")
+
 print("  BUG REGRESSION (real case, Trixie Mattel - Video Games, 2026-08-15): prepare_lrc's word_lines "
       "must be built DIRECTLY from reconcile_line_structure's own our_line_index (via our_line_of_word), "
       "not re-derived by calling assign_words_to_lines -- its own independent whole-song WORD-level diff "

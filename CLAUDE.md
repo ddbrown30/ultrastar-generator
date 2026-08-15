@@ -744,6 +744,24 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   fixes: zero regressions, several songs now at 100% (Chicago, Tarzan,
   Gold) or very high match (Video Games 95%, Under The Sea 90%, Gaston
   91%) that previously declined or matched partially.
+- `reconcile_line_structure`'s FILLER-WORD tolerance (2026-08-15, user's
+  own explicit request): `FILLER_WORDS`/`_strip_filler_flat` in
+  `lrc_timing.py` — a short, deliberately conservative list (`ooh`,
+  `ooo`, `oh`, `ohh`, `mmm`, `mm`, `yeah`, `and`, `but`) tried as a
+  FALLBACK (never in place of the raw comparison) in both the plain-line
+  match and the merge check (`_match_kind`): an LRC's own author and our
+  existing file's own author often choose differently whether to write
+  an ad-lib or a filler connector, which is a transcription CHOICE, not
+  the line actually being different content — specifically motivated by
+  realignment, where this disagreement is common between independently-
+  authored sources. Guarded so two lines that are BOTH entirely filler
+  words (but different ones) can never fuzzy-match via an empty-string
+  tie once stripped. Real-network validation across the whole `sandbox/`
+  roster (comparing reconciliation `match_ratio` with vs. without this
+  tolerance, real LRC candidates, real audio durations): zero
+  regressions anywhere, with genuine real wins — Chappell Roan - Pink
+  Pony Club 96.7%→98.9%, The Little Mermaid - Under The Sea 90.1%→91.4%,
+  Trixie Mattel - Video Games 94.9%→96.6%.
 - `mxl_lrc_generator.select_lrc_candidate` ranking fixed (2026-08-15,
   real bug found via the Video Games investigation above): used to rank
   candidates by content-match ratio first, duration only as a tiebreaker

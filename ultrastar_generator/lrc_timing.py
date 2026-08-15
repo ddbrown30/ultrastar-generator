@@ -191,6 +191,31 @@ def _normalize_line(text: str) -> str:
     return " ".join(n for n in (_normalize(tok) for tok in text.split()) if n)
 
 
+# Ad-lib/filler and connector words that different transcribers (an LRC's
+# own author vs. whoever wrote our existing .txt) commonly add or drop
+# without it meaning the LINE is actually different content -- user's own
+# explicit request, 2026-08-15, specifically motivated by realignment:
+# "the choice of filler words may differ between the author of the LRC and
+# the author of the usdx file." Deliberately a short, conservative list
+# (ad-libs + a few connector words the user named directly) rather than a
+# broad stopword list -- a real content word incorrectly on this list
+# would silently make two genuinely different lines match.
+FILLER_WORDS = frozenset({
+    "ooh", "ooo", "oh", "ohh", "mmm", "mm",
+    "yeah", "and", "but",
+})
+
+
+def _strip_filler_flat(normalized_line: str) -> str:
+    """Whitespace-flattened form of `normalized_line` (itself the output
+    of `_normalize_line`) with any whole FILLER_WORDS token removed --
+    used as a FALLBACK comparison alongside the raw flattened form (see
+    `reconcile_line_structure`), never in place of it, so two lines still
+    have to be identical content-wise once ad-libs/connectors are set
+    aside."""
+    return "".join(tok for tok in normalized_line.split() if tok not in FILLER_WORDS)
+
+
 def check_repeat_structure(our_lines: List[str], lrc_line_texts: List[str],
                             min_repeat: int = 3, min_word_len: int = 4) -> Optional[str]:
     """Rejects an LRC candidate whose REPEAT STRUCTURE doesn't match ours --
@@ -499,6 +524,19 @@ def reconcile_line_structure(
     aligns anywhere in that whole window, the current LRC line has no
     plausible match nearby at all -- drop it (advance j by 1) and keep
     walking, rather than aborting the whole reconciliation over one line.
+
+    Both the plain-match check and the merge check ALSO try a FILLER-
+    WORD-TOLERANT fallback (`FILLER_WORDS`/`_strip_filler_flat`, user's
+    own explicit request, 2026-08-15) when the raw comparison fails: an
+    LRC's own author and our existing file's own author often choose
+    differently whether to write an ad-lib ("ooh"/"mmm"/"ooh"/"ohh") or a
+    filler connector ("yeah"/"and"/"but") that the singer may or may not
+    audibly include -- that's a transcription CHOICE, not the line
+    actually being different content, and is specifically common in
+    realignment (comparing our own file's lines against an independently
+    -authored LRC candidate). Guarded so an all-filler line (e.g. "Ooh
+    ooh ooh") can never fuzzy-match a different all-filler line via both
+    sides stripping down to an empty string.
     """
     our_norm = [_normalize_line(t) for t in our_lines]
     lrc_norm = [_normalize_line(t) for _t, t in lrc_lines]
@@ -514,6 +552,16 @@ def reconcile_line_structure(
     # sequence match -- no fuzzy tolerance for a real word difference.
     our_flat = ["".join(t.split()) for t in our_norm]
     lrc_flat = ["".join(t.split()) for t in lrc_norm]
+    # Filler-word-stripped parallel versions -- FALLBACK ONLY (see
+    # _match_kind below), never used in place of the raw flat form. User's
+    # own explicit request, 2026-08-15, motivated by realignment: an LRC's
+    # own author and our existing file's own author may each choose
+    # differently whether to write in an ad-lib ("ooh"/"mmm") or a filler
+    # connector ("yeah"/"and"/"but") -- that's not the line actually being
+    # different content, so a line that matches once those words are set
+    # aside on both sides should still count as a real match.
+    our_flat_nofill = [_strip_filler_flat(t) for t in our_norm]
+    lrc_flat_nofill = [_strip_filler_flat(t) for t in lrc_norm]
     n_i, n_j = len(our_norm), len(lrc_norm)
 
     def _match_kind(i2: int, j2: int) -> Optional[Tuple[str, int]]:
@@ -524,10 +572,21 @@ def reconcile_line_structure(
             return None
         if our_flat[i2] and _flat_fuzzy_equal(our_flat[i2], lrc_flat[j2]):
             return ("match", 1)
+        # Filler-word-tolerant fallback -- only once both sides still have
+        # SOME real content left after stripping (an all-filler line, e.g.
+        # "Ooh ooh ooh", must never fuzzy-match another all-filler line
+        # with genuinely different filler words via an empty-string tie).
+        if our_flat_nofill[i2] and lrc_flat_nofill[j2] and \
+                _flat_fuzzy_equal(our_flat_nofill[i2], lrc_flat_nofill[j2]):
+            return ("match", 1)
         lrc_k = _consume_as_merge(lrc_flat[j2], our_flat[i2:i2 + max_merge_lines])
+        if lrc_k is None:
+            lrc_k = _consume_as_merge(lrc_flat_nofill[j2], our_flat_nofill[i2:i2 + max_merge_lines])
         if lrc_k is not None:
             return ("lrc_merge", lrc_k)
         our_k = _consume_as_merge(our_flat[i2], lrc_flat[j2:j2 + max_merge_lines])
+        if our_k is None:
+            our_k = _consume_as_merge(our_flat_nofill[i2], lrc_flat_nofill[j2:j2 + max_merge_lines])
         if our_k is not None:
             return ("our_merge", our_k)
         return None
