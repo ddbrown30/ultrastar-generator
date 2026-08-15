@@ -55,7 +55,7 @@ from typing import Callable, List, Optional, Tuple
 from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib, effective_lrc_duration
 from .lrc_timing import (parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines, lrc_line_window,
-                          match_block_to_candidates)
+                          match_block_to_candidates, words_in_time_window)
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
 from .text_normalize import normalize_word as _normalize
@@ -538,7 +538,7 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
     for li, idxs in line_word_idxs.items():
         idxs = sorted(idxs)
         t0, t1 = lrc_line_window(lrc_lines, li)
-        asr_in_window = [w for w in asr_words if t0 - 0.5 <= w.start <= t1 + 0.5]
+        asr_in_window = words_in_time_window(asr_words, t0, t1)
         mxl_norm_line = [_normalize(word_clean_text[i]) if word_clean_text and word_clean_text[i]
                           else mxl_words[i].norm for i in idxs]
         # matched_local: see lrc_timing.match_block_to_candidates -- ASR

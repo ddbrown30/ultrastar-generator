@@ -63,7 +63,7 @@ from .usdx_writer import write_song
 from .lyrics_lookup import LrcLibCandidate, fetch_lrclib_by_id, load_lrc_file
 from .lrc_timing import (match_asr_to_lrc_lines, two_tier_time_calibration, check_repeat_structure,
                           reconcile_line_structure, find_cursor_window_match, lrc_line_window,
-                          match_block_to_candidates)
+                          match_block_to_candidates, words_in_time_window)
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
 from .text_normalize import normalize_word as _normalize
 
@@ -660,7 +660,7 @@ def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: 
     for li, idxs in line_word_idxs.items():
         idxs = sorted(idxs)
         t0, t1 = lrc_line_window(lrc_lines, li)
-        asr_in_window = [w for w in asr_words if t0 - 0.5 <= w.start <= t1 + 0.5]
+        asr_in_window = words_in_time_window(asr_words, t0, t1)
         existing_norm_line = [existing_words[i].norm for i in idxs]
 
         matched_local = match_block_to_candidates(existing_norm_line, asr_in_window)
@@ -712,7 +712,7 @@ def rematch_local_gaps(existing_words: List[ExistingWord], asr_words: List[Word]
         if t1 is None:
             t1 = t0 + 30.0
 
-        asr_in_window = [w for w in asr_words if t0 - slack_sec <= w.start <= t1 + slack_sec]
+        asr_in_window = words_in_time_window(asr_words, t0, t1, slack=slack_sec)
         if not asr_in_window:
             continue
 

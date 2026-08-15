@@ -190,6 +190,17 @@ def lrc_line_window(lrc_lines: List[Tuple[float, str]], li: int) -> Tuple[float,
     return t0, t1
 
 
+def words_in_time_window(words: List[Word], t0: float, t1: float, slack: float = 0.5) -> List[Word]:
+    """Every `Word` whose own start falls in `[t0 - slack, t1 + slack]`,
+    order preserved. Trivial (a single filtered list comprehension), but
+    was 3 separately-written copies (`mxl_lrc_generator.
+    place_words_via_asr`, `realign.match_words_to_asr_windowed`, `realign.
+    rematch_local_gaps`) before this was extracted 2026-08-16 -- kept as
+    its own function so all 3 stay in sync if the slop convention ever
+    changes, not because the logic itself is complex."""
+    return [w for w in words if t0 - slack <= w.start <= t1 + slack]
+
+
 def match_block_to_candidates(
     target_norm: List[str],
     candidate_words: List[Word],

@@ -1220,6 +1220,14 @@ all of them.
   "favors"~"favorites" fuzzy-mishearing and next-line-spillover cases),
   `rematch_local_gaps`'s own block, and `match_words_to_asr_windowed`'s
   own block.
+- **`lrc_timing.words_in_time_window`** (added 2026-08-16): trivial
+  `[t0 - slack, t1 + slack]` ASR-word filter — was 3 copies (same 3
+  callers as `match_block_to_candidates` above, since each builds its
+  own `asr_in_window` right before calling it). Purely mechanical, kept
+  as its own function so the slop convention (currently a flat 0.5s
+  default) can't drift between callers unnoticed.
+  Re-test: `test_dry_run.py` in full — exercised transitively through
+  all 3 callers' own existing test coverage, same as `lrc_line_window`.
 
 ## Environment
 
