@@ -164,6 +164,97 @@ def load_vocal_notes(
     return notes_out, [p.partName for p in chosen]
 
 
+def nearest_pitch_for_class(our_pitch: int, target_pc: int) -> int:
+    """Nearest UltraStar-convention pitch (MIDI - 60) to `our_pitch` with
+    pitch CLASS `target_pc` (0-11) -- moves by at most +-6 semitones,
+    staying in the same octave region `our_pitch` is already in rather
+    than jumping to a distant octave that happens to share the target
+    class. Shared by `apply_musicxml_reference` and
+    `pitch_refresh.apply_mxl_pitch_reference` (same "correct pitch class
+    only, never octave" rule both places)."""
+    our_pc = (our_pitch + 60) % 12
+    if our_pc == target_pc:
+        return our_pitch
+    diff = (target_pc - our_pc) % 12
+    if diff > 6:
+        diff -= 12
+    return our_pitch + diff
+
+
+def _calibrate_pitch_class(
+    matches: List[Tuple[int, int, float]],  # (our_ultrastar_pitch, mxl_absolute_midi, our_confidence)
+    min_calibration_samples: int,
+    min_calibration_confidence: float,
+    force_calibration: bool,
+    verbose: bool,
+    log_prefix: str = "[musicxml]",
+) -> Tuple[Optional[int], float, List[Tuple[int, int, float]], Optional[str]]:
+    """Shared by `apply_musicxml_reference` (matches syllable-for-syllable
+    via `load_vocal_notes`) and `pitch_refresh.apply_mxl_pitch_reference`
+    (matches word-for-word via `mxl_lrc_generator.load_mxl_vocal_words`,
+    then position-aligns each matched word's own syllables) -- both need
+    the exact same per-song PITCH-CLASS calibration-offset logic (full
+    population, then a high-confidence-subset retry, then optional
+    force_calibration fallback), just fed from a different alignment
+    mechanism. See `apply_musicxml_reference`'s own docstring for the
+    full rationale (real Gaston-based validation of the two-tier retry).
+
+    Returns (offset, confidence, population_used, skipped_reason) --
+    offset is None (with skipped_reason set) whenever calibration isn't
+    trusted and `force_calibration` is False."""
+    if len(matches) < min_calibration_samples:
+        reason = (f"only {len(matches)} matched note(s) (< {min_calibration_samples} required) -- "
+                   f"not enough to trust a calibration offset")
+        if verbose:
+            print(f"{log_prefix} skipping correction: {reason}")
+        return None, 0.0, [], reason
+
+    def _pc_offset(m):
+        our_p, mxl_p, _ = m
+        return (mxl_p - (our_p + 60)) % 12
+
+    def _best_offset(population):
+        counts = Counter(_pc_offset(m) for m in population)
+        offset, n_agree = counts.most_common(1)[0]
+        return offset, n_agree / len(population)
+
+    calibration, confidence = _best_offset(matches)
+    calibration_population = matches
+
+    if confidence < min_calibration_confidence:
+        sorted_by_conf = sorted(matches, key=lambda m: -m[2])
+        top_half = sorted_by_conf[:max(min_calibration_samples, len(matches) // 2)]
+        alt_calibration, alt_confidence = _best_offset(top_half)
+        cleared_alt_bar = alt_confidence >= config.MUSICXML_MIN_CALIBRATION_CONFIDENCE_HIGH_CONF_SUBSET
+        use_alt = cleared_alt_bar or (force_calibration and alt_confidence > confidence)
+        if use_alt:
+            if verbose:
+                print(f"{log_prefix} full-population calibration too weak ({confidence:.0%}) -- "
+                      f"retrying with top {len(top_half)}/{len(matches)} matches by our own "
+                      f"confidence: {alt_calibration:+d} semitones, {alt_confidence:.0%} agreement")
+            calibration, confidence = alt_calibration, alt_confidence
+            calibration_population = top_half
+        elif not force_calibration:
+            reason = (f"no clear per-song calibration offset (best candidate {calibration} semitones "
+                       f"covers {confidence:.0%} of all {len(matches)} matches, "
+                       f"{alt_confidence:.0%} of the top {len(top_half)} by our own confidence -- "
+                       f"neither clears the required bar)")
+            if verbose:
+                print(f"{log_prefix} skipping correction: {reason}")
+            return None, 0.0, [], reason
+        elif verbose:
+            print(f"{log_prefix} force_calibration: neither candidate cleared its bar "
+                  f"({confidence:.0%} full population, {alt_confidence:.0%} high-confidence subset) "
+                  f"-- proceeding anyway with the full-population offset {calibration:+d}")
+
+    if verbose:
+        print(f"{log_prefix} calibration offset: {calibration:+d} semitones (pitch-class), "
+              f"{confidence:.0%} agreement over {len(calibration_population)} match(es)"
+              f"{' [FORCED]' if force_calibration and confidence < min_calibration_confidence else ''}")
+
+    return calibration, confidence, calibration_population, None
+
+
 def apply_musicxml_reference(
     syllables: List[Syllable],
     mxl_path: str,
@@ -246,90 +337,23 @@ def apply_musicxml_reference(
               f"{len(matches)}/{len(comparable_indices)} syllables matched by lyric text "
               f"(ratio={sm.ratio():.3f})")
 
-    if len(matches) < min_calibration_samples:
-        stats.skipped_reason = (
-            f"only {len(matches)} matched notes (< {min_calibration_samples} required) -- "
-            f"not enough to trust a calibration offset"
-        )
-        if verbose:
-            print(f"[musicxml] skipping correction: {stats.skipped_reason}")
-        return syllables, stats
-
-    def _pc_offset(m):
-        _, our_p, mxl_p, _ = m
-        return (mxl_p - (our_p + 60)) % 12
-
-    def _best_offset(population):
-        counts = Counter(_pc_offset(m) for m in population)
-        offset, n_agree = counts.most_common(1)[0]
-        return offset, n_agree / len(population)
-
     # Calibrate at the PITCH-CLASS level (mod 12) -- absorbs both genuine
     # transpositions (e.g. +2, +5 semitones, confirmed on real files) and
     # octave-only notation inconsistency (e.g. -12), which a plain
     # semitone-offset calibration would treat as conflicting evidence.
-    #
-    # Try the full matched population first (unchanged behavior for the
-    # common case -- most songs calibrate cleanly here). If that doesn't
-    # clear the bar, retry using only the TOP HALF by OUR OWN note
-    # confidence: on a song where our own detection is noisy overall
-    # (real case: Gaston, our baseline pyin accuracy only ~41%), the full
-    # population's calibration signal gets diluted by matches where our
-    # own pitch is simply wrong, not by any real multi-offset ambiguity
-    # in the song itself -- restricting to higher-confidence matches
-    # measurably cleans the signal (confirmed on Gaston: 39.5% agreement
-    # over all 281 matches vs 46.1% over the top 141 by our own
-    # confidence, with the SAME winning offset both times, not a
-    # different one -- the extra confidence isn't cherry-picking a
-    # different answer, it's the same answer with less noise around it).
-    # A lower bar is used for this second attempt specifically because a
-    # plurality among an already-noise-reduced population is more
-    # trustworthy than the same plurality would be over the full one.
-    calibration, confidence = _best_offset(matches)
+    # See `_calibrate_pitch_class`'s own docstring for the two-tier
+    # retry/force_calibration logic (real Gaston-based validation: full-
+    # population 39.5% agreement vs. 46.1% over the top-confidence half,
+    # same winning offset both times, just less noise around it).
+    calibration, confidence, _, skipped_reason = _calibrate_pitch_class(
+        [(our_p, mxl_p, conf) for (_, our_p, mxl_p, conf) in matches],
+        min_calibration_samples, min_calibration_confidence, force_calibration, verbose,
+    )
     stats.calibration_offset = calibration
     stats.calibration_confidence = confidence
-    calibration_population = matches
-
-    if confidence < min_calibration_confidence:
-        sorted_by_conf = sorted(matches, key=lambda m: -m[3])
-        top_half = sorted_by_conf[:max(min_calibration_samples, len(matches) // 2)]
-        alt_calibration, alt_confidence = _best_offset(top_half)
-        cleared_alt_bar = alt_confidence >= config.MUSICXML_MIN_CALIBRATION_CONFIDENCE_HIGH_CONF_SUBSET
-        # Prefer the high-confidence-subset offset over the full-population
-        # one whenever it's actually the stronger signal, even under
-        # force_calibration (where neither needs to clear its own bar) --
-        # picking the weaker of two known candidates just because it
-        # happened to be checked first would defeat the point of trying
-        # the subset at all.
-        use_alt = cleared_alt_bar or (force_calibration and alt_confidence > confidence)
-        if use_alt:
-            if verbose:
-                print(f"[musicxml] full-population calibration too weak ({confidence:.0%}) -- "
-                      f"retrying with top {len(top_half)}/{len(matches)} matches by our own "
-                      f"confidence: {alt_calibration:+d} semitones, {alt_confidence:.0%} agreement")
-            calibration, confidence = alt_calibration, alt_confidence
-            calibration_population = top_half
-            stats.calibration_offset = calibration
-            stats.calibration_confidence = confidence
-        elif not force_calibration:
-            stats.skipped_reason = (
-                f"no clear per-song calibration offset (best candidate {calibration} semitones "
-                f"covers {confidence:.0%} of all {len(matches)} matches, "
-                f"{alt_confidence:.0%} of the top {len(top_half)} by our own confidence -- "
-                f"neither clears the required bar)"
-            )
-            if verbose:
-                print(f"[musicxml] skipping correction: {stats.skipped_reason}")
-            return syllables, stats
-        elif verbose:
-            print(f"[musicxml] force_calibration: neither candidate cleared its bar "
-                  f"({confidence:.0%} full population, {alt_confidence:.0%} high-confidence subset) "
-                  f"-- proceeding anyway with the full-population offset {calibration:+d}")
-
-    if verbose:
-        print(f"[musicxml] calibration offset: {calibration:+d} semitones (pitch-class), "
-              f"{confidence:.0%} agreement over {len(calibration_population)} match(es)"
-              f"{' [FORCED]' if force_calibration and confidence < min_calibration_confidence else ''}")
+    if calibration is None:
+        stats.skipped_reason = skipped_reason
+        return syllables, stats
 
     # Correction applies to EVERY matched syllable once calibration is
     # trusted, regardless of that syllable's own confidence -- a
@@ -340,14 +364,10 @@ def apply_musicxml_reference(
     # rather than something to leave alone just because we were sure.
     new_syllables = list(syllables)
     for syl_idx, our_p, mxl_p, _ in matches:
-        our_pc = (our_p + 60) % 12
         target_pc = (mxl_p - calibration) % 12
-        if our_pc == target_pc:
+        new_pitch = nearest_pitch_for_class(our_p, target_pc)
+        if new_pitch == our_p:
             continue
-        diff = (target_pc - our_pc) % 12
-        if diff > 6:
-            diff -= 12
-        new_pitch = our_p + diff
         stats.corrections.append(MusicXMLCorrection(syl_idx, syllables[syl_idx].text, our_p, new_pitch, target_pc))
         old = new_syllables[syl_idx]
         new_syllables[syl_idx] = Syllable(

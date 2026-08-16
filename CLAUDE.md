@@ -342,6 +342,46 @@ to the gui at the same time.
   `--no-isolate-vocals` is now the only way back to that footprint. Full
   design rationale lives in `pitch_refresh.py`'s own module docstring,
   not duplicated here.
+- **`pitch_refresh.py` MusicXML support** (2026-08-16, `musicxml_pitch`
+  default ON, `apply_mxl_pitch_reference(s)`): tried BEFORE audio-based
+  pitch detection, same "MXL if possible, else fall back" priority as
+  main.py's own MXL+LRC primary path — skips Demucs/audio pitch
+  detection entirely when it succeeds. Built on `mxl_lrc_generator.
+  load_mxl_vocal_words` (word-level, captures tied/slurred lyric-less
+  continuation notes) rather than `musicxml_reference.load_vocal_notes`
+  (flat single-note list, pass 4's own parser) — needed to see a word's
+  REAL note count. Existing words (`realign.extract_words`) are aligned
+  to MXL words by a whole-sequence lyric-text diff, then a per-song
+  pitch-class calibration offset is established via the same shared
+  logic pass 4 uses (extracted into `musicxml_reference.
+  _calibrate_pitch_class`/`nearest_pitch_for_class`, now used by both).
+  Once calibrated, a matched word whose existing single note the MXL
+  reveals to be a multi-note melisma is SPLIT into that many notes
+  (proportional to the MXL's own relative note durations, pitched to the
+  calibrated class nearest the ORIGINAL note's own octave) — the one
+  deliberate exception to this module's "never touches note count"
+  invariant, explicitly authorized by the user for the MXL path only.
+  Only the first of the new notes keeps the original word's own text;
+  the rest are empty-text continuation notes, so the word's own text is
+  completely unchanged either way. A word whose existing note count
+  can't be safely split further (already > 1 syllable) or where MXL has
+  FEWER notes than the existing word instead picks the position-
+  proportional-nearest MXL syllable per existing note, same as an exact
+  1:1 match, never changing note count — audio-based pitch detection's
+  own `_pred_for_note`/`_weighted_mode_pitch` (already existed, per-note
+  confidence-weighted-mode aggregation) is the one deciding "which pitch
+  is correct" whenever a note can't be split, unchanged by this feature.
+  Real-validated: Beauty and the Beast (100% calibration agreement over
+  138 matches, 0 corrections needed — the existing SingStar ground truth
+  was already correct once the MXL's own +2 semitone transposition is
+  accounted for); Great Big Sea - Ordinary Day (94% agreement, 22 notes
+  corrected, 9 real melisma words split into 9 extra notes) — confirmed
+  via the real written output, not in-memory: GAP/BPM identical, full
+  concatenated lyric text byte-identical before/after, note count
+  increased by exactly 9, every split note's own text/timing/pitch
+  inspected directly and correct. `--musicxml-reference`/`--musicxml-
+  part`/`--no-musicxml-force-calibration` mirror the main pipeline's own
+  flags; `--no-musicxml-pitch` opts out entirely.
 - `ENABLE_MUSICXML_FORCE_CALIBRATION = True`: when a user supplies (or
   auto-detects) a MusicXML reference and normal pass-4 calibration can't
   clear its confidence bar, apply the best available pitch-class offset

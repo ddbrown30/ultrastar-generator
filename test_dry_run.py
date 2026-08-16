@@ -4644,3 +4644,133 @@ unnudged = _KeyNudge.correct(0, [0])
 assert unnudged == [0], unnudged
 print("OK: an out-of-key pitch class (1, zero probability under key 0) is nudged +-1 semitone toward "
       "whichever neighbor scores higher (2), while an in-key class (0) is left untouched")
+
+print("\n--- pitch_refresh.apply_mxl_pitch_reference: MusicXML-based pitch refresh, tried before audio "
+      "pitch detection -- never touches timing/text/note count EXCEPT a deliberate SPLIT when the MXL "
+      "reveals an existing single note to actually be a multi-note melisma ---")
+from ultrastar_generator.pitch_refresh import apply_mxl_pitch_reference, apply_mxl_pitch_references
+
+
+def _make_mxl_words(spec, path):
+    """spec: list of (word_text_or_None, midi) tuples -- a real word_text
+    starts a new single-syllable MXL word; None continues the PREVIOUS
+    word as an untexted (melisma) note, exactly like a real tied/slurred
+    continuation note `mxl_lrc_generator.load_mxl_vocal_words` merges in."""
+    notes_xml = ""
+    for text, midi in spec:
+        step, alter = _PC_TO_STEP_ALTER[midi % 12]
+        octave = midi // 12 - 1
+        alter_xml = f"<alter>{alter}</alter>" if alter else ""
+        lyric_xml = f'<lyric><syllabic>single</syllabic><text>{text}</text></lyric>' if text is not None else ""
+        notes_xml += (
+            f'<note><pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch>'
+            f'<duration>4</duration><type>quarter</type>{lyric_xml}</note>'
+        )
+    xml = (
+        '<?xml version="1.0"?><score-partwise version="3.1">'
+        '<part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>'
+        f'<part id="P1"><measure number="1">{notes_xml}</measure></part></score-partwise>'
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml)
+
+
+# Existing file: 5 single-note words. "oh" is a real melisma our own existing
+# file only has ONE note for; MXL will reveal 3 real notes for it. Every word
+# is a semitone flat of what a +2-semitone-transposed MXL reference would say,
+# calibration should land on pitch-class +2 (same style as the musicxml_
+# reference.apply_musicxml_reference test above, just at the WORD level).
+_pr_mxl_entries = [
+    Syllable(text="hello", start=0.0, end=0.5, midi_note=0, is_word_start=True),   # 60 abs
+    Syllable(text="oh", start=1.0, end=2.5, midi_note=2, is_word_start=True),      # 62 abs -- melisma, 1 note
+    Syllable(text="wor-", start=3.0, end=3.5, midi_note=4, is_word_start=True),    # 64 abs -- 2-syllable word
+    Syllable(text="ld", start=3.5, end=4.0, midi_note=4, is_word_start=False),
+    Syllable(text="friend", start=4.5, end=5.0, midi_note=7, is_word_start=True),  # 67 abs
+]
+# MXL: same words +2 semitones from our octave/key convention. "oh" gets 3
+# real notes (1 lyric + 2 untexted melisma continuations at DIFFERENT
+# pitches -- real sung pitch movement within the held word, same shape
+# `load_mxl_vocal_words` was built and validated to capture).
+_pr_mxl_spec = [
+    ("hello", 62),
+    ("oh", 64), (None, 67), (None, 65),
+    ("world", 66),  # MXL's own OCR/encoding merges "wor-"+"ld" into one word -- won't matter, still splits
+    ("friend", 69),
+]
+with _tempfile.TemporaryDirectory() as _pr_tmpdir:
+    _pr_mxl_path = f"{_pr_tmpdir}/melisma_song.musicxml"
+    _make_mxl_words(_pr_mxl_spec, _pr_mxl_path)
+    pr_entries, pr_stats = apply_mxl_pitch_reference(
+        _pr_mxl_entries, _pr_mxl_path, min_calibration_samples=3, verbose=True,
+    )
+    assert pr_stats.skipped_reason is None, pr_stats.skipped_reason
+    assert pr_stats.calibration_offset == 2, pr_stats.calibration_offset
+    print(f"OK: word-level calibration landed on {pr_stats.calibration_offset:+d} semitones "
+          f"(pitch-class), {pr_stats.calibration_confidence:.0%} agreement")
+
+    pr_notes = [e for e in pr_entries if isinstance(e, Syllable)]
+    assert len(pr_notes) == len(_pr_mxl_entries) + 2, len(pr_notes)  # "oh" 1 -> 3 notes = +2
+    assert pr_stats.n_split == 1 and pr_stats.n_notes_added == 2, (pr_stats.n_split, pr_stats.n_notes_added)
+    print(f"OK: exactly 1 word split ({pr_stats.n_notes_added} extra note(s)) -- \"oh\"'s single existing "
+          f"note became 3, matching the MXL's own real melisma note count")
+
+    # Full concatenated text must be BYTE-IDENTICAL before/after -- splitting
+    # a note must never add/remove/alter any lyric text, only where the
+    # PITCH lives.
+    orig_text = "".join(e.text for e in _pr_mxl_entries)
+    new_text = "".join(e.text for e in pr_notes)
+    assert orig_text == new_text, (orig_text, new_text)
+    print("OK: full concatenated lyric text is byte-identical before/after splitting -- "
+          f"{orig_text!r}")
+
+    # Locate the 3 notes that replaced "oh" and check them directly.
+    oh_notes = [e for e in pr_notes if e.start >= 1.0 - 1e-6 and e.end <= 2.5 + 1e-6]
+    assert len(oh_notes) == 3, oh_notes
+    assert oh_notes[0].text == "oh" and oh_notes[1].text == "" and oh_notes[2].text == "", oh_notes
+    assert oh_notes[0].is_word_start and not oh_notes[1].is_word_start and not oh_notes[2].is_word_start
+    assert oh_notes[0].start == 1.0 and oh_notes[-1].end == 2.5, (oh_notes[0].start, oh_notes[-1].end)
+    # MXL pitch classes for "oh"'s 3 notes were 64, 67, 65 -- calibrated by
+    # -2 semitones (our own convention) that's pitch-class (64-2)%12=2,
+    # (67-2)%12=5, (65-2)%12=3, nearest to the ORIGINAL note's own octave (62).
+    assert [n.midi_note % 12 for n in oh_notes] == [2, 5, 3], [n.midi_note % 12 for n in oh_notes]
+    print("OK: the 3 split notes for \"oh\" keep the word's own [start, end) span exactly, only the "
+          "first keeps the real text (rest are empty continuation notes), and each adopts its own "
+          "calibrated MXL pitch class:", [(n.text, n.start, n.end, n.midi_note % 12) for n in oh_notes])
+
+    # "wor-"/"ld" already has 2 syllables -- MXL's own single "world" word
+    # (1 note) must NOT be force-split further; both existing notes just
+    # adopt the (only available) calibrated pitch class, note count unchanged.
+    world_notes = [e for e in pr_notes if e.text in ("wor-", "ld")]
+    assert len(world_notes) == 2, world_notes
+    assert all(n.midi_note % 12 == (66 - 2) % 12 for n in world_notes), world_notes
+    print("OK: an existing word that ALREADY has more than one syllable is never force-split even when "
+          "the MXL word has fewer notes than syllables -- note count stays unchanged, both syllables "
+          "adopt the single available calibrated pitch class")
+
+# --- too few matched words: skip, don't guess (mirrors apply_musicxml_reference's own test) ---
+with _tempfile.TemporaryDirectory() as _pr_tmpdir2:
+    _pr_mxl_path2 = f"{_pr_tmpdir2}/melisma_song2.musicxml"
+    _make_mxl_words(_pr_mxl_spec, _pr_mxl_path2)
+    _, few_pr_stats = apply_mxl_pitch_reference(
+        _pr_mxl_entries[:1], _pr_mxl_path2, min_calibration_samples=3, verbose=False,
+    )
+    assert few_pr_stats.skipped_reason is not None
+    assert few_pr_stats.n_corrected == 0 and few_pr_stats.n_split == 0
+print("OK: too few matched words correctly skips calibration entirely (n_corrected=n_split=0), "
+      f"same as apply_musicxml_reference's own gate: {few_pr_stats.skipped_reason}")
+
+# --- apply_mxl_pitch_references (plural): unmatched/unparseable files never abort the whole run ---
+with _tempfile.TemporaryDirectory() as _pr_tmpdir3:
+    _pr_good_path = f"{_pr_tmpdir3}/good.musicxml"
+    _make_mxl_words(_pr_mxl_spec, _pr_good_path)
+    _pr_bad_path = f"{_pr_tmpdir3}/bad.musicxml"
+    with open(_pr_bad_path, "w", encoding="utf-8") as f:
+        f.write("not xml at all")
+    plural_entries, plural_stats = apply_mxl_pitch_references(
+        _pr_mxl_entries, [_pr_bad_path, _pr_good_path], min_calibration_samples=3, verbose=False,
+    )
+    assert plural_stats[0].skipped_reason is not None and "failed to parse" in plural_stats[0].skipped_reason
+    assert plural_stats[1].calibration_offset == 2, plural_stats[1].calibration_offset
+    assert len([e for e in plural_entries if isinstance(e, Syllable)]) == len(_pr_mxl_entries) + 2
+print("OK: apply_mxl_pitch_references skips an unparseable file (doesn't abort the batch) and still "
+      "applies the next, genuinely usable one")

@@ -443,6 +443,9 @@ class App(tk.Tk):
         self.pitch_refresh_source = tk.StringVar(value=config.DEFAULT_PITCH_SOURCE)
         self.pitch_refresh_isolate_vocals = tk.BooleanVar(value=True)
         self.pitch_refresh_key_nudge = tk.BooleanVar(value=DEFAULT_KEY_NUDGE)
+        self.pitch_refresh_musicxml = tk.BooleanVar(value=True)
+        self.pitch_refresh_musicxml_force_calibration = tk.BooleanVar(
+            value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.pitch_refresh_delete_work_files = tk.BooleanVar(value=False)
 
         # Curated main-surface options (see gui.py's own module docstring
@@ -811,10 +814,27 @@ class App(tk.Tk):
                                      "detected song key. Real multi-song regression testing found this "
                                      "generalizes cleanly (no confirmed regression) and is a real improvement "
                                      "on several songs -- see CLAUDE.md / project memory.")
+        pr_musicxml_check = ttk.Checkbutton(pr_options_frame, text="Use MusicXML when available",
+                                             variable=self.pitch_refresh_musicxml)
+        pr_musicxml_check.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        Tooltip(pr_musicxml_check, "On by default. When a MusicXML file is found in the input folder AND a "
+                                     "per-song pitch-class calibration can be established, refresh pitch "
+                                     "from it directly instead of audio-based detection -- never touches "
+                                     "timing/text/note count, except splitting an existing note the "
+                                     "MusicXML reveals to be a multi-note melisma (only the first of the "
+                                     "new notes keeps the original text). Falls back to audio-based "
+                                     "detection when no usable MusicXML is found.")
+        pr_musicxml_force_calibration_check = ttk.Checkbutton(
+            pr_options_frame, text="MusicXML force calibration",
+            variable=self.pitch_refresh_musicxml_force_calibration)
+        pr_musicxml_force_calibration_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        Tooltip(pr_musicxml_force_calibration_check, "When a MusicXML reference is found but pitch can't "
+                                                        "confidently calibrate against it, use the best "
+                                                        "available offset anyway rather than skipping.")
         pr_delete_work_files_check = ttk.Checkbutton(
             pr_options_frame, text="Delete work files after refreshing",
             variable=self.pitch_refresh_delete_work_files)
-        pr_delete_work_files_check.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        pr_delete_work_files_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=2)
         Tooltip(pr_delete_work_files_check, "Deletes the entire .ultrastar_work directory (cached Demucs "
                                              "separation, if vocal isolation was used) once pitch refreshing "
                                              "completes. Leave off if you'll re-run this song again soon.")
@@ -1391,6 +1411,8 @@ class App(tk.Tk):
             isolate_vocals=self.pitch_refresh_isolate_vocals.get(),
             pitch_source=self.pitch_refresh_source.get(),
             key_nudge=self.pitch_refresh_key_nudge.get(),
+            musicxml_pitch=self.pitch_refresh_musicxml.get(),
+            musicxml_force_calibration=self.pitch_refresh_musicxml_force_calibration.get(),
             delete_work_files=self.pitch_refresh_delete_work_files.get(),
             batch=is_batch,
             cancel_requested=self._cancel_event.is_set,
