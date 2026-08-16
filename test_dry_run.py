@@ -3489,6 +3489,7 @@ fa_words = extract_words([
     Syllable(text="mystery", start=1.0, end=1.5, midi_note=0, is_word_start=True),
     Syllable(text="hello", start=2.0, end=2.5, midi_note=0, is_word_start=True),
 ])
+fa_words_text = [w.text for w in fa_words]
 fa_starts = [None, None, 10.0]
 fa_ends = [None, None, 10.5]
 fa_confident = [False, False, True]
@@ -3499,7 +3500,7 @@ transcription_mod_rg.force_align_words_in_window = lambda words_text, w0, w1, *a
 ]
 model_cache_mod_rg.get_whisperx_align_model = lambda *a, **kw: (None, None)
 _sys_fa.modules["whisperx"] = _types_fa.SimpleNamespace(load_audio=lambda path: [0] * 160000)  # 10s @ 16kHz
-fa_n = _force_align_unconfident_runs(fa_words, fa_starts, fa_ends, fa_confident, Path("dummy.wav"))
+fa_n = _force_align_unconfident_runs(fa_words_text, fa_starts, fa_ends, fa_confident, Path("dummy.wav"))
 assert fa_n == 2, fa_n
 assert fa_confident == [True, True, True], fa_confident
 assert fa_starts[0] == 0.0 and fa_starts[1] == 0.3, fa_starts  # window = [0.0 (song start), 10.0)
@@ -3509,7 +3510,7 @@ print("  OK: a run with NO neighboring confident word before it (song start) sti
 # force_align_words_in_window returning None (window unusable) -> run stays unconfident for interpolation.
 transcription_mod_rg.force_align_words_in_window = lambda *a, **kw: None
 fa_confident2 = [False, False, True]
-fa_n2 = _force_align_unconfident_runs(fa_words, list(fa_starts), list(fa_ends), fa_confident2, Path("dummy.wav"))
+fa_n2 = _force_align_unconfident_runs(fa_words_text, list(fa_starts), list(fa_ends), fa_confident2, Path("dummy.wav"))
 assert fa_n2 == 0 and fa_confident2 == [False, False, True], (fa_n2, fa_confident2)
 print("  OK: an unrecoverable run (no usable alignment result) is left unconfident, not force-marked anyway")
 
@@ -3517,7 +3518,7 @@ print("  OK: an unrecoverable run (no usable alignment result) is left unconfide
 def _fa_rg_boom(*a, **kw):
     raise AssertionError("force_align_words_in_window must not be called when nothing is unconfident")
 transcription_mod_rg.force_align_words_in_window = _fa_rg_boom
-fa_none_n = _force_align_unconfident_runs(fa_words, [0.0, 1.0, 10.0], [0.5, 1.5, 10.5], [True, True, True],
+fa_none_n = _force_align_unconfident_runs(fa_words_text, [0.0, 1.0, 10.0], [0.5, 1.5, 10.5], [True, True, True],
                                            Path("dummy.wav"))
 assert fa_none_n == 0
 print("  OK: no unconfident words at all -> returns immediately, never touches the audio/align model")

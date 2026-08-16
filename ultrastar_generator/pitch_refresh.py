@@ -350,6 +350,9 @@ class PitchRefreshOptions:
     output_path: Optional[str] = None
     delete_work_files: bool = False
     batch: bool = False
+    # GUI-only, never set by the CLI -- see config.PipelineOptions.
+    # cancel_requested's own docstring.
+    cancel_requested: Optional[Callable[[], bool]] = None
 
 
 @dataclass
@@ -366,6 +369,9 @@ def run_pitch_refresh_pipeline(input_dir: Path, existing_txt_path: Optional[Path
     `realign.run_realign_pipeline`'s own wrapper exactly."""
     try:
         return _run_pitch_refresh_pipeline_body(input_dir, existing_txt_path, opts, log=log)
+    except config.PipelineCancelled:
+        log("Cancelled by user.")
+        return PitchRefreshPipelineResult(success=False, error="Cancelled by user.")
     finally:
         if opts.delete_work_files:
             from .main import delete_work_files as _delete_work_files
@@ -404,10 +410,12 @@ def _run_pitch_refresh_pipeline_body(input_dir: Path, existing_txt_path: Optiona
     except (AmbiguousInputError, NoAudioSourceFoundError) as e:
         return PitchRefreshPipelineResult(success=False, error=str(e))
 
+    config.check_cancelled(opts.cancel_requested)
     if opts.isolate_vocals:
         log("Isolating vocals with Demucs...")
         try:
-            audio_path = isolate_vocals(resolved.analysis_audio, work_dir, model=opts.demucs_model)
+            audio_path = isolate_vocals(resolved.analysis_audio, work_dir, model=opts.demucs_model,
+                                         cancel_requested=opts.cancel_requested)
         except SeparationError as e:
             return PitchRefreshPipelineResult(success=False, error=f"Vocal isolation failed: {e}")
     else:
@@ -446,6 +454,9 @@ def run_pitch_refresh_batch(parent_dir: Path, opts: PitchRefreshOptions,
     results: List[tuple] = []
 
     for i, sub in enumerate(subdirs, 1):
+        if opts.cancel_requested is not None and opts.cancel_requested():
+            log(f"Cancelled by user before {sub.name} ({i}/{len(subdirs)}).")
+            break
         log(f"== Batch {i}/{len(subdirs)}: {sub.name} ==")
         try:
             result = run_pitch_refresh_pipeline(sub, None, opts, log=log)

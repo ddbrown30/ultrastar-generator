@@ -703,15 +703,13 @@ LRC_TIMING_HOLDOUT_MIN_ANCHORS = 4
 
 
 # --- Existing-file verification (verify_existing_song.py) ------------------
-# When an existing "<Artist> - <Title>.txt" is found in the input folder (or
-# --existing-txt points at one), this compares its own pitch/timing against
-# a FRESH pipeline run of the same audio, and only overwrites it if real
-# problems are found. OFF by default -- decided with the user: unlike this
-# project's other on-by-default features (which only ever ADD a correction
-# on top of what's already there), this one can result in NOT writing
-# output the user expected on a plain re-run, which is a qualitatively
-# different kind of surprise than "one more automatic fix."
-ENABLE_EXISTING_TXT_CHECK = False
+# verify_existing_song() compares an existing, already-parsed .txt's own
+# pitch/timing against a fresh syllable sequence from a separate run of the
+# same audio (e.g. for a real-output-vs-ground-truth comparison -- see
+# CLAUDE.md's "Use verify_existing_song.verify_existing_song directly for
+# any future real-output-vs-ground-truth comparison"). Not wired into any
+# pipeline's own default flow -- these are just that function's own
+# threshold defaults.
 EXISTING_TXT_MIN_MATCHED = 10
 # NOT YET EMPIRICALLY VALIDATED -- picked by analogy to this project's other
 # calibration/agreement bars, not measured against this pipeline's own
@@ -1045,8 +1043,6 @@ class PipelineOptions:
     no_debug_log: bool = False
     quiet: bool = False
     # New in the folder-based/batch/YouTube/GUI rework -- see CLAUDE.md.
-    existing_txt_check: bool = ENABLE_EXISTING_TXT_CHECK
-    existing_txt_path: Optional[str] = None
     youtube_url: Optional[str] = None
     youtube_audio_only: bool = True
     batch: bool = False
@@ -1086,3 +1082,45 @@ class PipelineOptions:
     # or when `fetch_lyrics` is off (a deliberate opt-out, nothing to ask
     # about).
     no_lrc_fallback_callback: Optional[Callable[[str], bool]] = None
+    # GUI-only, never set by the CLI (there's no equivalent of a mid-run
+    # Stop button on the CLI -- Ctrl+C already works there). Polled via
+    # check_cancelled() at stage boundaries between the pipeline's own
+    # long-running steps (vocal separation, transcription, pass 1, batch
+    # song-to-song); True raises PipelineCancelled, caught at this
+    # function's own top level. See PipelineCancelled's docstring for the
+    # two different mechanisms this now drives.
+    cancel_requested: Optional[Callable[[], bool]] = None
+
+
+class PipelineCancelled(Exception):
+    """Raised (directly, or via check_cancelled()) when opts.
+    cancel_requested() returns True -- caught at each run_*_pipeline's
+    own top level and converted into a normal success=False result, the
+    same "expected failure" convention as every other early-return in
+    these pipelines (no usable audio, no notes detected, etc.), not a
+    real exception.
+
+    Two different mechanisms raise this, covering different parts of the
+    pipeline:
+      - `check_cancelled()`, called at stage BOUNDARIES (before vocal
+        separation, before transcription, between batch songs, etc.) --
+        coarse, but free; fine for the many short, quick steps in
+        between the pipeline's few genuinely long stages.
+      - The long GPU-bound stages themselves (Demucs separation,
+        WhisperX transcription, pass-1 pitch detection, forced-alignment
+        gap recovery) run in a KILLABLE CHILD PROCESS when a real
+        cancel_requested is given (see worker_process.py and
+        separation.isolate_vocals's own cancel_requested param) --
+        cancellation there is near-instant (bounded by a ~0.15s poll
+        interval plus however long the child takes to actually die),
+        not stage-boundary-only, since a Python thread can't be killed
+        forcibly at all but an OS process can. The CLI never routes
+        through this (no cancel_requested to give it) -- Ctrl+C already
+        gives it real instant cancellation for free, and paying
+        subprocess/model-reload overhead there would be pure loss.
+    """
+
+
+def check_cancelled(cancel_requested: Optional[Callable[[], bool]]) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise PipelineCancelled()

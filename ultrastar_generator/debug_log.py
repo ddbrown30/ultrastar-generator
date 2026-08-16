@@ -85,6 +85,26 @@ class DebugLog:
             self.line(f"    {n.start:9.4f} - {n.end:9.4f}  ({n.end - n.start:7.4f}s)  "
                       f"pitch={n.pitch:+3d}  protected_start={n.protected_start}")
 
+    def log_lyrics_selection(self, *, source: str, track_name: str = "", artist_name: str = "",
+                              lrclib_id: Optional[int] = None, duration: Optional[float] = None,
+                              synced: bool = False, extra: str = "") -> None:
+        """Records which specific lyrics candidate this run actually used
+        -- id/duration/track/artist, not just "got a reference from
+        lrclib" -- so a wrong-recording pick (right song, different
+        performer/version) can be diagnosed after the fact instead of
+        only inferred from downstream symptoms."""
+        if self._f is None:
+            return
+        self.section("LYRICS SELECTION")
+        self.line(f"  source: {source or '(none)'}")
+        if track_name or artist_name:
+            self.line(f"  track: {track_name!r} / artist: {artist_name!r}")
+        self.line(f"  lrclib id: {lrclib_id if lrclib_id is not None else '(none)'}")
+        self.line(f"  duration: {f'{duration:.1f}s' if duration is not None else '(unknown)'}")
+        self.line(f"  synced lyrics: {synced}")
+        if extra:
+            self.line(f"  {extra}")
+
     def log_reference_corrections(self, diffs: List[str]) -> None:
         if self._f is None:
             return
@@ -94,6 +114,19 @@ class DebugLog:
         else:
             for d in diffs:
                 self.line(f"  {d}")
+
+    def append_raw(self, text: str) -> None:
+        """Appends pre-formatted text (already including its own section
+        markers, e.g. output from another DebugLog instance's own write
+        calls) directly into this log's file. Used to merge a
+        cancellable-subprocess worker's own DebugLog output (see
+        worker_process.py) into the main process's log after the fact --
+        two processes can't safely share one open file handle while the
+        worker is running, so the worker writes to its own temp file and
+        the result is stitched in here once the worker finishes."""
+        if self._f is None:
+            return
+        self._f.write(text)
 
     def close(self) -> None:
         if self._f is not None:

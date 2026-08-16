@@ -45,6 +45,9 @@ def run_batch(
     results: List[Tuple[str, PipelineResult]] = []
 
     for i, sub in enumerate(subdirs, 1):
+        if opts.cancel_requested is not None and opts.cancel_requested():
+            log(f"Cancelled by user before {sub.name} ({i}/{len(subdirs)}).")
+            break
         log(f"== Batch {i}/{len(subdirs)}: {sub.name} ==")
         sub_output_dir = (output_parent_dir / sub.name) if output_parent_dir is not None else None
         try:

@@ -197,6 +197,21 @@ to the gui at the same time.
   from the codebase**: `verification.verify_placement`, `PlacementCorrection`/
   `PlacementWarning`, the CLI flags, the GUI checkbox, and its tests are
   all gone.
+- **`main.py`'s existing-file verification** (was `--existing-txt`/
+  `--existing-txt-check`, GUI "Check existing .txt before overwriting"
+  checkbox — parsed an existing `.txt`, compared pitch-class/timing
+  against a fresh pass via `verify_existing_song.verify_existing_song`,
+  kept the existing file byte-for-byte on `PASS` instead of
+  regenerating): **fully removed from the codebase 2026-08-16** (user's
+  explicit request): the CLI flags, `config.ENABLE_EXISTING_TXT_CHECK`,
+  `PipelineOptions.existing_txt_check`/`existing_txt_path`, the
+  `_run_pipeline_body` detection/comparison/keep-existing-file logic,
+  `PipelineResult.regenerated`, and the GUI checkbox are all gone.
+  `verify_existing_song.py` itself (and its own threshold constants,
+  e.g. `EXISTING_TXT_MIN_COVERAGE`) is **not** removed — still a live,
+  git-tracked utility for real-output-vs-ground-truth comparisons (see
+  its own entry earlier in this doc), just no longer wired into
+  `main.py`'s own default pipeline flow.
 - **`--zone-boundary-snap`** (was: snap zone/word boundaries to nearby
   pass-1 note onsets): synthetically verified, but flat-to-negative on
   all 5 real songs tested. Kept off-by-default/dead-but-present for a
@@ -433,15 +448,6 @@ to the gui at the same time.
   `cover_extract.py`) — a re-run against the same `work_dir` never
   re-downloads. Runs in `main.py` only, after artist/title are resolved
   (needed for the query) — not wired into `realign.py`.
-- **Existing-file verification** (`--existing-txt`/`--existing-txt-check`,
-  **off by default** — the one deliberate exception to "default on",
-  since it can result in NOT regenerating output the user expected):
-  parses an existing `.txt`, compares pitch-class/timing against a
-  fresh pass, keeps the existing file byte-for-byte on `PASS`, else
-  regenerates normally. Gate includes `EXISTING_TXT_MIN_COVERAGE = 0.85`
-  (fraction of words that matched at all) alongside pitch/timing
-  accuracy — a clean-looking matched subset can no longer report PASS
-  while a real chunk of the song went unscored.
 - **YouTube input** (`--youtube-url`, requires `--artist`/`--title`):
   `yt-dlp` downloads to a deterministic filename, falls through the
   same folder-resolution logic as local files (no special-casing

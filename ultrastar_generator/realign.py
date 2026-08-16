@@ -66,6 +66,7 @@ from .lrc_timing import (match_asr_to_lrc_lines, two_tier_time_calibration, chec
                           match_block_to_candidates, words_in_time_window)
 from .mxl_lrc_generator import MxlWord, select_lrc_candidate, assign_words_to_lines
 from .text_normalize import normalize_word as _normalize
+from .worker_process import run_cancellable, WorkerError
 
 
 @dataclass
@@ -147,7 +148,7 @@ def _longest_false_run(confident: List[bool]) -> int:
     return best
 
 
-def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Optional[float]],
+def _force_align_unconfident_runs(words_text: List[str], starts: List[Optional[float]],
                                    ends: List[Optional[float]], confident: List[bool],
                                    vocals_path: Path, *, debug_log: Optional[DebugLog] = None
                                    ) -> int:
@@ -169,7 +170,13 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
     alignment result doesn't validate. Returns how many words were
     recovered this way. Lazily loads the audio/align model at most once,
     and only if there's actually an unconfident run to try -- a clean
-    file with no gaps never pays this cost."""
+    file with no gaps never pays this cost.
+
+    Takes plain `words_text` (not the existing file's own ExistingWord
+    objects) -- the only thing this ever needed from each word was its
+    own text -- so a cancellable-subprocess caller (see
+    _force_align_unconfident_runs_cancellable/worker_process.py) can
+    serialize the input as plain strings, no reconstruction needed."""
     if not any(not c for c in confident):
         return 0
     from .transcription import force_align_words_in_window
@@ -181,7 +188,7 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
     audio_duration = 0.0
     promoted = 0
 
-    n = len(words)
+    n = len(words_text)
     idx = 0
     while idx < n:
         if confident[idx]:
@@ -202,12 +209,12 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
         win_start = max(0.0, min(win_start, audio_duration))
         win_end = max(0.0, min(win_end, audio_duration))
 
-        words_text = [words[k].text.strip() for k in run]
-        aligned = force_align_words_in_window(words_text, win_start, win_end, align_model, metadata, audio)
+        run_text = [words_text[k].strip() for k in run]
+        aligned = force_align_words_in_window(run_text, win_start, win_end, align_model, metadata, audio)
         if aligned is None:
             if debug_log is not None:
                 debug_log.line(f"  force-align: gap [{win_start:8.3f}-{win_end:8.3f}] "
-                                f"({len(run)} word(s) {' '.join(words_text)!r}) -- no usable result, "
+                                f"({len(run)} word(s) {' '.join(run_text)!r}) -- no usable result, "
                                 f"left for interpolation")
             continue
 
@@ -218,9 +225,37 @@ def _force_align_unconfident_runs(words: List[ExistingWord], starts: List[Option
             promoted += 1
         if debug_log is not None:
             debug_log.line(f"  force-align: gap [{win_start:8.3f}-{win_end:8.3f}] "
-                            f"({len(run)} word(s) {' '.join(words_text)!r}) -- recovered via forced alignment")
+                            f"({len(run)} word(s) {' '.join(run_text)!r}) -- recovered via forced alignment")
 
     return promoted
+
+
+def _force_align_unconfident_runs_cancellable(words_text: List[str], starts: List[Optional[float]],
+                                               ends: List[Optional[float]], confident: List[bool],
+                                               vocals_path: Path, *,
+                                               cancel_requested: Optional[Callable[[], bool]],
+                                               debug_log: Optional[DebugLog] = None,
+                                               log: Callable[[str], None] = print) -> int:
+    """Same contract as `_force_align_unconfident_runs` (mutates
+    starts/ends/confident in place, returns the promoted count) -- routes
+    through a killable child process (worker_process.run_cancellable)
+    when `cancel_requested` is given, so the GUI's Stop button can kill
+    this mid-call instead of waiting for it to finish; falls straight
+    through to the in-process call otherwise (the CLI, and any other
+    caller with no cancel_requested at all)."""
+    if cancel_requested is None:
+        return _force_align_unconfident_runs(words_text, starts, ends, confident, vocals_path,
+                                               debug_log=debug_log)
+    result = run_cancellable(
+        "force_align_unconfident_runs",
+        {"words_text": words_text, "starts": starts, "ends": ends, "confident": confident,
+         "vocals_path": str(vocals_path)},
+        cancel_requested=cancel_requested, debug_log=debug_log, log=log,
+    )
+    starts[:] = result["starts"]
+    ends[:] = result["ends"]
+    confident[:] = result["confident"]
+    return result["promoted"]
 
 
 def _line_chunks(line_of_word: List[int]) -> List[Tuple[int, int]]:
@@ -869,7 +904,8 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                   forced_lrc_candidate: Optional[LrcLibCandidate] = None,
                   force_align_gaps: bool = False, vocals_path: Optional[Path] = None,
                   log: Callable[[str], None] = print,
-                  debug_log: Optional[DebugLog] = None) -> RealignResult:
+                  debug_log: Optional[DebugLog] = None,
+                  cancel_requested: Optional[Callable[[], bool]] = None) -> RealignResult:
     """Core realignment step: given an already-parsed existing song and
     already-transcribed ASR words, returns a new `Song`
     with the SAME notes (never added/removed/reordered, pitch untouched)
@@ -1004,8 +1040,9 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     source = ["asr" if c else "" for c in confident]
 
     if force_align_gaps and vocals_path is not None:
-        quality.n_force_aligned = _force_align_unconfident_runs(words, starts, ends, confident, vocals_path,
-                                                                  debug_log=debug_log)
+        quality.n_force_aligned = _force_align_unconfident_runs_cancellable(
+            [w.text for w in words], starts, ends, confident, vocals_path,
+            cancel_requested=cancel_requested, debug_log=debug_log, log=log)
         if quality.n_force_aligned:
             log(f"  Force-alignment of known gaps: recovered {quality.n_force_aligned} word(s) via a real "
                 f"wav2vec2 CTC forced alignment of the existing file's own text.")
@@ -1619,6 +1656,11 @@ class RealignPipelineOptions:
     # ASR's own value directly -- selectable via CLI --strategy or the
     # GUI's Strategy dropdown.
     strategy: str = "validate"
+    # GUI-only, never set by the CLI -- see config.PipelineOptions.
+    # cancel_requested's own docstring for the full explanation (same
+    # stage-boundary-only convention, shared config.check_cancelled/
+    # PipelineCancelled).
+    cancel_requested: Optional[Callable[[], bool]] = None
 
 
 @dataclass
@@ -1626,6 +1668,31 @@ class RealignPipelineResult:
     success: bool
     output_path: Optional[Path] = None
     error: Optional[str] = None
+
+
+def _transcribe_words_cancellable(vocals_path: Path, model_name: str, opts: RealignPipelineOptions,
+                                   debug_log: Optional[DebugLog], log: Callable[[str], None]) -> List[Word]:
+    """Same contract as `transcription.transcribe_words`, routed through a
+    killable child process (worker_process.run_cancellable) whenever
+    `opts.cancel_requested` is set -- see that module's own docstring.
+    Falls straight through to the in-process call otherwise (the CLI)."""
+    whisperx_vad_options = config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None
+    if opts.cancel_requested is None:
+        from .transcription import transcribe_words
+        return transcribe_words(
+            vocals_path, model_name, prefer_whisperx=not opts.no_whisperx,
+            whisperx_vad_options=whisperx_vad_options,
+            debug_log=debug_log, rewindow_long_segments=opts.rewindow_long_segments,
+        )
+    result = run_cancellable(
+        "transcribe_words",
+        {"vocals_path": str(vocals_path), "model_name": model_name,
+         "prefer_whisperx": not opts.no_whisperx, "whisperx_vad_options": whisperx_vad_options,
+         "rewindow_long_segments": opts.rewindow_long_segments},
+        cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
+    )
+    from .models import Word as _Word
+    return [_Word(**d) for d in result]
 
 
 def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vocals_path: Path,
@@ -1701,16 +1768,12 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
              f"get this fixed.")
         return result
 
+    config.check_cancelled(opts.cancel_requested)
     if debug_log is not None:
         debug_log.section(f"ASR QUALITY RETRY -- re-transcribing with '{config.RETRY_ASR_MODEL}'")
     dlog(f"  {reason[0].upper()}{reason[1:]} -- retrying transcription with '{config.RETRY_ASR_MODEL}' "
          f"before accepting this result...")
-    from .transcription import transcribe_words
-    retry_asr_words = transcribe_words(
-        vocals_path, config.RETRY_ASR_MODEL, prefer_whisperx=not opts.no_whisperx,
-        whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
-        debug_log=debug_log, rewindow_long_segments=opts.rewindow_long_segments,
-    )
+    retry_asr_words = _transcribe_words_cancellable(vocals_path, config.RETRY_ASR_MODEL, opts, debug_log, log)
     if not retry_asr_words:
         dlog(f"  Retry transcription with '{config.RETRY_ASR_MODEL}' produced no words -- keeping the "
              f"original result.")
@@ -1720,7 +1783,7 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
         existing, retry_asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
         use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate,
         force_align_gaps=opts.force_align_gaps, vocals_path=vocals_path, log=log,
-        debug_log=debug_log,
+        debug_log=debug_log, cancel_requested=opts.cancel_requested,
     )
     if retry_result.success and retry_result.quality is not None:
         improved = (retry_result.quality.anchor_rate > result.quality.anchor_rate
@@ -1753,6 +1816,11 @@ def run_realign_pipeline(input_dir: Path, existing_txt_path: Optional[Path], opt
     itself used."""
     try:
         return _run_realign_pipeline_body(input_dir, existing_txt_path, opts, log=log)
+    except config.PipelineCancelled:
+        log("Cancelled by user.")
+        return RealignPipelineResult(success=False, error="Cancelled by user.")
+    except WorkerError as e:
+        return RealignPipelineResult(success=False, error=str(e))
     finally:
         if opts.delete_work_files:
             from .main import delete_work_files as _delete_work_files
@@ -1777,7 +1845,6 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     from .song_input import resolve_song_folder
     from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError
     from .separation import isolate_vocals, SeparationError
-    from .transcription import transcribe_words
 
     input_dir = Path(input_dir)
     if existing_txt_path is None:
@@ -1809,6 +1876,7 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     except (AmbiguousInputError, NoAudioSourceFoundError) as e:
         return RealignPipelineResult(success=False, error=str(e))
 
+    config.check_cancelled(opts.cancel_requested)
     if opts.skip_separation:
         if not opts.vocals_path:
             return RealignPipelineResult(success=False, error="skip_separation requires vocals_path")
@@ -1816,7 +1884,8 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     else:
         log("Isolating vocals with Demucs...")
         try:
-            vocals_path = isolate_vocals(resolved.analysis_audio, work_dir, model=opts.demucs_model)
+            vocals_path = isolate_vocals(resolved.analysis_audio, work_dir, model=opts.demucs_model,
+                                          cancel_requested=opts.cancel_requested)
         except SeparationError as e:
             return RealignPipelineResult(success=False, error=f"Vocal isolation failed: {e}")
 
@@ -1824,13 +1893,10 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
     y, sr = librosa.load(str(vocals_path), sr=None, mono=True)
     audio_duration = len(y) / sr
 
+    config.check_cancelled(opts.cancel_requested)
     log(f"Transcribing with {'whisperx' if not opts.no_whisperx else 'faster-whisper'} "
         f"({opts.whisper_model})...")
-    asr_words = transcribe_words(
-        vocals_path, opts.whisper_model, prefer_whisperx=not opts.no_whisperx,
-        whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
-        debug_log=debug_log, rewindow_long_segments=opts.rewindow_long_segments,
-    )
+    asr_words = _transcribe_words_cancellable(vocals_path, opts.whisper_model, opts, debug_log, log)
     if not asr_words:
         return RealignPipelineResult(
             success=False, error="No words were transcribed -- check the audio / vocal isolation quality.")
@@ -1858,7 +1924,7 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
             existing, asr_words, artist=opts.artist, title=opts.title, audio_duration=audio_duration,
             use_lrc=opts.use_lrc, lrc_mode=opts.lrc_mode, forced_lrc_candidate=forced_candidate,
             force_align_gaps=opts.force_align_gaps, vocals_path=vocals_path, log=log,
-            debug_log=debug_log,
+            debug_log=debug_log, cancel_requested=opts.cancel_requested,
         )
         result = _retry_asr_if_low_quality(
             result, existing=existing, vocals_path=vocals_path, opts=opts, audio_duration=audio_duration,
@@ -1899,6 +1965,9 @@ def run_realign_batch(parent_dir: Path, opts: RealignPipelineOptions,
     results: List[Tuple[str, RealignPipelineResult]] = []
 
     for i, sub in enumerate(subdirs, 1):
+        if opts.cancel_requested is not None and opts.cancel_requested():
+            log(f"Cancelled by user before {sub.name} ({i}/{len(subdirs)}).")
+            break
         log(f"== Batch {i}/{len(subdirs)}: {sub.name} ==")
         try:
             result = run_realign_pipeline(sub, None, opts, log=log)

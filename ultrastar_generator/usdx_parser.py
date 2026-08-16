@@ -102,8 +102,8 @@ def parse_usdx_file(path: Path) -> ParsedSong:
     # space) -- relying on text.startswith(" ") alone silently merged that
     # word onto the END of the PREVIOUS line's last word instead ("idol" +
     # "Keep" + "ing" -> one bogus "idolkeeping" token), corrupting every
-    # downstream word-level comparison (verify_existing_song, the
-    # --existing-txt-check feature) for any file authored this way.
+    # downstream word-level comparison (verify_existing_song) for any
+    # file authored this way.
     force_word_start = True
     prev_raw_text = None
     for line in note_lines:

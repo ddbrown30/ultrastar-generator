@@ -86,3 +86,24 @@ def extract_audio_track(src: Path, dst: Path, *, as_mp3: bool = False, sr: Optio
     except (OSError, subprocess.TimeoutExpired):
         return False
     return proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
+
+def strip_audio_track(src: Path, dst: Path) -> bool:
+    """Copies src's video stream to dst with the audio track dropped (a
+    stream copy, no re-encode -- fast, lossless). Used when a video
+    companion's own audio track is redundant with the real #MP3 (a
+    genuinely separate audio file, or extracted directly from this same
+    video) and would only waste output size. Returns False (never
+    raises) on any failure -- missing ffmpeg, no video stream, etc. --
+    same graceful-degrade convention as extract_audio_track."""
+    if shutil.which("ffmpeg") is None:
+        return False
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-c:v", "copy", "-an", str(dst),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=600, creationflags=_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and dst.exists() and dst.stat().st_size > 0

@@ -12,6 +12,14 @@ no relation to the song), so the output folder is the one place this
 project guarantees the naming convention actually holds. Not used by
 realign.py -- that mode only ever writes a single .txt back next to the
 existing file, never a self-contained output folder.
+
+A separately-staged video companion (i.e. video_src != mp3_src -- a real
+standalone #MP3 already covers the audio, whether that's a genuinely
+separate audio file or one extracted directly from this same video's own
+audio track) has its own audio track stripped before being copied, via
+ffmpeg stream-copy (no re-encode) -- it's always redundant with the real
+#MP3 and only wastes output size. Falls back to a plain copy if ffmpeg
+is unavailable/fails, or the video has no audio track to begin with.
 """
 
 from __future__ import annotations
@@ -22,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from .file_discovery import sanitize_filename
+from .media_extract import has_audio_stream, strip_audio_track
 
 
 @dataclass
@@ -42,6 +51,21 @@ def _copy_as(src: Path, output_dir: Path, target_name: str) -> str:
     dst = output_dir / target_name
     if src.resolve() != dst.resolve():
         shutil.copy2(src, dst)
+    return target_name
+
+
+def _copy_video_stripped(src: Path, output_dir: Path, target_name: str) -> str:
+    """Same as _copy_as, but strips src's own audio track first (see this
+    module's own docstring for why) whenever one exists. Falls back to a
+    plain copy if ffmpeg is unavailable, the strip fails, or src has no
+    audio track to begin with -- losing this size optimization is better
+    than failing the whole staging step."""
+    dst = output_dir / target_name
+    if src.resolve() == dst.resolve():
+        return target_name
+    if has_audio_stream(src) and strip_audio_track(src, dst):
+        return target_name
+    shutil.copy2(src, dst)
     return target_name
 
 
@@ -66,7 +90,11 @@ def stage_companions_to_output(output_dir: Path, artist: str, title: str, *, mp3
     if video_src == mp3_src:
         video_name = mp3_name
     elif video_src:
-        video_name = _copy_as(video_src, output_dir, f"{base}{video_src.suffix}")
+        # A separately-staged video's own audio is always redundant here --
+        # mp3_src already covers it (either a genuinely separate audio
+        # file, or extracted directly from this same video) -- so strip it
+        # to save output size (see module docstring).
+        video_name = _copy_video_stripped(video_src, output_dir, f"{base}{video_src.suffix}")
     else:
         video_name = None
 

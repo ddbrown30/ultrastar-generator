@@ -70,6 +70,17 @@ class LyricsResult:
                                           # from that requirement and could
                                           # legitimately have none.
     source: str = ""  # "lrclib", for diagnostics/logging.
+    # Display/diagnostic metadata carried through from the LrcLibCandidate
+    # this was built from (see to_lyrics_result) -- kept here (not just on
+    # the candidate, which callers may not still have a reference to) so
+    # main.py can log which specific lyric was selected (id, duration,
+    # etc.) regardless of which path (pinned/forced vs. auto-picked)
+    # produced this result. All blank/None for a candidate with nothing to
+    # report (e.g. a hand-typed --lrc-file with no known duration).
+    track_name: str = ""
+    artist_name: str = ""
+    lrclib_id: Optional[int] = None
+    duration: Optional[float] = None
 
 
 @dataclass
@@ -92,7 +103,11 @@ class LrcLibCandidate:
                                # search/scoring entirely (see fetch_lrclib_by_id).
 
     def to_lyrics_result(self) -> "LyricsResult":
-        return LyricsResult(plain_lyrics=self.plain_lyrics, synced_lyrics=self.synced_lyrics, source="lrclib")
+        return LyricsResult(
+            plain_lyrics=self.plain_lyrics, synced_lyrics=self.synced_lyrics, source="lrclib",
+            track_name=self.track_name, artist_name=self.artist_name, lrclib_id=self.id,
+            duration=effective_lrc_duration(self),
+        )
 
 
 def effective_lrc_duration(c: "LrcLibCandidate") -> Optional[float]:

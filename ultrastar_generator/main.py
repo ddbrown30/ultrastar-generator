@@ -20,6 +20,7 @@ import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import argparse
+import dataclasses
 import shutil
 import sys
 from dataclasses import dataclass
@@ -27,25 +28,23 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import config
-from .models import Song, Syllable
+from .models import Song, Syllable, Word
 from .file_discovery import (resolve_artist_title, headline_case, sanitize_filename,
                               AmbiguousInputError, NoAudioSourceFoundError)
 from .song_input import resolve_song_folder
 from .cover_fetch import fetch_cover_online
 from .output_staging import stage_companions_to_output
-from .usdx_parser import parse_usdx_file, UsdxParseError
-from .verify_existing_song import verify_existing_song
 from .youtube_source import download_youtube_source, YoutubeDownloadError
 from .separation import isolate_vocals, SeparationError
 from .transcription import transcribe_words, force_align_reference_lyrics
 from .tempo import detect_bpm
-from .note_detection import detect_notes
+from .note_detection import detect_notes, NoteEvent
 from .alignment import align_words
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
                              is_lrc_line_tracking_confident, alignment_diff_summary, reference_match_ratio,
                              largest_unmatched_reference_run, recover_dropped_reference_words,
-                             fetch_lrclib_by_id, load_lrc_file)
+                             fetch_lrclib_by_id, load_lrc_file, effective_lrc_duration)
 from .musicxml_reference import apply_musicxml_references
 from .mxl_lrc_generator import try_mxl_lrc_primary
 from .lrc_timing import apply_lrc_timing_check
@@ -53,6 +52,7 @@ from .video_sync import estimate_videogap
 from .usdx_writer import write_song
 from .debug_output import write_pass1_debug_file
 from .debug_log import DebugLog
+from .worker_process import run_cancellable, WorkerError
 
 
 @dataclass
@@ -66,7 +66,6 @@ class PipelineResult:
     success: bool
     output_txt_path: Optional[Path] = None
     error: Optional[str] = None
-    regenerated: bool = True  # False only when existing-txt verification passed (Phase B)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -270,19 +269,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-lrc-timing-check", dest="lrc_timing_check", action="store_false",
                     help="Disable the LRC timing check (no-op unless --lrc-timing-check or "
                          "config.ENABLE_LRC_TIMING_CHECK enabled it).")
-    p.add_argument("--existing-txt", dest="existing_txt_path", default=None,
-                    help="Path to an existing UltraStar .txt for this song -- if given, this always wins "
-                         "over auto-detection (no filename-matching required, same convention as "
-                         "--musicxml-reference). Its own pitch/timing is compared against a fresh "
-                         "pipeline run; a NEW file is only written if real problems are found.")
-    p.add_argument("--existing-txt-check", dest="existing_txt_check", action="store_true",
-                    default=config.ENABLE_EXISTING_TXT_CHECK,
-                    help="Auto-detect an existing '<Artist> - <Title>.txt' already sitting in the input "
-                         "folder and verify it the same way --existing-txt does (default: OFF -- unlike "
-                         "this project's other on-by-default features, this one can result in NOT "
-                         "writing output you expected on a plain re-run).")
-    p.add_argument("--no-existing-txt-check", dest="existing_txt_check", action="store_false",
-                    help="Explicitly disable existing-file auto-detection (already off by default).")
     p.add_argument("--pitch-smooth-window", type=float, default=config.PITCH_SMOOTH_WINDOW_SEC,
                     help=f"Median-filter window (sec) for vibrato suppression before note "
                          f"segmentation (default: {config.PITCH_SMOOTH_WINDOW_SEC}). Raise this "
@@ -356,6 +342,92 @@ def delete_work_files(work_dir: Path) -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _transcribe_words_cancellable(vocals_path: Path, model_name: str, opts: config.PipelineOptions,
+                                   debug_log, log: Callable[[str], None]):
+    """Same contract as transcription.transcribe_words, routed through a
+    killable child process (worker_process.run_cancellable) whenever
+    `opts.cancel_requested` is set -- see that module's own docstring for
+    why (a GUI Stop press can then kill this mid-call instead of waiting
+    for it to finish). Falls straight through to the in-process call
+    otherwise (the CLI, which gets real instant cancellation via Ctrl+C
+    for free and shouldn't pay subprocess overhead for nothing)."""
+    whisperx_vad_options = config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None
+    if opts.cancel_requested is None:
+        return transcribe_words(
+            vocals_path, model_name, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
+            whisperx_vad_options=whisperx_vad_options, rewindow_long_segments=opts.rewindow_long_segments,
+        )
+    result = run_cancellable(
+        "transcribe_words",
+        {"vocals_path": str(vocals_path), "model_name": model_name, "prefer_whisperx": not opts.no_whisperx,
+         "whisperx_vad_options": whisperx_vad_options, "rewindow_long_segments": opts.rewindow_long_segments},
+        cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
+    )
+    return [Word(**d) for d in result]
+
+
+def _detect_notes_cancellable(vocals_path: Path, y, sr, bpm: float, opts: config.PipelineOptions,
+                               debug_log, log: Callable[[str], None]):
+    """Same contract as note_detection.detect_notes, routed through a
+    killable child process when `opts.cancel_requested` is set -- see
+    _transcribe_words_cancellable's own docstring for the full reasoning.
+    The subprocess re-loads audio from `vocals_path` itself (cheap, and
+    avoids pickling a potentially large `y` array through the request
+    file) rather than being handed `y`/`sr` directly."""
+    if opts.cancel_requested is None:
+        return detect_notes(
+            y, sr, bpm=bpm, pitch_source=opts.pitch_source, smooth_window_sec=opts.pitch_smooth_window,
+            pitch_jump_semitones=opts.note_split_semitones, min_note_beats_fraction=opts.min_note_beat_fraction,
+            silence_threshold_db=opts.silence_threshold_db, silence_absolute_floor_db=opts.silence_floor_db,
+            spike_max_duration_sec=opts.spike_max_duration, spike_min_jump_semitones=opts.spike_jump_semitones,
+            verbose=not opts.quiet, debug_log=debug_log,
+        )
+    result = run_cancellable(
+        "detect_notes",
+        {"vocals_path": str(vocals_path), "bpm": bpm, "pitch_source": opts.pitch_source,
+         "smooth_window_sec": opts.pitch_smooth_window, "pitch_jump_semitones": opts.note_split_semitones,
+         "min_note_beats_fraction": opts.min_note_beat_fraction, "silence_threshold_db": opts.silence_threshold_db,
+         "silence_floor_db": opts.silence_floor_db, "spike_max_duration_sec": opts.spike_max_duration,
+         "spike_min_jump_semitones": opts.spike_jump_semitones, "verbose": not opts.quiet},
+        cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
+    )
+    return [NoteEvent(**d) for d in result]
+
+
+def _recover_dropped_reference_words_cancellable(ref_lines, words, vocals_path: Path,
+                                                   opts: config.PipelineOptions, debug_log,
+                                                   log: Callable[[str], None]):
+    """Same contract as lyrics_lookup.recover_dropped_reference_words,
+    routed through a killable child process whenever `opts.cancel_
+    requested` is set -- see _transcribe_words_cancellable's own
+    docstring."""
+    if opts.cancel_requested is None:
+        return recover_dropped_reference_words(ref_lines, words, vocals_path, debug_log=debug_log)
+    result = run_cancellable(
+        "recover_dropped_reference_words",
+        {"ref_lines": ref_lines, "words": [dataclasses.asdict(w) for w in words], "vocals_path": str(vocals_path)},
+        cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
+    )
+    return [Word(**d) for d in result["words"]], result["n_recovered"]
+
+
+def _force_align_reference_lyrics_cancellable(vocals_path: Path, synced_lyrics: str, audio_duration: float,
+                                                opts: config.PipelineOptions, debug_log,
+                                                log: Callable[[str], None]):
+    """Same contract as transcription.force_align_reference_lyrics,
+    routed through a killable child process whenever `opts.cancel_
+    requested` is set -- see _transcribe_words_cancellable's own
+    docstring."""
+    if opts.cancel_requested is None:
+        return force_align_reference_lyrics(vocals_path, synced_lyrics, audio_duration, debug_log=debug_log)
+    result = run_cancellable(
+        "force_align_reference_lyrics",
+        {"vocals_path": str(vocals_path), "synced_lyrics": synced_lyrics, "audio_duration": audio_duration},
+        cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
+    )
+    return [Word(**d) for d in result]
+
+
 def _retry_transcribe(vocals_path: Path, opts: config.PipelineOptions, debug_log, log: Callable[[str], None]):
     """PROTOTYPE, see config.RETRY_LOW_QUALITY_ASR's docstring. Re-runs
     transcription with `config.RETRY_ASR_MODEL` -- shared by both retry
@@ -365,14 +437,11 @@ def _retry_transcribe(vocals_path: Path, opts: config.PipelineOptions, debug_log
     duplicated. The caller writes its own (more specific, e.g. "MXL+LRC
     path" vs "standard fallback path") `debug_log.section(...)` marker
     before calling this -- this only logs the one line common to both."""
+    config.check_cancelled(opts.cancel_requested)
     log(f"  Retrying transcription with '{config.RETRY_ASR_MODEL}'...")
     if debug_log is not None:
         debug_log.line(f"  Retrying transcription with '{config.RETRY_ASR_MODEL}'...")
-    return transcribe_words(
-        vocals_path, config.RETRY_ASR_MODEL, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
-        whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
-        rewindow_long_segments=opts.rewindow_long_segments,
-    )
+    return _transcribe_words_cancellable(vocals_path, config.RETRY_ASR_MODEL, opts, debug_log, log)
 
 
 def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.PipelineOptions,
@@ -397,6 +466,11 @@ def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.Pipel
     """
     try:
         return _run_pipeline_body(input_dir, output_dir, opts, log=log)
+    except config.PipelineCancelled:
+        log("Cancelled by user.")
+        return PipelineResult(success=False, error="Cancelled by user.")
+    except WorkerError as e:
+        return PipelineResult(success=False, error=str(e))
     finally:
         if opts.delete_work_files:
             wd = Path(opts.work_dir).resolve() if opts.work_dir else (Path(input_dir) / ".ultrastar_work")
@@ -489,19 +563,6 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Existing-file verification (feature 6, OFF by default) -- an
-    # explicit --existing-txt always wins; otherwise auto-detected only if
-    # opts.existing_txt_check is on. Detected here (needs artist/title to
-    # know the expected filename); actually PARSED and COMPARED much
-    # later, once a fresh syllable sequence exists to compare against.
-    existing_txt_path: Optional[Path] = None
-    if opts.existing_txt_path:
-        existing_txt_path = Path(opts.existing_txt_path)
-    elif opts.existing_txt_check:
-        candidate = input_dir / sanitize_filename(f"{artist} - {title}.txt")
-        if candidate.is_file():
-            existing_txt_path = candidate
-
     # --- Forced/pinned LRCLIB candidate (feature: MXL+LRC primary path) --
     # An explicit --lrclib-id (CLI) or the GUI's own pre-search pin always
     # wins over automatic search, everywhere a candidate is needed -- both
@@ -561,6 +622,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         log(f"Found MusicXML reference file(s): {names}")
 
     # --- 2. Vocal isolation --------------------------------------------------
+    config.check_cancelled(opts.cancel_requested)
     if opts.skip_separation:
         if not opts.vocals_path:
             return PipelineResult(success=False, error="--skip-separation requires --vocals-path")
@@ -568,7 +630,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     else:
         log("Isolating vocals with Demucs...")
         try:
-            vocals_path = isolate_vocals(audio_path, work_dir, model=opts.demucs_model)
+            vocals_path = isolate_vocals(audio_path, work_dir, model=opts.demucs_model,
+                                          cancel_requested=opts.cancel_requested)
         except SeparationError as e:
             return PipelineResult(success=False, error=f"Vocal isolation failed: {e}")
     log(f"Vocals: {vocals_path}")
@@ -602,8 +665,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     if opts.no_transcribe and forced_lrc_candidate is not None and forced_lrc_candidate.synced_lyrics:
         log("--no-transcribe: skipping the WhisperX decoder entirely -- force-aligning the pinned LRC "
             "candidate's own known line text onto the audio via wav2vec2 CTC alone...")
-        words = force_align_reference_lyrics(vocals_path, forced_lrc_candidate.synced_lyrics, audio_duration,
-                                              debug_log=debug_log)
+        words = _force_align_reference_lyrics_cancellable(vocals_path, forced_lrc_candidate.synced_lyrics,
+                                                            audio_duration, opts, debug_log, log)
         if words:
             forced_align_only = True
             log(f"Force-aligned {len(words)} word(s) directly from the pinned LRC candidate's synced "
@@ -618,13 +681,10 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             "normal transcription.")
 
     if not forced_align_only:
+        config.check_cancelled(opts.cancel_requested)
         log(f"Transcribing with {'whisperx' if not opts.no_whisperx else 'faster-whisper'} ({opts.whisper_model})"
             f"{' [VAD near-disabled]' if opts.whisperx_no_vad else ''}...")
-        words = transcribe_words(
-            vocals_path, opts.whisper_model, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
-            whisperx_vad_options=config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None,
-            rewindow_long_segments=opts.rewindow_long_segments,
-        )
+        words = _transcribe_words_cancellable(vocals_path, opts.whisper_model, opts, debug_log, log)
     if not words:
         return PipelineResult(success=False,
                                error="No words were transcribed -- check the audio / vocal isolation quality.")
@@ -659,6 +719,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     # standard fallback path below.
     current_asr_model = opts.whisper_model
     if opts.mxl_lrc_primary and mxl_paths:
+        config.check_cancelled(opts.cancel_requested)
         log("Attempting MXL+LRC primary generation (MusicXML pitch + synced-lyric line anchors + ASR word placement)...")
         mxl_lrc_result = try_mxl_lrc_primary(
             mxl_paths, artist, title, audio_duration, words,
@@ -734,6 +795,12 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 f"proportional fallback, {q.non_monotonic_fix_count} monotonic fix(es).")
             log("  Skipping pass 1 (audio-only pitch detection) and pass 3/4 -- pitch comes directly "
                 "from the MusicXML.")
+            debug_log.log_lyrics_selection(
+                source="lrclib (mxl+lrc primary path)", track_name=c.track_name, artist_name=c.artist_name,
+                lrclib_id=c.id, duration=effective_lrc_duration(c), synced=bool(c.synced_lyrics),
+                extra=f"{q.n_asr_placed}/{q.n_words} words placed via transcription, {q.n_fallback} via "
+                      f"proportional fallback",
+            )
         else:
             reason = mxl_lrc_result.reason if mxl_lrc_result is not None else "no MusicXML file available"
             log(f"  WARNING: MXL+LRC primary generation not usable ({reason}) -- falling back to "
@@ -750,20 +817,9 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         # --- FALLBACK: standard audio-based pass 1 -> lyrics fetch -> pass 3 -> pass 4, unchanged. ---
 
         # --- PASS 1: pitch/timing from audio alone, no lyrics involved -------
+        config.check_cancelled(opts.cancel_requested)
         log("Pass 1: detecting notes from audio (pitch + timing only)...")
-        notes = detect_notes(
-            y, sr, bpm=bpm,
-            pitch_source=opts.pitch_source,
-            smooth_window_sec=opts.pitch_smooth_window,
-            pitch_jump_semitones=opts.note_split_semitones,
-            min_note_beats_fraction=opts.min_note_beat_fraction,
-            silence_threshold_db=opts.silence_threshold_db,
-            silence_absolute_floor_db=opts.silence_floor_db,
-            spike_max_duration_sec=opts.spike_max_duration,
-            spike_min_jump_semitones=opts.spike_jump_semitones,
-            verbose=not opts.quiet,
-            debug_log=debug_log,
-        )
+        notes = _detect_notes_cancellable(vocals_path, y, sr, bpm, opts, debug_log, log)
         if not notes:
             return PipelineResult(success=False,
                                    error="No notes were detected -- check the audio / vocal isolation quality.")
@@ -808,8 +864,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 # onto our own audio, not recover anything real.
                 if (opts.force_align_gaps
                         and reference_match_ratio(candidate_lines, words) >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
-                    words, n_recovered = recover_dropped_reference_words(candidate_lines, words, vocals_path,
-                                                                          debug_log=debug_log)
+                    words, n_recovered = _recover_dropped_reference_words_cancellable(
+                        candidate_lines, words, vocals_path, opts, debug_log, log)
                     if n_recovered:
                         dlog(f"  Force-alignment of known gaps: recovered {n_recovered} word(s) from the "
                              f"reference lyrics that ASR produced no word for at all, via a real wav2vec2 "
@@ -871,8 +927,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         # there's no guarantee the bigger model independently recovers the same passage.
                         if (opts.force_align_gaps and reference_match_ratio(candidate_lines, retry_words)
                                 >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
-                            retry_words, retry_n_recovered = recover_dropped_reference_words(
-                                candidate_lines, retry_words, vocals_path, debug_log=debug_log)
+                            retry_words, retry_n_recovered = _recover_dropped_reference_words_cancellable(
+                                candidate_lines, retry_words, vocals_path, opts, debug_log, log)
                             if retry_n_recovered:
                                 dlog(f"  Force-alignment of known gaps (retry transcription): recovered "
                                      f"{retry_n_recovered} more word(s).")
@@ -904,6 +960,12 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                     synced_lyrics_text = reference.synced_lyrics
                     log(f"  Got {len(ref_lines)} reference line(s) from {reference.source}"
                         f"{' (synced)' if reference.synced_lyrics else ''}.")
+                    debug_log.log_lyrics_selection(
+                        source=reference.source, track_name=reference.track_name,
+                        artist_name=reference.artist_name, lrclib_id=reference.lrclib_id,
+                        duration=reference.duration, synced=bool(reference.synced_lyrics),
+                        extra=f"{len(ref_lines)} reference line(s), match ratio {match_ratio:.0%}",
+                    )
                     corrected = align_words_to_reference(
                         words, ref_lines,
                         synced_lyrics_text=synced_lyrics_text if opts.time_based_line_assignment else None,
@@ -993,26 +1055,6 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 f"({lrc_stats.calibration_confidence:.0%} agreement), "
                 f"{len(lrc_stats.flags)}/{lrc_stats.n_matched_lines} line(s) flagged")
 
-    # --- 7d. Existing-file verification (feature 6, OFF by default): compares
-    # the existing file's own pitch/timing against THIS fresh syllable
-    # sequence, before deciding whether to overwrite it. Runs here (after
-    # pass 3/4, before phrasing) since it needs a fully fresh syllable
-    # sequence to compare against -- line grouping isn't needed for the
-    # comparison itself. Never saves pipeline compute vs. a full
-    # regeneration; its value is avoiding unnecessary file churn on an
-    # already-correct file, not avoiding processing time.
-    existing_verification = None
-    if existing_txt_path is not None:
-        log(f"Checking existing file against this fresh run: {existing_txt_path}")
-        try:
-            existing_song = parse_usdx_file(existing_txt_path)
-            existing_verification = verify_existing_song(existing_song, syllables, verbose=not opts.quiet,
-                                                           debug_log=debug_log)
-            log(f"  verdict: {existing_verification.verdict}"
-                + (f" -- {existing_verification.reason}" if existing_verification.reason else ""))
-        except UsdxParseError as e:
-            log(f"  Could not parse existing file ({e}) -- generating fresh.")
-
     entries = build_lines(syllables, strict_reference_lines=strict_line_breaks_from_lrc)
 
     # --- 8. GAP = start of the first syllable --------------------------------
@@ -1050,37 +1092,27 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         background_src=resolved.background,
     )
 
-    # --- 12. Assemble + write Song, UNLESS existing-file verification passed
-    # (in which case the existing file is kept, byte-for-byte, instead of
-    # being overwritten by a fresh regeneration it didn't actually disagree
-    # with). Companion staging above already ran either way -- an
-    # output_dir != input_dir still needs to be self-contained even when
-    # verification passes.
+    # --- 12. Assemble + write Song. Companion staging above already ran --
+    # an output_dir != input_dir still needs to be self-contained.
     out_name = sanitize_filename(f"{artist} - {title}.txt")
     out_path = output_dir / out_name
-    regenerated = True
 
-    if existing_verification is not None and existing_verification.verdict == "PASS":
-        shutil.copy2(existing_txt_path, out_path)
-        log(f"Existing file verified OK -- kept as-is (copied to {out_path}, not regenerated).")
-        regenerated = False
-    else:
-        song = Song(
-            title=title,
-            artist=artist,
-            language=config.DEFAULT_LANGUAGE,
-            mp3=staged.mp3,
-            cover=staged.cover,
-            background=staged.background,
-            video=staged.video,
-            videogap=videogap,
-            bpm=write_bpm,
-            gap_ms=gap_ms,
-            preview_start=preview_start,
-            entries=entries,
-        )
-        write_song(song, out_path, merge_connected_melisma=opts.merge_connected_melisma)
-        log(f"Wrote {out_path}")
+    song = Song(
+        title=title,
+        artist=artist,
+        language=config.DEFAULT_LANGUAGE,
+        mp3=staged.mp3,
+        cover=staged.cover,
+        background=staged.background,
+        video=staged.video,
+        videogap=videogap,
+        bpm=write_bpm,
+        gap_ms=gap_ms,
+        preview_start=preview_start,
+        entries=entries,
+    )
+    write_song(song, out_path, merge_connected_melisma=opts.merge_connected_melisma)
+    log(f"Wrote {out_path}")
 
     if not opts.skip_separation:
         if opts.delete_work_files:
@@ -1089,7 +1121,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             log(f"(Work files kept in {work_dir}; delete it to reclaim disk space.)")
 
     debug_log.close()
-    return PipelineResult(success=True, output_txt_path=out_path, regenerated=regenerated)
+    return PipelineResult(success=True, output_txt_path=out_path)
 
 
 def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
@@ -1123,7 +1155,6 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         spike_jump_semitones=args.spike_jump_semitones, pitch_source=args.pitch_source,
         no_pass1_debug=args.no_pass1_debug,
         no_debug_log=args.no_debug_log, quiet=args.quiet,
-        existing_txt_check=args.existing_txt_check, existing_txt_path=args.existing_txt_path,
         youtube_url=args.youtube_url, youtube_audio_only=args.youtube_audio_only,
         delete_work_files=args.delete_work_files,
         mxl_lrc_primary=args.mxl_lrc_primary, lrclib_id=args.lrclib_id,
@@ -1150,8 +1181,6 @@ def run(argv=None) -> int:
         incompatible = []
         if args.artist or args.title:
             incompatible.append("--artist/--title")
-        if args.existing_txt_path:
-            incompatible.append("--existing-txt")
         if args.youtube_url:
             incompatible.append("--youtube-url")
         if args.work_dir:

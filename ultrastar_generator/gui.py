@@ -391,7 +391,6 @@ class App(tk.Tk):
         # for why only a subset of the ~30 CLI flags are exposed here).
         self.fetch_lyrics = tk.BooleanVar(value=True)
         self.fetch_cover = tk.BooleanVar(value=True)
-        self.existing_txt_check = tk.BooleanVar(value=config.ENABLE_EXISTING_TXT_CHECK)
         self.musicxml_force_calibration = tk.BooleanVar(value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.whisper_model = tk.StringVar(value=config.DEFAULT_WHISPER_MODEL)
         self.pitch_source = tk.StringVar(value=config.DEFAULT_PITCH_SOURCE)
@@ -425,6 +424,12 @@ class App(tk.Tk):
         self.lrc_file = tk.StringVar(value="")
 
         self._running = False
+        # Set by _on_stop (after user confirmation) and polled via
+        # PipelineOptions.cancel_requested at stage boundaries inside the
+        # pipeline itself -- see config.PipelineCancelled's docstring for
+        # why this only takes effect between stages, not instantly.
+        # Cleared at the start of every new run.
+        self._cancel_event = threading.Event()
         self._build_widgets()
         self._on_mode_change()
 
@@ -639,6 +644,10 @@ class App(tk.Tk):
         # (Options), same distinction the normal pipeline already draws.
         self.realign_lyrics_frame = ttk.LabelFrame(self, text="Lyrics (single-song mode only)")
         realign_lyrics_frame = self.realign_lyrics_frame
+        self.realign_search_lyrics_button = ttk.Button(realign_lyrics_frame, text="Search Lyrics...", command=self._on_search_lyrics)
+        self.realign_search_lyrics_button.pack(side="left", padx=8, pady=4)
+        Tooltip(self.realign_search_lyrics_button, "Search LRCLIB directly and pick which result to use, BEFORE running "
+                                            "-- overrides the automatic lookup/pick for this run.")
         ttk.Label(realign_lyrics_frame, text="LRCLIB ID:").pack(side="left", padx=8, pady=4)
         self.realign_lrclib_id_entry = ttk.Entry(realign_lyrics_frame, textvariable=self.lrclib_id, width=10)
         self.realign_lrclib_id_entry.pack(side="left", padx=4, pady=4)
@@ -743,24 +752,29 @@ class App(tk.Tk):
         c2.grid(row=0, column=1, sticky="w", padx=8, pady=2)
         Tooltip(c2, "Download a cover image online (MusicBrainz/Cover Art Archive, then iTunes, then "
                     "Deezer) when the input folder has no [CO]-tagged or embedded cover art of its own.")
-        c4 = ttk.Checkbutton(opts_frame, text="Check existing .txt before overwriting", variable=self.existing_txt_check)
-        c4.grid(row=1, column=0, sticky="w", padx=8, pady=2)
-        Tooltip(c4, "If an existing '<Artist> - <Title>.txt' is found in the input folder, verify its "
-                    "pitch/timing first and only regenerate if problems are found.")
         c5 = ttk.Checkbutton(opts_frame, text="MusicXML force calibration", variable=self.musicxml_force_calibration)
-        c5.grid(row=1, column=1, sticky="w", padx=8, pady=2)
+        c5.grid(row=0, column=2, sticky="w", padx=8, pady=2)
         Tooltip(c5, "When a MusicXML reference file is found but our own pitch can't confidently "
                     "calibrate against it, use the best available offset anyway rather than skipping.")
 
-        ttk.Label(opts_frame, text="Whisper model:").grid(row=2, column=0, sticky="w", padx=8, pady=2)
-        whisper_entry = ttk.Entry(opts_frame, textvariable=self.whisper_model, width=15)
-        whisper_entry.grid(row=2, column=0, sticky="e", padx=8)
+        # Each label + its own input lives in a small sub-frame (packed
+        # tightly together) rather than sharing the outer grid's columns
+        # directly -- those columns are also shared with the wider
+        # checkbox rows above/below, which pushed the label and input
+        # apart whenever a column's width came from a different row.
+        whisper_frame = ttk.Frame(opts_frame)
+        whisper_frame.grid(row=2, column=0, sticky="w", padx=8, pady=2)
+        ttk.Label(whisper_frame, text="Whisper model:").pack(side="left")
+        whisper_entry = ttk.Entry(whisper_frame, textvariable=self.whisper_model, width=15)
+        whisper_entry.pack(side="left", padx=(4, 0))
         Tooltip(whisper_entry, "ASR model size, e.g. small.en (default), medium.en, large-v3. "
                                 "Bigger is more accurate but slower.")
-        ttk.Label(opts_frame, text="Pitch source:").grid(row=2, column=1, sticky="w", padx=8, pady=2)
-        pitch_combo = ttk.Combobox(opts_frame, textvariable=self.pitch_source, values=sorted(PITCH_SOURCES.keys()),
+        pitch_frame = ttk.Frame(opts_frame)
+        pitch_frame.grid(row=2, column=1, sticky="w", padx=8, pady=2)
+        ttk.Label(pitch_frame, text="Pitch source:").pack(side="left")
+        pitch_combo = ttk.Combobox(pitch_frame, textvariable=self.pitch_source, values=sorted(PITCH_SOURCES.keys()),
                                     state="readonly", width=12)
-        pitch_combo.grid(row=2, column=1, sticky="e", padx=8)
+        pitch_combo.pack(side="left", padx=(4, 0))
         Tooltip(pitch_combo, "rmvpe (default): RMVPE's own pitch/voicing decision, fastest and most "
                               "accurate on average. swiftf0: lightweight CNN pitch detector with a "
                               "real native voicing decision of its own. Whichever is chosen supplies "
@@ -801,6 +815,12 @@ class App(tk.Tk):
         self.run_frame.pack(fill="x", **pad)
         self.run_button = ttk.Button(self.run_frame, text="Run", command=self._on_run)
         self.run_button.pack(side="left")
+        self.stop_button = ttk.Button(self.run_frame, text="Stop", command=self._on_stop, state=tk.DISABLED)
+        self.stop_button.pack(side="left", padx=4)
+        Tooltip(self.stop_button, "Cancels the current run. Takes effect at the next stage boundary (e.g. "
+                    "after the current vocal-separation/transcription/pass-1 step finishes), not instantly "
+                    "-- there's no safe way to interrupt GPU inference mid-call. In batch mode, the current "
+                    "song still finishes; no further songs are started.")
         self.status_label = ttk.Label(self.run_frame, text="")
         self.status_label.pack(side="left", padx=12)
         open_output_btn = ttk.Button(self.run_frame, text="Open Output Folder", command=self._open_output_folder)
@@ -1198,7 +1218,6 @@ class App(tk.Tk):
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             fetch_lyrics=self.fetch_lyrics.get(),
             fetch_cover=self.fetch_cover.get(),
-            existing_txt_check=self.existing_txt_check.get(),
             musicxml_force_calibration=self.musicxml_force_calibration.get(),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
             pitch_source=self.pitch_source.get(),
@@ -1237,6 +1256,7 @@ class App(tk.Tk):
             # above (whenever fetch_reference_lyrics finds no valid synced
             # candidate at all). Batch mode auto-falls-back silently.
             no_lrc_fallback_callback=self._make_no_lrc_fallback_callback() if not is_batch else None,
+            cancel_requested=self._cancel_event.is_set,
         )
 
     def _effective_lrclib_id(self) -> Optional[int]:
@@ -1278,6 +1298,7 @@ class App(tk.Tk):
             strategy=self.realign_strategy.get(),
             delete_work_files=self.realign_delete_work_files.get(),
             batch=is_batch,
+            cancel_requested=self._cancel_event.is_set,
         )
 
     def _build_pitch_refresh_opts(self) -> PitchRefreshOptions:
@@ -1292,6 +1313,7 @@ class App(tk.Tk):
             key_nudge=self.pitch_refresh_key_nudge.get(),
             delete_work_files=self.pitch_refresh_delete_work_files.get(),
             batch=is_batch,
+            cancel_requested=self._cancel_event.is_set,
         )
 
     def _on_run(self):
@@ -1339,6 +1361,7 @@ class App(tk.Tk):
         else:
             opts = self._build_opts()
         self.log_text.delete("1.0", tk.END)
+        self._cancel_event.clear()
         self._set_running(True)
 
         q: "queue.Queue" = queue.Queue()
@@ -1444,9 +1467,24 @@ class App(tk.Tk):
         if self._running:
             self.after(100, self._drain_queue, q)
 
+    def _on_stop(self):
+        if not self._running or self._cancel_event.is_set():
+            return
+        if not messagebox.askyesno(
+                "Stop run?",
+                "Stop the current run?\n\nThis takes effect at the next stage boundary (e.g. after the "
+                "current vocal-separation/transcription/pass-1 step finishes), not instantly -- there's no "
+                "safe way to interrupt GPU inference mid-call. In batch mode, the song currently in "
+                "progress still finishes; no further songs are started."):
+            return
+        self._cancel_event.set()
+        self.stop_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Cancelling... (finishing the current stage)")
+
     def _set_running(self, running: bool):
         self._running = running
         self.run_button.config(state=tk.DISABLED if running else tk.NORMAL)
+        self.stop_button.config(state=tk.NORMAL if running else tk.DISABLED)
         self.status_label.config(text="Running... (this can take several minutes per song)" if running else "")
 
 
