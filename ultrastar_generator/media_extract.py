@@ -49,6 +49,32 @@ def has_audio_stream(path: Path) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() != ""
 
 
+def probe_duration_sec(path: Path) -> Optional[float]:
+    """ffprobe-based container duration in seconds -- works uniformly
+    across real audio files AND video containers (mp4/mpg/avi/etc, same
+    ones resolve_primary_source can return), so a caller never needs to
+    know which kind of file it's probing. Returns None (never raises) if
+    ffprobe is missing, the file can't be probed, or the duration field
+    is missing/unparseable -- callers must treat 'unknown' as a real
+    possibility, never assume a number came back."""
+    if shutil.which("ffprobe") is None:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
 def extract_audio_track(src: Path, dst: Path, *, as_mp3: bool = False, sr: Optional[int] = None) -> bool:
     """Extracts src's audio track to dst via ffmpeg.
 

@@ -97,6 +97,7 @@ class LrcLibCandidate:
     plain_lyrics: str
     synced_lyrics: Optional[str]
     instrumental: bool
+    dupe_count: int = 0
     id: Optional[int] = None  # LRCLIB's own numeric id -- lets a user who
                                # browsed lrclib.net directly and confirmed a
                                # perfect match paste the id back in, bypassing

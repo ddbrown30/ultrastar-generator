@@ -27,8 +27,9 @@ from . import config
 from .batch import run_batch
 from .file_discovery import (AmbiguousInputError, NoAudioSourceFoundError, headline_case,
                               resolve_artist_title, resolve_primary_source)
-from .lyrics_lookup import LrcLibCandidate, search_lrclib, load_lrc_file
+from .lyrics_lookup import LrcLibCandidate, search_lrclib, load_lrc_file, effective_lrc_duration
 from .main import check_cuda_available, delete_work_files, run_pipeline
+from .media_extract import probe_duration_sec
 from .realign import RealignPipelineOptions, run_realign_batch, run_realign_pipeline
 from .pitch_refresh import (DEFAULT_KEY_NUDGE, PITCH_SOURCES, PitchRefreshOptions,
                              run_pitch_refresh_batch, run_pitch_refresh_pipeline)
@@ -95,10 +96,19 @@ class LrcLibSearchDialog(tk.Toplevel):
     prompt -- the caller decides how/when to show it and what to do with
     `.result` afterward; this class only handles the search/picking UI
     itself. `.result` is the chosen LrcLibCandidate, or None if the user
-    cancelled (closed the window or clicked Cancel)."""
+    cancelled (closed the window or clicked Cancel).
+
+    `audio_duration`, if known, is used to pick a winner among candidates
+    that turn out to have 100% identical synced lyrics (see
+    `_dedupe_identical_synced`) -- the one closest to it is kept, the
+    rest hidden as pure clutter (same content, just a different
+    source/album entry). None (audio not resolved yet -- no folder
+    picked, an ambiguous folder, batch mode, etc.) falls back to keeping
+    whichever of the duplicates appeared first."""
 
     def __init__(self, parent: tk.Misc, *, initial_artist: str = "", initial_title: str = "",
-                 initial_candidates: Optional[List[LrcLibCandidate]] = None, title: str = "Select lyrics"):
+                 initial_candidates: Optional[List[LrcLibCandidate]] = None, title: str = "Select lyrics",
+                 audio_duration: Optional[float] = None):
         super().__init__(parent)
         self.title(title)
         self.iconbitmap('assets/lrcicon.ico')
@@ -106,6 +116,7 @@ class LrcLibSearchDialog(tk.Toplevel):
         self.minsize(500, 340)
         self.candidates: List[LrcLibCandidate] = []
         self.result: Optional[LrcLibCandidate] = None
+        self.audio_duration = audio_duration
 
         search_frame = ttk.Frame(self)
         search_frame.pack(fill="x", padx=8, pady=(8, 4))
@@ -208,13 +219,58 @@ class LrcLibSearchDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Search failed", str(e), parent=self)
             return
-        results = [c for c in results if not c.instrumental]
+        # Synced-only: an LRCLIB entry with no per-line timestamps is
+        # useless to this project's own line/word-timing pipeline (see
+        # lyrics_lookup.py's own hard synced-lyrics requirement), so it's
+        # not worth ever showing here as a pickable option.
+        results = [c for c in results if not c.instrumental and c.synced_lyrics]
         self._set_candidates(results)
         if not results:
             what = repr(query) if query else f"{artist!r} / {title!r}"
-            messagebox.showinfo("No results", f"No LRCLIB results found for {what}.", parent=self)
+            messagebox.showinfo("No results", f"No LRCLIB results with synced lyrics found for {what}.",
+                                 parent=self)
+
+    def _dedupe_identical_synced(self, candidates: List[LrcLibCandidate]) -> List[LrcLibCandidate]:
+        """Collapses candidates whose synced lyrics are 100% identical
+        (exact same words AND times, no extra/missing lines -- i.e. the
+        raw LRC text matches exactly) down to just one per group, since
+        the rest are pure clutter (same content, different source/album
+        entry). Within a group, keeps whichever candidate's own
+        effective duration (lyrics_lookup.effective_lrc_duration, not
+        the raw possibly-untrustworthy `duration` field) is closest to
+        `self.audio_duration`; falls back to keeping the group's first
+        entry (original list order) when the audio duration isn't known
+        (no folder picked yet, an ambiguous folder, batch mode, etc.) or
+        no candidate in the group has a usable duration either. A
+        candidate with no synced lyrics at all has nothing to compare,
+        so it's never merged with anything, including another
+        synced-lyrics-less candidate."""
+        groups: dict = {}
+        for i, c in enumerate(candidates):
+            key = (c.synced_lyrics or "").strip()
+            groups.setdefault(key if key else ("__no_sync__", i), []).append(i)
+
+        audio_duration = self.audio_duration
+        keep_candidates: List[LrcLibCandidate] = []
+        for idxs in groups.values():
+            if len(idxs) == 1 or audio_duration is None:
+                keep_candidate = candidates[idxs[0]]
+                keep_candidate.dupe_count = len(idxs) - 1
+                keep_candidates.append(keep_candidate)
+                continue
+
+            def _distance(i, _target=audio_duration):
+                d = effective_lrc_duration(candidates[i])
+                return abs(d - _target) if d is not None else float("inf")
+
+            keep_candidate = candidates[min(idxs, key=_distance)]
+            keep_candidate.dupe_count = len(idxs) - 1
+            keep_candidates.append(keep_candidate)
+
+        return keep_candidates
 
     def _set_candidates(self, candidates: List[LrcLibCandidate]):
+        candidates = self._dedupe_identical_synced(candidates)
         self.candidates = candidates
         self.listbox.configure(state="normal")
         self.listbox.delete("1.0", tk.END)
@@ -223,6 +279,8 @@ class LrcLibSearchDialog(tk.Toplevel):
             self.listbox.insert(tk.END, f"[{c.id}][{int(c.duration // 60)}:{int(c.duration % 60):02d}]", even)
             if c.synced_lyrics:
                 self.listbox.insert(tk.END, "[Synced]", ("synced", even))
+            if c.dupe_count > 0:
+                self.listbox.insert(tk.END, f"[{c.dupe_count} dupes]")
             self.listbox.insert(tk.END,
                 f"\n{c.track_name}\n"
                 f"{c.artist_name}{f' ({c.album_name})' if c.album_name else ''}\n",
@@ -476,6 +534,28 @@ class App(tk.Tk):
                     title = title or parsed_title
         return (headline_case(artist) if artist else artist,
                 headline_case(title) if title else title)
+
+    def _resolved_audio_duration(self) -> Optional[float]:
+        """Best-effort real audio duration for the currently-selected
+        input folder, used by LrcLibSearchDialog to pick a winner among
+        candidates with 100% identical synced lyrics (closest duration
+        wins) -- see its own _dedupe_identical_synced. Returns None
+        (never raises) whenever the audio isn't resolvable yet -- no
+        folder picked, an ambiguous folder, batch mode (no single song),
+        no ffprobe, etc. -- the dialog falls back to keeping whichever
+        duplicate came first in that case. Probes the container directly
+        via ffprobe (media_extract.probe_duration_sec), which works the
+        same for a real audio file or a video-as-audio/avi source -- no
+        need to know which kind resolve_primary_source returned."""
+        input_dir = self.input_dir.get().strip()
+        if not input_dir or not Path(input_dir).is_dir() or self._is_batch():
+            return None
+        try:
+            audio_path, _kind = resolve_primary_source(
+                Path(input_dir), audio_file_override=(self.audio_file.get().strip() or None))
+        except (AmbiguousInputError, NoAudioSourceFoundError, OSError):
+            return None
+        return probe_duration_sec(audio_path)
 
     def _artist_placeholder_text(self) -> str:
         artist, _ = self._resolved_artist_title()
@@ -997,7 +1077,7 @@ class App(tk.Tk):
         # starting point, not a requirement.
         artist, title = self._resolved_artist_title()
         dlg = LrcLibSearchDialog(self, initial_artist=artist or "", initial_title=title or "",
-                                  title="Search lyrics")
+                                  title="Search lyrics", audio_duration=self._resolved_audio_duration())
         self.wait_window(dlg)
         if dlg.result is not None:
             self.pinned_lyrics = dlg.result
