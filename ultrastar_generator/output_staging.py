@@ -5,11 +5,15 @@ folder needs to be self-contained, not depend on files still sitting in
 the input folder.
 
 Each file is also renamed to "<Artist> - <Title>[.ext]" (images keep
-their own "[CO]"/"[BG]" tag) regardless of what it was called in the
-input folder -- folder-based input means individual files can be named
-anything at all (a ripped/downloaded file's generic name, an image with
-no relation to the song), so the output folder is the one place this
-project guarantees the naming convention actually holds. Not used by
+their own "[CO]"/"[BG]" tag, always with a space before the bracket,
+e.g. "<Artist> - <Title> [CO].jpg") regardless of what it was called in
+the input folder -- folder-based input means individual files can be
+named anything at all (a ripped/downloaded file's generic name, an
+image with no relation to the song), so the output folder is the one
+place this project guarantees the naming convention actually holds. A
+stale "<Artist> - <Title>[CO/BG].<ext>" (no space) already sitting in
+the output folder from an older run/convention is renamed in place to
+the spaced form too, see `_fix_unspaced_tag_file`. Not used by
 realign.py -- that mode only ever writes a single .txt back next to the
 existing file, never a self-contained output folder.
 
@@ -69,6 +73,27 @@ def _copy_video_stripped(src: Path, output_dir: Path, target_name: str) -> str:
     return target_name
 
 
+def _fix_unspaced_tag_file(output_dir: Path, base: str, tag: str) -> None:
+    """If "<base>[CO/BG].<ext>" (no space before the tag -- an older
+    naming convention, or a hand-placed file) is already sitting in
+    output_dir, renames it in place to "<base> [CO/BG].<ext>" -- the
+    fresh copy this function's own caller writes next always uses the
+    spaced form, so leaving an unspaced one around would just be a
+    stale, wrongly-named duplicate. output_dir is entirely this tool's
+    own artifact area (never user input, see this module's own
+    docstring), so freely correcting a file already inside it is safe.
+    Only ever renames, never overwrites an already-correct spaced file
+    that also happens to exist (the caller's own copy step handles
+    that)."""
+    unspaced_stem = f"{base}[{tag}]"
+    spaced_stem = f"{base} [{tag}]"
+    for candidate in output_dir.iterdir():
+        if candidate.is_file() and candidate.stem == unspaced_stem:
+            target = output_dir / f"{spaced_stem}{candidate.suffix}"
+            if candidate.resolve() != target.resolve():
+                shutil.move(str(candidate), str(target))
+
+
 def stage_companions_to_output(output_dir: Path, artist: str, title: str, *, mp3_src: Path,
                                 video_src: Optional[Path] = None,
                                 cover_src: Optional[Path] = None,
@@ -97,6 +122,13 @@ def stage_companions_to_output(output_dir: Path, artist: str, title: str, *, mp3
         video_name = _copy_video_stripped(video_src, output_dir, f"{base}{video_src.suffix}")
     else:
         video_name = None
+
+    # A previous run (or an older, unspaced-tag convention) may have left
+    # "<base>[CO/BG].<ext>" sitting in output_dir with no space -- fix it
+    # in place before writing the fresh, correctly-spaced copy below, so
+    # a stale wrongly-named duplicate never lingers.
+    _fix_unspaced_tag_file(output_dir, base, "CO")
+    _fix_unspaced_tag_file(output_dir, base, "BG")
 
     if cover_src and cover_src == background_src:
         cover_name = _copy_as(cover_src, output_dir, f"{base}{cover_src.suffix}")

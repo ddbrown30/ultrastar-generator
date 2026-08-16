@@ -1444,7 +1444,7 @@ def find_existing_txt_in_folder(folder: Path, *, exclude_markers: Tuple[str, ...
     compounding drift across repeated runs instead of always realigning
     the same original file. `exclude_markers` is overridable so a sibling
     module with its own output naming convention (e.g. `pitch_refresh.py`'s
-    "[PITCH REFRESHED]") can reuse this same auto-detection logic and
+    "[PITCH_REFRESHED]") can reuse this same auto-detection logic and
     exclude its OWN prior output too, without either module needing to
     know about the other's marker by default.
 

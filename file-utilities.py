@@ -24,31 +24,32 @@ def delete_usdb_files(root: Path) -> None:
             path.unlink()
 
 
-def process_folder(root: Path, reverse: bool = False) -> None:
+def process_folder(root: Path, mode: str, reverse: bool = False) -> None:
+    tag = "REALIGNED" if mode == "realign" else "PITCH_REFRESHED"
     if reverse:
         # Reverse the replacement:
         # File.txt -> File [REALIGNED].txt
         # File.bak -> File.txt
 
         for txt_file in root.rglob("*.txt"):
-            bak_file = txt_file.with_suffix(".bak")
+            bak_file = txt_file.with_suffix(f".{tag}.bak")
 
             if not bak_file.is_file():
                 continue
 
-            realigned_file = txt_file.with_name(
-                txt_file.stem + " [REALIGNED].txt"
+            tagged_file = txt_file.with_name(
+                txt_file.stem + f" [{tag}].txt"
             )
 
-            if realigned_file.exists():
-                print(f"SKIPPED (REALIGNED file already exists): {realigned_file}")
+            if tagged_file.exists():
+                print(f"SKIPPED ({tag} file already exists): {tagged_file}")
                 continue
 
             print(f"Reversing: {txt_file}")
             print(f"  Backup:  {bak_file}")
-            print(f"  New:     {realigned_file}")
+            print(f"  New:     {tagged_file}")
 
-            txt_file.rename(realigned_file)
+            txt_file.rename(tagged_file)
             bak_file.rename(txt_file)
 
     else:
@@ -56,21 +57,21 @@ def process_folder(root: Path, reverse: bool = False) -> None:
         # File.txt -> File.bak
         # File [REALIGNED].txt -> File.txt
 
-        suffix = " [REALIGNED].txt"
+        suffix = f" [{tag}].txt"
 
-        for realigned_file in root.rglob("*.txt"):
-            name = realigned_file.name
+        for tagged_file in root.rglob("*.txt"):
+            name = tagged_file.name
 
             if not name.endswith(suffix):
                 continue
 
             original_name = name[:-len(suffix)] + ".txt"
-            original_file = realigned_file.with_name(original_name)
+            original_file = tagged_file.with_name(original_name)
 
             if not original_file.is_file():
                 continue
 
-            backup_file = original_file.with_suffix(".bak")
+            backup_file = original_file.with_suffix(f".{tag}.bak")
 
             if backup_file.exists():
                 print(f"SKIPPED (backup already exists): {original_file}")
@@ -78,10 +79,10 @@ def process_folder(root: Path, reverse: bool = False) -> None:
 
             print(f"Replacing: {original_file}")
             print(f"  Backup:  {backup_file}")
-            print(f"  New:     {realigned_file}")
+            print(f"  New:     {tagged_file}")
 
             original_file.rename(backup_file)
-            realigned_file.rename(original_file)
+            tagged_file.rename(original_file)
 
 
 def main() -> None:
@@ -97,6 +98,18 @@ def main() -> None:
 
     mode_group.add_argument(
         "--realign-reverse",
+        action="store_true",
+        help="Reverse the realignment replacement",
+    )
+
+    mode_group.add_argument(
+        "--pitch-replace",
+        action="store_true",
+        help="Replace original files with [REALIGNED] files",
+    )
+
+    mode_group.add_argument(
+        "--pitch-reverse",
         action="store_true",
         help="Reverse the realignment replacement",
     )
@@ -140,10 +153,16 @@ def main() -> None:
         raise SystemExit(1)
 
     if args.realign_replace:
-        process_folder(root, reverse=False)
+        process_folder(root, "realign", reverse=False)
 
     elif args.realign_reverse:
-        process_folder(root, reverse=True)
+        process_folder(root, "realign", reverse=True)
+
+    if args.pitch_replace:
+        process_folder(root, "pitch", reverse=False)
+
+    elif args.pitch_reverse:
+        process_folder(root, "pitch", reverse=True)
 
     elif args.clean_work:
         delete_ultrastar_work(root)

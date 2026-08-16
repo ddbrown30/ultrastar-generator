@@ -3040,6 +3040,59 @@ with _tempfile.TemporaryDirectory() as root:
 print("OK: a single image serving both cover and background roles is renamed WITHOUT a '[CO]'/'[BG]' "
       "tag (nothing to disambiguate), matching find_companions' own single-untagged-image convention")
 
+with _tempfile.TemporaryDirectory() as root:
+    root = Path(root)
+    in_dir = root / "in"
+    out_dir = root / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+    mp3c = in_dir / "song.mp3"
+    mp3c.write_bytes(b"mp3-bytes")
+    cover2 = in_dir / "cover.jpg"
+    cover2.write_bytes(b"cover-bytes-NEW")
+    bg2 = in_dir / "bg.png"
+    bg2.write_bytes(b"bg-bytes-NEW")
+    # A stale, UN-SPACED "[CO]"/"[BG]" file already sitting in the output
+    # folder -- an older naming convention, or a hand-placed file.
+    stale_co = out_dir / "Some Artist - Some Song[CO].jpg"
+    stale_co.write_bytes(b"cover-bytes-OLD")
+    stale_bg = out_dir / "Some Artist - Some Song[BG].png"
+    stale_bg.write_bytes(b"bg-bytes-OLD")
+
+    staged = stage_companions_to_output(out_dir, "Some Artist", "Some Song",
+                                         mp3_src=mp3c, cover_src=cover2, background_src=bg2)
+    assert staged.cover == "Some Artist - Some Song [CO].jpg", staged.cover
+    assert staged.background == "Some Artist - Some Song [BG].png", staged.background
+    assert not stale_co.exists() and not stale_bg.exists(), "stale unspaced files must not survive"
+    assert (out_dir / "Some Artist - Some Song [CO].jpg").read_bytes() == b"cover-bytes-NEW"
+    assert (out_dir / "Some Artist - Some Song [BG].png").read_bytes() == b"bg-bytes-NEW"
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "Some Artist - Some Song [BG].png", "Some Artist - Some Song [CO].jpg", "Some Artist - Some Song.mp3",
+    ], sorted(p.name for p in out_dir.iterdir())
+print("OK: a stale UN-SPACED '<base>[CO/BG].<ext>' already sitting in the output folder (an older run/"
+      "convention) is fixed in place before the fresh, correctly-spaced copy is written -- no orphaned "
+      "wrongly-named duplicate is left behind")
+
+with _tempfile.TemporaryDirectory() as root:
+    root = Path(root)
+    in_dir = root / "in"
+    out_dir = root / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+    mp3d = in_dir / "song.mp3"
+    mp3d.write_bytes(b"mp3-bytes")
+    stale_co2 = out_dir / "Some Artist - Some Song[CO].jpg"
+    stale_co2.write_bytes(b"cover-bytes-OLD")
+
+    # No cover_src/background_src at all THIS run -- the stale unspaced
+    # file should still get its space fixed rather than being left as a
+    # wrongly-named orphan with no fresh copy ever correcting it.
+    staged = stage_companions_to_output(out_dir, "Some Artist", "Some Song", mp3_src=mp3d)
+    assert staged.cover is None, staged.cover
+    assert not stale_co2.exists()
+    assert (out_dir / "Some Artist - Some Song [CO].jpg").exists()
+print("OK: the unspaced-tag fix runs even when no fresh cover/background is being staged this run at all")
+
 print("\n--- main.delete_work_files: deletes the entire work_dir, debug files included (intentional) ---")
 import tempfile as _tempfile_delint
 from ultrastar_generator.main import delete_work_files as _delete_intermediates
@@ -4620,7 +4673,7 @@ with _tempfile_pr.TemporaryDirectory() as _tmp_pr:
     print("OK: an --output that resolves to the SAME path as the existing file is refused")
 
 print("\n--- pitch_refresh: find_existing_txt_in_folder auto-detection excludes BOTH this module's "
-      "own '[PITCH REFRESHED]' output AND realign.py's '[REALIGNED]' output, not just its own ---")
+      "own '[PITCH_REFRESHED]' output AND realign.py's '[REALIGNED]' output, not just its own ---")
 with _tempfile_pr.TemporaryDirectory() as _tmp_pr2:
     _tmp_pr2 = Path(_tmp_pr2)
     original = _tmp_pr2 / "My Song.txt"
@@ -4714,19 +4767,23 @@ with _tempfile.TemporaryDirectory() as _pr_tmpdir:
     print(f"OK: exactly 1 word split ({pr_stats.n_notes_added} extra note(s)) -- \"oh\"'s single existing "
           f"note became 3, matching the MXL's own real melisma note count")
 
-    # Full concatenated text must be BYTE-IDENTICAL before/after -- splitting
-    # a note must never add/remove/alter any lyric text, only where the
-    # PITCH lives.
+    # Full concatenated REAL-WORD text must be BYTE-IDENTICAL before/after --
+    # splitting a note must never add/remove/alter any lyric text, only where
+    # the PITCH lives. New continuation notes contribute the standard
+    # MELISMA_CONTINUATION_TEXT ("~") marker, not nothing, so they're
+    # stripped out before comparing (same as how a real UltraStar file's own
+    # "~" notes are never counted as real lyric content).
     orig_text = "".join(e.text for e in _pr_mxl_entries)
-    new_text = "".join(e.text for e in pr_notes)
+    new_text = "".join(e.text for e in pr_notes if e.text != mxl_lrc_config.MELISMA_CONTINUATION_TEXT)
     assert orig_text == new_text, (orig_text, new_text)
-    print("OK: full concatenated lyric text is byte-identical before/after splitting -- "
-          f"{orig_text!r}")
+    print("OK: full concatenated REAL-WORD lyric text is byte-identical before/after splitting "
+          f"(continuation markers aside) -- {orig_text!r}")
 
     # Locate the 3 notes that replaced "oh" and check them directly.
     oh_notes = [e for e in pr_notes if e.start >= 1.0 - 1e-6 and e.end <= 2.5 + 1e-6]
     assert len(oh_notes) == 3, oh_notes
-    assert oh_notes[0].text == "oh" and oh_notes[1].text == "" and oh_notes[2].text == "", oh_notes
+    assert (oh_notes[0].text == "oh" and oh_notes[1].text == mxl_lrc_config.MELISMA_CONTINUATION_TEXT
+            and oh_notes[2].text == mxl_lrc_config.MELISMA_CONTINUATION_TEXT), oh_notes
     assert oh_notes[0].is_word_start and not oh_notes[1].is_word_start and not oh_notes[2].is_word_start
     assert oh_notes[0].start == 1.0 and oh_notes[-1].end == 2.5, (oh_notes[0].start, oh_notes[-1].end)
     # MXL pitch classes for "oh"'s 3 notes were 64, 67, 65 -- calibrated by
@@ -4734,8 +4791,9 @@ with _tempfile.TemporaryDirectory() as _pr_tmpdir:
     # (67-2)%12=5, (65-2)%12=3, nearest to the ORIGINAL note's own octave (62).
     assert [n.midi_note % 12 for n in oh_notes] == [2, 5, 3], [n.midi_note % 12 for n in oh_notes]
     print("OK: the 3 split notes for \"oh\" keep the word's own [start, end) span exactly, only the "
-          "first keeps the real text (rest are empty continuation notes), and each adopts its own "
-          "calibrated MXL pitch class:", [(n.text, n.start, n.end, n.midi_note % 12) for n in oh_notes])
+          "first keeps the real text (rest are '~' continuation notes, not blank), and each adopts "
+          "its own calibrated MXL pitch class:",
+          [(n.text, n.start, n.end, n.midi_note % 12) for n in oh_notes])
 
     # "wor-"/"ld" already has 2 syllables -- MXL's own single "world" word
     # (1 note) must NOT be force-split further; both existing notes just

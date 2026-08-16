@@ -7,7 +7,7 @@ solved, trusted INPUT, not something this module ever tries to detect.
 
 Like `realign.py` (the timing-only counterpart), the existing file is
 treated as READ-ONLY, unconditionally: `run_pitch_refresh_pipeline` never
-writes to it, defaults to a separate "<name> [PITCH REFRESHED].txt"
+writes to it, defaults to a separate "<name> [PITCH_REFRESHED].txt"
 output, and hard-refuses to run if an explicit output path resolves to
 the same path as the existing file (reuses `realign.check_output_not_
 existing_file`, the exact same guarantee, not a re-implementation).
@@ -95,7 +95,7 @@ from .realign import (
 # pitch-refresh output would either see two candidates (falsely
 # "ambiguous") or, worse, pick this module's OWN prior output as the next
 # run's INPUT, compounding drift across repeated runs.
-OUTPUT_MARKER = "[PITCH REFRESHED]"
+OUTPUT_MARKER = "[PITCH_REFRESHED]"
 _EXCLUDE_MARKERS = ("[REALIGNED]", OUTPUT_MARKER)
 
 # This module's own validated recipe (real grid-search tuning on Trixie Mattel - Gold,
@@ -398,10 +398,12 @@ def apply_mxl_pitch_reference(
         calibrated MXL pitch class (nearest to the ORIGINAL note's own
         octave -- octave is never guessed from MXL, same rule as pass 4).
         The lyric TEXT is never touched: only the first of the new notes
-        keeps the original word's own text; the rest become empty-text
-        continuation notes (this project's existing melisma convention),
-        so the word's own text is exactly what it was before, just
-        spread across more notes.
+        keeps the original word's own text; the rest become
+        `config.MELISMA_CONTINUATION_TEXT` ("~") continuation notes
+        (this project's existing melisma convention -- see
+        lyric_alignment.py's own identical fallback), so the word's own
+        real text is exactly what it was before, just spread across more
+        notes.
       - Otherwise (counts already match, or the existing word already
         has more than one syllable and can't be safely split further
         without deciding how to redistribute ITS OWN existing sub-word
@@ -493,7 +495,7 @@ def apply_mxl_pitch_reference(
                 target_pc = (midi - calibration) % 12
                 new_midi = nearest_pitch_for_class(orig.midi_note, target_pc)
                 split_syllables.append(Syllable(
-                    text=orig.text if k == 0 else "",
+                    text=orig.text if k == 0 else config.MELISMA_CONTINUATION_TEXT,
                     start=seg_start, end=seg_end, midi_note=new_midi,
                     is_word_start=orig.is_word_start if k == 0 else False,
                     note_type=orig.note_type, line_id=orig.line_id,

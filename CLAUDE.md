@@ -362,8 +362,11 @@ to the gui at the same time.
   deliberate exception to this module's "never touches note count"
   invariant, explicitly authorized by the user for the MXL path only.
   Only the first of the new notes keeps the original word's own text;
-  the rest are empty-text continuation notes, so the word's own text is
-  completely unchanged either way. A word whose existing note count
+  the rest are `config.MELISMA_CONTINUATION_TEXT` ("~") continuation
+  notes (this project's existing melisma-tail convention, e.g.
+  `lyric_alignment.py`'s own identical fallback — not left blank), so
+  the word's own real text is completely unchanged either way. A word
+  whose existing note count
   can't be safely split further (already > 1 syllable) or where MXL has
   FEWER notes than the existing word instead picks the position-
   proportional-nearest MXL syllable per existing note, same as an exact
