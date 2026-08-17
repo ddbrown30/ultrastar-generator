@@ -17,12 +17,24 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from . import config
 from . import model_cache
 from .models import Word
+
+# pyannote.audio (pulled in by whisperx's VAD) tries to use torchcodec for
+# audio decoding and warns loudly when torchcodec's compiled DLLs can't find
+# a compatible FFmpeg build on this machine. Harmless: WhisperX always hands
+# pyannote a preloaded in-memory waveform, which is the documented fallback
+# path this same warning points to -- never triggers the broken decode path.
+warnings.filterwarnings(
+    "ignore",
+    message=r"\s*torchcodec is not installed correctly.*",
+    category=UserWarning,
+)
 
 # whisperx.audio.load_audio() shells out to ffmpeg via a bare
 # `subprocess.run(cmd, ...)` call inside the third-party package -- a call
