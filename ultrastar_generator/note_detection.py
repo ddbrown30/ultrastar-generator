@@ -535,7 +535,7 @@ def _energy_gate(
 
 def _rmvpe_pitch(
     y: np.ndarray, sr: int, hop_length: int, fmin: float, fmax: float,
-    n_frames: int, device: str,
+    n_frames: int, device: str, activation_out: Optional[dict] = None,
 ) -> tuple:
     """Runs RMVPE (rmvpe_onnx) over the whole track once, returning (midi,
     confidence) arrays fit to n_frames.
@@ -546,11 +546,28 @@ def _rmvpe_pitch(
     and a voiced/unvoiced mask are interpolated separately from pitch so
     interpolation can't fabricate a pitch value by blending across a real
     unvoiced gap in RMVPE's own output into a fictitious in-between
-    semitone."""
+    semitone.
+
+    `activation_out`, if given a dict, is populated (side effect) with
+    RMVPE's own RAW 360-bin salience distribution (`rmvpe.predict`'s own
+    4th return value -- otherwise discarded here) on ITS OWN native
+    ~10ms grid, plus its per-bin cents mapping -- used by
+    `pitch_ambiguity.apply_ambiguity_tiebreak` for a note-level
+    aggregation independent of (and finer-grained than) the single
+    interpolated `midi`/`confidence` values this function returns. Kept
+    as an optional side channel rather than widening this function's own
+    return tuple so every OTHER existing caller (there are several) is
+    completely unaffected -- costs nothing extra when not requested,
+    since it's the exact same already-computed `rmvpe.predict()` call
+    either way, never a second inference."""
     from rmvpe_onnx import RMVPE
 
     rmvpe = RMVPE(device=device)
-    rtime, rfreq, rconf, _ = rmvpe.predict(y, sr)
+    rtime, rfreq, rconf, activation = rmvpe.predict(y, sr)
+    if activation_out is not None:
+        activation_out["rtime"] = rtime
+        activation_out["activation"] = activation
+        activation_out["cents_mapping"] = rmvpe.cents_mapping[4:364]  # strip internal windowing padding
 
     rmidi = np.where(
         (rfreq > 0) & (rfreq >= fmin) & (rfreq <= fmax),
@@ -586,12 +603,15 @@ def _rmvpe_pitch(
 # ---------------------------------------------------------------------------
 
 def _rmvpe_source(y, sr, hop_length, frame_length, fmin, fmax, n_frames,
-                   device="cpu", voicing_threshold=0.5):
+                   device="cpu", voicing_threshold=0.5, activation_out=None):
     """RMVPE alone. voiced is derived from RMVPE's own confidence
     clearing voicing_threshold -- _rmvpe_pitch already returns NaN below
     its own internal 0.5 gate, so this is effectively `~isnan(midi)`
-    unless voicing_threshold is raised above that internal default."""
-    midi, conf = _rmvpe_pitch(y, sr, hop_length, fmin, fmax, n_frames, device)
+    unless voicing_threshold is raised above that internal default.
+
+    `activation_out`: see _rmvpe_pitch's own docstring -- forwarded
+    as-is, not a second inference call."""
+    midi, conf = _rmvpe_pitch(y, sr, hop_length, fmin, fmax, n_frames, device, activation_out=activation_out)
     voiced = ~np.isnan(midi) & (conf >= voicing_threshold)
     return midi, conf, voiced
 
@@ -667,6 +687,8 @@ def detect_notes(
     trailing_artifact_confidence_ratio: float = config.TRAILING_ARTIFACT_CONFIDENCE_RATIO,
     trailing_artifact_max_gap_sec: float = config.TRAILING_ARTIFACT_MAX_GAP_SEC,
     trailing_artifact_min_preceding_duration_sec: float = config.TRAILING_ARTIFACT_MIN_PRECEDING_DURATION_SEC,
+    enable_ambiguity_key_tiebreak: bool = config.ENABLE_AMBIGUITY_KEY_TIEBREAK,
+    ambiguity_margin_threshold: float = config.AMBIGUITY_MARGIN_THRESHOLD,
     pitch_source: str = config.DEFAULT_PITCH_SOURCE,  # "rmvpe" or "swiftf0"
                                    # -- the SOLE pitch source for this call:
                                    # supplies both the pitch VALUE and the
@@ -701,6 +723,14 @@ def detect_notes(
     # alone. No cross-checking, no ensemble, no consensus vote. See
     # PITCH_SOURCES' module comment for why this exists and how to add a
     # new source.
+    # Populated only when the ambiguity key tie-break is actually usable
+    # (RMVPE-only, and only outside the precomputed parameter-sweep fast
+    # path -- see pitch_ambiguity.py's own module docstring). Requesting
+    # it costs nothing extra: same single rmvpe.predict() call either
+    # way, never a second inference.
+    activation_out: Optional[dict] = None
+    want_ambiguity_tiebreak = enable_ambiguity_key_tiebreak and pitch_source == "rmvpe"
+
     if precomputed is not None:
         times = precomputed["times"]
         src_midi, src_conf, src_voiced = (
@@ -708,11 +738,16 @@ def detect_notes(
         )
         n_frames = len(times)
         source_label = precomputed.get("label", "precomputed")
+        want_ambiguity_tiebreak = False  # raw activation isn't part of the precomputed contract
     else:
         n_frames = 1 + len(y) // hop_length
         times = np.arange(n_frames) * (hop_length / sr)
+        source_kwargs = {}
+        if want_ambiguity_tiebreak:
+            activation_out = {}
+            source_kwargs["activation_out"] = activation_out
         src_midi, src_conf, src_voiced = PITCH_SOURCES[pitch_source](
-            y, sr, hop_length, frame_length, fmin, fmax, n_frames,
+            y, sr, hop_length, frame_length, fmin, fmax, n_frames, **source_kwargs,
         )
         source_label = pitch_source
 
@@ -1058,6 +1093,15 @@ def detect_notes(
     notes = _ensure_nonoverlapping(notes, verbose=verbose)
     if debug_log is not None:
         debug_log.log_notes(notes, "pass 1 note segmentation, stage 6 (FINAL): after enforcing non-overlap")
+
+    if want_ambiguity_tiebreak and activation_out and notes:
+        from .pitch_ambiguity import apply_ambiguity_tiebreak  # lazy: avoids a module-level circular import (pitch_ambiguity imports NoteEvent from here)
+        notes = apply_ambiguity_tiebreak(
+            notes, activation_out["activation"], activation_out["rtime"], activation_out["cents_mapping"],
+            ambiguity_margin_threshold, debug_log=debug_log, verbose=verbose,
+        )
+        if debug_log is not None:
+            debug_log.log_notes(notes, "pass 1 note segmentation, stage 7 (FINAL): after ambiguity-gated key tie-break")
 
     if verbose:
         print(f"[pass1] notes: {n_raw} raw segments -> {n_after_similar} after "

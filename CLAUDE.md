@@ -329,6 +329,72 @@ to the gui at the same time.
   (since fully removed — see "Removed / rejected approaches" above).
   `"swiftf0"` (lightweight CNN pitch detector, own native voicing
   decision) is the only other supported source.
+- **`config.ENABLE_AMBIGUITY_KEY_TIEBREAK = True`** (`--ambiguity-key-
+  tiebreak`/`--no-ambiguity-key-tiebreak`, `--ambiguity-margin-threshold`
+  default `0.35`, GUI "Ambiguity key tie-break (pass 1)" checkbox under
+  Advanced — the margin threshold is CLI-only, no existing GUI float-
+  entry pattern to mirror), 2026-08-16. `pitch_ambiguity.py` (new
+  module): RMVPE-only (no-op for `--pitch-source swiftf0`) refinement of
+  pass 1's own note pitch-CLASS computation, applied as a real
+  post-processing step after `detect_notes()`'s own final segmentation
+  (never changes timing/note count/order). Two parts, validated and
+  shipped together as a unit (not separately): (1) a note's pitch class
+  is recomputed by SUMMING RMVPE's own raw per-frame 360-bin salience
+  distribution (`rmvpe_onnx.RMVPE.predict`'s own 4th return value,
+  previously computed and silently discarded by `_rmvpe_pitch` on every
+  single inference call) across the note's own span and taking the
+  argmax, instead of a per-frame-rounded confidence-weighted mode — same
+  aggregation shape usp's own trained classifier uses, applied to
+  RMVPE's own output instead of a separate model; (2) when the resulting
+  top-1/top-2 candidates are genuinely close (`AMBIGUITY_MARGIN_
+  THRESHOLD`, relative salience-mass margin), the tie is broken using
+  the song's own detected key via the real published Krumhansl & Kessler
+  (1982/1990) key-profile ratings (listener probe-tone study data,
+  standard in MIR key-finding) — deliberately narrower than this
+  project's own twice-rejected blanket key-correction (see "Removed /
+  rejected approaches" above: a full global key-correction pass was
+  built and fully removed for blindly snapping legitimate modal-mixture/
+  borrowed notes; usp's own unconditional ±1-semitone `key_nudge`,
+  vendored into `pitch_refresh.py`, is real but explicitly NOT universal
+  — a measured regression on Tarzan). A confident, unambiguous note
+  (RMVPE's own salience shows one clear peak) is NEVER touched by the
+  key profile, no matter how out-of-key it looks — gating on genuine
+  acoustic ambiguity rather than acting on every out-of-key note is what
+  let this survive real-audio validation where the broader approaches
+  didn't. Threaded through `note_detection._rmvpe_pitch`/`_rmvpe_source`
+  via an optional `activation_out` side-channel dict (costs nothing
+  extra — same single `rmvpe.predict()` call either way, never a second
+  inference) and both `detect_notes()` call sites (`main.py`'s in-process
+  path and `worker_process.py`'s cancellable-subprocess path).
+  **Real-audio validated at full-pipeline scale** (pass 1's own SELF-
+  DETECTED segmentation — the harder, riskier scenario, not a given-
+  correct-timing shortcut) across a 12-song roster via a resumable
+  scratch harness (`scratchpad/pitch_comparison/tiebreak_selfdetected.py`
+  + `ambiguity_tiebreak_prototype.py`): a single FIXED threshold applied
+  uniformly (not per-song-tuned) gives weighted pitch-class accuracy
+  63.1% → 65.5% (+2.4pp) vs. the previously-shipped baseline, 9/12 songs
+  improved (Jungle Book +7.7pp, BATB +6.4pp, Little Mermaid +4.6pp),
+  2 modest regressions (Trixie Mattel - Gold −1.6pp, David Bowie - Magic
+  Dance −1.4pp — real, known, accepted, not universal, same risk
+  profile already accepted once for usp's own `key_nudge`). Threshold
+  0.35 was the single best value found sweeping 0.10–1.00 on real
+  audio — weighted accuracy peaks in the 0.30–0.50 range and clearly
+  REVERSES past ~0.50 as the threshold widens toward "tie-break nearly
+  everything," converging on the already-rejected blanket key-correction
+  failure mode — confirms the ambiguity gate is doing real work, not
+  coincidentally correlating with something else. Two closely related
+  ideas from the SAME investigation were tried on the same real-audio
+  harness and explicitly REJECTED — do not re-attempt without new
+  evidence: tuning `ATTACK_TRIM_SEC`/`CONFIDENCE_FLOOR_PERCENTILE` for
+  pass 1's own segmentation (real word-for-word churn analysis
+  — `scratchpad/pitch_comparison/churn_check.py` — showed a "flat"
+  aggregate was hiding real bidirectional regressions, net negative on
+  Trixie Mattel - Gold specifically); integrating usp's own separately
+  -trained ONNX pitch classifier directly (`usp_classifier_prototype.py`
+  — wins Trixie Mattel - Gold, loses Great Big Sea - Ordinary Day, no
+  consistent cross-song signal even in the easier given-correct-timing
+  scenario). See `project_three_way_pitch_comparison` memory for the
+  full investigation history.
 - **`pitch_refresh.py`'s `isolate_vocals` default flipped to `True`
   (2026-08-15)**, reversing its original mixed-audio-by-default design —
   see the "Removed / rejected approaches" entry above for the full

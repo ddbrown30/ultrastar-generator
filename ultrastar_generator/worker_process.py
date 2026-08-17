@@ -176,6 +176,8 @@ def _do_detect_notes(kwargs: dict, debug_log):
         silence_absolute_floor_db=kwargs.get("silence_floor_db"),
         spike_max_duration_sec=kwargs.get("spike_max_duration_sec"),
         spike_min_jump_semitones=kwargs.get("spike_min_jump_semitones"),
+        enable_ambiguity_key_tiebreak=kwargs.get("ambiguity_key_tiebreak"),
+        ambiguity_margin_threshold=kwargs.get("ambiguity_margin_threshold"),
         verbose=kwargs.get("verbose", True),
         debug_log=debug_log,
     )

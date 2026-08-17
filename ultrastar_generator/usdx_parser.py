@@ -84,13 +84,21 @@ def parse_usdx_file(path: Path) -> ParsedSong:
 
     if "BPM" not in tags:
         raise UsdxParseError("Missing #BPM tag")
-    if "GAP" not in tags:
-        raise UsdxParseError("Missing #GAP tag")
     bpm = _parse_bpm(tags["BPM"])
-    try:
-        gap_ms = int(round(float(tags["GAP"].strip().replace(",", "."))))
-    except ValueError:
-        raise UsdxParseError(f"Invalid #GAP value: {tags['GAP']!r}")
+    if "GAP" in tags:
+        try:
+            gap_ms = int(round(float(tags["GAP"].strip().replace(",", "."))))
+        except ValueError:
+            raise UsdxParseError(f"Invalid #GAP value: {tags['GAP']!r}")
+    else:
+        # Unlike #BPM, #GAP is NOT required by the real UltraStar Deluxe
+        # format -- usdx itself treats an absent #GAP as 0 (user's own
+        # explicit correction). Confirmed real case: some SingStar-ripped
+        # files (Sleeping Beauty - Once Upon A Dream, The Jungle Book -
+        # Bare Necessities) simply never wrote #GAP at all -- legitimate,
+        # spec-compliant files, not malformed ones; a previous version of
+        # this parser wrongly rejected them.
+        gap_ms = 0
 
     entries: List[Union[Syllable, LineBreak]] = []
     # A word's FIRST syllable is forced word-start=True whenever there's no

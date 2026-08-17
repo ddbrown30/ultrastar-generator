@@ -114,6 +114,31 @@ ATTACK_TRIM_SEC = 0.0
 # -- see _confidence_floor_filter's docstring.
 CONFIDENCE_FLOOR_PERCENTILE = 0.0
 
+# Ambiguity-gated, Krumhansl-Kessler key-profile pitch-CLASS refinement
+# (2026-08-16) -- see pitch_ambiguity.py's own module docstring for the
+# full design/validation. Unlike ATTACK_TRIM_SEC/CONFIDENCE_FLOOR_PERCENTILE
+# above, this WAS validated at full-pipeline scale (pass-1's own real
+# self-detected segmentation, not given-correct-timing) across a 12-song
+# roster: weighted pitch-class accuracy +2.4pp vs. the previously-shipped
+# baseline (single fixed threshold applied uniformly, not per-song-tuned),
+# 9/12 songs improved, 2 modest regressions (Trixie Mattel - Gold -1.6pp,
+# David Bowie - Magic Dance -1.4pp -- real, known, accepted, not universal
+# -- same "net positive but not universal" risk profile this project has
+# already accepted once for usp's own key_nudge in pitch_refresh.py).
+# RMVPE-only (SwiftF0 has no comparable raw multi-bin salience output) --
+# a no-op whenever pitch_source="swiftf0".
+ENABLE_AMBIGUITY_KEY_TIEBREAK = True
+# Relative margin between the top-2 candidate pitch classes' own
+# aggregated salience mass below which a note is treated as genuinely
+# ambiguous (and so eligible for the key-profile tie-break) rather than
+# confidently decided. 0.35 is the single best value found sweeping
+# 0.10-1.00 on real audio -- weighted accuracy peaks in the 0.30-0.50
+# range and clearly REVERSES past ~0.50 as the threshold widens toward
+# "tie-break nearly everything," converging on the already-rejected
+# blanket key-correction failure mode (see pitch_ambiguity.py's own
+# docstring) -- this is not an arbitrary round number.
+AMBIGUITY_MARGIN_THRESHOLD = 0.35
+
 # Reconciles a protected_start (re-articulation) split's rounded pitch
 # with its immediate predecessor when they're near-contiguous and land
 # EXACTLY 1 semitone apart -- see _confidence_floor_filter's neighbor,
@@ -1038,6 +1063,8 @@ class PipelineOptions:
     silence_floor_db: float = SILENCE_ABSOLUTE_FLOOR_DB
     spike_max_duration: float = SPIKE_MAX_DURATION_SEC
     spike_jump_semitones: float = SPIKE_MIN_JUMP_SEMITONES
+    ambiguity_key_tiebreak: bool = ENABLE_AMBIGUITY_KEY_TIEBREAK
+    ambiguity_margin_threshold: float = AMBIGUITY_MARGIN_THRESHOLD
     pitch_source: str = DEFAULT_PITCH_SOURCE
     no_pass1_debug: bool = False
     no_debug_log: bool = False

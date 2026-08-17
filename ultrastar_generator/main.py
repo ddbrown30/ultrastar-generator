@@ -299,6 +299,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--spike-jump-semitones", type=float, default=config.SPIKE_MIN_JUMP_SEMITONES,
                     help=f"Minimum pitch jump (semitones) from both neighbors for a short note to "
                          f"be treated as a spike/glitch (default: {config.SPIKE_MIN_JUMP_SEMITONES})")
+    p.add_argument("--ambiguity-key-tiebreak", dest="ambiguity_key_tiebreak", action="store_true",
+                    default=config.ENABLE_AMBIGUITY_KEY_TIEBREAK,
+                    help="Default: ON. RMVPE-only (no-op for --pitch-source swiftf0). Recomputes each "
+                         "note's PITCH CLASS (never octave) by summing RMVPE's own raw per-frame "
+                         "salience distribution across the note's own span instead of a per-frame-"
+                         "rounded confidence-weighted mode; when the top-2 candidate pitch classes are "
+                         "genuinely close (--ambiguity-margin-threshold), breaks the tie using the "
+                         "song's own detected key (published Krumhansl-Kessler profiles) -- a confident, "
+                         "unambiguous note is never touched, in- or out-of-key. Real-audio validated: "
+                         "weighted +2.4pp pitch-class accuracy across a 12-song roster, 9 songs improved, "
+                         "2 modest regressions (not universal). See CLAUDE.md / pitch_ambiguity.py.")
+    p.add_argument("--no-ambiguity-key-tiebreak", dest="ambiguity_key_tiebreak", action="store_false")
+    p.add_argument("--ambiguity-margin-threshold", type=float, default=config.AMBIGUITY_MARGIN_THRESHOLD,
+                    help="Relative salience-mass margin between the top-2 candidate pitch classes below "
+                         "which a note is treated as genuinely ambiguous and eligible for the key-profile "
+                         "tie-break (default: {0}, the single best value found sweeping 0.10-1.00 on real "
+                         "audio -- see config.AMBIGUITY_MARGIN_THRESHOLD's own comment)".format(
+                             config.AMBIGUITY_MARGIN_THRESHOLD))
     p.add_argument("--pitch-source", default=config.DEFAULT_PITCH_SOURCE, choices=["rmvpe", "swiftf0"],
                     help="Which pass-1 pitch source to use (default: "
                          f"{config.DEFAULT_PITCH_SOURCE!r}). The chosen source alone supplies both "
@@ -380,6 +398,8 @@ def _detect_notes_cancellable(vocals_path: Path, y, sr, bpm: float, opts: config
             pitch_jump_semitones=opts.note_split_semitones, min_note_beats_fraction=opts.min_note_beat_fraction,
             silence_threshold_db=opts.silence_threshold_db, silence_absolute_floor_db=opts.silence_floor_db,
             spike_max_duration_sec=opts.spike_max_duration, spike_min_jump_semitones=opts.spike_jump_semitones,
+            enable_ambiguity_key_tiebreak=opts.ambiguity_key_tiebreak,
+            ambiguity_margin_threshold=opts.ambiguity_margin_threshold,
             verbose=not opts.quiet, debug_log=debug_log,
         )
     result = run_cancellable(
@@ -388,7 +408,10 @@ def _detect_notes_cancellable(vocals_path: Path, y, sr, bpm: float, opts: config
          "smooth_window_sec": opts.pitch_smooth_window, "pitch_jump_semitones": opts.note_split_semitones,
          "min_note_beats_fraction": opts.min_note_beat_fraction, "silence_threshold_db": opts.silence_threshold_db,
          "silence_floor_db": opts.silence_floor_db, "spike_max_duration_sec": opts.spike_max_duration,
-         "spike_min_jump_semitones": opts.spike_jump_semitones, "verbose": not opts.quiet},
+         "spike_min_jump_semitones": opts.spike_jump_semitones,
+         "ambiguity_key_tiebreak": opts.ambiguity_key_tiebreak,
+         "ambiguity_margin_threshold": opts.ambiguity_margin_threshold,
+         "verbose": not opts.quiet},
         cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
     )
     return [NoteEvent(**d) for d in result]
@@ -1152,7 +1175,10 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         pitch_smooth_window=args.pitch_smooth_window, note_split_semitones=args.note_split_semitones,
         min_note_beat_fraction=args.min_note_beat_fraction, silence_threshold_db=args.silence_threshold_db,
         silence_floor_db=args.silence_floor_db, spike_max_duration=args.spike_max_duration,
-        spike_jump_semitones=args.spike_jump_semitones, pitch_source=args.pitch_source,
+        spike_jump_semitones=args.spike_jump_semitones,
+        ambiguity_key_tiebreak=args.ambiguity_key_tiebreak,
+        ambiguity_margin_threshold=args.ambiguity_margin_threshold,
+        pitch_source=args.pitch_source,
         no_pass1_debug=args.no_pass1_debug,
         no_debug_log=args.no_debug_log, quiet=args.quiet,
         youtube_url=args.youtube_url, youtube_audio_only=args.youtube_audio_only,

@@ -3206,6 +3206,15 @@ with _tempfile.TemporaryDirectory() as d:
         pass
 print("OK: a missing required tag (#BPM) raises UsdxParseError")
 
+with _tempfile.TemporaryDirectory() as d:
+    missing_gap_path = Path(d) / "missing_gap.txt"
+    missing_gap_path.write_text("#TITLE:Bad\n#ARTIST:Bad\n#BPM:200\n: 0 1 0 hi\nE\n", encoding="utf-8")
+    parsed_no_gap = parse_usdx_file(missing_gap_path)
+    assert parsed_no_gap.gap_ms == 0, parsed_no_gap.gap_ms
+print("OK: a missing #GAP tag defaults to 0 rather than raising -- unlike #BPM, #GAP is NOT required by "
+      "the real UltraStar Deluxe format (real usdx itself treats an absent #GAP as 0); confirmed real case: "
+      "some SingStar-ripped files never write #GAP at all")
+
 print("\n--- verify_existing_song: compares an existing .txt's pitch/timing against a fresh pipeline run ---")
 from ultrastar_generator.verify_existing_song import verify_existing_song
 
@@ -4832,3 +4841,87 @@ with _tempfile.TemporaryDirectory() as _pr_tmpdir3:
     assert len([e for e in plural_entries if isinstance(e, Syllable)]) == len(_pr_mxl_entries) + 2
 print("OK: apply_mxl_pitch_references skips an unparseable file (doesn't abort the batch) and still "
       "applies the next, genuinely usable one")
+
+print("\n--- pitch_ambiguity: ambiguity-gated Krumhansl-Kessler key tie-break for pass-1's own "
+      "RMVPE-based note detection (2026-08-16, real-audio validated, see config."
+      "ENABLE_AMBIGUITY_KEY_TIEBREAK) ---")
+from ultrastar_generator.pitch_ambiguity import (
+    bin_pitch_classes, note_pc_mass, detect_key, apply_ambiguity_tiebreak,
+)
+
+# One octave, MIDI 60-71 (pitch classes 0-11), computed via the SAME
+# cents<->frequency formula rmvpe_onnx.RMVPE.predict itself uses --
+# bin_pitch_classes should recover pitch classes 0..11 in order.
+_pa_cents_mapping = np.array([
+    1200 * np.log2((440 * 2 ** ((midi - 69) / 12)) / 10) for midi in range(60, 72)
+])
+_pa_bin_pc = bin_pitch_classes(_pa_cents_mapping)
+assert list(_pa_bin_pc) == list(range(12)), _pa_bin_pc
+print("OK: bin_pitch_classes recovers pitch classes 0..11 in order from a one-octave cents mapping, "
+      "using the exact same cents<->frequency formula RMVPE's own predict() uses")
+
+# note_pc_mass: one frame per note (rtime steps of 1.0s), each row of
+# `activation` is that note's own 12-bin salience.
+_pa_rtime = np.array([0.0, 1.0, 2.0, 3.0])
+_pa_activation = np.array([
+    [1000, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],   # filler note A: tonic (pc 0), strongly dominant
+    [0, 0, 0, 0, 0, 0, 0, 1000, 0, 0, 0, 0],   # filler note B: fifth (pc 7), strongly dominant
+    [48, 52, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],    # test note: AMBIGUOUS, pc1 (52) vs pc0 (48), margin ~0.077
+    [1, 100, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],    # test note: UNAMBIGUOUS, pc1 (100) clearly dominant
+])
+_pa_mass0 = note_pc_mass(_pa_activation, _pa_rtime, _pa_bin_pc, 0.0, 0.99)
+assert _pa_mass0[0] == 1000 and _pa_mass0[7] == 1, _pa_mass0
+print("OK: note_pc_mass sums one note's own 360-(here 12-)bin activation into a 12-bin pitch-class mass")
+
+# detect_key: global mass overwhelmingly favors C-major-consistent pitch
+# classes (tonic + fifth, the two highest-weighted degrees in the real
+# published K-K major profile) regardless of the two small test notes'
+# own contribution -- should robustly land on tonic=0, major.
+_pa_global_mass = np.sum(_pa_activation, axis=0)
+_pa_profile, _pa_tonic, _pa_mode, _pa_corr = detect_key(_pa_global_mass)
+assert _pa_tonic == 0 and _pa_mode == "major", (_pa_tonic, _pa_mode)
+print(f"OK: detect_key recovers tonic pitch-class {_pa_tonic} ({_pa_mode}) from a pitch-class mass "
+      f"dominated by the tonic and fifth (correlation={_pa_corr:.3f})")
+
+# apply_ambiguity_tiebreak, the real shipped entry point: the AMBIGUOUS
+# note (originally pitch class 1, e.g. from _weighted_mode_pitch) gets
+# flipped to pitch class 0 (the key profile's own strong preference,
+# KK_MAJOR[0]=6.35 vs KK_MAJOR[1]=2.23) -- but the UNAMBIGUOUS note,
+# EQUALLY out-of-key (also pitch class 1), is left completely untouched,
+# proving this is genuinely narrower than a blanket key-correction: only
+# a note RMVPE's own salience was already torn about ever gets nudged.
+_pa_notes = [
+    NoteEvent(start=0.0, end=0.99, pitch=0, confidence=1.0),     # filler A, untouched by design (not under test)
+    NoteEvent(start=1.0, end=1.99, pitch=7, confidence=1.0),     # filler B, untouched by design (not under test)
+    NoteEvent(start=2.0, end=2.99, pitch=1, confidence=1.0),     # ambiguous -- pc 1, octave 0
+    NoteEvent(start=3.0, end=3.99, pitch=13, confidence=1.0),    # unambiguous -- pc 1, octave +1 (midi-relative 13)
+]
+_pa_out = apply_ambiguity_tiebreak(
+    _pa_notes, _pa_activation, _pa_rtime, _pa_cents_mapping, margin_threshold=0.35, verbose=False,
+)
+assert len(_pa_out) == 4, len(_pa_out)
+assert _pa_out[2].pitch == 0, _pa_out[2].pitch
+assert _pa_out[3].pitch == 13, _pa_out[3].pitch
+print("OK: apply_ambiguity_tiebreak flips the genuinely ambiguous note's pitch class 1 -> 0 (the "
+      "detected key's own strong preference), while leaving the equally out-of-key but UNAMBIGUOUS "
+      "note's pitch (13, pitch class 1, octave preserved) completely untouched")
+
+# Octave is NEVER touched, even when the tie-break DOES fire -- only the
+# pitch-class digit changes.
+_pa_notes_octave = [
+    NoteEvent(start=0.0, end=0.99, pitch=0, confidence=1.0),
+    NoteEvent(start=1.0, end=1.99, pitch=7, confidence=1.0),
+    NoteEvent(start=2.0, end=2.99, pitch=13, confidence=1.0),    # ambiguous, but octave +1 this time (midi-relative 13, pc 1)
+    NoteEvent(start=3.0, end=3.99, pitch=13, confidence=1.0),
+]
+_pa_out_octave = apply_ambiguity_tiebreak(
+    _pa_notes_octave, _pa_activation, _pa_rtime, _pa_cents_mapping, margin_threshold=0.35, verbose=False,
+)
+assert _pa_out_octave[2].pitch == 12, _pa_out_octave[2].pitch  # pc 1 -> pc 0, SAME octave (13 -> 12, not 0)
+print("OK: the tie-break only ever replaces the pitch-CLASS digit -- an ambiguous note starting an "
+      "octave up (13) lands on 12 (same octave, pitch class 0), never dropped to pitch class 0 in the "
+      "base octave (0)")
+
+# Empty note list / disabled-path safety: never crashes, never fabricates notes.
+assert apply_ambiguity_tiebreak([], _pa_activation, _pa_rtime, _pa_cents_mapping, 0.35, verbose=False) == []
+print("OK: apply_ambiguity_tiebreak on an empty note list returns an empty list, no crash")
