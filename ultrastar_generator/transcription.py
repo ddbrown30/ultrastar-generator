@@ -36,6 +36,32 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+# torch's CUDA allocator warns that `expandable_segments` (a Linux-only
+# allocator optimization) isn't supported on this platform. We never set
+# that config option ourselves -- this fires purely because we're on
+# Windows -- so it's a platform statement, not something actionable.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*expandable_segments not supported on this platform.*",
+    category=UserWarning,
+)
+
+# pyannote.audio (pulled in by whisperx's VAD) intentionally disables TF32
+# for reproducible alignment results and warns when it does so. This is the
+# behavior we want, not a problem to fix.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*TensorFloat-32 \(TF32\) has been disabled.*",
+    category=UserWarning,
+)
+
+# WhisperX's bundled align-model checkpoint is in an older Lightning
+# checkpoint format; Lightning auto-upgrades it in memory on every load and
+# logs an INFO note about it (harmless -- nothing on disk is touched unless
+# the suggested one-time conversion command is run manually). Silence it at
+# the logger level since it's emitted via `logging`, not `warnings.warn`.
+logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.WARNING)
+
 # whisperx.audio.load_audio() shells out to ffmpeg via a bare
 # `subprocess.run(cmd, ...)` call inside the third-party package -- a call
 # site we don't own, unlike separation.py/media_extract.py's own ffmpeg/
