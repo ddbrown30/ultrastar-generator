@@ -91,12 +91,12 @@ class LrcLibSearchDialog(tk.Toplevel):
     top (pre-filled from the current run's own artist/title when known,
     but freely editable -- lets the user search for anything, not just
     what was auto-detected), LRCLIB results listed on the left, the
-    selected one's lyrics preview on the right. Used for BOTH the manual
-    pre-run "Search Lyrics..." button and the automatic mid-run ambiguity
-    prompt -- the caller decides how/when to show it and what to do with
-    `.result` afterward; this class only handles the search/picking UI
-    itself. `.result` is the chosen LrcLibCandidate, or None if the user
-    cancelled (closed the window or clicked Cancel).
+    selected one's lyrics preview on the right. Used by the manual
+    pre-run "Search Lyrics..." button -- the caller decides how/when to
+    show it and what to do with `.result` afterward; this class only
+    handles the search/picking UI itself. `.result` is the chosen
+    LrcLibCandidate, or None if the user cancelled (closed the window or
+    clicked Cancel).
 
     `audio_duration`, if known, is used to pick a winner among candidates
     that turn out to have 100% identical synced lyrics (see
@@ -107,8 +107,7 @@ class LrcLibSearchDialog(tk.Toplevel):
     whichever of the duplicates appeared first."""
 
     def __init__(self, parent: tk.Misc, *, initial_artist: str = "", initial_title: str = "",
-                 initial_candidates: Optional[List[LrcLibCandidate]] = None, title: str = "Select lyrics",
-                 audio_duration: Optional[float] = None):
+                 title: str = "Select lyrics", audio_duration: Optional[float] = None):
         super().__init__(parent)
         self.title(title)
         self.iconbitmap('assets/lrcicon.ico')
@@ -194,9 +193,7 @@ class LrcLibSearchDialog(tk.Toplevel):
 
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
-        if initial_candidates is not None:
-            self._set_candidates(initial_candidates)
-        elif initial_artist or initial_title:
+        if initial_artist or initial_title:
             self._do_search()
 
         self.grab_set()
@@ -467,13 +464,11 @@ class App(tk.Tk):
         self.delete_work_files = tk.BooleanVar(value=False)
         self._last_output_parent: Optional[Path] = None  # set after a successful run, for "Open Output Folder"
 
-        # Interactive LRCLIB disambiguation. pinned_lyrics is a manual
+        # Interactive LRCLIB disambiguation: pinned_lyrics is a manual
         # pre-run pick (via the "Search Lyrics..." button) that always
-        # wins outright; lyrics_ambiguity_prompt is the checkbox-gated
-        # mid-run fallback for when nothing was pre-picked. Both are
-        # single-song-mode only -- batch mode always auto-picks silently.
+        # wins outright -- single-song-mode only, batch mode always
+        # auto-picks silently.
         self.pinned_lyrics: Optional[LrcLibCandidate] = None
-        self.lyrics_ambiguity_prompt = tk.BooleanVar(value=False)
         # LRCLIB numeric id override -- lets a user who browsed lrclib.net
         # directly and confirmed a perfect match paste the id back in,
         # bypassing search/scoring entirely for both the MXL+LRC primary
@@ -720,13 +715,6 @@ class App(tk.Tk):
                                       "entirely -- wins over both search and LRCLIB ID above if given.")
         self.lrc_file_browse_button = ttk.Button(lyrics_frame, text="Browse...", command=self._browse_lrc_file)
         self.lrc_file_browse_button.pack(side="left", padx=(2, 0))
-        self.lyrics_ambiguity_check = ttk.Checkbutton(
-            lyrics_frame, text="Ask when lyrics are ambiguous", variable=self.lyrics_ambiguity_prompt)
-        self.lyrics_ambiguity_check.pack(side="left", padx=16)
-        Tooltip(self.lyrics_ambiguity_check, "Off by default. When on (and nothing was manually searched above), "
-                                              "pauses mid-run to let you pick if the automatic LRCLIB search finds "
-                                              "more than one real candidate. Single-song mode only -- batch mode "
-                                              "always auto-picks silently.")
         self._update_pinned_lyrics_label()
 
         # Mirrors the normal pipeline's own Lyrics/Options split immediately
@@ -1110,7 +1098,6 @@ class App(tk.Tk):
         # here is moot for it but harmless to set consistently.
         lyrics_controls_state = tk.DISABLED if is_batch else tk.NORMAL
         self.search_lyrics_button.config(state=lyrics_controls_state)
-        self.lyrics_ambiguity_check.config(state=lyrics_controls_state)
         self.lrclib_id_entry.config(state=lyrics_controls_state)
         self.lrc_file_entry.config(state=lyrics_controls_state)
         self.lrc_file_browse_button.config(state=lyrics_controls_state)
@@ -1147,44 +1134,11 @@ class App(tk.Tk):
             self.pinned_lyrics_label.config(text="")
             self.clear_pinned_button.pack_forget()
 
-    def _make_ambiguity_callback(self) -> Callable[[List[LrcLibCandidate]], Optional[LrcLibCandidate]]:
-        """Returns a callback for PipelineOptions.lyrics_disambiguation_callback.
-        Called from the BACKGROUND pipeline thread (inside fetch_reference_lyrics);
-        schedules the real dialog on the MAIN thread via self.after(0, ...) (the
-        only safe way to touch Tk widgets from another thread), then blocks the
-        background thread on a threading.Event until the dialog closes --
-        wait_window() runs its own nested event loop while waiting, so the main
-        thread (including this same polling/log-draining) stays fully responsive
-        during the pause; only the background pipeline thread is parked.
-
-        Artist/title are captured HERE (before the run starts) to pre-fill the
-        dialog's own search fields -- the callback itself only receives
-        `candidates`, not the artist/title actually used inside run_pipeline,
-        but they should match in the vast majority of cases (same input
-        folder/fields)."""
-        artist, title = self._resolved_artist_title()
-
-        def callback(candidates: List[LrcLibCandidate]) -> Optional[LrcLibCandidate]:
-            result_holder = {}
-            done_event = threading.Event()
-
-            def show_dialog():
-                dlg = LrcLibSearchDialog(self, initial_artist=artist or "", initial_title=title or "",
-                                          initial_candidates=candidates,
-                                          title="Multiple lyrics results found -- pick one")
-                self.wait_window(dlg)
-                result_holder["choice"] = dlg.result
-                done_event.set()
-
-            self.after(0, show_dialog)
-            done_event.wait()
-            return result_holder.get("choice")
-        return callback
-
     def _make_mxl_lrc_fallback_callback(self) -> Callable[[str], bool]:
         """Returns a callback for PipelineOptions.mxl_lrc_fallback_callback.
-        Same thread-hop shape as `_make_ambiguity_callback` (the only safe
-        pattern for a blocking dialog from the background pipeline thread):
+        Same thread-hop shape as `_make_no_lrc_fallback_callback` (the only
+        safe pattern for a blocking dialog from the background pipeline
+        thread):
         `self.after(0, ...)` schedules a `messagebox.askyesno` on the main
         thread, the background thread blocks on a `threading.Event` until
         it's answered. Shown by default whenever the MXL+LRC quality gate
@@ -1363,15 +1317,8 @@ class App(tk.Tk):
             # Interactive LRCLIB disambiguation -- single-song-mode only
             # (see _on_mode_change, which also disables the controls
             # themselves in batch mode). A manual pre-run pick always wins
-            # outright; the ambiguity-prompt callback is only wired up as
-            # a fallback when nothing was pre-picked.
+            # outright.
             pinned_lyrics=self._effective_pinned_lyrics() if not is_batch else None,
-            lyrics_ambiguity_prompt=self.lyrics_ambiguity_prompt.get() if not is_batch else False,
-            lyrics_disambiguation_callback=(
-                self._make_ambiguity_callback()
-                if (not is_batch and self.lyrics_ambiguity_prompt.get() and self.pinned_lyrics is None)
-                else None
-            ),
             # LRCLIB id override -- single-song-mode only, same scoping as
             # pinned_lyrics above (a per-song override doesn't make sense
             # across a batch run of different songs).

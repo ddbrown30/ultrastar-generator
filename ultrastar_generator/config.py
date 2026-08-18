@@ -1,7 +1,7 @@
 """Defaults and constants shared across the pipeline."""
 
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional
+from typing import Callable, Optional
 
 # --- UltraStar note types -------------------------------------------------
 NOTE_NORMAL = ":"
@@ -1079,12 +1079,7 @@ class PipelineOptions:
     # forward-reference string here to avoid a circular import, since
     # lyrics_lookup.py itself imports this module) is a manual pre-run
     # pick that always wins outright, skipping the network fetch entirely.
-    # `lyrics_disambiguation_callback` is the GUI's mid-run fallback for
-    # when nothing was pre-picked -- only ever consulted when
-    # `lyrics_ambiguity_prompt` is on AND `pinned_lyrics` is None.
     pinned_lyrics: Optional["LrcLibCandidate"] = None
-    lyrics_ambiguity_prompt: bool = False
-    lyrics_disambiguation_callback: Optional[Callable[[List[Any]], Optional[Any]]] = None
     # MXL+LRC primary generation path -- see mxl_lrc_generator.py.
     # `lrclib_id`, if set, always wins over both search AND `pinned_lyrics`
     # for candidate selection everywhere a candidate is needed (this new

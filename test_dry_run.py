@@ -1473,59 +1473,6 @@ assert abs(slc_bad_duration_match.duration_delta - 2.0) < 1e-6, slc_bad_duration
 print("  OK: candidate survived the duration filter and scoring using its own real last-lyric timestamp "
       "(98s, 2s off), not its untrustworthy reported duration (50s, 50s off, would have failed the filter)")
 
-print("\n--- lyrics_lookup._fetch_from_lrclib: on_ambiguous callback (GUI disambiguation path) ---")
-# Dedicated fixture (config.LRCLIB_DURATION_TOLERANCE_SEC == 60.0, so the
-# ambiguity filter's 3x-tolerance cutoff is 180s): duration_sec=100 makes
-# the 350s candidate's diff (250s) clearly exceed 180s -> excluded from
-# "real" candidates, while the two ~100s candidates (diff 5s/10s) stay in.
-ambiguous_candidates = [
-    {"trackName": "Song", "artistName": "Artist", "duration": 30,
-     "instrumental": True, "plainLyrics": None, "syncedLyrics": None},  # excluded: instrumental
-    {"trackName": "Song", "artistName": "Artist", "duration": 350,
-     "instrumental": False, "plainLyrics": "wildly different recording",
-     "syncedLyrics": "[00:01.00]wildly different recording"},  # excluded: duration (synced doesn't save it)
-    {"trackName": "Song", "artistName": "Artist", "duration": 105,
-     "instrumental": False, "plainLyrics": "candidate A", "syncedLyrics": "[00:01.00]candidate A"},
-    {"trackName": "Song", "artistName": "Artist", "duration": 110,
-     "instrumental": False, "plainLyrics": "candidate B", "syncedLyrics": "[00:01.00]candidate B"},
-]
-_sys.modules["requests"] = _FakeRequestsModule(search_payload=ambiguous_candidates)
-seen_real_candidates = []
-
-
-def _pick_second(candidates):
-    seen_real_candidates.append(candidates)
-    return candidates[1]  # deliberately NOT the auto-pick winner (candidate A scores higher: closer duration)
-
-
-chosen = _fetch_from_lrclib("Artist", "Song", duration_sec=100.0, on_ambiguous=_pick_second)
-assert len(seen_real_candidates) == 1
-real_seen = seen_real_candidates[0]
-assert len(real_seen) == 2, [c.plain_lyrics for c in real_seen]
-assert {c.plain_lyrics for c in real_seen} == {"candidate A", "candidate B"}
-assert chosen is not None and chosen.plain_lyrics == "candidate B"
-print("OK: on_ambiguous is offered only the filtered 'real' candidates (instrumental and wildly-off-duration "
-      "both excluded), and its choice is used directly -- even when it's NOT what automatic scoring would pick")
-
-_sys.modules["requests"] = _FakeRequestsModule(search_payload=ambiguous_candidates)
-
-
-def _decline(candidates):
-    return None  # user cancelled the popup
-
-
-declined = _fetch_from_lrclib("Artist", "Song", duration_sec=100.0, on_ambiguous=_decline)
-assert declined is not None and declined.plain_lyrics == "candidate A", declined
-print("OK: on_ambiguous returning None (user cancelled) falls through to the normal automatic pick")
-
-# A single-real-candidate case must NOT invoke on_ambiguous at all -- no ambiguity to resolve.
-_sys.modules["requests"] = _FakeRequestsModule(search_payload=[ambiguous_candidates[0], ambiguous_candidates[2]])
-was_called = []
-_fetch_from_lrclib("Artist", "Song", duration_sec=105.0, on_ambiguous=lambda c: was_called.append(c) or None)
-assert not was_called, "on_ambiguous must not fire when there's only one real candidate"
-print("OK: on_ambiguous is never invoked when there's only one real (non-instrumental) candidate")
-del _sys.modules["requests"]
-
 print("\n--- lyrics_lookup.fetch_reference_lyrics: LRCLIB is the only source (lyrics.ovh removed "
       "2026-08-15) -- an empty search returns None, no fallback source left to try ---")
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=[])

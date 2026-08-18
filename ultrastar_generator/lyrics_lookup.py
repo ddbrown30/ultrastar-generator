@@ -41,7 +41,7 @@ import difflib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from . import config
 from .models import Word
@@ -244,27 +244,6 @@ def load_lrc_file(path, artist: str = "", title: str = "") -> Optional[LrcLibCan
     )
 
 
-def _real_lrclib_candidates(candidates: List[LrcLibCandidate],
-                             duration_sec: Optional[float]) -> List[LrcLibCandidate]:
-    """Filters to candidates worth treating as genuine options for
-    ambiguity-prompt purposes: not instrumental, has real lyrics, HAS
-    SYNCED LYRICS (2026-08-15 -- a plain-lyrics-only candidate is not a
-    valid option at all, not even a worse one), and -- if both durations
-    are known -- not wildly off from our own audio's length (a generous
-    3x the normal scoring tolerance, just to exclude obviously-different
-    recordings, not to pick a winner)."""
-    real = []
-    for c in candidates:
-        if c.instrumental or not c.plain_lyrics or not c.synced_lyrics:
-            continue
-        c_duration = effective_lrc_duration(c)
-        if duration_sec is not None and c_duration:
-            if abs(c_duration - duration_sec) > 3 * config.LRCLIB_DURATION_TOLERANCE_SEC:
-                continue
-        real.append(c)
-    return real
-
-
 def _score_lrclib_candidate(c: LrcLibCandidate, duration_sec: Optional[float]) -> float:
     """Same scoring `_fetch_from_lrclib` always used, factored out so
     both the automatic-pick path and (if it ever needs one) a caller can
@@ -283,7 +262,6 @@ def _score_lrclib_candidate(c: LrcLibCandidate, duration_sec: Optional[float]) -
 
 def _fetch_from_lrclib(
         artist: str, title: str, duration_sec: Optional[float] = None,
-        on_ambiguous: Optional[Callable[[List[LrcLibCandidate]], Optional[LrcLibCandidate]]] = None,
 ) -> Optional[LyricsResult]:
     """Searches LRCLIB and picks the best candidate.
 
@@ -297,25 +275,10 @@ def _fetch_from_lrclib(
     left, a candidate whose duration is far from ours is heavily
     penalized (but not excluded -- still better than nothing if it's the
     only one left).
-
-    `on_ambiguous`, if given, is called with the "real" (already
-    instrumental/no-lyrics/non-synced/wildly-off-duration filtered)
-    candidates whenever there's more than one -- letting a human (the
-    GUI's ambiguity-prompt checkbox) pick instead of trusting the
-    automatic score. A returned candidate is used directly; returning
-    None (user cancelled) falls through to the normal automatic pick
-    below.
     """
     candidates = search_lrclib(artist, title)
     if not candidates:
         return None
-
-    if on_ambiguous is not None:
-        real = _real_lrclib_candidates(candidates, duration_sec)
-        if len(real) > 1:
-            chosen = on_ambiguous(real)
-            if chosen is not None:
-                return chosen.to_lyrics_result()
 
     best = max(candidates, key=lambda c: _score_lrclib_candidate(c, duration_sec))
     if _score_lrclib_candidate(best, duration_sec) < 0:
@@ -325,21 +288,17 @@ def _fetch_from_lrclib(
 
 def fetch_reference_lyrics(
         artist: str, title: str, duration_sec: Optional[float] = None,
-        on_ambiguous: Optional[Callable[[List[LrcLibCandidate]], Optional[LrcLibCandidate]]] = None,
 ) -> Optional[LyricsResult]:
     """Searches LRCLIB (the only reference-lyrics source, see this
     module's own docstring) for a candidate with synced lyrics.
     `duration_sec` (our own audio's length) helps LRCLIB's search
     disambiguate between same-title candidates; pass it when available.
-    `on_ambiguous`, if given, lets a human resolve a genuinely ambiguous
-    LRCLIB result (see `_fetch_from_lrclib`'s own docstring) -- never set
-    outside the GUI, so the CLI's own behavior is completely unchanged.
     Returns None if no valid (synced) candidate was found -- best-effort
     only; `main.py`'s `no_lrc_fallback_callback` (GUI only) is where a
     None here gets surfaced to the user before silently continuing with
     pure ASR transcription.
     """
-    return _fetch_from_lrclib(artist, title, duration_sec, on_ambiguous=on_ambiguous)
+    return _fetch_from_lrclib(artist, title, duration_sec)
 
 
 def reference_match_ratio(ref_lines: List[str], words: List[Word]) -> float:

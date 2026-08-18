@@ -871,10 +871,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 reference = forced_lrc_candidate.to_lyrics_result()
             else:
                 log("Fetching reference lyrics (LRCLIB, synced lyrics only)...")
-                reference = fetch_reference_lyrics(
-                    artist, title, duration_sec=audio_duration,
-                    on_ambiguous=opts.lyrics_disambiguation_callback if opts.lyrics_ambiguity_prompt else None,
-                )
+                reference = fetch_reference_lyrics(artist, title, duration_sec=audio_duration)
                 if reference is None:
                     reason = (f"No valid synced-lyrics candidate was found on LRCLIB for "
                               f"{artist!r} - {title!r}.")

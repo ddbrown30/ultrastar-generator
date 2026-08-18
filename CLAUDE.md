@@ -317,6 +317,22 @@ to the gui at the same time.
   until it is. All investigation scripts kept in `scratchpad/` (not
   committed): `mixed_vs_isolated_pass1.py`, `hybrid_pitch_prototype.py`
   (both runnable with an optional `rmvpe`/`swiftf0` CLI arg).
+- **GUI automatic mid-run lyrics-ambiguity prompt**: fully removed
+  2026-08-17 (user's explicit request, not a data-quality finding like
+  the other entries here). Was an opt-in checkbox ("Ask when lyrics are
+  ambiguous") that paused the background pipeline thread mid-run and
+  opened `LrcLibSearchDialog` on the main thread via the `self.after(0,
+  ...)` + `threading.Event` pattern when LRCLIB search found more than
+  one real candidate and nothing was pre-picked. Removed entirely:
+  `config.PipelineOptions.lyrics_ambiguity_prompt`/
+  `lyrics_disambiguation_callback`; `lyrics_lookup._fetch_from_lrclib`/
+  `fetch_reference_lyrics`'s `on_ambiguous` parameter and the now-dead
+  `_real_lrclib_candidates` helper that fed it; `gui.py`'s checkbox
+  widget, `App._make_ambiguity_callback`, and `LrcLibSearchDialog`'s
+  `initial_candidates` param (its only caller). The manual pre-run
+  "Search Lyrics..." button/dialog and `pinned_lyrics`/`--lrclib-id`/
+  `--lrc-file` are all unrelated and unaffected — this only removed the
+  automatic mid-run popup.
 
 ## Shipped defaults / current config (as of 2026-08-15)
 
@@ -610,15 +626,6 @@ to the gui at the same time.
 
 - Manual "Search Lyrics..." button + dialog to pick/pin a candidate
   (`PipelineOptions.pinned_lyrics` always wins over automatic fetch).
-- Automatic mid-run ambiguity prompt (opt-in checkbox, single-song mode
-  only): pauses the background pipeline thread, opens the same dialog
-  on the main thread via `self.after(0, ...)` + `threading.Event`,
-  resumes on selection/cancel. Never triggered in batch mode. **Gotcha**:
-  cross-thread `self.after(...)` only works when the main thread is
-  genuinely inside a real `Tk.mainloop()` — a manual `update()`-polling
-  test loop raises `RuntimeError: main thread is not in main loop`, so
-  any test exercising this path needs a real `mainloop()` (a watchdog
-  thread calling `app.after(0, app.quit)` to stop it).
 - `--lrclib-id <id>` / GUI "LRCLIB ID" field fetches one specific entry
   directly (`/api/get/<id>`), always wins over search/pinning.
   `--lrc-file <path>` (CLI + GUI Browse) builds the same pinned
@@ -651,10 +658,10 @@ generously and still be timed to a *different recording* entirely
 audio's real ASR transcript. A wrong-recording candidate collapses this
 on its own. On gate failure: CLI logs a warning and falls through to
 standard pass 1–4 pipeline; GUI (single-song only) prompts
-Continue/Cancel via the same thread-hop pattern as the lyrics
-ambiguity prompt. An `ASR quality retry` (re-transcribe with large-v3,
-see the `realign.py` section below) fires before giving up, when
-`opts.batch` is set.
+Continue/Cancel via the same `self.after(0, ...)` + `threading.Event`
+thread-hop pattern `no_lrc_fallback_callback` also uses. An `ASR quality
+retry` (re-transcribe with large-v3, see the `realign.py` section below)
+fires before giving up, when `opts.batch` is set.
 
 **Real production bugs found and fixed** (validated against the actual
 written file, not in-memory floats — a critical distinction: the
