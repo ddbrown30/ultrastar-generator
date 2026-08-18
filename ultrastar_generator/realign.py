@@ -602,7 +602,8 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
         our_idx_to_li = {our_idx: li for li, our_idx in enumerate(reconciliation.our_line_index)}
         word_lines = [our_idx_to_li.get(our_line) for our_line in our_line_of_word]
     else:
-        word_lines, _clean_text, _group, _group_text = assign_words_to_lines(fake_words, lrc_lines)
+        word_lines, _clean_text, _group, _group_text, _syl_override, _lrc_candidate = assign_words_to_lines(
+            fake_words, lrc_lines)
 
     return LrcPrep(lrc_match=lrc_match, lrc_lines=lrc_lines, word_lines=word_lines,
                     calibration_offset=offset, calibration_kind=kind, calibration_confidence=confidence)

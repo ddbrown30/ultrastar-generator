@@ -33,25 +33,103 @@ Heuristic fallback (non-strict mode only), in priority order:
      break at the next word boundary that has at least a small
      (PREFERRED_LINE_GAP_SEC) gap, to avoid mid-word splits.
   3. If neither applies but the line is *way* over length (1.5x max),
-     force a break at the next word boundary anyway, so no single line
-     runs on indefinitely.
+     the length safety net fires -- but ONLY for a KNOWN reference-line
+     segment does it get to choose WHERE (see `_segment_overflow_break_
+     before`'s own docstring): the whole segment (a contiguous run of
+     syllables sharing one known line_id) is scanned up front for a
+     punctuation-marked word near its own middle to break after; an
+     overlong segment with no such punctuation is left whole, unbroken
+     (2026-08-19, user's explicit request after a real case broke
+     "...it's just an ordinary day," right before the trailing "day,"
+     purely because that's where the running syllable count happened to
+     cross the threshold, not because of anything about the text there).
+     Content with no known line_id at all still breaks mechanically at
+     the next word boundary once over-length -- there's no bounded
+     segment to scan ahead of time for that content.
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional, Set
 
 from . import config
 from .models import Syllable, LineBreak
 
+_OVERFLOW_BREAK_PUNCTUATION = (",", ".")
+
+
+def _segment_overflow_break_before(seg: List[Syllable]) -> Optional[int]:
+    """Given one reference-line segment (a contiguous run of Syllable
+    sharing the same known line_id, already confirmed to overflow
+    `MAX_SYLLABLES_PER_LINE * 1.5`), returns the segment-local syllable
+    index to break BEFORE -- the word-start nearest the segment's own
+    middle whose PRECEDING word ends in trailing comma/period
+    punctuation. Returns None (don't break at all) when no such
+    punctuation exists in the segment's INTERIOR.
+
+    Deliberately excludes both the first word (breaking there would
+    leave an empty first line) and the LAST word's own trailing
+    punctuation specifically -- a reference line's own final word
+    almost always ends in terminal punctuation, and that's the line's
+    own sentence-ending mark, not a real interior clause boundary (real
+    case: "I've got a smile on my face and I've got four walls around
+    me," has exactly one comma, on its own final word -- the correct
+    outcome is leaving this whole line unbroken, not splitting off
+    "me," as its own one-word line)."""
+    word_start_indices = [i for i, s in enumerate(seg) if s.is_word_start]
+    if len(word_start_indices) < 3:
+        return None
+    mid = len(seg) / 2.0
+    candidates = []
+    for wi in word_start_indices[1:-1]:
+        prev_text = (seg[wi - 1].text or "").rstrip()
+        if prev_text and prev_text[-1] in _OVERFLOW_BREAK_PUNCTUATION:
+            candidates.append(wi)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda wi: abs(wi - mid))
+
+
+def _find_reference_overflow_breaks(syllables: List[Syllable]) -> Set[int]:
+    """Precomputes indices (into `syllables`) where an extra LineBreak
+    should be forced for the length safety net, scoped to confidently-
+    tracked reference-line segments (contiguous runs sharing the same
+    known Syllable.line_id) that overflow `MAX_SYLLABLES_PER_LINE * 1.5`
+    -- see `_segment_overflow_break_before`'s own docstring for the
+    split-point rule. Content with no known line_id is left entirely to
+    `build_lines`'s own streaming gap/length heuristics, unaffected by
+    this."""
+    breaks: Set[int] = set()
+    n = len(syllables)
+    i = 0
+    while i < n:
+        lid = syllables[i].line_id
+        if lid is None:
+            i += 1
+            continue
+        j = i
+        while j < n and syllables[j].line_id == lid:
+            j += 1
+        seg = syllables[i:j]
+        if len(seg) >= int(config.MAX_SYLLABLES_PER_LINE * 1.5):
+            local = _segment_overflow_break_before(seg)
+            if local is not None:
+                breaks.add(i + local)
+        i = j
+    return breaks
+
 
 def build_lines(syllables: List[Syllable], strict_reference_lines: bool = False) -> List[object]:
+    extra_breaks_before: Set[int] = (
+        set() if strict_reference_lines else _find_reference_overflow_breaks(syllables)
+    )
+
     entries: List[object] = []
     current_line_len = 0
     prev_end = None
     current_line_id = None
 
-    for syl in syllables:
+    for idx, syl in enumerate(syllables):
         if syl.is_word_start and prev_end is not None:
             line_id_changed = (
                 current_line_id is not None
@@ -80,10 +158,13 @@ def build_lines(syllables: List[Syllable], strict_reference_lines: bool = False)
                     # (real case: "Just a little change" has an audible
                     # pause before "change" that used to force a spurious
                     # break here). Only the implausible-length safety net
-                    # still applies.
-                    force_break = False
+                    # still applies, and only at the precomputed segment-
+                    # level punctuation split point (if any) -- never
+                    # mechanically at whichever word boundary the running
+                    # count happens to cross.
+                    force_break = idx in extra_breaks_before
                     soft_break = False
-                    hard_overflow = current_line_len >= int(config.MAX_SYLLABLES_PER_LINE * 1.5)
+                    hard_overflow = False
                 else:
                     force_break = line_id_changed or gap >= config.MIN_LINE_GAP_SEC
                     soft_break = (

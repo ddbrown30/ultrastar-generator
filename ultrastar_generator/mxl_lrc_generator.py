@@ -473,9 +473,60 @@ def _distribute_words_to_slots(lrc_words_raw: List[str], n_slots: int,
     return words
 
 
+def _slice_time_by_weights(offset: float, dur: float, weights: List[int]) -> List[Tuple[float, float]]:
+    """Splits one note's own (offset, duration) span into len(weights)
+    proportionally-sized sub-spans -- used to synthesize new note slots
+    for an MXL word that OCR-merged multiple real spoken words onto a
+    SINGLE physical note with no spare slot to borrow (unlike the
+    right,it's/ellipsis repairs in `load_mxl_vocal_words`, which only
+    fire when an adjacent note already exists with no lyric of its own
+    to move text onto -- here there isn't one). Weights are each target
+    syllable's own character length, same proportional-by-letters
+    philosophy as `_slice_by_weights`, just applied to TIME instead of a
+    text string, since a single garbled note carries no real
+    per-syllable rhythm info to recover."""
+    total = sum(weights) or len(weights)
+    spans = []
+    acc = 0.0
+    start = offset
+    for i, w in enumerate(weights):
+        acc += w
+        end = offset + dur if i == len(weights) - 1 else offset + dur * (acc / total)
+        end = max(end, start + 1e-6)
+        spans.append((start, end - start))
+        start = end
+    return spans
+
+
+def _flatten_real_syllables(words_slice: List[MxlWord]) -> List[Tuple[int, int]]:
+    """Returns (word_local_idx, syllable_idx) for every REAL (non-empty)
+    syllable across a slice of MXL words, in order -- the flattened
+    positions a cross-word syllable-level reconciliation (see
+    `assign_words_to_lines`'s own docstring) matches against."""
+    flat = []
+    for wi, w in enumerate(words_slice):
+        for si, (_, _, _, text) in enumerate(w.syllables):
+            if text:
+                flat.append((wi, si))
+    return flat
+
+
+def _hyphenate_token(tok: str) -> List[str]:
+    """Splits one recovered LRC token into syllable-shaped pieces for
+    cross-word reconciliation -- a literal hyphen (a real compound word,
+    e.g. "double-edged") always wins over guessing; otherwise falls back
+    to `syllables.hyphenate` (the same real-word-boundary-aware splitter
+    the non-MXL path uses)."""
+    if "-" in tok:
+        pieces = [p for p in tok.split("-") if p]
+        if pieces:
+            return pieces
+    return hyphenate(tok)
+
+
 def assign_words_to_lines(
         mxl_words: List[MxlWord],
-        lrc_lines: List[Tuple[float, str]]) -> Tuple[List[int], List[Optional[str]], List[int], dict]:
+        lrc_lines: List[Tuple[float, str]]) -> Tuple[List[int], List[Optional[str]], List[int], dict, dict, dict]:
     """Assigns each MXL word to an LRC line index via word-level
     whole-sequence matching (order-preserving, resistant to picking a
     wrong repeated-phrase instance the same way this project's other
@@ -517,13 +568,63 @@ def assign_words_to_lines(
         own); MXL "double"+"edged"+"kide" (3 words) for LRC
         "double-edged"+"knife," (2 words, one hyphenated). The WHOLE
         block's concatenated characters (not each word pair individually)
-        must clear `MXL_LRC_FUZZY_TEXT_MIN_RATIO`, then the recovered LRC
-        words are distributed across the MXL block's own word slots via
-        `_distribute_words_to_slots` -- splitting a hyphenated LRC word
-        into pieces first if that's what's needed to make the counts
-        line up (the "double-edged"/"kide" case), otherwise merging or
-        melisma-padding the same way syllable counts are already
-        reconciled elsewhere in this module.
+        must clear `MXL_LRC_FUZZY_TEXT_MIN_RATIO`.
+
+        Within a confirmed block, a SYLLABLE-LEVEL reconciliation is
+        tried FIRST (2026-08-18, user's own proposed design): flatten the
+        block's own REAL per-note syllables in order (`_flatten_real_
+        syllables`) and build a same-length list of TARGET syllables to
+        pair against them positionally, verifying each pair's own
+        character-level similarity clears `MXL_LRC_FUZZY_TEXT_MIN_RATIO`
+        too (not just the whole block). The target list is built one of
+        two ways depending on how many real LRC words the block recovers:
+          - Exactly ONE recovered word spanning several flattened slots
+            (e.g. "ne"+"ver" -> "never"): sliced via `_slice_by_weights`
+            using the MXL's own real per-syllable LETTER lengths as
+            weights -- same mechanism `_text_for_mxl_syllables` already
+            uses within one word. Deliberately NOT `hyphenate()` here:
+            the MXL's own letters are already correct in this shape (only
+            the WORD boundary was wrong), so a generic hyphenation guess
+            would throw away trustworthy data for an ambiguous one (real
+            case: `hyphenate("never")` itself is genuinely ambiguous --
+            "nev"/"er" by pyphen's own tie-break default -- while
+            `_slice_by_weights` reconstructs the MXL's own real "ne"/
+            "ver" exactly, since "ne"(2)+"ver"(3) sums to "never"'s own
+            5 letters precisely).
+          - MULTIPLE recovered words (e.g. "stop"+"trying,"): each token
+            hyphenated independently (`_hyphenate_token`, a literal "-"
+            wins over guessing, matching a real compound word) and
+            concatenated in order. Real motivating case: the "stomty"+
+            "in" block -- WORD-level assignment alone gives "stomty" the
+            whole word "stop" (2 real MXL syllable slots vs 1 real target
+            syllable) and "in" the whole "trying," (1 slot vs 2 target
+            syllables), scrambling the display text ("sto"/"p" and an
+            un-split "trying,") even though the block match itself was
+            correct. Flattened, this block is 3 real MXL syllables
+            ("stom"/"ty"/"in") against 3 target syllables ("stop"/"try"/
+            "ing,") -- a clean positional match ("stom"~"stop", "ty"~
+            "try", "in"~"ing," each individually clearing the fuzzy bar)
+            that lands each syllable on its own real note directly, no
+            further within-word reconciliation needed. This is also the
+            intended mechanism for a "-in'" vs "-ing" NOTATION difference
+            between MXL and LRC (e.g. "tryin'"/"trying", "swingin'"/
+            "swinging") -- deliberately a FUZZY per-syllable comparison,
+            not an exact one, for this reason.
+        When the flattened counts DON'T match and the block is exactly
+        ONE MXL word recovering MULTIPLE real LRC words (the "winnes"
+        case above is actually this path, not the syllable-level one --
+        it has only 1 real note, so 1 vs 2 flattened slots never
+        matches): the single note has no spare slot to reuse at all
+        (unlike right,it's/the ellipsis case, both of which borrow an
+        ALREADY-EXISTING adjacent blank note in `load_mxl_vocal_words`),
+        so `_slice_time_by_weights` synthesizes new note slots by
+        splitting the ONE note's own (offset, duration) span
+        proportionally by each target syllable's own character length,
+        and the word's `syllables` list is replaced wholesale (all
+        synthesized slots share the original note's own pitch -- a
+        single merged note has no per-syllable pitch info to recover).
+        Falls through to the WORD-level `_distribute_words_to_slots`
+        path below (unchanged) whenever neither of the above applies.
 
     ALSO returns `word_group` and `word_group_text` (2026-08-18, user's
     explicit correction: a word spanning several MXL NOTES is a normal,
@@ -545,7 +646,30 @@ def assign_words_to_lines(
     match down to a less-reliable interpolated guess. NOT set for the
     "double"+"edged"+"kide" shape -- there each MXL slot recovers its OWN
     distinct real word, and those genuinely are separate, independently
-    matchable spoken words."""
+    matchable spoken words.
+
+    ALSO returns `word_syllable_override`: `{mxl_word_index: [display
+    text per syllable slot]}`, set ONLY by the syllable-level
+    reconciliation above. When present for a word, `build_syllables`
+    uses it DIRECTLY instead of calling `_text_for_mxl_syllables` --
+    the override already carries the correct per-syllable text (and
+    "~" for any of that word's own untexted continuation slots), so
+    re-deriving it from a single per-word `word_clean_text` string
+    would lose the cross-word split this mechanism exists to fix.
+
+    ALSO returns `word_lrc_candidate`: `{mxl_word_index: rejected LRC
+    token text}`, set ONLY for a 1:1 replace pair whose fuzzy ratio fell
+    short of `config.MXL_LRC_FUZZY_TEXT_MIN_RATIO` (real case, Ordinary
+    Day, 2026-08-19: MXL OCR'd "sink" as "souk", ratio 0.5 < 0.6 -- too
+    different to trust directly, but still the position difflib's own
+    whole-sequence alignment decided is the best fit). `place_words_via_
+    asr` tries this candidate directly against the real ASR transcript;
+    only if ASR independently confirms it does the word's DISPLAY text
+    (not just its timing) get upgraded from the MXL's own raw OCR text
+    to this candidate -- an MXL<->LRC text mismatch alone is never
+    enough, since that's exactly what already failed here, but an
+    ASR<->LRC agreement is real independent corroboration the direct
+    comparison didn't have access to."""
     lrc_flat: List[str] = []       # normalized, for matching
     lrc_flat_raw: List[str] = []   # raw, for display substitution
     lrc_line_idx: List[int] = []
@@ -563,6 +687,8 @@ def assign_words_to_lines(
     word_clean_text: dict = {}
     word_group = list(range(len(mxl_words)))  # identity by default -- each word its own group
     word_group_text: dict = {}
+    word_syllable_override: dict = {}
+    word_lrc_candidate: dict = {}
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
@@ -573,25 +699,129 @@ def assign_words_to_lines(
             if ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO:
                 word_line[i1] = lrc_line_idx[j1]
                 word_clean_text[i1] = lrc_flat_raw[j1]
-            # else: genuinely too different -- leave unmatched, falls
-            # through to MXL's own raw text same as before.
+            else:
+                # Real case (Ordinary Day, 2026-08-19): MXL OCR'd "sink"
+                # as "souk" -- too different from the LRC token to trust
+                # directly (ratio 0.5 < 0.6), but this IS the position
+                # difflib's own whole-sequence alignment (anchored by
+                # correctly-matched words on both sides) already decided
+                # is the best fit. Kept as an UNCONFIRMED candidate --
+                # `place_words_via_asr` tries matching it directly
+                # against the real ASR transcript, and only trusts it
+                # (as both timing AND display text) if ASR independently
+                # confirms it; otherwise this word falls through to the
+                # MXL's own raw OCR text exactly as before.
+                word_lrc_candidate[i1] = lrc_flat_raw[j1]
         elif (tag == "replace" and (i2 - i1) <= config.MXL_LRC_BLOCK_MAX_WORDS
               and (j2 - j1) <= config.MXL_LRC_BLOCK_MAX_WORDS):
             mxl_block_norm = "".join(mxl_norm[i1:i2])
             lrc_block_norm = "".join(lrc_flat[j1:j2])
             ratio = difflib.SequenceMatcher(None, mxl_block_norm, lrc_block_norm).ratio()
             if ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO:
-                assigned = _distribute_words_to_slots(
-                    lrc_flat_raw[j1:j2], i2 - i1,
-                    mxl_slot_texts=[w.text for w in mxl_words[i1:i2]])
                 for k in range(i2 - i1):
                     word_line[i1 + k] = lrc_line_idx[j1]
-                    word_clean_text[i1 + k] = assigned[k]
+
+                # Syllable-level reconciliation first (see this
+                # function's own docstring, "stomty"+"in" case) -- only
+                # applies on a clean flattened-count match, each pair
+                # individually fuzzy-verified too.
+                block_words = mxl_words[i1:i2]
+                flat_real = _flatten_real_syllables(block_words)
+                if j2 - j1 == 1:
+                    # A SINGLE recovered LRC word spanning several MXL
+                    # syllable slots (e.g. "ne"+"ver" -> "never") -- slice
+                    # it using the MXL's own real per-syllable LETTER
+                    # lengths as weights (`_slice_by_weights`, same
+                    # mechanism `_text_for_mxl_syllables` already uses
+                    # within one word), not a linguistic hyphenation
+                    # guess: the MXL's own letters are already correct
+                    # here (only the WORD boundary was wrong), so
+                    # `hyphenate("never")` would throw away trustworthy
+                    # data for an ambiguous guess ("nev"/"er" instead of
+                    # the MXL's own real "ne"/"ver").
+                    real_weights = [max(1, len(block_words[wi].syllables[si][3])) for wi, si in flat_real]
+                    sliced = _slice_by_weights(lrc_flat_raw[j1], real_weights) if flat_real else None
+                    target_syllables: List[str] = sliced if sliced is not None else []
+                    # A single recovered token -- only its own FIRST
+                    # piece is a real word start, every other piece is a
+                    # continuation syllable of that SAME word (e.g. "ne"
+                    # starts "never", "ver" doesn't), matching how a
+                    # normal multi-syllable single MXL word already
+                    # behaves via its own syl_i==0 check.
+                    target_is_new_word = [i == 0 for i in range(len(target_syllables))]
+                else:
+                    target_syllables = []
+                    target_is_new_word = []
+                    for tok in lrc_flat_raw[j1:j2]:
+                        pieces = _hyphenate_token(tok)
+                        target_syllables.extend(pieces)
+                        target_is_new_word.extend(i == 0 for i in range(len(pieces)))
+                applied_syllable_level = False
+                if flat_real and len(flat_real) == len(target_syllables):
+                    pair_ratios = [
+                        difflib.SequenceMatcher(
+                            None, _normalize(block_words[wi].syllables[si][3]), _normalize(piece)
+                        ).ratio()
+                        for (wi, si), piece in zip(flat_real, target_syllables)
+                    ]
+                    if all(r >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO for r in pair_ratios):
+                        for (wi, si), piece, is_new in zip(flat_real, target_syllables, target_is_new_word):
+                            gi = i1 + wi
+                            if gi not in word_syllable_override:
+                                word_syllable_override[gi] = [
+                                    (config.MELISMA_CONTINUATION_TEXT, False)] * len(block_words[wi].syllables)
+                            word_syllable_override[gi][si] = (piece, is_new)
+                        applied_syllable_level = True
+
+                if not applied_syllable_level and (i2 - i1) == 1 and (j2 - j1) > 1:
+                    # Real OCR/engraving defect (2026-08-19, user-
+                    # identified real case, "Great Big Sea - Ordinary
+                    # Day": MXL "winnes" -- a SINGLE physical note --
+                    # OCR-merged TWO real spoken words ("win"+"now")
+                    # with no separator at all, and no spare blank note
+                    # to borrow (unlike the right,it's/ellipsis repairs
+                    # in `load_mxl_vocal_words`, which only fire when an
+                    # adjacent note already exists with no lyric of its
+                    # own). The note's own (offset, duration) span is
+                    # the only trustworthy signal left to recover a
+                    # split from -- synthesize `len(target_syllables)`
+                    # new note slots proportional to each target
+                    # syllable's own character length
+                    # (`_slice_time_by_weights`, same weighting
+                    # philosophy as `_slice_by_weights`, applied to TIME
+                    # instead of a text string) and replace the word's
+                    # own syllable list wholesale, all sharing the
+                    # original note's own pitch (a single merged note
+                    # carries no per-syllable pitch info to recover).
+                    only_word = block_words[0]
+                    o0 = only_word.syllables[0][0]
+                    d0 = (only_word.syllables[-1][0] + only_word.syllables[-1][1]) - o0
+                    midi0 = only_word.syllables[0][2]
+                    weights = [max(1, len(s)) for s in target_syllables]
+                    spans = _slice_time_by_weights(o0, d0, weights)
+                    only_word.syllables = [(off, dur, midi0, piece)
+                                            for (off, dur), piece in zip(spans, target_syllables)]
+                    word_syllable_override[i1] = list(zip(target_syllables, target_is_new_word))
+                    applied_syllable_level = True
+
+                if not applied_syllable_level:
+                    assigned = _distribute_words_to_slots(
+                        lrc_flat_raw[j1:j2], i2 - i1,
+                        mxl_slot_texts=[w.text for w in mxl_words[i1:i2]])
+                    for k in range(i2 - i1):
+                        word_clean_text[i1 + k] = assigned[k]
+
                 if (i2 - i1) > 1 and (j2 - j1) == 1:
                     # Several separate MXL WORDS recovered to exactly ONE
                     # real LRC word -- group them (see this function's own
                     # docstring) so place_words_via_asr searches the real
-                    # ASR transcript for the whole word ONCE.
+                    # ASR transcript for the whole word ONCE. Applies
+                    # REGARDLESS of which text path above fired -- a real
+                    # confirmed case (Stars' own "ne"+"ver") hits BOTH:
+                    # the syllable-level path already gets the DISPLAYED
+                    # text right, but place_words_via_asr still needs the
+                    # grouping to search ASR for "never" as a whole,
+                    # never "ne"/"ver" separately.
                     for k in range(i1, i2):
                         word_group[k] = i1
                     word_group_text[i1] = lrc_flat_raw[j1]
@@ -609,7 +839,7 @@ def assign_words_to_lines(
     first_known = next((v for v in filled if v is not None), None)
     lines = [v if v is not None else first_known for v in filled]
     clean_text = [word_clean_text.get(i) for i in range(n)]
-    return lines, clean_text, word_group, word_group_text
+    return lines, clean_text, word_group, word_group_text, word_syllable_override, word_lrc_candidate
 
 
 @dataclass
@@ -628,7 +858,8 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
                          asr_words: List[Word],
                          word_clean_text: Optional[List[Optional[str]]] = None,
                          word_group: Optional[List[int]] = None,
-                         word_group_text: Optional[dict] = None) -> Tuple[List[float], List[float], MxlLrcQuality]:
+                         word_group_text: Optional[dict] = None,
+                         word_lrc_candidate: Optional[dict] = None) -> Tuple[List[float], List[float], MxlLrcQuality]:
     """PASS 0 (2026-08-18): for each GROUPED block (`word_group`/
     `word_group_text` from `assign_words_to_lines` -- several separate
     MXL words the MXL itself notated for what's really ONE spoken/sung
@@ -683,6 +914,25 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
     timestamp, independent of anything else in this pipeline. A
     low-confidence "match" is treated as no match at all. A trusted
     match's START/END come directly from the ASR word's own values.
+
+    A word with NO `word_clean_text` (its own MXL<->LRC 1:1 fuzzy check
+    already failed in `assign_words_to_lines`) tries `word_lrc_candidate`
+    -- that REJECTED LRC token -- ahead of the MXL's own raw OCR norm,
+    real case (Ordinary Day, 2026-08-19): MXL OCR'd "sink" as "souk",
+    too different from LRC's own "sink" to trust directly (ratio 0.5 <
+    the 0.6 display-text bar), and ALSO too different from "souk" for
+    ASR's real "sink" to ever match against the raw OCR norm either --
+    both comparisons were doomed by the SAME bad OCR text. Trying the
+    LRC candidate instead gives ASR a text worth matching against; if it
+    DOES confirm (clears the same confidence bar as any other Pass 1
+    match), the word's DISPLAY text is upgraded to the candidate too
+    (`word_clean_text[global_i]` is set here, not just start/end) --
+    an ASR<->LRC agreement is real independent corroboration neither the
+    MXL<->LRC nor the MXL<->ASR direct comparison had access to on their
+    own. A word whose candidate ISN'T confirmed by ASR falls through to
+    Pass 2 with its display text unchanged (still the MXL's own raw OCR
+    text), exactly as before this existed -- no regression risk, since
+    an unconfirmed candidate changes nothing.
 
     PASS 2: every remaining (non-confident) word is placed by
     interpolating from its NEAREST CONFIDENT neighbors (by MXL offset
@@ -758,8 +1008,18 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
         idxs = sorted(i for i in idxs if i not in grouped_handled)
         t0, t1 = lrc_line_window(lrc_lines, li)
         asr_in_window = words_in_time_window(asr_words, t0, t1)
-        mxl_norm_line = [_normalize(word_clean_text[i]) if word_clean_text and word_clean_text[i]
-                          else mxl_words[i].norm for i in idxs]
+        mxl_norm_line = []
+        used_candidate = []
+        for i in idxs:
+            if word_clean_text and word_clean_text[i]:
+                mxl_norm_line.append(_normalize(word_clean_text[i]))
+                used_candidate.append(False)
+            elif word_lrc_candidate and word_lrc_candidate.get(i):
+                mxl_norm_line.append(_normalize(word_lrc_candidate[i]))
+                used_candidate.append(True)
+            else:
+                mxl_norm_line.append(mxl_words[i].norm)
+                used_candidate.append(False)
         # matched_local: see lrc_timing.match_block_to_candidates -- ASR
         # mishearing a word (e.g. "favors" transcribed as "favorites") is
         # tolerated via a fuzzy-ratio fallback on a single-word replace
@@ -783,6 +1043,11 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
                                else asr_w.start + word_qtr_dur * config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC)
             confident[global_i] = True
             quality.n_asr_placed += 1
+            if used_candidate[local_i] and word_clean_text is not None:
+                # ASR independently confirmed the rejected LRC candidate
+                # -- upgrade the DISPLAY text too, not just timing (see
+                # this function's own docstring, "sink"/"souk" case).
+                word_clean_text[global_i] = word_lrc_candidate[global_i]
 
     # --- Pass 2: nearest-confident-anchor interpolation for everything else. ---
     confident_idxs = [i for i in range(n) if confident[i]]
@@ -1001,7 +1266,8 @@ def _text_for_mxl_syllables(clean_text: Optional[str], mxl_syllable_texts: List[
 
 
 def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_ends: List[float],
-                     word_lines: List[int], word_clean_text: List[Optional[str]]) -> List[Syllable]:
+                     word_lines: List[int], word_clean_text: List[Optional[str]],
+                     word_syllable_override: Optional[dict] = None) -> List[Syllable]:
     """Splits each word's own syllables proportionally within
     [word_start, word_end) (see `place_words_via_asr` for how those are
     derived from ASR and/or MXL note values -- NOT simply "until the next
@@ -1011,9 +1277,27 @@ def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_end
     no need to guess those from ASR too. The DISPLAYED text comes from
     `word_clean_text` (the matched LRC token) via `_text_for_mxl_syllables`
     whenever available -- MXL supplies pitch/timing only, never the
-    displayed text, when a clean source exists. `line_id` is set from
+    displayed text, when a clean source exists -- UNLESS `word_syllable_
+    override` (from `assign_words_to_lines`'s own cross-word syllable-
+    level reconciliation) has an explicit per-slot override for this
+    word, which is used directly instead (it already carries the correct
+    per-syllable text, re-deriving it from a single per-word clean-text
+    string would lose the cross-word split). `line_id` is set from
     `assign_words_to_lines` so `phrasing.build_lines` gets accurate,
-    LRC-native line breaks."""
+    LRC-native line breaks.
+
+    WORD-START marking (the leading-space convention this project's own
+    writer uses to tell one word from the next) normally comes from a
+    slot's own position WITHIN its MXL word (`syl_i == 0`) -- correct
+    for a normal multi-syllable word, but WRONG when `word_syllable_
+    override` has moved syllables across a WORD boundary (real bug,
+    2026-08-18: "stomty"+"in" -> "stop"/"try"/"ing," -- "try" is really
+    the START of "trying,", not a continuation of "stop", even though
+    it's the SECOND slot of the "stomty" MXL word; "ing," is really a
+    CONTINUATION of "trying,", not a new word, even though it's the
+    FIRST (only) slot of the "in" MXL word). `word_syllable_override`'s
+    own entries are `(text, is_word_start)` pairs for exactly this
+    reason -- used directly instead of `syl_i == 0` whenever present."""
     syllables: List[Syllable] = []
     for i, w in enumerate(mxl_words):
         t0 = word_starts[i]
@@ -1028,13 +1312,17 @@ def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_end
         lo = w.offset
         hi = w.offset + sum(s[1] for s in w.syllables)
         mxl_syllable_texts = [s[3] for s in w.syllables]
-        display_texts = _text_for_mxl_syllables(word_clean_text[i], mxl_syllable_texts)
-        for syl_i, ((off, dur, midi, _orig_text), text) in enumerate(zip(w.syllables, display_texts)):
+        if word_syllable_override and i in word_syllable_override:
+            display_pairs = word_syllable_override[i]
+        else:
+            display_pairs = [(t, syl_i == 0)
+                              for syl_i, t in enumerate(_text_for_mxl_syllables(word_clean_text[i], mxl_syllable_texts))]
+        for (off, dur, midi, _orig_text), (text, is_start) in zip(w.syllables, display_pairs):
             frac0 = (off - lo) / (hi - lo) if hi > lo else 0.0
             frac1 = (off + dur - lo) / (hi - lo) if hi > lo else 1.0
             syllables.append(Syllable(
                 text=text, start=t0 + frac0 * (t1 - t0), end=t0 + frac1 * (t1 - t0),
-                midi_note=midi - 60, is_word_start=(syl_i == 0), line_id=word_lines[i],
+                midi_note=midi - 60, is_word_start=is_start, line_id=word_lines[i],
             ))
     return syllables
 
@@ -1210,12 +1498,15 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
     if offset is not None:
         lrc_match.lrc_lines = [(correction_fn(t), text) for t, text in lrc_match.lrc_lines]
 
-    word_lines, word_clean_text, word_group, word_group_text = assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
+    word_lines, word_clean_text, word_group, word_group_text, word_syllable_override, word_lrc_candidate = \
+        assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
     word_starts, word_ends, quality = place_words_via_asr(mxl_words, word_lines, lrc_match.lrc_lines, asr_words,
                                                             word_clean_text=word_clean_text,
                                                             word_group=word_group,
-                                                            word_group_text=word_group_text)
-    syllables = build_syllables(mxl_words, word_starts, word_ends, word_lines, word_clean_text)
+                                                            word_group_text=word_group_text,
+                                                            word_lrc_candidate=word_lrc_candidate)
+    syllables = build_syllables(mxl_words, word_starts, word_ends, word_lines, word_clean_text,
+                                 word_syllable_override=word_syllable_override)
 
     nonmonotonic_rate = quality.non_monotonic_fix_count / quality.n_words if quality.n_words else 1.0
     if quality.asr_placement_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:

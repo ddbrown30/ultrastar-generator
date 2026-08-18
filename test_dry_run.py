@@ -1611,7 +1611,8 @@ mlg_words = [
 ]
 mlg_lrc_lines = [(10.0, "hello world"), (20.0, "good bye now")]
 
-word_lines, word_clean_text, word_group, word_group_text = assign_words_to_lines(mlg_words, mlg_lrc_lines)
+word_lines, word_clean_text, word_group, word_group_text, word_syllable_override, word_lrc_candidate = \
+    assign_words_to_lines(mlg_words, mlg_lrc_lines)
 assert word_lines == [0, 0, 1, 1, 1], word_lines
 assert word_clean_text == ["hello", "world", "good", "bye", "now"], word_clean_text
 print("OK: assign_words_to_lines correctly tags each word with its own LRC line index AND its own "
@@ -1628,23 +1629,30 @@ fuzzy_words = [
     MxlWord(text="works", norm="works", offset=2.0, syllables=[(2.0, 1.0, 60, "works")]),
 ]
 fuzzy_lines = [(10.0, "the system works")]
-_, fuzzy_clean, _, _ = assign_words_to_lines(fuzzy_words, fuzzy_lines)
+_, fuzzy_clean, _, _, _, fuzzy_candidate = assign_words_to_lines(fuzzy_words, fuzzy_lines)
 assert fuzzy_clean == ["the", "system", "works"], fuzzy_clean
+assert fuzzy_candidate == {}, fuzzy_candidate
 print("OK: an OCR-garbled MXL word in a 1:1 replace slot gets fuzzy-matched to the clean LRC text "
       "('systern' -> 'system'), not left stuck on the MXL's own OCR garbage")
 
 # But a GENUINELY different word in the same kind of slot (not just an OCR
 # spelling variant) must NOT be fuzzy-matched -- the ratio gate has to
-# actually reject low-similarity pairs, not just be a formality.
+# actually reject low-similarity pairs, not just be a formality. The
+# rejected LRC token is still captured in word_lrc_candidate though (real
+# case, Ordinary Day, 2026-08-19: MXL OCR'd "sink" as "souk", ratio 0.5 <
+# 0.6 -- too different to trust directly, but place_words_via_asr can
+# still try it against real ASR as an unconfirmed candidate).
 unrelated_words = [
     MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
     MxlWord(text="xyz", norm="xyz", offset=1.0, syllables=[(1.0, 1.0, 60, "xyz")]),
     MxlWord(text="works", norm="works", offset=2.0, syllables=[(2.0, 1.0, 60, "works")]),
 ]
-_, unrelated_clean, _, _ = assign_words_to_lines(unrelated_words, fuzzy_lines)
+_, unrelated_clean, _, _, _, unrelated_candidate = assign_words_to_lines(unrelated_words, fuzzy_lines)
 assert unrelated_clean == ["the", None, "works"], unrelated_clean
+assert unrelated_candidate == {1: "system"}, unrelated_candidate
 print("OK: a genuinely unrelated word in the same kind of slot is correctly REJECTED by the similarity "
-      "ratio gate, not fuzzy-matched just because it landed in a replace slot")
+      "ratio gate, not fuzzy-matched just because it landed in a replace slot -- but the rejected LRC "
+      "token is still captured as an unconfirmed word_lrc_candidate")
 
 # BUG REGRESSION (real cases, "Great Big Sea - Ordinary Day", lrclib id
 # 6210269): a REPLACE block that isn't a clean 1:1 shape used to be left
@@ -1655,34 +1663,71 @@ print("OK: a genuinely unrelated word in the same kind of slot is correctly REJE
 from ultrastar_generator.mxl_lrc_generator import _distribute_words_to_slots
 
 # 1: N -- one MXL word (OCR-merged) covers TWO real LRC words ("winnes"
-# for "win now"). Only one display slot exists, so the two real words are
-# joined with a space into that one slot.
+# for "win now"). Real case (Ordinary Day, 2026-08-19): the single note
+# has no spare slot to reuse (unlike right,it's/ellipsis, which borrow an
+# already-existing blank NEXT note) -- so its own (offset, duration) span
+# is split proportionally by weights=[3, 3] (len("win"), len("now")) into
+# two new note slots, both real words become their own note/word instead
+# of being crammed together with a literal space into one slot.
 merge_words = [
     MxlWord(text="I", norm="i", offset=0.0, syllables=[(0.0, 1.0, 60, "I")]),
     MxlWord(text="winnes", norm="winnes", offset=1.0, syllables=[(1.0, 1.5, 69, "winnes")]),
     MxlWord(text="and", norm="and", offset=2.5, syllables=[(2.5, 1.0, 60, "and")]),
 ]
-merge_lines = [(10.0, "I win now and")]
-_, merge_clean, _, _ = assign_words_to_lines(merge_words, merge_lines)
-assert merge_clean == ["I", "win now", "and"], merge_clean
+_, merge_clean, _, _, merge_override, _ = assign_words_to_lines(merge_words, [(10.0, "I win now and")])
+assert merge_clean == ["I", None, "and"], merge_clean
+assert merge_override == {1: [("win", True), ("now", True)]}, merge_override
+assert merge_words[1].syllables == [(1.0, 0.75, 69, "win"), (1.75, 0.75, 69, "now")], merge_words[1].syllables
 
 # N: N (same count, individually too garbled) -- "stomty"+"in" for
-# "stop"+"trying," -- positional 1:1 once the WHOLE block is compared.
+# "stop"+"trying," -- BUG REGRESSION (real case, "Great Big Sea -
+# Ordinary Day", 2026-08-18, user-identified): word-level 1:1 assignment
+# alone gives "stomty" (2 real MXL syllable slots) the WHOLE word "stop"
+# (1 real target syllable) and "in" (1 slot) the WHOLE "trying," (2
+# target syllables) -- scrambling the displayed text ("sto"/"p" and an
+# un-split "trying,") even though the block match itself is correct.
+# Fixed with a SYLLABLE-LEVEL reconciliation tried first: flatten the
+# block's own real per-note syllables ("stom"/"ty"/"in") against the
+# recovered LRC words' own hyphenated pieces ("stop"/"try"/"ing,") --
+# same length, each pair individually fuzzy-close enough ("stom"~"stop",
+# "ty"~"try", "in"~"ing,") -- so each syllable lands on its own real
+# note directly via `word_syllable_override`, crossing the "stomty"/"in"
+# word boundary as needed. `word_clean_text` is correctly left unset for
+# these two words (the override supersedes it in `build_syllables`).
 same_count_words = [
-    MxlWord(text="won't", norm="wont", offset=0.0, syllables=[(0.0, 1.0, 60, "won't")]),
+    MxlWord(text="won't", norm="won't", offset=0.0, syllables=[(0.0, 1.0, 60, "won't")]),
     MxlWord(text="stomty", norm="stomty", offset=1.0,
             syllables=[(1.0, 0.5, 67, "stom"), (1.5, 1.0, 67, "ty")]),
     MxlWord(text="in", norm="in", offset=2.5, syllables=[(2.5, 3.0, 69, "in")]),
     MxlWord(text="Oh", norm="oh", offset=5.5, syllables=[(5.5, 1.0, 60, "Oh")]),
 ]
 same_count_lines = [(10.0, "won't stop trying, oh")]
-_, same_count_clean, _, _ = assign_words_to_lines(same_count_words, same_count_lines)
-assert same_count_clean == ["won't", "stop", "trying,", "oh"], same_count_clean
+_, same_count_clean, _, _, same_count_override, _ = assign_words_to_lines(same_count_words, same_count_lines)
+assert same_count_clean == ["won't", None, None, "oh"], same_count_clean
+# Each override entry is (text, is_word_start) -- "stop" and "try" are
+# each their own real word (both True), even though they land on the
+# SAME "stomty" MXL word's own 2 syllable slots; "ing," is a
+# CONTINUATION of "trying," (False), even though it's the "in" MXL
+# word's own only/first slot -- word-start tracks the RECOVERED LRC
+# token boundary, never the underlying MXL word's own slot position,
+# once an override is in play (real bug, 2026-08-18: without this,
+# "try" wrongly showed as a continuation of "stop" and "ing," wrongly
+# showed as its own new word, backwards from the real sung phrasing).
+assert same_count_override == {1: [("stop", True), ("try", True)], 2: [("ing,", False)]}, same_count_override
+print("OK: assign_words_to_lines resolves a multi-word block via SYLLABLE-LEVEL reconciliation when the "
+      "flattened real-syllable count matches the recovered LRC's own hyphenated syllable count, correctly "
+      "crossing the 'stomty'/'in' word boundary ('stop'/'try'/'ing,' each land on their own real note, "
+      "each syllable's own word-start flag matching the RECOVERED word phrasing) instead of scrambling "
+      "text via whole-word assignment")
 
 # N: M -- three MXL words for two real (one hyphenated) LRC words
 # ("double"+"edged"+"kide" for "double-edged"+"knife,") -- fewer real
 # words than slots, recovered by splitting the hyphenated word first
-# rather than falling straight to melisma-padding.
+# rather than falling straight to melisma-padding. Each MXL word here
+# has exactly 1 real syllable of its own, so the flattened syllable-level
+# path (see the "stomty"/"in" test above) also applies cleanly and takes
+# priority -- same semantic result (each word gets its own right text),
+# just delivered via `word_syllable_override` instead of `word_clean_text`.
 split_words = [
     MxlWord(text="a", norm="a", offset=0.0, syllables=[(0.0, 1.0, 60, "a")]),
     MxlWord(text="double", norm="double", offset=1.0, syllables=[(1.0, 1.0, 60, "double")]),
@@ -1691,8 +1736,13 @@ split_words = [
     MxlWord(text="but", norm="but", offset=4.0, syllables=[(4.0, 1.0, 60, "but")]),
 ]
 split_lines = [(10.0, "a double-edged knife, but")]
-_, split_clean, split_group, split_group_text = assign_words_to_lines(split_words, split_lines)
-assert split_clean == ["a", "double", "edged", "knife,", "but"], split_clean
+_, split_clean, split_group, split_group_text, split_override, _ = assign_words_to_lines(split_words, split_lines)
+assert split_clean == ["a", None, None, None, "but"], split_clean
+# "edged" is a CONTINUATION (False) of the SAME hyphenated token
+# "double-edged", not its own new word -- a real compound word reads as
+# one connected unit when sung, matching how a literal "-" is already
+# treated as an internal word boundary elsewhere in this module.
+assert split_override == {1: [("double", True)], 2: [("edged", False)], 3: [("knife,", True)]}, split_override
 print("OK: assign_words_to_lines recovers a MULTI-word replace block anchored by real matches on both "
       "sides -- 1-MXL-word-merges-2-real-words, same-count-but-individually-garbled, and "
       "fewer-real-words-than-slots-via-hyphen-split, all real 'Ordinary Day' cases")
@@ -1707,7 +1757,7 @@ unrelated_block_words = [
     MxlWord(text="works", norm="works", offset=3.0, syllables=[(3.0, 1.0, 60, "works")]),
 ]
 unrelated_block_lines = [(10.0, "the completely unrelated text works")]
-_, unrelated_block_clean, _, _ = assign_words_to_lines(unrelated_block_words, unrelated_block_lines)
+_, unrelated_block_clean, _, _, _, _ = assign_words_to_lines(unrelated_block_words, unrelated_block_lines)
 assert unrelated_block_clean[1] is None and unrelated_block_clean[2] is None, unrelated_block_clean
 print("OK: a genuinely unrelated multi-word block is correctly rejected by the block-level similarity "
       "ratio gate too, not fuzzy-matched just because it's bounded by real anchors")
@@ -1738,12 +1788,26 @@ never_words = [
     MxlWord(text="shall", norm="shall", offset=2.0, syllables=[(2.0, 1.0, 60, "shall")]),
 ]
 never_lines = [(9.5, "I never shall")]  # close to the fake ASR words' own real timestamps below
-never_word_lines, never_clean, never_group, never_group_text = assign_words_to_lines(never_words, never_lines)
-assert never_clean[1] == "ne" and never_clean[2] == "ver", never_clean
+never_word_lines, never_clean, never_group, never_group_text, never_override, _ = assign_words_to_lines(
+    never_words, never_lines)
+# The DISPLAYED text now comes via the syllable-level override (weight-
+# sliced from the MXL's own real letters, "ne"+"ver" -- NOT `hyphenate
+# ("never")`'s own genuinely-ambiguous guess, which currently favors
+# "nev"/"er" -- see this function's own docstring), not word_clean_text.
+assert never_clean[1] is None and never_clean[2] is None, never_clean
+# "ne" is the real word start (True), "ver" is a continuation (False) --
+# both land on their own separate MXL word ("ne"'s and "ver"'s own only
+# slot are each their own MxlWord), so without word-start coming from
+# the override itself (not the underlying MXL slot position) "ver"
+# would wrongly get its own leading space too.
+assert never_override == {1: [("ne", True)], 2: [("ver", False)]}, never_override
+# Grouping must STILL apply regardless of which text path fired --
+# place_words_via_asr needs it to search ASR for "never" as a whole.
 assert never_group[1] == never_group[2] == 1 and never_group[0] != never_group[1], never_group
 assert never_group_text[1] == "never", never_group_text
 print("OK: assign_words_to_lines groups 'ne'+'ver' (two separate single-syllable MXL words recovering to "
-      "one real LRC word) as one semantic unit, distinct from an ungrouped neighbor")
+      "one real LRC word) as one semantic unit for ASR matching, AND gets the displayed text right via "
+      "weight-slicing the MXL's own real letters (not a generic, currently-ambiguous hyphenation guess)")
 
 never_asr = [
     Word(text="I", start=10.0, end=10.2, confidence=0.98),
@@ -1900,6 +1964,53 @@ assert u_quality.n_asr_placed == 1 and u_quality.n_fallback == 1, u_quality
 print("OK: place_words_via_asr also trusts a close-but-not-identical 1:1 ASR pairing (\"favors\"~\"favorites\", "
       "a real ASR mishearing) via the same fuzzy-ratio technique used for display text, while still rejecting "
       "a genuinely unrelated word in the same slot")
+
+# BUG REGRESSION (real case: "Great Big Sea - Ordinary Day", 2026-08-19):
+# MXL OCR'd "sink" as "souk" -- ratio 0.5 < the 0.6 display-text bar, so
+# assign_words_to_lines correctly declines to trust it directly (word_clean_
+# text stays None), but the REJECTED LRC candidate ("sink") is captured in
+# word_lrc_candidate. Real ASR independently transcribed the word correctly
+# as "sink" -- place_words_via_asr must try the candidate (not just the raw
+# MXL OCR norm "souk", which real ASR "sink" would never match either) and,
+# once ASR confirms it, upgrade BOTH timing AND display text to "sink".
+candidate_mxl_words = [
+    MxlWord(text="you", norm="you", offset=0.0, syllables=[(0.0, 0.5, 64, "you")]),
+    MxlWord(text="souk", norm="souk", offset=0.5, syllables=[(0.5, 0.5, 64, "souk")]),
+    MxlWord(text="or", norm="or", offset=1.0, syllables=[(1.0, 0.5, 64, "or")]),
+]
+candidate_word_lines = [0, 0, 0]
+candidate_lrc_lines = [(10.0, "you sink or")]
+_, candidate_clean_text, _, _, _, candidate_lrc_candidate = assign_words_to_lines(
+    candidate_mxl_words, candidate_lrc_lines)
+assert candidate_clean_text == ["you", None, "or"], candidate_clean_text
+assert candidate_lrc_candidate == {1: "sink"}, candidate_lrc_candidate
+candidate_asr = [
+    _Word(text="you", start=10.0, end=10.3),
+    _Word(text="sink", start=10.4, end=10.7),
+    _Word(text="or", start=10.8, end=11.0),
+]
+sink_starts, sink_ends, sink_quality = place_words_via_asr(
+    candidate_mxl_words, candidate_word_lines, candidate_lrc_lines, candidate_asr,
+    word_clean_text=candidate_clean_text, word_lrc_candidate=candidate_lrc_candidate)
+assert sink_starts[1] == 10.4 and sink_ends[1] == 10.7, (sink_starts[1], sink_ends[1])
+assert candidate_clean_text[1] == "sink", candidate_clean_text  # display text upgraded too, not just timing
+assert sink_quality.n_asr_placed == 3 and sink_quality.n_fallback == 0, sink_quality
+# When ASR does NOT confirm the candidate either, display text is left
+# completely unchanged (still the MXL's own raw OCR text) -- no regression
+# risk from trying an unconfirmed candidate.
+no_confirm_asr = [
+    _Word(text="you", start=10.0, end=10.3),
+    _Word(text="banana", start=10.4, end=10.7),
+    _Word(text="or", start=10.8, end=11.0),
+]
+_, no_confirm_clean_text2, _, _, _, no_confirm_candidate2 = assign_words_to_lines(
+    candidate_mxl_words, candidate_lrc_lines)
+place_words_via_asr(candidate_mxl_words, candidate_word_lines, candidate_lrc_lines, no_confirm_asr,
+                     word_clean_text=no_confirm_clean_text2, word_lrc_candidate=no_confirm_candidate2)
+assert no_confirm_clean_text2[1] is None, no_confirm_clean_text2
+print("OK: place_words_via_asr tries a REJECTED MXL<->LRC fuzzy candidate (\"souk\"->\"sink\") directly "
+      "against real ASR, upgrading both timing AND display text once ASR independently confirms it, while "
+      "leaving display text untouched when ASR doesn't confirm it either")
 
 # BUG REGRESSION (real case: the user's own re-run, "There's a lot of
 # favors, I'm prepared..." -- the fuzzy-replace fix above only checked a
@@ -2065,7 +2176,7 @@ anchor_asr = [
     _Word(text="one", start=0.0, end=0.4),
     _Word(text="four", start=1.3, end=1.6),
 ]
-a_word_lines, _, _, _ = assign_words_to_lines(anchor_words, anchor_lines)
+a_word_lines, _, _, _, _, _ = assign_words_to_lines(anchor_words, anchor_lines)
 a_starts, a_ends, a_quality = place_words_via_asr(anchor_words, a_word_lines, anchor_lines, anchor_asr)
 # "two"/"three" must land BETWEEN "one" (0.0) and "four" (1.3) -- a locally
 # sane position -- NOT stretched out toward the line's own 20s-wide window.
@@ -2471,7 +2582,14 @@ print("\n--- phrasing.build_lines(strict_reference_lines=True): removes the impl
       "tracked throughout via calibrated LRC timing -- user's explicit directive: when using LRC, "
       "match it 100%, no exceptions. Real-audio validated as a clear net improvement (line-break "
       "agreement 81.7%->87.8%, spurious breaks 29->7), not just a wash ---")
-_long_line_syls = [Syllable(f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0) for i in range(20)]
+
+# A comma on the word nearest the middle (2026-08-19: the default-mode
+# safety net now needs interior punctuation to fire at all -- see the
+# "punctuation-near-middle" test block below) so default mode's own
+# break still has somewhere to land, keeping this test's own point
+# (strict mode changes the outcome) meaningful.
+_long_line_syls = [Syllable(f"w{i}," if i == 10 else f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0)
+                    for i in range(20)]
 _strict_entries = build_lines(_long_line_syls, strict_reference_lines=True)
 assert all(type(e).__name__ == "Syllable" for e in _strict_entries), \
     [type(e).__name__ for e in _strict_entries]
@@ -2484,6 +2602,65 @@ assert any(type(e).__name__ == "LineBreak" for e in _default_entries), \
     "expected the default mode's own safety net to still fire on this same data"
 print("OK: default (non-strict) mode still applies the safety net on the identical data, confirming "
       "the flag is what changed the outcome")
+
+print("\n--- BUG REGRESSION (real case, \"Great Big Sea - Ordinary Day\", 2026-08-19): the default-mode "
+      "overflow safety net used to break mechanically at whichever word boundary the running syllable "
+      "count first crossed 1.5x MAX_SYLLABLES_PER_LINE, landing on an arbitrary position (real case: right "
+      "before the line's own trailing \"day,\") instead of a real clause boundary. It now scans the WHOLE "
+      "overflowing reference-line segment up front for interior punctuation nearest the middle, or skips "
+      "the break entirely if none exists ---")
+# 20 words, all one known reference line (overflows 1.5x8=12) -- a comma
+# sits just past the middle (word 11 of 20) and nowhere else. The break
+# must land right after "w11,", not at word 12 (where the old mechanical
+# threshold-crossing would have put it).
+_mid_punct_syls = [Syllable(f"w{i}," if i == 11 else f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0)
+                    for i in range(20)]
+_mid_punct_entries = build_lines(_mid_punct_syls, strict_reference_lines=False)
+_kinds = [type(e).__name__ for e in _mid_punct_entries]
+assert _kinds.count("LineBreak") == 1, _kinds
+_break_at = _kinds.index("LineBreak")
+assert _mid_punct_entries[_break_at - 1].text == "w11,", _mid_punct_entries[_break_at - 1].text
+assert _mid_punct_entries[_break_at + 1].text == "w12", _mid_punct_entries[_break_at + 1].text
+print("OK: the overflow break lands right after the interior word nearest the middle that ends in "
+      "punctuation ('w11,'), not wherever the running syllable count happened to cross the threshold")
+
+# The line's own FINAL word almost always carries trailing punctuation
+# (a sentence-ending period/comma) -- that must NOT count as an interior
+# candidate, or every long line with no real internal punctuation would
+# still get split off into a trivial one-word trailing line. Real case:
+# "I've got a smile on my face and I've got four walls around me," has
+# exactly one comma, on its own last word -- must stay whole, unbroken.
+_trailing_only_syls = [Syllable(f"w{i}," if i == 19 else f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0)
+                        for i in range(20)]
+_trailing_only_entries = build_lines(_trailing_only_syls, strict_reference_lines=False)
+assert all(type(e).__name__ == "Syllable" for e in _trailing_only_entries), \
+    [type(e).__name__ for e in _trailing_only_entries]
+print("OK: punctuation on ONLY the segment's own final word is correctly ignored (that's just the line's "
+      "own terminal punctuation, not an interior clause boundary) -- the overflowing line is left whole "
+      "rather than splitting off a trivial trailing one-word line")
+
+# No punctuation anywhere in a long, one-reference-line segment -- the
+# user's explicit rule: "if none is found, don't break the line."
+_no_punct_syls = [Syllable(f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0) for i in range(20)]
+_no_punct_entries = build_lines(_no_punct_syls, strict_reference_lines=False)
+assert all(type(e).__name__ == "Syllable" for e in _no_punct_entries), \
+    [type(e).__name__ for e in _no_punct_entries]
+print("OK: an overlong reference-line segment with NO interior punctuation anywhere is left whole, "
+      "unbroken, rather than force-split at an arbitrary word")
+
+# A short (non-overflowing) segment is completely unaffected by any of
+# this, even with plenty of interior punctuation.
+_short_punct_syls = [
+    Syllable("Hi,", 0.0, 0.2, 4, True, line_id=0),
+    Syllable(" there,", 0.2, 0.4, 4, True, line_id=0),
+    Syllable(" friend.", 0.4, 0.6, 4, True, line_id=0),
+]
+_short_punct_entries = build_lines(_short_punct_syls, strict_reference_lines=False)
+assert all(type(e).__name__ == "Syllable" for e in _short_punct_entries), \
+    [type(e).__name__ for e in _short_punct_entries]
+print("OK: a short reference-line segment (well under the overflow threshold) is never split on interior "
+      "punctuation -- this rule only ever applies to a genuinely overflowing segment")
+
 # A REAL line_id change must still break in strict mode -- strict only removes the EXTRA heuristics,
 # it doesn't stop tracking real reference line transitions.
 _strict_two_lines = [
