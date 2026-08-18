@@ -350,7 +350,16 @@ to the gui at the same time.
   default `0.35`, GUI "Ambiguity key tie-break (pass 1)" checkbox under
   Advanced — the margin threshold is CLI-only, no existing GUI float-
   entry pattern to mirror), 2026-08-16. `pitch_ambiguity.py` (new
-  module): RMVPE-only (no-op for `--pitch-source swiftf0`) refinement of
+  module): RMVPE-only (no-op for `--pitch-source swiftf0` — confirmed
+  2026-08-17 at the ONNX-graph level that this is architectural, not a
+  missed accessor: RMVPE's graph outputs the full 360-bin salience
+  tensor directly, SwiftF0's exported graph has only two scalar outputs
+  per frame [pitch_hz, confidence], no discretized candidate space to
+  disambiguate between at all. Extending it would mean forking and
+  re-exporting the upstream SwiftF0 model with no guarantee the
+  underlying architecture even has an internal layer to expose — see
+  `pitch_ambiguity.py`'s own docstring, not attempted without new
+  evidence) refinement of
   pass 1's own note pitch-CLASS computation, applied as a real
   post-processing step after `detect_notes()`'s own final segmentation
   (never changes timing/note count/order). Two parts, validated and

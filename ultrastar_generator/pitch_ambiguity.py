@@ -61,7 +61,19 @@ separately):
 
 RMVPE-only: SwiftF0 (this project's only other `PITCH_SOURCES` entry)
 has no comparable raw multi-bin salience output, so this refinement is a
-no-op whenever `pitch_source != "rmvpe"`.
+no-op whenever `pitch_source != "rmvpe"`. Confirmed architectural, not a
+missed accessor (2026-08-17): RMVPE's ONNX graph outputs the full
+360-bin activation tensor directly (pitch/confidence are Python-side
+post-processing on top of it); SwiftF0's exported ONNX graph has exactly
+two outputs -- `pitch_hz` and `confidence`, both single scalars per
+frame, confirmed by inspecting the graph itself
+(`onnxruntime.InferenceSession(...).get_outputs()`), not just its Python
+wrapper. There is no discretized candidate space to disambiguate
+between. Extending this to SwiftF0 would mean forking the upstream
+model and re-exporting a different cut of it, with no guarantee the
+underlying architecture even has an internal bin/logit layer to expose
+-- not attempted without new evidence (e.g. upstream SwiftF0 itself
+shipping a distribution output).
 """
 
 from __future__ import annotations
