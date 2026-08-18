@@ -562,12 +562,21 @@ class App(tk.Tk):
         return probe_duration_sec(audio_path)
 
     def _artist_placeholder_text(self) -> str:
+        # YouTube mode can't auto-detect anything (a video's own title isn't
+        # a reliable "Artist - Title" source, see the mode tooltip) -- both
+        # fields are actually REQUIRED there, so the usual "auto-detected"
+        # ghost text would be actively misleading. No placeholder at all
+        # (blank field) reads as "you must type something" instead.
+        if self.mode.get() == "youtube":
+            return ""
         artist, _ = self._resolved_artist_title()
-        return artist or "(auto-detected from filename)"
+        return artist or "(auto-detected from input folder)"
 
     def _title_placeholder_text(self) -> str:
+        if self.mode.get() == "youtube":
+            return ""
         _, title = self._resolved_artist_title()
-        return title or "(auto-detected from filename)"
+        return title or "(auto-detected from input folder)"
 
     def _output_dir_placeholder_text(self) -> str:
         # The output folder is now the PARENT under which "<Artist> -
@@ -620,6 +629,7 @@ class App(tk.Tk):
         io_frame = ttk.LabelFrame(self, text="Folders")
         io_frame.pack(fill="x", **pad)
         io_frame.columnconfigure(1, weight=1)
+        self.io_frame = io_frame
 
         self.input_label = ttk.Label(io_frame, text="Input folder:")
         self.input_label.grid(row=0, column=0, sticky="w", **pad)
@@ -673,7 +683,7 @@ class App(tk.Tk):
                                           "in the input folder (if more than one exists, tries '<folder "
                                           "name>.txt' before giving up).")
 
-        self.artist_frame = ttk.LabelFrame(self, text="Artist / Title (required for YouTube; overrides filename parsing otherwise)")
+        self.artist_frame = ttk.LabelFrame(self, text="Artist / Title")
         artist_frame = self.artist_frame
         artist_frame.pack(fill="x", **pad)
         ttk.Label(artist_frame, text="Artist:").pack(side="left", padx=8)
@@ -682,10 +692,8 @@ class App(tk.Tk):
         ttk.Label(artist_frame, text="Title:").pack(side="left", padx=8)
         self.title_entry = PlaceholderEntry(artist_frame, self.title_var, self._title_placeholder_text, width=25)
         self.title_entry.pack(side="left", padx=4)
-        Tooltip(self.artist_entry, "Overrides the artist parsed from the filename. Required (must be typed, "
-                                    "not left as the preview) for YouTube mode.")
-        Tooltip(self.title_entry, "Overrides the title parsed from the filename. Required (must be typed, "
-                                   "not left as the preview) for YouTube mode.")
+        Tooltip(self.artist_entry, "Overrides the artist parsed from the folder. Required for YouTube mode.")
+        Tooltip(self.title_entry, "Overrides the title parsed from the folder. Required for YouTube mode.")
 
         self.lyrics_frame = ttk.LabelFrame(self, text="Lyrics (single-song mode only)")
         lyrics_frame = self.lyrics_frame
@@ -1036,10 +1044,10 @@ class App(tk.Tk):
 
         if is_realign:
             self.artist_frame.config(text="Artist / Title (overrides the existing file's own tags for LRCLIB lookup)")
-        elif is_pitch_refresh:
-            self.artist_frame.config(text="Artist / Title (not used by Refresh pitch -- no lyrics lookup happens)")
+        elif is_youtube:
+            self.artist_frame.config(text="Artist / Title (required for YouTube)")
         else:
-            self.artist_frame.config(text="Artist / Title (required for YouTube; overrides filename parsing otherwise)")
+            self.artist_frame.config(text="Artist / Title")
         # A single artist/title override doesn't make sense across multiple
         # batch subfolders either -- disabled, not hidden, same as above.
         # pitch_refresh has no artist/title CONCEPT at all (no lyrics lookup
@@ -1048,15 +1056,25 @@ class App(tk.Tk):
         artist_title_state = tk.DISABLED if (is_batch or is_pitch_refresh) else tk.NORMAL
         self.artist_entry.config(state=artist_title_state)
         self.title_entry.config(state=artist_title_state)
+        # Mode switch changes what _artist_placeholder_text/
+        # _title_placeholder_text would return (YouTube's own blank-vs-
+        # "auto-detected" branch above) -- refresh now rather than waiting
+        # for the entry's next FocusOut, so switching TO or AWAY FROM
+        # YouTube mode updates the ghost text immediately.
+        self.artist_entry.refresh_placeholder()
+        self.title_entry.refresh_placeholder()
 
         # Realign mode skips pass 1-4 entirely, and pitch_refresh skips them
         # PLUS realign's own ASR/LRC matching (it has no lyrics functionality
         # at all) -- each uses a completely different, much smaller option
         # surface, toggled as whole frames (not picked apart widget-by-widget
-        # the way audio_file/youtube rows are above). `artist_frame` is
-        # always packed, so it's a safe `after=` anchor regardless of which
-        # set is currently showing.
+        # the way audio_file/youtube rows are above). `io_frame` is always
+        # packed, so it's a safe `after=` anchor regardless of which set is
+        # currently showing -- `artist_frame` itself is hidden entirely in
+        # pitch_refresh mode (no artist/title concept at all there, see
+        # above), so it can't be used as the anchor unconditionally.
         if is_realign:
+            self.artist_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
             self.lyrics_frame.pack_forget()
             self.opts_frame.pack_forget()
             self.advanced_toggle.pack_forget()
@@ -1065,14 +1083,16 @@ class App(tk.Tk):
             self.realign_lyrics_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
             self.realign_options_frame.pack(fill="x", padx=8, pady=4, after=self.realign_lyrics_frame)
         elif is_pitch_refresh:
+            self.artist_frame.pack_forget()
             self.lyrics_frame.pack_forget()
             self.opts_frame.pack_forget()
             self.advanced_toggle.pack_forget()
             self.advanced_frame.pack_forget()
             self.realign_lyrics_frame.pack_forget()
             self.realign_options_frame.pack_forget()
-            self.pitch_refresh_options_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
+            self.pitch_refresh_options_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
         else:
+            self.artist_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
             self.realign_lyrics_frame.pack_forget()
             self.realign_options_frame.pack_forget()
             self.pitch_refresh_options_frame.pack_forget()

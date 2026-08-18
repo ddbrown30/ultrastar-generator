@@ -747,6 +747,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         mxl_lrc_result = try_mxl_lrc_primary(
             mxl_paths, artist, title, audio_duration, words,
             forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
+            vocals_path=vocals_path, debug_log=debug_log,
         )
         # PROTOTYPE ASR-quality retry, see config.RETRY_LOW_QUALITY_ASR's
         # docstring. Reuses the SAME asr_placement_rate/MXL_LRC_MIN_ASR_
@@ -782,6 +783,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 retry_mxl_result = try_mxl_lrc_primary(
                     mxl_paths, artist, title, audio_duration, retry_words,
                     forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
+                    vocals_path=vocals_path, debug_log=debug_log,
                 )
                 if (retry_mxl_result is not None and retry_mxl_result.quality is not None
                         and retry_mxl_result.quality.asr_placement_rate > mxl_lrc_result.quality.asr_placement_rate):
@@ -818,6 +820,13 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 f"proportional fallback, {q.non_monotonic_fix_count} monotonic fix(es).")
             log("  Skipping pass 1 (audio-only pitch detection) and pass 3/4 -- pitch comes directly "
                 "from the MusicXML.")
+            if mxl_lrc_result.pitch_calibration_offset is not None:
+                log(f"  MXL pitch-class calibration: {mxl_lrc_result.pitch_calibration_offset:+d} "
+                    f"semitone(s) ({mxl_lrc_result.pitch_calibration_confidence:.0%} agreement) -- "
+                    f"corrected before writing.")
+            else:
+                log("  MXL pitch-class calibration: none applied (no confident offset found) -- "
+                    "MXL pitch used as-is.")
             debug_log.log_lyrics_selection(
                 source="lrclib (mxl+lrc primary path)", track_name=c.track_name, artist_name=c.artist_name,
                 lrclib_id=c.id, duration=effective_lrc_duration(c), synced=bool(c.synced_lyrics),

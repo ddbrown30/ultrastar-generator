@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, List, Optional, Tuple
 
 from . import config
@@ -718,6 +718,96 @@ def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_end
     return syllables
 
 
+def calibrate_mxl_syllable_pitch(
+    syllables: List[Syllable],
+    vocals_path: Optional[str],
+    min_calibration_samples: int = config.MUSICXML_MIN_CALIBRATION_SAMPLES,
+    min_calibration_confidence: float = config.MUSICXML_MIN_CALIBRATION_CONFIDENCE,
+    force_calibration: bool = config.ENABLE_MUSICXML_FORCE_CALIBRATION,
+    verbose: bool = True,
+    debug_log=None,
+) -> Tuple[List[Syllable], Optional[int], float]:
+    """Corrects each syllable's PITCH CLASS (never octave or timing)
+    against a per-song calibration offset -- the same correction
+    `musicxml_reference.apply_musicxml_reference` (pass 4) and
+    `pitch_refresh.apply_mxl_pitch_reference` already apply for the
+    OTHER two paths that take pitch from a MusicXML file, using the
+    exact same shared logic (`musicxml_reference._calibrate_pitch_class`/
+    `nearest_pitch_for_class`). THIS path (MXL+LRC primary) skips pass 1
+    entirely by design -- unlike those two, it has no independently-
+    derived audio pitch to calibrate the MXL's own raw pitch against,
+    so without this step a transposed MXL (confirmed real case: BATB's
+    own score is +2 semitones off its actual SingStar-ground-truth
+    vocal) is written completely uncorrected. Confirmed via real
+    end-to-end comparison: 100% timing agreement, 0% pitch-class
+    accuracy, every mismatch a uniform +2 semitones, before this fix.
+
+    Runs a SINGLE whole-track pitch-class pass
+    (`pitch_refresh.compute_pitch_class_predictions`, same RMVPE-by-
+    default source pass 1 uses) over the already-ASR-placed syllables'
+    own [start, end) spans -- never a per-word isolated clip (this
+    project's own "don't run pitch inference on a tiny isolated clip"
+    rule) -- purely to get an independent per-syllable pitch-class
+    reading to calibrate the MXL's own pitch against; the syllables'
+    own START/END TIMING is never touched here, only `midi_note`.
+
+    A missing `vocals_path` or empty `syllables` is a no-op (returns
+    `syllables` unchanged, offset None) -- keeps this function safe to
+    call unconditionally without every caller needing its own guard.
+    """
+    if not vocals_path or not syllables:
+        return syllables, None, 0.0
+
+    import librosa
+
+    from .musicxml_reference import _calibrate_pitch_class, nearest_pitch_for_class
+    from .pitch_refresh import compute_pitch_class_predictions
+
+    y, sr = librosa.load(str(vocals_path), sr=None, mono=True)
+    predicted_pc = compute_pitch_class_predictions(syllables, y, sr)
+
+    calibration_samples: List[Tuple[int, int, float]] = []
+    for syl, pred_pc in zip(syllables, predicted_pc):
+        if pred_pc is None:
+            continue
+        mxl_absolute_midi = syl.midi_note + 60  # raw MXL pitch, pre-correction
+        our_fake_pitch = pred_pc - 60  # so (our_fake_pitch + 60) % 12 == pred_pc
+        calibration_samples.append((our_fake_pitch, mxl_absolute_midi, syl.confidence))
+
+    calibration, confidence, _, skipped_reason = _calibrate_pitch_class(
+        calibration_samples, min_calibration_samples, min_calibration_confidence,
+        force_calibration, verbose, log_prefix="[mxl-lrc]",
+    )
+    if calibration is None:
+        if verbose:
+            print(f"[mxl-lrc] pitch-class calibration skipped: {skipped_reason}")
+        return syllables, None, 0.0
+
+    new_syllables = list(syllables)
+    n_corrected = 0
+    for i, syl in enumerate(new_syllables):
+        mxl_p = syl.midi_note + 60
+        target_pc = (mxl_p - calibration) % 12
+        new_pitch = nearest_pitch_for_class(syl.midi_note, target_pc)
+        if new_pitch == syl.midi_note:
+            continue
+        n_corrected += 1
+        new_syllables[i] = replace(
+            syl, midi_note=new_pitch,
+            confidence=max(syl.confidence, config.MUSICXML_CORRECTED_CONFIDENCE),
+        )
+        if debug_log is not None:
+            debug_log.line(f"[mxl-lrc] {syl.text!r} @ {syl.start:.2f}s: pitch class corrected "
+                            f"{syl.midi_note:+d} -> {new_pitch:+d} (target class {target_pc}, "
+                            f"calibration {calibration:+d})")
+
+    if verbose:
+        print(f"[mxl-lrc] pitch-class calibration: {calibration:+d} semitone(s), {confidence:.0%} "
+              f"agreement over {len(calibration_samples)} sample(s), {n_corrected} note(s) corrected")
+
+    return new_syllables, calibration, confidence
+
+
 @dataclass
 class TimeCalibration:
     offset_sec: Optional[float] = None
@@ -745,11 +835,14 @@ class MxlLrcResult:
     mxl_path: Optional[str] = None
     part_names_used: List[str] = field(default_factory=list)
     time_calibration: Optional[TimeCalibration] = None
+    pitch_calibration_offset: Optional[int] = None  # semitones; None if skipped, see calibrate_mxl_syllable_pitch
+    pitch_calibration_confidence: float = 0.0
 
 
 def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_duration: float,
                                asr_words: List[Word], forced_candidate: Optional[LrcLibCandidate] = None,
-                               preferred_part_name: Optional[str] = None) -> MxlLrcResult:
+                               preferred_part_name: Optional[str] = None,
+                               vocals_path: Optional[str] = None, debug_log=None) -> MxlLrcResult:
     """Orchestrates the full MXL+LRC generation for one MusicXML file and
     applies the quality gate. Never raises on expected failure modes (no
     lyric-bearing part, no candidate found) -- returns a failed
@@ -819,14 +912,28 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
             mxl_path=mxl_path, part_names_used=part_names, time_calibration=time_cal,
         )
 
+    # Only calibrated once both quality gates above have passed -- pitch
+    # calibration loads the whole vocal track and runs a real pitch-source
+    # inference pass over it, not worth paying for on a result that's
+    # about to be discarded in favor of the standard fallback pipeline
+    # anyway. See `calibrate_mxl_syllable_pitch`'s own docstring for why
+    # this path needs its own calibration step at all (unlike pass 4 and
+    # pitch_refresh.py, it has no independent audio-derived pitch of its
+    # own to calibrate the MXL's raw pitch against otherwise).
+    syllables, pitch_cal_offset, pitch_cal_confidence = calibrate_mxl_syllable_pitch(
+        syllables, vocals_path, debug_log=debug_log,
+    )
+
     return MxlLrcResult(success=True, reason="", syllables=syllables, quality=quality,
                          lrc_match=lrc_match, mxl_path=mxl_path, part_names_used=part_names,
-                         time_calibration=time_cal)
+                         time_calibration=time_cal, pitch_calibration_offset=pitch_cal_offset,
+                         pitch_calibration_confidence=pitch_cal_confidence)
 
 
 def try_mxl_lrc_primary(mxl_paths: List[str], artist: str, title: str, audio_duration: float,
                          asr_words: List[Word], forced_candidate: Optional[LrcLibCandidate] = None,
-                         preferred_part_name: Optional[str] = None) -> Optional[MxlLrcResult]:
+                         preferred_part_name: Optional[str] = None,
+                         vocals_path: Optional[str] = None, debug_log=None) -> Optional[MxlLrcResult]:
     """Tries each MXL path in order (mirrors `apply_musicxml_references`'
     multi-file convention), returning the first one that clears the
     quality gate. If every path was attempted but none succeeded, returns
@@ -838,6 +945,7 @@ def try_mxl_lrc_primary(mxl_paths: List[str], artist: str, title: str, audio_dur
         result = generate_from_mxl_and_lrc(
             mxl_path, artist, title, audio_duration, asr_words,
             forced_candidate=forced_candidate, preferred_part_name=preferred_part_name,
+            vocals_path=vocals_path, debug_log=debug_log,
         )
         if result.success:
             return result
