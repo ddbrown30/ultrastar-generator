@@ -106,6 +106,76 @@ def load_mxl_vocal_words(mxl_path: str, preferred_part_name: Optional[str] = Non
     if chosen_part is None:
         chosen_part = max(lyric_parts, key=lambda t: t[1])[0]
 
+    # Materialize each note's own (offset, duration, pitch, text,
+    # syllabic, tied) up front -- decoupled from live music21 objects, to
+    # allow the lookahead OCR-repair pass below (and to keep the main
+    # grouping loop's own logic working over a plain list either way).
+    raw_notes = []
+    for n in chosen_part.flatten().notes:
+        if n.isChord:
+            continue
+        text = syl = None
+        for ly in n.lyrics:
+            if ly.text:
+                text, syl = ly.text, ly.syllabic
+            break  # one lyric verse only
+        raw_notes.append({
+            "offset": float(n.offset), "dur": float(n.quarterLength),
+            "midi": int(n.pitch.midi), "text": text, "syl": syl,
+            "tied": n.tie is not None,
+        })
+
+    # Real OCR/engraving defect (2026-08-18, user-identified real case,
+    # "Great Big Sea - Ordinary Day": a trailing ellipsis ("...") after
+    # "know." got engraved as its OWN separate note/word ("..", a second
+    # note immediately after "know."'s own note, contiguous, real
+    # confirmed case) instead of staying part of "know."'s own trailing
+    # punctuation. A note whose ENTIRE lyric text is punctuation (nothing
+    # alphanumeric at all -- normalizes to "") is never a real word on
+    # its own; if it's immediately contiguous with a preceding REAL word,
+    # its text is absorbed onto that word's own end and the note itself
+    # becomes a plain melisma continuation (no lyric of its own), same as
+    # any other untexted tied/slurred note.
+    for i, entry in enumerate(raw_notes):
+        if not entry["text"] or _normalize(entry["text"]):
+            continue  # no text, or it has real alphanumeric content -- not pure punctuation
+        if i == 0:
+            continue
+        prev = raw_notes[i - 1]
+        if not prev["text"]:
+            continue
+        if abs(entry["offset"] - (prev["offset"] + prev["dur"])) > 1e-6:
+            continue  # not contiguous with the preceding word -- leave alone
+        prev["text"] += entry["text"]
+        entry["text"] = None
+        entry["syl"] = None
+
+    # Real OCR/engraving defect (2026-08-18, user-identified real case,
+    # "Great Big Sea - Ordinary Day": "right,it's" -- two real words
+    # merged onto ONE note's own lyric text, missing the space/note split
+    # the engraver should have made, while the NEXT note was left with no
+    # lyric of its own at all. Detected by an internal comma/period/space
+    # in the text that still has real ALPHANUMERIC content AFTER it (not
+    # just more punctuation -- a real confirmed near-miss: "know..." must
+    # NOT be treated as "know."+".." merged wrong, the ".." isn't a real
+    # word start). A genuine TRAILING comma/period (e.g. "battered,") has
+    # nothing after it at all and is untouched either way. Only acted on
+    # when the next note doesn't already carry its own real word -- if it
+    # does, this isn't confidently an OCR mistake, so the merged text is
+    # left alone rather than guessed at.
+    merge_re = re.compile(r"^(.+?[,.\s])([A-Za-z0-9].*)$")
+    for i, entry in enumerate(raw_notes):
+        if not entry["text"]:
+            continue
+        m = merge_re.match(entry["text"])
+        if not m:
+            continue
+        if i + 1 >= len(raw_notes) or raw_notes[i + 1]["text"]:
+            continue  # no next note, or it already has its own real word
+        entry["text"] = m.group(1)
+        raw_notes[i + 1]["text"] = m.group(2)
+        raw_notes[i + 1]["syl"] = "single"
+
     words: List[MxlWord] = []
     cur_syllables: List[Tuple[float, float, int, str]] = []
     cur_text = ""
@@ -120,10 +190,8 @@ def load_mxl_vocal_words(mxl_path: str, preferred_part_name: Optional[str] = Non
         cur_text = ""
         cur_offset = None
 
-    for n in chosen_part.flatten().notes:
-        if n.isChord:
-            continue
-        if not n.lyrics:
+    for entry in raw_notes:
+        if not entry["text"]:
             # A note with no lyric at all -- if a word is currently being
             # built AND this note starts exactly where the last syllable's
             # note ends (no rest in between), it's a real continuation of
@@ -144,27 +212,23 @@ def load_mxl_vocal_words(mxl_path: str, preferred_part_name: Optional[str] = Non
             # such notes would otherwise get wrongly glued onto that word.
             if cur_syllables:
                 off, dur, prev_midi, text = cur_syllables[-1]
-                if abs(float(n.offset) - (off + dur)) < 1e-6:
-                    midi = int(n.pitch.midi)
-                    if n.tie is not None and midi == prev_midi:
-                        cur_syllables[-1] = (off, dur + float(n.quarterLength), prev_midi, text)
+                if abs(entry["offset"] - (off + dur)) < 1e-6:
+                    midi = entry["midi"]
+                    if entry["tied"] and midi == prev_midi:
+                        cur_syllables[-1] = (off, dur + entry["dur"], prev_midi, text)
                     else:
-                        cur_syllables.append((float(n.offset), float(n.quarterLength), midi, ""))
+                        cur_syllables.append((entry["offset"], entry["dur"], midi, ""))
                 # else: a real rest separates this note from the word in
                 # progress -- not a continuation, leave it unattached.
             continue
-        for ly in n.lyrics:
-            if not ly.text:
-                continue
-            syl = ly.syllabic
-            if syl in (None, "single", "begin"):
-                flush()
-                cur_text = ly.text
-                cur_offset = float(n.offset)
-            else:
-                cur_text += ly.text
-            cur_syllables.append((float(n.offset), float(n.quarterLength), int(n.pitch.midi), ly.text))
-            break  # one lyric verse only
+        syl = entry["syl"]
+        if syl in (None, "single", "begin"):
+            flush()
+            cur_text = entry["text"]
+            cur_offset = entry["offset"]
+        else:
+            cur_text += entry["text"]
+        cur_syllables.append((entry["offset"], entry["dur"], entry["midi"], entry["text"]))
     flush()
 
     return words, [chosen_part.partName]
@@ -315,7 +379,39 @@ def _merge_words_to_count(words: List[str], n_chunks: int) -> List[str]:
     return chunks
 
 
-def _distribute_words_to_slots(lrc_words_raw: List[str], n_slots: int) -> List[str]:
+def _slice_by_weights(text: str, weights: List[int]) -> Optional[List[str]]:
+    """Slices `text` into len(weights) contiguous pieces, sized
+    proportionally to `weights` -- used to recover a real per-syllable
+    split from the MXL's own notated NOTE structure (never a linguistic
+    hyphenation guess: the weights are each MXL syllable/word's own
+    character length, which reflects the real notated split even when
+    its own letters can't be trusted, e.g. OCR garbling or a word
+    mis-segmented into several single-syllable "words" -- see
+    `_text_for_mxl_syllables`/`_distribute_words_to_slots`, the two
+    callers). Returns None (defer to a hyphenation-based fallback
+    instead) when `text` doesn't even have one character per slot -- that
+    signals a genuine melisma (one syllable held across several notes),
+    not a recoverable per-syllable split, and must never be force-split
+    into fake pieces."""
+    n = len(weights)
+    if n <= 0 or len(text) < n:
+        return None
+    total = sum(weights) or n
+    boundaries = [0]
+    acc = 0
+    for i, w in enumerate(weights[:-1]):
+        acc += w
+        remaining_slots = n - (i + 1)
+        b = round(acc / total * len(text))
+        b = max(b, boundaries[-1] + 1)
+        b = min(b, len(text) - remaining_slots)
+        boundaries.append(b)
+    boundaries.append(len(text))
+    return [text[boundaries[i]:boundaries[i + 1]] for i in range(n)]
+
+
+def _distribute_words_to_slots(lrc_words_raw: List[str], n_slots: int,
+                                mxl_slot_texts: Optional[List[str]] = None) -> List[str]:
     """Distributes a recovered stretch of raw LRC words across n_slots MXL
     word display slots -- OCR word-segmentation doesn't always match the
     real lyric's own word boundaries (see `assign_words_to_lines`'s own
@@ -324,10 +420,32 @@ def _distribute_words_to_slots(lrc_words_raw: List[str], n_slots: int) -> List[s
       - Fewer real words than slots: first tries splitting any hyphenated
         word into its own pieces (real case: MXL notated "double"/"edged"
         as two separate words, but LRC's own line joins them into one
-        "double-edged" token) -- if that still isn't enough, pads the
-        remainder with `config.MELISMA_CONTINUATION_TEXT` (same
-        convention `_text_for_mxl_syllables` already uses for a word with
-        fewer syllables than notated).
+        "double-edged" token). If exactly ONE real (non-hyphenated) word
+        remains short of the slot count, recovers the split from the
+        MXL's OWN NOTES rather than guessing linguistically -- real
+        confirmed case (Les Miserables - Stars, 2026-08-18): the MXL's
+        own syllabic markers mis-notated "never" as two separate
+        SINGLE-syllable words ("ne", "ver") instead of one word split
+        "begin"/"end", so this function was handed exactly 1 LRC word
+        ("never") for 2 MXL slots and produced "never"+"~" (a word-count
+        mismatch, not a real melisma) instead of splitting it. When the
+        caller passes `mxl_slot_texts` (each slot's own original MXL
+        word/syllable text -- "ne"/"ver" here), `_slice_by_weights` uses
+        THEIR character lengths to slice the recovered clean word at the
+        matching position (never a hyphenation guess: "ne"(2)+"ver"(3)
+        sums to 5, matching "never"'s own 5 characters exactly, so the
+        slice lands precisely on "ne"/"ver" -- the real notated split).
+        Only falls back to `syllables.hyphenate` when no usable
+        `mxl_slot_texts` was given, or the word is too short for one
+        character per slot (a genuine melisma, not a recoverable split --
+        `_slice_by_weights` returns None for this itself). Gated on
+        actually producing >1 piece so a genuinely monosyllabic word sung
+        across multiple notes is never force-split into fake syllables --
+        it still falls through to melisma-padding below unchanged. If
+        that still isn't enough, pads the remainder with
+        `config.MELISMA_CONTINUATION_TEXT` (same convention
+        `_text_for_mxl_syllables` already uses for a word with fewer
+        syllables than notated).
       - More real words than slots: merges adjacent words evenly
         (`_merge_words_to_count`).
       - Equal counts: direct positional 1:1 assignment."""
@@ -338,6 +456,16 @@ def _distribute_words_to_slots(lrc_words_raw: List[str], n_slots: int) -> List[s
             pieces = [p for p in w.split("-") if p] if "-" in w else None
             expanded.extend(pieces if pieces else [w])
         words = expanded
+    if len(words) == 1 and n_slots > 1:
+        sliced = None
+        if mxl_slot_texts and len(mxl_slot_texts) == n_slots:
+            sliced = _slice_by_weights(words[0], [max(1, len(t)) for t in mxl_slot_texts])
+        if sliced is not None:
+            words = sliced
+        else:
+            parts = hyphenate(words[0])
+            if len(parts) > 1:
+                words = chunk_to_count(parts, n_slots) if len(parts) > n_slots else parts
     if len(words) > n_slots:
         words = _merge_words_to_count(words, n_slots)
     elif len(words) < n_slots:
@@ -345,8 +473,9 @@ def _distribute_words_to_slots(lrc_words_raw: List[str], n_slots: int) -> List[s
     return words
 
 
-def assign_words_to_lines(mxl_words: List[MxlWord],
-                           lrc_lines: List[Tuple[float, str]]) -> Tuple[List[int], List[Optional[str]]]:
+def assign_words_to_lines(
+        mxl_words: List[MxlWord],
+        lrc_lines: List[Tuple[float, str]]) -> Tuple[List[int], List[Optional[str]], List[int], dict]:
     """Assigns each MXL word to an LRC line index via word-level
     whole-sequence matching (order-preserving, resistant to picking a
     wrong repeated-phrase instance the same way this project's other
@@ -394,7 +523,29 @@ def assign_words_to_lines(mxl_words: List[MxlWord],
         into pieces first if that's what's needed to make the counts
         line up (the "double-edged"/"kide" case), otherwise merging or
         melisma-padding the same way syllable counts are already
-        reconciled elsewhere in this module."""
+        reconciled elsewhere in this module.
+
+    ALSO returns `word_group` and `word_group_text` (2026-08-18, user's
+    explicit correction: a word spanning several MXL NOTES is a normal,
+    intentional sheet-music pattern, not a defect -- but this specific
+    sub-case, several separate MXL WORDS recovering to exactly ONE real
+    LRC word, needs to be treated as ONE semantic word downstream too,
+    not just fixed for display text). `word_group[i]` is the group id
+    (the group's own first MXL index) for word `i` -- identical to `i`
+    itself for an ungrouped word. `word_group_text[gid]` is the group's
+    own recovered whole-word text (e.g. "never"). Set ONLY for the
+    "MULTIPLE MXL words -> exactly ONE real LRC word" shape above (real
+    case: Stars' own "never" mis-notated as two separate single-syllable
+    "words", "ne"+"ver", each syllabic="single" rather than one word
+    split "begin"/"end") -- `place_words_via_asr` uses this to search the
+    real ASR transcript for the whole word ONCE (e.g. "never"), instead
+    of trying to match "ne" and "ver" separately against a transcript
+    that only ever has the whole word, which can never succeed and
+    silently drops what would otherwise be a confident, accurate ASR
+    match down to a less-reliable interpolated guess. NOT set for the
+    "double"+"edged"+"kide" shape -- there each MXL slot recovers its OWN
+    distinct real word, and those genuinely are separate, independently
+    matchable spoken words."""
     lrc_flat: List[str] = []       # normalized, for matching
     lrc_flat_raw: List[str] = []   # raw, for display substitution
     lrc_line_idx: List[int] = []
@@ -410,6 +561,8 @@ def assign_words_to_lines(mxl_words: List[MxlWord],
     sm = difflib.SequenceMatcher(None, mxl_norm, lrc_flat, autojunk=False)
     word_line = {}
     word_clean_text: dict = {}
+    word_group = list(range(len(mxl_words)))  # identity by default -- each word its own group
+    word_group_text: dict = {}
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
             for k in range(i2 - i1):
@@ -428,10 +581,20 @@ def assign_words_to_lines(mxl_words: List[MxlWord],
             lrc_block_norm = "".join(lrc_flat[j1:j2])
             ratio = difflib.SequenceMatcher(None, mxl_block_norm, lrc_block_norm).ratio()
             if ratio >= config.MXL_LRC_FUZZY_TEXT_MIN_RATIO:
-                assigned = _distribute_words_to_slots(lrc_flat_raw[j1:j2], i2 - i1)
+                assigned = _distribute_words_to_slots(
+                    lrc_flat_raw[j1:j2], i2 - i1,
+                    mxl_slot_texts=[w.text for w in mxl_words[i1:i2]])
                 for k in range(i2 - i1):
                     word_line[i1 + k] = lrc_line_idx[j1]
                     word_clean_text[i1 + k] = assigned[k]
+                if (i2 - i1) > 1 and (j2 - j1) == 1:
+                    # Several separate MXL WORDS recovered to exactly ONE
+                    # real LRC word -- group them (see this function's own
+                    # docstring) so place_words_via_asr searches the real
+                    # ASR transcript for the whole word ONCE.
+                    for k in range(i1, i2):
+                        word_group[k] = i1
+                    word_group_text[i1] = lrc_flat_raw[j1]
             # else: genuinely too different -- leave unmatched.
 
     n = len(mxl_words)
@@ -446,7 +609,7 @@ def assign_words_to_lines(mxl_words: List[MxlWord],
     first_known = next((v for v in filled if v is not None), None)
     lines = [v if v is not None else first_known for v in filled]
     clean_text = [word_clean_text.get(i) for i in range(n)]
-    return lines, clean_text
+    return lines, clean_text, word_group, word_group_text
 
 
 @dataclass
@@ -463,11 +626,34 @@ class MxlLrcQuality:
 
 def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lines: List[Tuple[float, str]],
                          asr_words: List[Word],
-                         word_clean_text: Optional[List[Optional[str]]] = None) -> Tuple[List[float], List[float], MxlLrcQuality]:
-    """PASS 1: for each LRC line, matches that line's own MXL words
-    against real ASR words whose own timestamp falls near the line's
-    real-time window (order-preserving difflib, same technique used
-    throughout this project for text alignment).
+                         word_clean_text: Optional[List[Optional[str]]] = None,
+                         word_group: Optional[List[int]] = None,
+                         word_group_text: Optional[dict] = None) -> Tuple[List[float], List[float], MxlLrcQuality]:
+    """PASS 0 (2026-08-18): for each GROUPED block (`word_group`/
+    `word_group_text` from `assign_words_to_lines` -- several separate
+    MXL words the MXL itself notated for what's really ONE spoken/sung
+    word, e.g. Stars' own "never" mis-notated as "ne"+"ver"), searches
+    the group's own line window ONCE for the real ASR token matching the
+    group's WHOLE recovered word ("never"), via the same
+    `match_block_to_candidates` Pass 1 already uses. This exists because
+    the group's own INDIVIDUAL pieces ("ne", "ver") can never match a
+    transcript that only ever has the whole word -- without this, they'd
+    silently and permanently fall to the less-reliable Pass 2
+    interpolation below, even when a perfectly good, confident ASR match
+    for the whole word is sitting right there. On a confident match, the
+    matched span is distributed across the group's own member notes
+    proportionally by each note's own quarterLength -- the same
+    proportional-split idea `build_syllables` already uses WITHIN one
+    normal multi-syllable word, just applied across several MXL WORD
+    entries instead of one word's own syllables. A group that doesn't
+    match confidently as a whole is left alone; its members fall through
+    to Pass 1/Pass 2 exactly as if ungrouped -- no regression either way.
+
+    PASS 1: for each LRC line, matches that line's own (ungrouped, or
+    unmatched-as-a-group) MXL words against real ASR words whose own
+    timestamp falls near the line's real-time window (order-preserving
+    difflib, same technique used throughout this project for text
+    alignment).
 
     Matches on the CLEAN text (`word_clean_text`, from
     `assign_words_to_lines`) when available, falling back to the MXL
@@ -534,9 +720,42 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
     confident: List[bool] = [False] * n
     quality = MxlLrcQuality(n_words=n)
 
+    # --- Pass 0: grouped multi-MXL-word blocks, see this function's own docstring. ---
+    grouped_handled: set = set()
+    if word_group and word_group_text:
+        groups: dict = {}
+        for i, gid in enumerate(word_group):
+            groups.setdefault(gid, []).append(i)
+        for gid, members in groups.items():
+            if len(members) <= 1 or gid not in word_group_text:
+                continue
+            li = word_lines[members[0]]
+            t0, t1 = lrc_line_window(lrc_lines, li)
+            asr_in_window = words_in_time_window(asr_words, t0, t1)
+            target_norm = _normalize(word_group_text[gid])
+            if not target_norm:
+                continue
+            matched = match_block_to_candidates([target_norm], asr_in_window)
+            asr_w = matched.get(0)
+            if asr_w is None:
+                continue
+            total_qtr = sum(sum(s[1] for s in mxl_words[m].syllables) for m in members) or len(members)
+            asr_dur = asr_w.end - asr_w.start
+            span = asr_dur if asr_dur > 0 else total_qtr * config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC
+            cursor = asr_w.start
+            for m in members:
+                m_qtr = sum(s[1] for s in mxl_words[m].syllables) or 1.0
+                frac = m_qtr / total_qtr
+                starts[m] = cursor
+                ends[m] = cursor + span * frac
+                cursor = ends[m]
+                confident[m] = True
+                quality.n_asr_placed += 1
+                grouped_handled.add(m)
+
     # --- Pass 1: confident ASR matches only. ---
     for li, idxs in line_word_idxs.items():
-        idxs = sorted(idxs)
+        idxs = sorted(i for i in idxs if i not in grouped_handled)
         t0, t1 = lrc_line_window(lrc_lines, li)
         asr_in_window = words_in_time_window(asr_words, t0, t1)
         mxl_norm_line = [_normalize(word_clean_text[i]) if word_clean_text and word_clean_text[i]
@@ -657,26 +876,128 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
 
 def _text_for_mxl_syllables(clean_text: Optional[str], mxl_syllable_texts: List[str]) -> List[str]:
     """Returns the text to display on each of an MXL word's own syllable
-    slots. If `clean_text` (the matched LRC token, see
-    `assign_words_to_lines`) is available, it's hyphenated
-    (`syllables.hyphenate`) and reconciled to the MXL's own syllable
-    COUNT -- merged down (`syllables.chunk_to_count`) if the clean word
-    hyphenates into MORE pieces than MXL notated, or padded with
-    `config.MELISMA_CONTINUATION_TEXT` if FEWER -- mirroring
-    `lyric_alignment._syllables_for_word`'s existing pattern exactly.
-    Falls back to the MXL's own raw syllable text only when no clean
-    match exists at all (better than nothing, but never preferred: the
-    MXL's own OCR can be wrong, e.g. "systern"/"eystern" for "system")."""
+    slots.
+
+    The MXL score's own per-note syllable split (`syllabic="begin"/
+    "middle"/"end"`) is the musically-correct answer -- it's the
+    composer/engraver's own notated syllabification, not a guess -- and
+    is used DIRECTLY whenever its concatenation matches `clean_text` (the
+    matched LRC token, see `assign_words_to_lines`) after normalization.
+    This matters because `syllables.hyphenate` (a print-hyphenation
+    dictionary, tuned for legal line-wrap points, not phonetic syllable
+    boundaries) frequently disagrees with real singing syllabification --
+    confirmed real cases: "never" -> hyphenate gives "nev"/"er" instead of
+    the notated "ne"/"ver"; "Lucifer" -> hyphenate gives only "Lu"/"cifer"
+    (2 pieces) instead of the notated "Lu"/"ci"/"fer" (3); "fugitive" ->
+    "fugi"/"tive" (2) instead of "fu"/"gi"/"tive" (3) -- the last two
+    aren't just wrong BREAK POINTS, they're the wrong SYLLABLE COUNT,
+    which used to also trigger melisma-padding onto a musically-real
+    syllable (see `Removed / rejected` note: none removed, but this was
+    the "Stars" symptom the user reported 2026-08-18).
+
+    When the MXL's own text DOESN'T match clean_text -- i.e. the MXL's
+    own OCR is actually wrong (e.g. "systern"/"eystern" for "system") --
+    its individual LETTERS can't be trusted, but its own per-syllable
+    relative LENGTHS still reflect the real notated split, so
+    `_slice_by_weights` uses them to slice the corrected clean word at
+    the matching position -- still basing the split on the MXL's own
+    notes, never a linguistic hyphenation guess. Only falls back to
+    `hyphenate`+reconcile when that's not possible (the clean word is too
+    short for one character per syllable -- a genuine case where the
+    MXL's own note count can't be matched to real letters at all).
+    Falls back to the MXL's own raw syllable text as a last resort when
+    no clean match exists at all.
+
+    Real bug (Les Miserables - Stars, 2026-08-18): a MELISMA (ONE real
+    notated syllable held across several notes -- MXL's own untexted tied
+    /slurred continuation notes, `mxl_syllable_texts` mostly "") is
+    structurally NOT a multi-syllable word, even though it has multiple
+    slots. When the MXL's own single real syllable is "flame," but the
+    matched clean LRC token is "flames" (a genuine, expected spelling/
+    inflection difference, not OCR garbage), the exact-match check above
+    correctly declines (spelling differs) -- but `_slice_by_weights` then
+    WRONGLY treated the melisma's 3 empty continuation slots as real
+    syllable slots to redistribute "flames"'s own letters into, producing
+    "fla"/"m"/"e"/"s" (a real word torn into meaningless fragments, not
+    even valid text on any note). Fixed: when the MXL's own structure has
+    AT MOST ONE real (non-empty) syllable slot -- the defining shape of a
+    melisma, never a real multi-syllable word -- the whole clean word
+    goes on that one real slot unsliced, and every other slot melisma-
+    pads, regardless of spelling match. Slicing only ever applies when
+    there are genuinely 2+ real notated syllables to redistribute.
+
+    Two more real bugs (Great Big Sea - Ordinary Day, 2026-08-18), both
+    with 2+ real syllable slots (the case above doesn't cover them):
+      - A syllable-count-only MELISMA WITHIN a multi-syllable word (e.g.
+        "al"+""+"right." -- "al" held across 2 notes, THEN a real second
+        syllable "right.") still had its middle empty slot treated as a
+        real slicing target. When the matched clean text was a genuinely
+        DIFFERENT word ("all" for the MXL's own "alright.", not OCR noise
+        on the SAME word), slicing "all" across all 3 raw slot weights
+        produced "a"/"l"/"l" -- an invented extra syllable AND a doubled
+        letter, losing the "~" melisma marker entirely.
+      - A clean LRC token containing an internal SPACE ("all right," for
+        the MXL's own single word "alright,") got its raw characters
+        (space included) sliced across syllable boundaries, producing
+        "al"/"l right," -- a literal space glued into the middle of a
+        display syllable.
+      Fixed with two changes: (1) slicing is now restricted to the REAL
+      (non-empty) slots only, by their own weights -- every originally-
+      empty slot always melisma-pads, never receives sliced letters, no
+      matter how many real slots there are. (2) Before trusting
+      clean_text for character-level slicing at all, a sanity gate now
+      requires it to plausibly be THE SAME WORD as the MXL's own text:
+      no internal whitespace (multiple real LRC words for one MXL
+      word's own syllable slots is a genuine word-count mismatch, not a
+      spelling variant to slice), and a `MXL_LRC_FUZZY_TEXT_MIN_RATIO`
+      similarity to the MXL's own joined text (same bar
+      `assign_words_to_lines` already uses for "is this really the same
+      word", not a new threshold). Failing either falls back to the
+      MXL's own raw syllable text -- still safer than guessing at a
+      word LRC and MXL don't even agree is the same word."""
+    def _as_display(texts: List[str]) -> List[str]:
+        # A note with no lyric of its own (a tied hold / slurred pitch
+        # move within a melisma) is stored as "" -- display it with this
+        # project's own melisma-continuation marker, never a blank.
+        return [t if t else config.MELISMA_CONTINUATION_TEXT for t in texts]
+
+    def _place_at_real_slots(pieces: List[str], real_idxs: List[int]) -> List[str]:
+        result = [config.MELISMA_CONTINUATION_TEXT] * n
+        for idx, piece in zip(real_idxs, pieces):
+            result[idx] = piece
+        return result
+
     n = len(mxl_syllable_texts)
     if clean_text is None:
-        return mxl_syllable_texts
+        return _as_display(mxl_syllable_texts)
+
+    mxl_joined = _normalize("".join(mxl_syllable_texts))
+    clean_norm = _normalize(clean_text)
+    if mxl_joined and mxl_joined == clean_norm:
+        return _as_display(mxl_syllable_texts)
+
+    real_idxs = [i for i, t in enumerate(mxl_syllable_texts) if t]
+    n_real = len(real_idxs)
+    if n_real <= 1:
+        real_idx = real_idxs[0] if real_idxs else 0
+        result = [config.MELISMA_CONTINUATION_TEXT] * n
+        result[real_idx] = clean_text
+        return result
+
+    is_multi_word = any(c.isspace() for c in clean_text)
+    ratio = difflib.SequenceMatcher(None, mxl_joined, clean_norm).ratio() if mxl_joined else 0.0
+    if is_multi_word or ratio < config.MXL_LRC_FUZZY_TEXT_MIN_RATIO:
+        return _as_display(mxl_syllable_texts)
+
+    real_weights = [max(1, len(mxl_syllable_texts[i])) for i in real_idxs]
+    sliced = _slice_by_weights(clean_text, real_weights)
+    if sliced is not None:
+        return _place_at_real_slots(sliced, real_idxs)
+
     parts = hyphenate(clean_text)
-    if len(parts) == n:
-        return parts
-    elif len(parts) > n:
-        return chunk_to_count(parts, n)
-    else:
-        return list(parts) + [config.MELISMA_CONTINUATION_TEXT] * (n - len(parts))
+    if len(parts) > n_real:
+        parts = chunk_to_count(parts, n_real)
+    return _place_at_real_slots(parts, real_idxs)
 
 
 def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_ends: List[float],
@@ -889,9 +1210,11 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
     if offset is not None:
         lrc_match.lrc_lines = [(correction_fn(t), text) for t, text in lrc_match.lrc_lines]
 
-    word_lines, word_clean_text = assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
+    word_lines, word_clean_text, word_group, word_group_text = assign_words_to_lines(mxl_words, lrc_match.lrc_lines)
     word_starts, word_ends, quality = place_words_via_asr(mxl_words, word_lines, lrc_match.lrc_lines, asr_words,
-                                                            word_clean_text=word_clean_text)
+                                                            word_clean_text=word_clean_text,
+                                                            word_group=word_group,
+                                                            word_group_text=word_group_text)
     syllables = build_syllables(mxl_words, word_starts, word_ends, word_lines, word_clean_text)
 
     nonmonotonic_rate = quality.non_monotonic_fix_count / quality.n_words if quality.n_words else 1.0

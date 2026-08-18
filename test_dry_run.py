@@ -256,6 +256,78 @@ for w in ["reciprocity", "mothering", "cowboy", "I'm", "highway,", "always"]:
     assert "".join(parts) == w, (w, parts)
 print("OK")
 
+print("\n--- syllables.hyphenate (2026-08-18, four rounds): hybrid of pyphen + a from-scratch sonority-"
+      "sequencing syllabifier (which itself prefers a REAL WORD boundary over pure maximal-onset for an "
+      "inter-vowel consonant cluster, user's own proposed design), keeping whichever gives MORE real "
+      "pieces, ties favoring PYPHEN -- real-world-scale-validated against 413 unique real words from 55 "
+      "downloaded songs (70.5% exact-match / 90.8% count-match, beating plain pyphen's own 64.9%/72.2% on "
+      "BOTH metrics at once) -- see hyphenate()'s own docstring for the full staged validation, including "
+      "why ties flipped BACK to favoring pyphen after an earlier 56-word-only pass wrongly favored "
+      "sonority (86-vs-14 on the full corpus vs. 3-vs-2 on the tiny sample) ---")
+# Real reported symptom (Les Miserables - Stars, 2026-08-18): pyphen alone
+# under-counts these -- "Lucifer" -> only 2 pieces ("Lu"/"cifer"), "fugitive"
+# -> only 2 ("fugi"/"tive") -- both the WRONG syllable count, not just a
+# wrong break point. Resolved by the "more pieces wins" COUNT rule, so
+# unaffected by which way the tie-break points.
+assert hyphenate("Lucifer") == ["Lu", "ci", "fer"], hyphenate("Lucifer")
+assert hyphenate("fugitive") == ["fu", "gi", "tive"], hyphenate("fugitive")
+# The real word-boundary counterexample that motivated round 2 (Video
+# Games, same song): "filling" keeps its doubled 'l' WHOLE with the first
+# syllable ("fill" alone is a real word) but "running" splits its doubled
+# 'n' one-each ("runn" isn't a real word, "run" is) -- identical letter
+# shape, opposite real splits. Both still pass with ties favoring pyphen
+# because pyphen's OWN answer already happens to agree here -- confirmed
+# directly, not assumed, before reverting the tie-break in round 4.
+assert hyphenate("filling") == ["fill", "ing"], hyphenate("filling")
+assert hyphenate("running,") == ["run", "ning,"], hyphenate("running,")
+# "never" itself is NOT asserted here on purpose: the 413-word real-song
+# corpus shows it's a genuine, roughly even split in real notation
+# ("nev"/"er" 3x, "ne"/"ver" 4x across different shows) -- not a case
+# with one right answer for plain hyphenate() to chase. The Stars-
+# specific mis-notated occurrence still gets its own correct "ne"/"ver"
+# via the MXL's own real note data (see mxl_lrc_generator's own tests),
+# which never depends on this general-purpose guesser at all.
+# Real bug found via a real-audio validation run (Magic Dance, 2026-08-18)
+# right after shipping the word-boundary rule above: the bundled common-
+# word list is frequency-derived from web text, so it's contaminated with
+# calendar/title ABBREVIATIONS that are common strings but not real
+# standalone spoken/sung words ("thu" for Thursday, "mon"/"tue"/"wed"/
+# "fri"/"sat", "mr"/"dr"/"st"/"nd"/"rd"/"th" etc.) -- "Thunder" was
+# splitting as "Thu"/"nder" (a false-positive "real word" match on the
+# abbreviation) instead of the correct "Thun"/"der". Fixed by stripping
+# these specific entries from data/common_words.txt (not a blanket
+# length/frequency filter -- a real independent word that also happens
+# to double as an abbreviation, e.g. "sun"/"mar", is deliberately kept).
+assert hyphenate("Thunder") == ["Thun", "der"], hyphenate("Thunder")
+# Two more real refinements the user identified directly, 2026-08-18:
+# (1) a word-final "y" acting as a vowel is never sung as its own bare
+# syllable -- "bully" must split "bul"/"ly", not "bull"/"y", even though
+# "bull" (the longer, doubled-consonant-intact prefix) IS a real word;
+# "duty"/"rely" already worked but are re-asserted here as the same code
+# path. (2) a DOUBLED consonant only ever keeps the whole pair with the
+# first syllable or splits it one-each down the middle -- never pushes
+# the whole pair to the SECOND syllable: "happy" was wrongly matching
+# "ha" (a real short interjection) and splitting "ha"/"ppy" instead of
+# "hap"/"py".
+assert hyphenate("bully") == ["bul", "ly"], hyphenate("bully")
+assert hyphenate("duty") == ["du", "ty"], hyphenate("duty")
+assert hyphenate("rely") == ["re", "ly"], hyphenate("rely")
+assert hyphenate("happy") == ["hap", "py"], hyphenate("happy")
+# A genuinely monosyllabic word must never be force-split into fake
+# syllables just because the sonority splitter can find internal
+# consonant clusters to carve up.
+for w in ["go", "grace", "code", "fire"]:
+    assert hyphenate(w) == [w], (w, hyphenate(w))
+# Every result must still reconstruct the input exactly (punctuation
+# included) regardless of which of the two splitters won.
+for w in ["reciprocity", "double-edged", "Ev'rything", "buzzin'", "necessities,"]:
+    parts = hyphenate(w)
+    assert "".join(parts) == w, (w, parts)
+print("OK: hyphenate() correctly splits real wrong-count cases ('Lucifer', 'fugitive') into their true "
+      "syllable count, resolves the real word-boundary counterexample ('filling' vs 'running'), a "
+      "genuinely monosyllabic word is never force-split, and every result still reconstructs its input "
+      "exactly")
+
 print("\n--- BUG REGRESSION 1: enforce_monotonic removes overlaps ---")
 overlapping = [
     Syllable("A", 0.0, 1.0, 0, True),
@@ -1527,6 +1599,7 @@ from ultrastar_generator.mxl_lrc_generator import (
 )
 from ultrastar_generator.lrc_timing import two_tier_time_calibration
 from ultrastar_generator.models import Word as _Word
+from ultrastar_generator.syllables import hyphenate
 
 # A tiny two-line "song": line 0 "hello world", line 1 "good bye now".
 mlg_words = [
@@ -1538,7 +1611,7 @@ mlg_words = [
 ]
 mlg_lrc_lines = [(10.0, "hello world"), (20.0, "good bye now")]
 
-word_lines, word_clean_text = assign_words_to_lines(mlg_words, mlg_lrc_lines)
+word_lines, word_clean_text, word_group, word_group_text = assign_words_to_lines(mlg_words, mlg_lrc_lines)
 assert word_lines == [0, 0, 1, 1, 1], word_lines
 assert word_clean_text == ["hello", "world", "good", "bye", "now"], word_clean_text
 print("OK: assign_words_to_lines correctly tags each word with its own LRC line index AND its own "
@@ -1555,7 +1628,7 @@ fuzzy_words = [
     MxlWord(text="works", norm="works", offset=2.0, syllables=[(2.0, 1.0, 60, "works")]),
 ]
 fuzzy_lines = [(10.0, "the system works")]
-_, fuzzy_clean = assign_words_to_lines(fuzzy_words, fuzzy_lines)
+_, fuzzy_clean, _, _ = assign_words_to_lines(fuzzy_words, fuzzy_lines)
 assert fuzzy_clean == ["the", "system", "works"], fuzzy_clean
 print("OK: an OCR-garbled MXL word in a 1:1 replace slot gets fuzzy-matched to the clean LRC text "
       "('systern' -> 'system'), not left stuck on the MXL's own OCR garbage")
@@ -1568,7 +1641,7 @@ unrelated_words = [
     MxlWord(text="xyz", norm="xyz", offset=1.0, syllables=[(1.0, 1.0, 60, "xyz")]),
     MxlWord(text="works", norm="works", offset=2.0, syllables=[(2.0, 1.0, 60, "works")]),
 ]
-_, unrelated_clean = assign_words_to_lines(unrelated_words, fuzzy_lines)
+_, unrelated_clean, _, _ = assign_words_to_lines(unrelated_words, fuzzy_lines)
 assert unrelated_clean == ["the", None, "works"], unrelated_clean
 print("OK: a genuinely unrelated word in the same kind of slot is correctly REJECTED by the similarity "
       "ratio gate, not fuzzy-matched just because it landed in a replace slot")
@@ -1590,7 +1663,7 @@ merge_words = [
     MxlWord(text="and", norm="and", offset=2.5, syllables=[(2.5, 1.0, 60, "and")]),
 ]
 merge_lines = [(10.0, "I win now and")]
-_, merge_clean = assign_words_to_lines(merge_words, merge_lines)
+_, merge_clean, _, _ = assign_words_to_lines(merge_words, merge_lines)
 assert merge_clean == ["I", "win now", "and"], merge_clean
 
 # N: N (same count, individually too garbled) -- "stomty"+"in" for
@@ -1603,7 +1676,7 @@ same_count_words = [
     MxlWord(text="Oh", norm="oh", offset=5.5, syllables=[(5.5, 1.0, 60, "Oh")]),
 ]
 same_count_lines = [(10.0, "won't stop trying, oh")]
-_, same_count_clean = assign_words_to_lines(same_count_words, same_count_lines)
+_, same_count_clean, _, _ = assign_words_to_lines(same_count_words, same_count_lines)
 assert same_count_clean == ["won't", "stop", "trying,", "oh"], same_count_clean
 
 # N: M -- three MXL words for two real (one hyphenated) LRC words
@@ -1618,7 +1691,7 @@ split_words = [
     MxlWord(text="but", norm="but", offset=4.0, syllables=[(4.0, 1.0, 60, "but")]),
 ]
 split_lines = [(10.0, "a double-edged knife, but")]
-_, split_clean = assign_words_to_lines(split_words, split_lines)
+_, split_clean, split_group, split_group_text = assign_words_to_lines(split_words, split_lines)
 assert split_clean == ["a", "double", "edged", "knife,", "but"], split_clean
 print("OK: assign_words_to_lines recovers a MULTI-word replace block anchored by real matches on both "
       "sides -- 1-MXL-word-merges-2-real-words, same-count-but-individually-garbled, and "
@@ -1634,10 +1707,70 @@ unrelated_block_words = [
     MxlWord(text="works", norm="works", offset=3.0, syllables=[(3.0, 1.0, 60, "works")]),
 ]
 unrelated_block_lines = [(10.0, "the completely unrelated text works")]
-_, unrelated_block_clean = assign_words_to_lines(unrelated_block_words, unrelated_block_lines)
+_, unrelated_block_clean, _, _ = assign_words_to_lines(unrelated_block_words, unrelated_block_lines)
 assert unrelated_block_clean[1] is None and unrelated_block_clean[2] is None, unrelated_block_clean
 print("OK: a genuinely unrelated multi-word block is correctly rejected by the block-level similarity "
       "ratio gate too, not fuzzy-matched just because it's bounded by real anchors")
+
+# The "double"+"edged"+"kide" -> "double-edged"+"knife," case recovers TWO
+# distinct real words (2 real LRC tokens for its own 3 MXL slots) -- each
+# MXL slot keeps its OWN distinct identity, must NOT be grouped as one
+# semantic word the way the real Stars "never" case (below) is.
+assert split_group == [0, 1, 2, 3, 4] and split_group_text == {}, (split_group, split_group_text)
+print("OK: assign_words_to_lines does NOT group a multi-MXL-word block that recovers MULTIPLE distinct "
+      "real LRC words -- grouping is reserved for the 'one real word split across several separate MXL "
+      "word entries' shape only")
+
+# Real bug (Les Miserables - Stars, 2026-08-18, user's own correction): a
+# word spanning several MXL NOTES is a normal, intentional sheet-music
+# pattern -- but the MXL's own syllabic markers can still mis-notate a
+# word as several separate single-syllable WORDS (this exact case: "ne"
+# and "ver" each syllabic="single" instead of one word split
+# "begin"/"end"). Fixing only the DISPLAYED text (already covered above)
+# isn't enough -- place_words_via_asr must also treat "ne"+"ver" as ONE
+# semantic word for ASR matching, or it can never match a real transcript
+# that only ever has "never" as a single token, permanently losing a
+# real, confident ASR anchor to a less-reliable interpolated guess.
+never_words = [
+    MxlWord(text="I", norm="i", offset=0.0, syllables=[(0.0, 1.0, 60, "I")]),
+    MxlWord(text="ne", norm="ne", offset=1.0, syllables=[(1.0, 0.25, 60, "ne")]),
+    MxlWord(text="ver", norm="ver", offset=1.25, syllables=[(1.25, 0.25, 58, "ver")]),
+    MxlWord(text="shall", norm="shall", offset=2.0, syllables=[(2.0, 1.0, 60, "shall")]),
+]
+never_lines = [(9.5, "I never shall")]  # close to the fake ASR words' own real timestamps below
+never_word_lines, never_clean, never_group, never_group_text = assign_words_to_lines(never_words, never_lines)
+assert never_clean[1] == "ne" and never_clean[2] == "ver", never_clean
+assert never_group[1] == never_group[2] == 1 and never_group[0] != never_group[1], never_group
+assert never_group_text[1] == "never", never_group_text
+print("OK: assign_words_to_lines groups 'ne'+'ver' (two separate single-syllable MXL words recovering to "
+      "one real LRC word) as one semantic unit, distinct from an ungrouped neighbor")
+
+never_asr = [
+    Word(text="I", start=10.0, end=10.2, confidence=0.98),
+    Word(text="never", start=10.4, end=10.8, confidence=0.95),  # ASR transcribes it as ONE token, never "ne"/"ver"
+    Word(text="shall", start=11.0, end=11.3, confidence=0.9),
+]
+never_starts, never_ends, never_quality = place_words_via_asr(
+    never_words, never_word_lines, never_lines, never_asr,
+    word_clean_text=never_clean, word_group=never_group, word_group_text=never_group_text)
+# Both "ne" and "ver" get a real, CONFIDENT match (from the grouped whole-
+# word search) instead of falling to interpolation -- n_asr_placed counts
+# all 4 words (I/ne/ver/shall), not just the 2 that match ASR 1:1.
+assert never_quality.n_asr_placed == 4, never_quality.n_asr_placed
+# The matched "never" span (10.4-10.8) is split proportionally between
+# "ne" and "ver" by their own real note durations (0.25 qtr each -> 50/50).
+assert never_starts[1] == 10.4 and abs(never_ends[1] - 10.6) < 1e-9, (never_starts[1], never_ends[1])
+assert abs(never_starts[2] - 10.6) < 1e-9 and never_ends[2] == 10.8, (never_starts[2], never_ends[2])
+print("OK: place_words_via_asr searches a grouped block's own WHOLE recovered word ('never') once against "
+      "real ASR, instead of trying (and permanently failing) to match 'ne'/'ver' separately -- the matched "
+      "span is then split proportionally across the group's own notes by their real durations")
+
+# An ungrouped word (no word_group/word_group_text given at all) must
+# behave exactly as before -- this is a purely additive, opt-in change.
+plain_starts, plain_ends, plain_quality = place_words_via_asr(never_words, never_word_lines, never_lines, never_asr,
+                                                                word_clean_text=never_clean)
+assert plain_quality.n_asr_placed == 2, plain_quality.n_asr_placed  # only "I" and "shall" match ASR directly
+print("OK: place_words_via_asr behaves exactly as before when word_group/word_group_text aren't given at all")
 
 # _distribute_words_to_slots directly: the merge (more real words than
 # slots) and melisma-pad (fewer real words than slots, no hyphen to
@@ -1649,6 +1782,37 @@ assert _distribute_words_to_slots(["go"], 3) == ["go", mxl_lrc_config.MELISMA_CO
                                                   mxl_lrc_config.MELISMA_CONTINUATION_TEXT]
 print("OK: _distribute_words_to_slots handles more-words-than-slots (merge), fewer (hyphen-split, then "
       "melisma-pad), and equal counts (direct positional) correctly in isolation")
+
+# Real bug (Les Miserables - Stars, 2026-08-18): the MXL's own syllabic
+# markers mis-notated "never" as two separate SINGLE-syllable words ("ne",
+# "ver") instead of one word split "begin"/"end" -- assign_words_to_lines
+# correctly recovered the clean LRC word "never" for this 2-MXL-word
+# block, but _distribute_words_to_slots used to just melisma-pad a single
+# real word short of its slot count ("never"+"~") instead of trying to
+# split it. Fixed via `mxl_slot_texts`: uses the MXL's own two
+# mis-segmented "words"' OWN character lengths ("ne"=2, "ver"=3) to slice
+# the recovered clean word -- NOT a linguistic hyphenation guess, so it
+# lands on the real notated split exactly (not hyphenate's "nev"/"er").
+never_split_from_mxl = _distribute_words_to_slots(["never"], 2, mxl_slot_texts=["ne", "ver"])
+assert never_split_from_mxl == ["ne", "ver"], never_split_from_mxl
+# Without a usable `mxl_slot_texts` hint (e.g. an older/other caller),
+# falls back to hyphenate-splitting a lone multi-syllable word short of
+# its own slot count instead of melisma-padding it -- still better than
+# "never"+"~", just not guaranteed to land on the exact notated break.
+never_split_no_hint = _distribute_words_to_slots(["never"], 2)
+assert never_split_no_hint != ["never", mxl_lrc_config.MELISMA_CONTINUATION_TEXT], never_split_no_hint
+assert "".join(never_split_no_hint) == "never" and len(never_split_no_hint) == 2, never_split_no_hint
+# A genuinely monosyllabic word (a real melisma sustained across several
+# notes) must NOT be force-split into fake syllables, with or without an
+# `mxl_slot_texts` hint -- too few real characters to give each slot one.
+assert _distribute_words_to_slots(["go"], 3) == ["go", mxl_lrc_config.MELISMA_CONTINUATION_TEXT,
+                                                  mxl_lrc_config.MELISMA_CONTINUATION_TEXT]
+assert _distribute_words_to_slots(["go"], 3, mxl_slot_texts=["g", "o", "o"]) == [
+    "go", mxl_lrc_config.MELISMA_CONTINUATION_TEXT, mxl_lrc_config.MELISMA_CONTINUATION_TEXT]
+print("OK: _distribute_words_to_slots recovers the real notated split from the MXL's own mis-segmented "
+      "word slots via their own character lengths (real 'never'->'ne'+'ver' MXL mis-segmentation case), "
+      "falls back to hyphenate-splitting without that hint, and never force-splits a genuinely "
+      "monosyllabic melisma word either way")
 
 # ASR confidently catches "hello"/"world"/"bye" at real times close to (but not
 # exactly at) the printed line starts; "good" and "now" are missing from ASR
@@ -1812,6 +1976,73 @@ print("OK: _text_for_mxl_syllables prefers clean LRC text reconciled to the MXL'
       "(merging or melisma-padding as needed), falling back to MXL's own raw text only when no clean "
       "match exists at all")
 
+# Real bug (Les Miserables - Stars, 2026-08-18): a MELISMA -- the MXL's
+# own real note data is ONE real syllable ("flame,") plus untexted
+# tied/slurred continuation notes ("") -- is structurally NOT a multi-
+# syllable word, even though it has multiple slots. Real reported case:
+# the matched clean LRC token was "flames" (a genuine plural vs. the
+# MXL's own singular "flame,", not OCR garbage), which used to fall into
+# the weight-slicing path meant for genuine multi-syllable words and
+# fragment "flames" into meaningless letter pieces ("fla"/"m"/"e"/"s")
+# instead of keeping it whole. A word with only ONE real (non-empty) MXL
+# syllable slot must always keep the whole clean word on that one slot,
+# regardless of any spelling mismatch, and melisma-pad the rest.
+melisma_word_mismatch = _text_for_mxl_syllables("flames", ["flame,", "", "", ""])
+assert melisma_word_mismatch == ["flames", mxl_lrc_config.MELISMA_CONTINUATION_TEXT,
+                                  mxl_lrc_config.MELISMA_CONTINUATION_TEXT,
+                                  mxl_lrc_config.MELISMA_CONTINUATION_TEXT], melisma_word_mismatch
+# The real syllable can be in ANY position, not just the first -- the fix
+# must locate it, not assume index 0.
+melisma_mid_real = _text_for_mxl_syllables("flames", ["", "flame", ""])
+assert melisma_mid_real == [mxl_lrc_config.MELISMA_CONTINUATION_TEXT, "flames",
+                             mxl_lrc_config.MELISMA_CONTINUATION_TEXT], melisma_mid_real
+print("OK: _text_for_mxl_syllables never slices a clean word's letters across a melisma's untexted "
+      "continuation slots (real 'flame,'/'flames' Stars case) -- the whole word stays on the ONE real "
+      "syllable slot, wherever it is, with the rest melisma-padded")
+
+# Real bugs (Great Big Sea - Ordinary Day, 2026-08-18), both with 2+ real
+# syllable slots so the n_real<=1 case above doesn't cover them:
+# (1) a melisma WITHIN a multi-syllable word ("al"+""+"right." -- "al"
+# held across 2 notes, then a real second syllable) must still melisma-
+# pad its empty middle slot even when the clean text is a genuinely
+# DIFFERENT word ("all" for the MXL's own "alright.") -- the OLD
+# behavior sliced "all"'s raw letters across all 3 raw slots and
+# produced "a"/"l"/"l" (an invented extra syllable, a doubled letter,
+# and a lost melisma marker).
+alright_mismatch = _text_for_mxl_syllables("all", ["al", "", "right."])
+assert alright_mismatch == ["al", mxl_lrc_config.MELISMA_CONTINUATION_TEXT, "right."], alright_mismatch
+# (2) a clean LRC token with an internal SPACE ("all right," for the
+# MXL's own single word "alright,") must never have that space sliced
+# into the middle of a display syllable ("al"/"l right," -- a literal
+# space inside one syllable's text, the OLD bug).
+alright_two_words = _text_for_mxl_syllables("all right,", ["al", "right,"])
+assert alright_two_words == ["al", "right,"], alright_two_words
+print("OK: _text_for_mxl_syllables restricts slicing to the MXL's own REAL syllable slots only (never "
+      "invents letters for an empty melisma slot) and declines to slice at all when the clean LRC text "
+      "isn't plausibly the SAME WORD as the MXL's own text (multi-word phrase, or too dissimilar) -- "
+      "falling back to the MXL's own raw syllables instead of guessing")
+
+# Real bug (Les Miserables - Stars, 2026-08-18): the MXL's own notated
+# syllable split IS musically correct and must be used directly whenever
+# it actually matches the clean word, ARCHITECTURALLY (never routed
+# through `hyphenate` at all for this fast path) -- not merely because
+# `hyphenate` happens to agree today. `hyphenate` itself was ALSO fixed
+# the same day (see its own section below) and now gets "never"/
+# "Lucifer" right too, but `_text_for_mxl_syllables`'s exact-match branch
+# must not depend on that coincidence holding.
+matches_notated = _text_for_mxl_syllables("never", ["ne", "ver"])
+assert matches_notated == ["ne", "ver"], matches_notated
+lucifer = _text_for_mxl_syllables("Lucifer", ["Lu", "ci", "fer"])
+assert lucifer == ["Lu", "ci", "fer"], lucifer
+# A melisma continuation note (no lyric of its own) inside an otherwise
+# real-matching MXL word must display as "~", never a blank string.
+tied = _text_for_mxl_syllables("go", ["go", ""])
+assert tied == ["go", mxl_lrc_config.MELISMA_CONTINUATION_TEXT], tied
+print("OK: _text_for_mxl_syllables uses the MXL's own notated syllable split directly whenever it "
+      "matches the clean word -- more musically correct than generic dictionary hyphenation, and "
+      "fixes real wrong-syllable-count cases ('never', 'Lucifer'); untexted continuation notes "
+      "display as '~', never blank")
+
 print("\n--- mxl_lrc_generator: nearest-anchor interpolation replaces whole-line-stretch fallback ---")
 # Reproduces the real confirmed bug: an LRC line whose own window includes a
 # long trailing silence (an instrumental gap before the NEXT line) used to
@@ -1834,7 +2065,7 @@ anchor_asr = [
     _Word(text="one", start=0.0, end=0.4),
     _Word(text="four", start=1.3, end=1.6),
 ]
-a_word_lines, _ = assign_words_to_lines(anchor_words, anchor_lines)
+a_word_lines, _, _, _ = assign_words_to_lines(anchor_words, anchor_lines)
 a_starts, a_ends, a_quality = place_words_via_asr(anchor_words, a_word_lines, anchor_lines, anchor_asr)
 # "two"/"three" must land BETWEEN "one" (0.0) and "four" (1.3) -- a locally
 # sane position -- NOT stretched out toward the line's own 20s-wide window.
@@ -2122,6 +2353,83 @@ print("OK: tied same-pitch continuation merges into one extended-duration syllab
       f"({go_word.syllables}); slurred different-pitch continuation becomes a real second "
       f"syllable ({up_word.syllables}); a non-contiguous untexted note (after a rest) is "
       "correctly left unattached")
+
+print("\n--- load_mxl_vocal_words: OCR/engraving defect repair -- two real words merged onto ONE "
+      "note's own lyric text, missing the space/note split, real 'Great Big Sea - Ordinary Day' case "
+      "('right,it\\'s' on one note) ---")
+_merge_part = _music21.stream.Part()
+_merge_part.partName = "Voice 1"
+
+# "right,it's" merged onto ONE note; the FOLLOWING note has no lyric at
+# all -- the real defect shape. Must split into "right," (this note) and
+# "it's" (the next, currently-empty note), each its own real word.
+_m1 = _music21.note.Note(60, quarterLength=0.5)
+_m1.lyric = "right,it's"
+_merge_part.append(_m1)
+_m2 = _music21.note.Note(62, quarterLength=0.5)  # no lyric of its own
+_merge_part.append(_m2)
+
+# A NORMAL trailing comma ("battered,") must NOT be touched -- nothing
+# after the comma, so the merge-detection regex must not match at all,
+# regardless of whether the next note has its own lyric or not.
+_m3 = _music21.note.Note(64, quarterLength=0.5)
+_m3.lyric = "battered,"
+_merge_part.append(_m3)
+_m4 = _music21.note.Note(65, quarterLength=0.5)  # no lyric of its own either
+_merge_part.append(_m4)
+
+# A merge-shaped text where the NEXT note ALREADY has its own real word
+# must be left alone -- not confidently an OCR mistake, don't guess.
+_m5 = _music21.note.Note(67, quarterLength=0.5)
+_m5.lyric = "hello world"
+_merge_part.append(_m5)
+_m6 = _music21.note.Note(69, quarterLength=0.5)
+_m6.lyric = "already"
+_merge_part.append(_m6)
+
+# Real bug (Great Big Sea - Ordinary Day, 2026-08-18): a trailing
+# ellipsis engraved as its OWN separate note ("..") immediately after
+# "know."'s own note (contiguous, same pitch, real confirmed case) --
+# must be ABSORBED onto "know."'s own trailing text ("know..."), not
+# treated as an independent word. Also confirms the merge-repair regex
+# fix above doesn't mistake "know..."'s own internal periods for a
+# real-word merge (the char after each period is more punctuation, not
+# alphanumeric, so it must never split "know..." itself).
+_m7 = _music21.note.Note(65, quarterLength=1.0)
+_m7.lyric = "know."
+_merge_part.append(_m7)
+_m8 = _music21.note.Note(65, quarterLength=0.5)  # same pitch, contiguous, pure punctuation
+_m8.lyric = ".."
+_merge_part.append(_m8)
+
+# A pure-punctuation note that is NOT contiguous with the preceding real
+# word (a rest in between) must NOT be absorbed -- same non-contiguity
+# safety gate the existing untexted-continuation handling already uses.
+_m9 = _music21.note.Note(67, quarterLength=1.0)
+_m9.lyric = "word"
+_merge_part.append(_m9)
+_merge_part.append(_music21.note.Rest(quarterLength=1.0))
+_m10 = _music21.note.Note(67, quarterLength=0.5)
+_m10.lyric = ".."
+_merge_part.append(_m10)
+
+_merge_score = _music21.stream.Score()
+_merge_score.append(_merge_part)
+
+with _tempfile.TemporaryDirectory() as _tmpdir:
+    _merge_path = _os.path.join(_tmpdir, "test.musicxml")
+    _merge_score.write("musicxml", fp=_merge_path)
+    merge_words, _merge_parts = load_mxl_vocal_words(_merge_path)
+
+merge_texts = [w.text for w in merge_words]
+assert merge_texts == ["right,", "it's", "battered,", "hello world", "already",
+                        "know...", "word", ".."], merge_texts
+print("OK: 'right,it\\'s' merged onto one note splits into 'right,'+'it\\'s' (real words, next note was "
+      "empty) via the same real bug this fixes; a normal trailing comma ('battered,') is untouched; a "
+      "merge-shaped text whose next note already has its own real word ('hello world' before 'already') "
+      "is left alone rather than guessed at; a trailing ellipsis note ('..') contiguous with a real word "
+      "is absorbed into it ('know...'), but the same punctuation-only text stays its own separate entry "
+      "when a rest breaks contiguity with the preceding word")
 
 print("\n--- phrasing forces a break exactly on a line_id change (even with no silence gap) ---")
 line_syls = [
