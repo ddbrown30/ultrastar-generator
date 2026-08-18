@@ -276,8 +276,9 @@ def apply_musicxml_reference(
     otherwise this is a no-op and `stats.skipped_reason` explains why.
 
     `force_calibration=True` (ON by default, `config.
-    ENABLE_MUSICXML_FORCE_CALIBRATION` / `--no-musicxml-force-calibration`
-    to disable) skips the confidence bar entirely and always applies the
+    ENABLE_MUSICXML_FORCE_CALIBRATION` -- unconditional in both callers as
+    of 2026-08-17, no CLI/GUI off-switch anymore) skips the confidence bar
+    entirely and always applies the
     best available calibration offset (full population, or the high-
     confidence-subset fallback if that was tried), however weak.
     Validated real end-to-end on all 7 MXL-having songs in the test set

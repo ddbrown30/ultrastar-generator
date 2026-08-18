@@ -65,8 +65,8 @@ def _mean_word_score(words: list) -> float:
 
 def _find_best_window(segment: dict, align_model, metadata, audio, device: str,
                        debug_log=None) -> tuple:
-    """See config.REWINDOW_ENABLED's docstring for the real case this fixes
-    and its validation history. Sweeps fixed-width candidate windows across `segment`'s own
+    """See `_rewindow_long_segments`'s own docstring for the real case this
+    fixes and its validation history. Sweeps fixed-width candidate windows across `segment`'s own
     declared [start, end] span, re-running wav2vec2 CTC alignment of the
     SAME text against each, and keeps whichever gives the best mean word
     score -- provided it clears the baseline (whole-segment) score by
@@ -118,7 +118,13 @@ def _rewindow_long_segments(segments: list, align_model, metadata, audio, device
     segment at least `config.REWINDOW_MIN_SEGMENT_DURATION_SEC` long --
     everything else (text, downstream whisperx.align()/Word construction)
     is untouched; this only fixes segment BOUNDARIES before they're used,
-    so it composes with the normal pipeline for free.
+    so it composes with the normal pipeline for free. Unconditional
+    (rolled into core 2026-08-17, no CLI/GUI off-switch anymore) --
+    real-validated across 12 total runs (8 realign-mode songs, 4 full
+    generation-pipeline songs), zero regressions, 6 genuine verified
+    fixes carried through to the actual written output (not just the
+    intermediate ASR score). See CLAUDE.md's "Long-segment
+    re-windowing" section for the full validation history.
 
     The sweep in `_find_best_window` deliberately probes many implausible
     candidate windows (including narrow tail-end ones as short as
@@ -161,7 +167,7 @@ def force_align_words_in_window(words_text: List[str], window_start: float, wind
     have "heard" these words at all; it directly measures where the GIVEN
     text best fits within the window. This is what recovers content a
     free transcription pass can drop outright (a decoder segment that
-    silently omits real sung words -- see config.REWINDOW_ENABLED's
+    silently omits real sung words -- see `_rewindow_long_segments`'s
     docstring for the same underlying failure mode), rather than hoping a
     bigger model happens to transcribe it (config.RETRY_ASR_MODEL, which
     real-world testing found doesn't reliably recover a specific dropped
@@ -234,8 +240,9 @@ def force_align_reference_lyrics(vocals_path: Path, synced_lyrics: str, audio_du
     where a decoder hallucination on a real repeated passage ultimately
     corrupted output text even after reference-lyrics correction). Only
     the SEPARATE wav2vec2 CTC forced-alignment model runs here
-    (`force_align_words_in_window`, same mechanism `force_align_gaps`
-    already uses to recover known-but-undetected words), driven entirely
+    (`force_align_words_in_window`, same mechanism
+    `recover_dropped_reference_words` already uses to recover
+    known-but-undetected words), driven entirely
     by the KNOWN text from a pinned LRC candidate's own synced lyrics --
     there is no ASR output at all for anything downstream to inherit
     hallucinated text from.
@@ -297,7 +304,7 @@ def force_align_reference_lyrics(vocals_path: Path, synced_lyrics: str, audio_du
 
 
 def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None,
-                               vad_options: dict = None, rewindow_long_segments: bool = False) -> List[Word]:
+                               vad_options: dict = None) -> List[Word]:
     import whisperx
 
     audio = whisperx.load_audio(str(vocals_path))
@@ -314,12 +321,10 @@ def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None
 
     align_model, metadata = model_cache.get_whisperx_align_model()
 
-    segments = result["segments"]
-    if rewindow_long_segments:
-        if debug_log is not None:
-            debug_log.section("LONG-SEGMENT RE-WINDOWING (see config.REWINDOW_ENABLED)")
-        segments = _rewindow_long_segments(segments, align_model, metadata, audio, device="cuda",
-                                            debug_log=debug_log)
+    if debug_log is not None:
+        debug_log.section("LONG-SEGMENT RE-WINDOWING")
+    segments = _rewindow_long_segments(result["segments"], align_model, metadata, audio, device="cuda",
+                                        debug_log=debug_log)
 
     aligned = whisperx.align(segments, align_model, metadata, audio, device="cuda")
 
@@ -411,7 +416,6 @@ def transcribe_words(
     debug_log=None,
     vad_filter: bool = True,
     whisperx_vad_options: dict = None,
-    rewindow_long_segments: bool = config.REWINDOW_ENABLED,
 ) -> List[Word]:
     """Returns a flat, time-ordered list of Word objects for the whole track.
 
@@ -426,15 +430,14 @@ def transcribe_words(
     faster-whisper path. `whisperx_vad_options` only applies to the
     whisperx path -- see config.WHISPERX_NO_VAD_OPTIONS's docstring for
     why this fixed a real, confirmed timing bug (word timestamps up to
-    ~6s wrong around sustained/held notes). `rewindow_long_segments`
-    (whisperx path only, ON by default) -- see config.REWINDOW_ENABLED's
-    docstring for the real case this fixes and its validation history.
+    ~6s wrong around sustained/held notes). The whisperx path always
+    re-windows long decoder segments (see `_rewindow_long_segments`'s own
+    docstring for the real case this fixes and its validation history).
     """
     if prefer_whisperx:
         try:
             return _transcribe_with_whisperx(vocals_path, model_name, debug_log=debug_log,
-                                              vad_options=whisperx_vad_options,
-                                              rewindow_long_segments=rewindow_long_segments)
+                                              vad_options=whisperx_vad_options)
         except ImportError:
             print(
                 "whisperx not installed -- falling back to faster-whisper's own "

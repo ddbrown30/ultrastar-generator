@@ -72,7 +72,8 @@ def _quantize_entries(entries: List[object], bpm: float, gap_ms: int) -> List[tu
 
 
 def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
-    """See config.MERGE_CONNECTED_MELISMA_TAILS's docstring. Folds a 'syl'
+    """See config.py's "Final-step cleanup" comment (near MIN_NOTE_GAP_SEC)
+    for the real motivating case. Folds a 'syl'
     entry into the immediately preceding 'syl' entry when they're beat-
     adjacent (no gap), same pitch, and THIS entry's own text is the
     melisma-continuation placeholder -- extending the previous entry's

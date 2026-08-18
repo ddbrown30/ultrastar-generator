@@ -607,7 +607,6 @@ class PitchRefreshOptions:
     musicxml_pitch: bool = True
     musicxml_reference: Optional[str] = None
     musicxml_part: Optional[str] = None
-    musicxml_force_calibration: bool = config.ENABLE_MUSICXML_FORCE_CALIBRATION
     output_path: Optional[str] = None
     delete_work_files: bool = False
     batch: bool = False
@@ -692,7 +691,7 @@ def _run_pitch_refresh_pipeline_body(input_dir: Path, existing_txt_path: Optiona
             log("Attempting MusicXML-based pitch refresh...")
             mxl_entries, mxl_stats_list = apply_mxl_pitch_references(
                 existing.entries, mxl_paths, preferred_part_name=opts.musicxml_part,
-                force_calibration=opts.musicxml_force_calibration, verbose=not opts.batch,
+                verbose=not opts.batch,
             )
             usable_stats = [s for s in mxl_stats_list if s.calibration_offset is not None]
             for s in mxl_stats_list:
@@ -856,12 +855,6 @@ def build_arg_parser():
                     help="Hint: which part name in the MusicXML file carries the lead vocal line, for "
                          "duet/ensemble arrangements where multiple parts have lyrics. Falls back to the "
                          "lyric-bearing part with the most notes if not given.")
-    p.add_argument("--no-musicxml-force-calibration", dest="musicxml_force_calibration",
-                    action="store_false", default=config.ENABLE_MUSICXML_FORCE_CALIBRATION,
-                    help="Without a confident calibration offset, this normally still applies the best "
-                         "available offset anyway rather than skipping the file (same "
-                         "config.ENABLE_MUSICXML_FORCE_CALIBRATION default the main pipeline's own pass 4 "
-                         "uses). Pass this flag to require a confident calibration instead.")
     p.add_argument("--delete-work-files", action="store_true",
                     help="Delete <input-folder>/.ultrastar_work after refreshing. Default: OFF (keeps "
                          "cached separation for re-runs).")
@@ -873,7 +866,7 @@ def _opts_from_args(args) -> PitchRefreshOptions:
         audio_file=args.audio_file, work_dir=args.work_dir, isolate_vocals=args.isolate_vocals,
         demucs_model=args.demucs_model, pitch_source=args.pitch_source,
         musicxml_pitch=args.musicxml_pitch, musicxml_reference=args.musicxml_reference,
-        musicxml_part=args.musicxml_part, musicxml_force_calibration=args.musicxml_force_calibration,
+        musicxml_part=args.musicxml_part,
         attack_trim_sec=args.attack_trim_sec, confidence_floor_percentile=args.confidence_floor_percentile,
         voicing_threshold=args.voicing_threshold, key_nudge=args.key_nudge, output_path=args.output_path,
         delete_work_files=args.delete_work_files, batch=args.batch,

@@ -161,15 +161,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Use whisperx's own default pyannote VAD instead of the near-disabled "
                          "workaround -- re-enables the confirmed sustained-note timestamp bug; "
                          "kept only for comparison/debugging.")
-    p.add_argument("--rewindow-long-segments", dest="rewindow_long_segments", action="store_true",
-                    default=config.REWINDOW_ENABLED,
-                    help="Default: ON (real-validated across 12 real songs/runs, 6 genuine fixes, 0 "
-                         "regressions -- see CLAUDE.md). For any whisper decoder segment >= config."
-                         "REWINDOW_MIN_SEGMENT_DURATION_SEC long, sweeps smaller candidate windows and "
-                         "keeps whichever gives the best forced-alignment score -- fixes a real case where "
-                         "the decoder silently drops content, leaving a short remaining phrase aligned "
-                         "against a much-too-large window.")
-    p.add_argument("--no-rewindow-long-segments", dest="rewindow_long_segments", action="store_false")
     p.add_argument("--retry-low-quality-asr", dest="retry_low_quality_asr", action="store_true",
                     default=config.RETRY_LOW_QUALITY_ASR,
                     # NOTE: literal '%' in argparse help text must be escaped as '%%' -- argparse
@@ -187,33 +178,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                           f"triggered condition logs a WARNING suggesting --batch or a manual --whisper-model "
                           f"large-v3 instead. See CLAUDE.md.").replace("%", "%%"))
     p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
-    p.add_argument("--force-align-gaps", dest="force_align_gaps", action="store_true",
-                    default=config.FORCE_ALIGN_GAPS,
-                    help="PROTOTYPE, default: ON. Standard fallback path only: for any run of reference "
-                         "lyrics words ASR produced NO word for at all, forces that known text onto the "
-                         "audio window between the nearest ASR-matched neighbors via a real wav2vec2 CTC "
-                         "forced alignment -- doesn't need ASR to have transcribed anything in the gap. "
-                         "Adapted from UltraStarKaraokeMaker. See CLAUDE.md.")
-    p.add_argument("--no-force-align-gaps", dest="force_align_gaps", action="store_false")
-    p.add_argument("--time-based-line-assignment", dest="time_based_line_assignment", action="store_true",
-                    default=config.ENABLE_TIME_BASED_LINE_ASSIGNMENT,
-                    help="Default: ON. When the reference lyrics came with synced (LRC) timestamps, a word "
-                         "the whole-song TEXT match couldn't "
-                         "place at all gets its line_id assigned by nearest CALIBRATED LRC line timestamp to "
-                         "its own real ASR time, instead of blindly inheriting the nearest matched neighbor's "
-                         "line_id -- fixes a long unmatched run (e.g. around a repeated chorus) freezing on "
-                         "one stale line_id and suppressing/misplacing line breaks. Never re-matches text. "
-                         "Falls back to the old neighbor-inherit rule when no synced lyrics/confident "
-                         "calibration. See CLAUDE.md.")
-    p.add_argument("--no-time-based-line-assignment", dest="time_based_line_assignment", action="store_false")
-    p.add_argument("--merge-connected-melisma", dest="merge_connected_melisma", action="store_true",
-                    default=config.MERGE_CONNECTED_MELISMA_TAILS,
-                    help="Default: ON. Final write-time cleanup: a melisma-continuation note ('~') that's "
-                         "beat-adjacent (no gap) to the preceding note at the EXACT same pitch is merged "
-                         "into it (extending its length, dropping the '~') instead of being written as a "
-                         "separate note -- chains, so several connected same-pitch '~' notes in a row all "
-                         "collapse into one. See CLAUDE.md.")
-    p.add_argument("--no-merge-connected-melisma", dest="merge_connected_melisma", action="store_false")
     p.add_argument("--musicxml-reference", default=None,
                     help="Path to a MusicXML/.mxl file for this song (e.g. hand-downloaded sheet "
                          "music) -- pass 4, off unless given. Aligns by lyric text against pass 3's "
@@ -251,15 +215,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "a user who already has a synced-lyrics file on disk, including a deliberately "
                          "imprecise one for testing how the LRC-seeding/windowing/MXL+LRC logic handles "
                          "an off-but-close candidate.")
-    p.add_argument("--no-musicxml-force-calibration", dest="musicxml_force_calibration",
-                    action="store_false", default=config.ENABLE_MUSICXML_FORCE_CALIBRATION,
-                    help="Without a confident calibration offset (config."
-                         "MUSICXML_MIN_CALIBRATION_CONFIDENCE), pass 4 normally still applies the best "
-                         "available offset anyway rather than skipping the file -- validated real "
-                         "end-to-end on all 7 MXL-having songs in the test set: 0 regressions, up to "
-                         "+21.6pp on songs where pass 1 was confirmed unreliable (see CLAUDE.md). Pass "
-                         "this flag to go back to skipping uncalibratable files instead. Never touches "
-                         "octave or timing, same as normal pass 4.")
     p.add_argument("--lrc-timing-check", dest="lrc_timing_check", action="store_true",
                     default=config.ENABLE_LRC_TIMING_CHECK,
                     help="EXPERIMENTAL, off by default. Cross-checks each line's assigned start time "
@@ -373,12 +328,12 @@ def _transcribe_words_cancellable(vocals_path: Path, model_name: str, opts: conf
     if opts.cancel_requested is None:
         return transcribe_words(
             vocals_path, model_name, prefer_whisperx=not opts.no_whisperx, debug_log=debug_log,
-            whisperx_vad_options=whisperx_vad_options, rewindow_long_segments=opts.rewindow_long_segments,
+            whisperx_vad_options=whisperx_vad_options,
         )
     result = run_cancellable(
         "transcribe_words",
         {"vocals_path": str(vocals_path), "model_name": model_name, "prefer_whisperx": not opts.no_whisperx,
-         "whisperx_vad_options": whisperx_vad_options, "rewindow_long_segments": opts.rewindow_long_segments},
+         "whisperx_vad_options": whisperx_vad_options},
         cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
     )
     return [Word(**d) for d in result]
@@ -885,14 +840,13 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         "forced line breaks).")
             if reference:
                 candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
-                # PROTOTYPE force-align known gaps, see config.FORCE_ALIGN_GAPS's
-                # docstring. Gated on the SAME wrong-song floor as everything else
+                # Force-align known gaps (see recover_dropped_reference_words's own
+                # docstring). Gated on the SAME wrong-song floor as everything else
                 # in this block (reference_match_ratio computed on the ORIGINAL
                 # ASR words, before any recovery) -- running this against a
                 # wrong-song/wrong-language reference would force garbage text
                 # onto our own audio, not recover anything real.
-                if (opts.force_align_gaps
-                        and reference_match_ratio(candidate_lines, words) >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
+                if reference_match_ratio(candidate_lines, words) >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO:
                     words, n_recovered = _recover_dropped_reference_words_cancellable(
                         candidate_lines, words, vocals_path, opts, debug_log, log)
                     if n_recovered:
@@ -954,7 +908,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         # otherwise accepting the retry (its raw ratio can look better on the WHOLE song)
                         # silently throws away whatever the first pass's gap-recovery already found, and
                         # there's no guarantee the bigger model independently recovers the same passage.
-                        if (opts.force_align_gaps and reference_match_ratio(candidate_lines, retry_words)
+                        if (reference_match_ratio(candidate_lines, retry_words)
                                 >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
                             retry_words, retry_n_recovered = _recover_dropped_reference_words_cancellable(
                                 candidate_lines, retry_words, vocals_path, opts, debug_log, log)
@@ -997,9 +951,9 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                     )
                     corrected = align_words_to_reference(
                         words, ref_lines,
-                        synced_lyrics_text=synced_lyrics_text if opts.time_based_line_assignment else None,
+                        synced_lyrics_text=synced_lyrics_text,
                     )
-                    if opts.time_based_line_assignment and synced_lyrics_text:
+                    if synced_lyrics_text:
                         strict_line_breaks_from_lrc = is_lrc_line_tracking_confident(words, synced_lyrics_text)
                         if strict_line_breaks_from_lrc:
                             log("  Confidently trusted LRC line tracking -- line breaks will match it "
@@ -1056,7 +1010,6 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             log(f"Pass 4: cross-checking pitch against {len(mxl_paths)} MusicXML reference file(s)...")
             syllables, mxl_stats_list = apply_musicxml_references(
                 syllables, mxl_paths, preferred_part_name=opts.musicxml_part,
-                force_calibration=opts.musicxml_force_calibration,
                 verbose=not opts.quiet, debug_log=debug_log,
             )
             for path, mxl_stats in zip(mxl_paths, mxl_stats_list):
@@ -1140,7 +1093,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         preview_start=preview_start,
         entries=entries,
     )
-    write_song(song, out_path, merge_connected_melisma=opts.merge_connected_melisma)
+    write_song(song, out_path, merge_connected_melisma=True)
     log(f"Wrote {out_path}")
 
     if not opts.skip_separation:
@@ -1170,13 +1123,8 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
         skip_separation=args.skip_separation, vocals_path=args.vocals_path,
         fetch_lyrics=args.fetch_lyrics, fetch_cover=args.fetch_cover, no_video_sync=args.no_video_sync,
         no_whisperx=args.no_whisperx, no_transcribe=args.no_transcribe, whisperx_no_vad=args.whisperx_no_vad,
-        rewindow_long_segments=args.rewindow_long_segments,
         retry_low_quality_asr=args.retry_low_quality_asr,
-        force_align_gaps=args.force_align_gaps,
-        time_based_line_assignment=args.time_based_line_assignment,
-        merge_connected_melisma=args.merge_connected_melisma,
         musicxml_reference=args.musicxml_reference, musicxml_part=args.musicxml_part,
-        musicxml_force_calibration=args.musicxml_force_calibration,
         lrc_timing_check=args.lrc_timing_check,
         pitch_smooth_window=args.pitch_smooth_window, note_split_semitones=args.note_split_semitones,
         min_note_beat_fraction=args.min_note_beat_fraction, silence_threshold_db=args.silence_threshold_db,

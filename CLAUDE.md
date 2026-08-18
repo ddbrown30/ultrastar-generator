@@ -465,14 +465,15 @@ to the gui at the same time.
   concatenated lyric text byte-identical before/after, note count
   increased by exactly 9, every split note's own text/timing/pitch
   inspected directly and correct. `--musicxml-reference`/`--musicxml-
-  part`/`--no-musicxml-force-calibration` mirror the main pipeline's own
-  flags; `--no-musicxml-pitch` opts out entirely.
-- `ENABLE_MUSICXML_FORCE_CALIBRATION = True`: when a user supplies (or
-  auto-detects) a MusicXML reference and normal pass-4 calibration can't
-  clear its confidence bar, apply the best available pitch-class offset
-  anyway rather than skipping. Zero regressions across all 7 tested
-  MXL-having songs; big wins (+19–22pp) on rough/character-vocal songs.
-  Never touches octave or timing.
+  part` mirror the main pipeline's own flags; `--no-musicxml-pitch` opts
+  out entirely.
+- `ENABLE_MUSICXML_FORCE_CALIBRATION = True` (unconditional, no CLI/GUI
+  off-switch as of 2026-08-17): when a user supplies (or auto-detects) a
+  MusicXML reference and normal pass-4 calibration can't clear its
+  confidence bar, apply the best available pitch-class offset anyway
+  rather than skipping. Zero regressions across all 7 tested MXL-having
+  songs; big wins (+19–22pp) on rough/character-vocal songs. Never
+  touches octave or timing.
 - `file_discovery.find_companions` auto-detects `.mxl`/`.musicxml`/
   `.xml` reference files by extension; bare `.xml` is content-sniffed
   (`_looks_like_musicxml`) before trusting it, since some games ship an
@@ -526,12 +527,12 @@ to the gui at the same time.
 - `BPM_WRITE_MULTIPLIER = 2`: written `#BPM` is 2x the detected tempo
   for finer beat-grid resolution (display/write-time only, not fed into
   `detect_notes()`'s own segmentation).
-- `config.REWINDOW_ENABLED = True` (default everywhere): see
-  "Long-segment rewindowing" under the `realign.py` section below —
-  applies to both `realign.py` and `main.py`.
-- `config.FORCE_ALIGN_GAPS = True`, `config.MERGE_CONNECTED_MELISMA_TAILS
-  = True` (the latter `main.py`-only): see "UltraStarKaraokeMaker-
-  inspired improvements" below.
+- Long-segment re-windowing (unconditional, no CLI/GUI off-switch as of
+  2026-08-17): see "Long-segment rewindowing" under the `realign.py`
+  section below — applies to both `realign.py` and `main.py`.
+- Force-align known-text gaps and melisma-tail merging (the latter
+  `main.py`-only) are both unconditional, no CLI/GUI off-switch as of
+  2026-08-17: see "UltraStarKaraokeMaker-inspired improvements" below.
 - `NOTE_MERGE_SEMITONES = 1` (default, investigated and confirmed to
   stay) — a wider `=2` was tried to fix note over-segmentation, found a
   clean win on BATB but ~15-20% genuinely-ambiguous real melodic steps
@@ -1153,9 +1154,10 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   (zero warnings, no fallback to `"seed"` needed) where it previously
   warned and fell back; Chicago and Video Games both confirmed back to
   their own original (pre-regression) confident-match rates.
-- `force_align_gaps` and `retry_low_quality_asr` (see below) default ON.
-  `rewindow_long_segments` (see below) defaults ON, independently of the
-  shared `config.REWINDOW_ENABLED` used elsewhere.
+- Force-align known-text gaps and long-segment re-windowing (see below)
+  are both unconditional. `retry_low_quality_asr` (see below) defaults
+  ON, with a real CLI/GUI off-switch (it's a real cost tradeoff, unlike
+  the two above).
 - Strategy: `"validate"` (DEFAULT as of 2026-08-15, user's explicit
   request — previously an explicit non-default `--strategy validate`
   option; `"replace"` was the default before this) vs. `"replace"`
@@ -1232,7 +1234,7 @@ be net regressions (`--verify-placement`/`--zone-boundary-snap`).
   silence). This motivated three real, shipped mitigations: long-segment
   rewindowing, ASR-quality retry, and `--no-transcribe` (all below).
 
-### Long-segment rewindowing (`config.REWINDOW_ENABLED`, default ON everywhere)
+### Long-segment rewindowing (unconditional, no CLI/GUI off-switch as of 2026-08-17)
 
 For any whisper decoder segment ≥ `REWINDOW_MIN_SEGMENT_DURATION_SEC`
 (10s), sweeps fixed-10s-width candidate windows at 1s steps across the
@@ -1250,7 +1252,11 @@ the user listened and confirmed the true position by ear). A fine
 answer, and does so with a sharp, unambiguous score peak, not a fuzzy
 one. 12 real validation runs across 8 songs found 6 genuine fixes (all
 verified against trusted/written output, not just the raw score) and
-zero regressions before shipping default-on everywhere; a low-confidence
+zero regressions before shipping unconditionally everywhere (2026-08-17:
+the `--rewindow-long-segments`/`--no-rewindow-long-segments` off-switch
+that used to exist in both `main.py` and `realign.py` is gone — this
+much validation earned it core-behavior status, not just a default); a
+low-confidence
 segment that's already correctly placed (e.g. a sustained note dragging
 CTC score down without being misaligned) correctly does not trigger a
 change.
@@ -1308,14 +1314,16 @@ Compared our own output against a real run of UltraStarKaraokeMaker
 memory entry for the broader comparison) on "Trixie Mattel - Gold."
 Three concrete outcomes:
 
-1. **Force-align known gaps — shipped, default ON.**
+1. **Force-align known gaps — shipped, unconditional.**
    `transcription.force_align_words_in_window` (real wav2vec2 CTC
    forced alignment of KNOWN text into a bounded audio window), adapted
    from USKMaker's own `realign_gap_windows`. Wired into both
    `realign.py` (`_force_align_unconfident_runs`) and `main.py`'s
    standard fallback path (`lyrics_lookup.
-   recover_dropped_reference_words`). `config.FORCE_ALIGN_GAPS`,
-   `--no-force-align-gaps` opts out.
+   recover_dropped_reference_words`). No CLI/GUI off-switch as of
+   2026-08-17 (was `--force-align-gaps`/`--no-force-align-gaps`,
+   `config.FORCE_ALIGN_GAPS`) — this much validation earned it
+   core-behavior status.
 2. **Note over-segmentation — investigated, NOT shipped.** Confirmed
    real: pass-1's raw note count on Stars was ~2.8x the true (OMR)
    count, and untexted `~` continuation-note rate varies wildly by song
@@ -1323,7 +1331,7 @@ Three concrete outcomes:
    rate (forced-alignment-first, pitch extracted per-syllable
    afterward). See `NOTE_MERGE_SEMITONES` in Shipped Defaults above for
    why the obvious fix (widen the merge threshold) was rejected.
-3. **Melisma-tail merge — shipped, default ON in `main.py` only.**
+3. **Melisma-tail merge — shipped, unconditional in `main.py` only.**
    `usdx_writer._merge_connected_melisma_tails`: a beat-adjacent,
    exact-same-pitch `~` continuation note immediately following a real
    syllable is redundant and gets folded into the preceding note
@@ -1332,8 +1340,9 @@ Three concrete outcomes:
    float-seconds, since quantization itself can change what counts as
    adjacent. Deliberately NOT applied in `realign.py` — its own contract
    (never add/remove/reorder a note) would be violated by deleting a
-   note. `config.MERGE_CONNECTED_MELISMA_TAILS`,
-   `--no-merge-connected-melisma` opts out.
+   note. No CLI/GUI off-switch as of 2026-08-17 (was
+   `--merge-connected-melisma`/`--no-merge-connected-melisma`,
+   `config.MERGE_CONNECTED_MELISMA_TAILS`).
 
 All three, plus `retry_low_quality_asr`, validated together (not just in
 isolation) across 6 real gen+realign runs — zero regressions.

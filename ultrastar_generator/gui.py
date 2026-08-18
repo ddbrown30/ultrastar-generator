@@ -441,21 +441,36 @@ class App(tk.Tk):
         self.pitch_refresh_isolate_vocals = tk.BooleanVar(value=True)
         self.pitch_refresh_key_nudge = tk.BooleanVar(value=DEFAULT_KEY_NUDGE)
         self.pitch_refresh_musicxml = tk.BooleanVar(value=True)
-        self.pitch_refresh_musicxml_force_calibration = tk.BooleanVar(
-            value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.pitch_refresh_delete_work_files = tk.BooleanVar(value=False)
 
-        # Curated main-surface options (see gui.py's own module docstring
-        # for why only a subset of the ~30 CLI flags are exposed here).
+        # Curated main-surface options -- the GUI deliberately doesn't
+        # mirror every CLI flag. Three categories stay CLI-only:
+        # (1) diagnostic/isolation-only flags meant for chasing a specific
+        # bug, not normal use (--no-transcribe, --whisperx-vad, --no-pass1-
+        # debug, --no-debug-log, --no-whisperx); (2) expert numeric tuning
+        # knobs with no existing GUI float-entry widget pattern to mirror
+        # (same reasoning --ambiguity-margin-threshold's own CLI help
+        # already gives: the 7 pass-1 knobs -- pitch-smooth-window, note-
+        # split-semitones, min-note-beat-fraction, silence-threshold-db,
+        # silence-floor-db, spike-max-duration, spike-jump-semitones -- plus
+        # pitch_refresh.py's attack-trim-sec/confidence-floor-percentile/
+        # voicing-threshold); (3) rare/advanced overrides with a real but
+        # narrow use case (--bpm, --skip-separation/--vocals-path,
+        # --retry-low-quality-asr -- already default-on and --batch-gated
+        # specifically so it doesn't need a knob, see its own CLI help).
+        # Everything else genuinely user-facing lives below, either here or
+        # under the Advanced/experimental section further down.
         self.fetch_lyrics = tk.BooleanVar(value=True)
         self.fetch_cover = tk.BooleanVar(value=True)
-        self.musicxml_force_calibration = tk.BooleanVar(value=config.ENABLE_MUSICXML_FORCE_CALIBRATION)
         self.whisper_model = tk.StringVar(value=config.DEFAULT_WHISPER_MODEL)
         self.pitch_source = tk.StringVar(value=config.DEFAULT_PITCH_SOURCE)
+        self.demucs_model = tk.StringVar(value=config.DEFAULT_DEMUCS_MODEL)
+        # Default ON, quality-gated with automatic fallback to the standard
+        # pass 1-4 pipeline -- see --mxl-lrc-primary's own CLI help.
+        self.mxl_lrc_primary = tk.BooleanVar(value=config.ENABLE_MXL_LRC_PRIMARY)
 
         # Advanced/experimental -- collapsed by default.
         self.lrc_timing_check = tk.BooleanVar(value=config.ENABLE_LRC_TIMING_CHECK)
-        self.time_based_line_assignment = tk.BooleanVar(value=config.ENABLE_TIME_BASED_LINE_ASSIGNMENT)
         self.ambiguity_key_tiebreak = tk.BooleanVar(value=config.ENABLE_AMBIGUITY_KEY_TIEBREAK)
         self.no_video_sync = tk.BooleanVar(value=False)
         self.quiet = tk.BooleanVar(value=False)
@@ -479,6 +494,13 @@ class App(tk.Tk):
         # pattern as lrclib_id above (one Entry per Lyrics frame, single
         # source of truth). See lyrics_lookup.load_lrc_file.
         self.lrc_file = tk.StringVar(value="")
+        # MusicXML reference override -- normally auto-detected from the
+        # input folder's own companion files; only needed when that picks
+        # the wrong file (or none at all). musicxml_part is a rarely-needed
+        # hint for multi-part/duet arrangements. Both feed pass 4 AND the
+        # MXL+LRC primary path below.
+        self.musicxml_reference = tk.StringVar(value="")
+        self.musicxml_part = tk.StringVar(value="")
 
         self._running = False
         # Set by _on_stop (after user confirmation) and polled via
@@ -717,6 +739,30 @@ class App(tk.Tk):
         self.lrc_file_browse_button.pack(side="left", padx=(2, 0))
         self._update_pinned_lyrics_label()
 
+        # MusicXML reference override -- separate frame from Lyrics above
+        # (a different concept -- pitch/score reference, not lyrics text),
+        # same Entry+Browse shape as the LRC file field.
+        self.musicxml_frame = ttk.LabelFrame(self, text="MusicXML (single-song mode only)")
+        musicxml_frame = self.musicxml_frame
+        ttk.Label(musicxml_frame, text="Reference file:").pack(side="left", padx=(8, 2), pady=4)
+        self.musicxml_reference_entry = ttk.Entry(musicxml_frame, textvariable=self.musicxml_reference, width=24)
+        self.musicxml_reference_entry.pack(side="left", pady=4)
+        Tooltip(self.musicxml_reference_entry, "Path to a MusicXML/.mxl file for this song (e.g. hand-downloaded "
+                                                 "sheet music) -- normally auto-detected from companion files in "
+                                                 "the input folder; only needed if that picks the wrong file or "
+                                                 "finds none. Feeds both pass 4's pitch-class correction and the "
+                                                 "MXL+LRC primary path.")
+        self.musicxml_reference_browse_button = ttk.Button(
+            musicxml_frame, text="Browse...", command=self._browse_musicxml_reference)
+        self.musicxml_reference_browse_button.pack(side="left", padx=(2, 0), pady=4)
+        ttk.Label(musicxml_frame, text="Part name:").pack(side="left", padx=(16, 2), pady=4)
+        self.musicxml_part_entry = ttk.Entry(musicxml_frame, textvariable=self.musicxml_part, width=14)
+        self.musicxml_part_entry.pack(side="left", pady=4)
+        Tooltip(self.musicxml_part_entry, "Which part name in the MusicXML file carries the lead vocal line, "
+                                            "for duet/ensemble arrangements where multiple parts have lyrics -- "
+                                            "rarely needed. Falls back to the lyric-bearing part with the most "
+                                            "notes if left blank.")
+
         # Mirrors the normal pipeline's own Lyrics/Options split immediately
         # below (same LabelFrame styling/naming convention) rather than one
         # combined "Realign options" frame -- LRCLIB candidate selection
@@ -821,20 +867,19 @@ class App(tk.Tk):
                                      "MusicXML reveals to be a multi-note melisma (only the first of the "
                                      "new notes keeps the original text). Falls back to audio-based "
                                      "detection when no usable MusicXML is found.")
-        pr_musicxml_force_calibration_check = ttk.Checkbutton(
-            pr_options_frame, text="MusicXML force calibration",
-            variable=self.pitch_refresh_musicxml_force_calibration)
-        pr_musicxml_force_calibration_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=2)
-        Tooltip(pr_musicxml_force_calibration_check, "When a MusicXML reference is found but pitch can't "
-                                                        "confidently calibrate against it, use the best "
-                                                        "available offset anyway rather than skipping.")
         pr_delete_work_files_check = ttk.Checkbutton(
             pr_options_frame, text="Delete work files after refreshing",
             variable=self.pitch_refresh_delete_work_files)
-        pr_delete_work_files_check.grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=2)
+        pr_delete_work_files_check.grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=2)
         Tooltip(pr_delete_work_files_check, "Deletes the entire .ultrastar_work directory (cached Demucs "
                                              "separation, if vocal isolation was used) once pitch refreshing "
                                              "completes. Leave off if you'll re-run this song again soon.")
+        ttk.Label(pr_options_frame, text="Demucs model:").grid(row=5, column=0, sticky="w", padx=8, pady=2)
+        pr_demucs_entry = ttk.Entry(pr_options_frame, textvariable=self.demucs_model, width=15)
+        pr_demucs_entry.grid(row=5, column=1, sticky="w", padx=8, pady=2)
+        Tooltip(pr_demucs_entry, f"Vocal-separation model name (default: {config.DEFAULT_DEMUCS_MODEL}), used "
+                                   "only when \"Isolate vocals with Demucs first\" is checked above. Same "
+                                   "field/value as the main pipeline's own Demucs model setting.")
 
         self.opts_frame = ttk.LabelFrame(self, text="Options")
         opts_frame = self.opts_frame
@@ -849,11 +894,20 @@ class App(tk.Tk):
         c2.grid(row=0, column=1, sticky="w", padx=8, pady=2)
         Tooltip(c2, "Download a cover image online (MusicBrainz/Cover Art Archive, then iTunes, then "
                     "Deezer) when the input folder has no [CO]-tagged or embedded cover art of its own.")
-        c5 = ttk.Checkbutton(opts_frame, text="MusicXML force calibration", variable=self.musicxml_force_calibration)
-        c5.grid(row=0, column=2, sticky="w", padx=8, pady=2)
-        Tooltip(c5, "When a MusicXML reference file is found but our own pitch can't confidently "
-                    "calibrate against it, use the best available offset anyway rather than skipping.")
-
+        c3 = ttk.Checkbutton(opts_frame, text="MXL+LRC primary generation", variable=self.mxl_lrc_primary)
+        c3.grid(row=1, column=0, sticky="w", padx=8, pady=2)
+        Tooltip(c3, "Default ON. When a MusicXML file (Reference file above, or auto-detected) AND matching "
+                    "synced lyrics are both available, generate from those directly (MusicXML for pitch, "
+                    "LRCLIB line starts as real-time anchors, real transcription to place words within a "
+                    "line) instead of the standard audio-only pass 1-4 pipeline. Quality-gated -- falls back "
+                    "to the standard pipeline automatically if the match doesn't check out.")
+        demucs_frame = ttk.Frame(opts_frame)
+        demucs_frame.grid(row=1, column=1, sticky="w", padx=8, pady=2)
+        ttk.Label(demucs_frame, text="Demucs model:").pack(side="left")
+        demucs_entry = ttk.Entry(demucs_frame, textvariable=self.demucs_model, width=15)
+        demucs_entry.pack(side="left", padx=(4, 0))
+        Tooltip(demucs_entry, f"Vocal-separation model name (default: {config.DEFAULT_DEMUCS_MODEL}), e.g. "
+                               "htdemucs_ft (higher quality, slower). Passed straight through to Demucs.")
         # Each label + its own input lives in a small sub-frame (packed
         # tightly together) rather than sharing the outer grid's columns
         # directly -- those columns are also shared with the wider
@@ -899,14 +953,6 @@ class App(tk.Tk):
         a4.grid(row=2, column=0, sticky="w", padx=8, pady=2)
         Tooltip(a4, "Suppress the verbose [pass1] diagnostic logging (still prints the main pipeline "
                     "stage messages).")
-        a5 = ttk.Checkbutton(self.advanced_frame, text="Time-based line assignment",
-                              variable=self.time_based_line_assignment)
-        a5.grid(row=3, column=0, sticky="w", padx=8, pady=2)
-        Tooltip(a5, "When the reference lyrics have synced (LRC) timestamps, a word the text match "
-                    "couldn't place at all gets its line break assigned by nearest calibrated LRC line "
-                    "timestamp instead of blindly inheriting the nearest matched neighbor's -- fixes a "
-                    "long unmatched run (e.g. around a repeated chorus) freezing on one stale line and "
-                    "suppressing/misplacing line breaks. Never re-matches text.")
         a6 = ttk.Checkbutton(self.advanced_frame, text="Ambiguity key tie-break (pass 1)",
                               variable=self.ambiguity_key_tiebreak)
         a6.grid(row=4, column=0, sticky="w", padx=8, pady=2)
@@ -1064,6 +1110,7 @@ class App(tk.Tk):
         if is_realign:
             self.artist_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
             self.lyrics_frame.pack_forget()
+            self.musicxml_frame.pack_forget()
             self.opts_frame.pack_forget()
             self.advanced_toggle.pack_forget()
             self.advanced_frame.pack_forget()
@@ -1073,6 +1120,7 @@ class App(tk.Tk):
         elif is_pitch_refresh:
             self.artist_frame.pack_forget()
             self.lyrics_frame.pack_forget()
+            self.musicxml_frame.pack_forget()
             self.opts_frame.pack_forget()
             self.advanced_toggle.pack_forget()
             self.advanced_frame.pack_forget()
@@ -1085,7 +1133,8 @@ class App(tk.Tk):
             self.realign_options_frame.pack_forget()
             self.pitch_refresh_options_frame.pack_forget()
             self.lyrics_frame.pack(fill="x", padx=8, pady=4, after=self.artist_frame)
-            self.opts_frame.pack(fill="x", padx=8, pady=4, after=self.lyrics_frame)
+            self.musicxml_frame.pack(fill="x", padx=8, pady=4, after=self.lyrics_frame)
+            self.opts_frame.pack(fill="x", padx=8, pady=4, after=self.musicxml_frame)
             self.advanced_toggle.pack(fill="x", padx=8, pady=4, after=self.opts_frame)
             if self._advanced_visible:
                 self.advanced_frame.pack(fill="x", padx=8, pady=4, after=self.advanced_toggle)
@@ -1101,6 +1150,11 @@ class App(tk.Tk):
         self.lrclib_id_entry.config(state=lyrics_controls_state)
         self.lrc_file_entry.config(state=lyrics_controls_state)
         self.lrc_file_browse_button.config(state=lyrics_controls_state)
+        # Same reasoning: a single explicit MusicXML file/part override
+        # can't apply across multiple batch subfolders either.
+        self.musicxml_reference_entry.config(state=lyrics_controls_state)
+        self.musicxml_reference_browse_button.config(state=lyrics_controls_state)
+        self.musicxml_part_entry.config(state=lyrics_controls_state)
         self.realign_lrclib_id_entry.config(state=artist_title_state)
         self.realign_lrc_file_entry.config(state=artist_title_state)
         self.realign_lrc_file_browse_button.config(state=artist_title_state)
@@ -1241,6 +1295,13 @@ class App(tk.Tk):
         if f:
             self.lrc_file.set(str(Path(f)))
 
+    def _browse_musicxml_reference(self):
+        initial = self.input_dir.get().strip() or self._last_dir("input_dir")
+        filetypes = [("MusicXML files", "*.mxl *.musicxml *.xml"), ("All files", "*.*")]
+        f = filedialog.askopenfilename(title="Select MusicXML file", initialdir=initial, filetypes=filetypes)
+        if f:
+            self.musicxml_reference.set(str(Path(f)))
+
     # --- work-file cleanup / open-output-folder -------------------
 
     def _delete_work_files_now(self):
@@ -1302,11 +1363,16 @@ class App(tk.Tk):
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             fetch_lyrics=self.fetch_lyrics.get(),
             fetch_cover=self.fetch_cover.get(),
-            musicxml_force_calibration=self.musicxml_force_calibration.get(),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
             pitch_source=self.pitch_source.get(),
+            demucs_model=self.demucs_model.get().strip() or config.DEFAULT_DEMUCS_MODEL,
+            mxl_lrc_primary=self.mxl_lrc_primary.get(),
+            # Single-song-mode only, same reasoning as pinned_lyrics/
+            # lrclib_id above -- a specific file/part override can't apply
+            # across multiple batch subfolders.
+            musicxml_reference=None if is_batch else (self.musicxml_reference.get().strip() or None),
+            musicxml_part=None if is_batch else (self.musicxml_part.get().strip() or None),
             lrc_timing_check=self.lrc_timing_check.get(),
-            time_based_line_assignment=self.time_based_line_assignment.get(),
             ambiguity_key_tiebreak=self.ambiguity_key_tiebreak.get(),
             no_video_sync=self.no_video_sync.get(),
             quiet=self.quiet.get(),
@@ -1387,10 +1453,10 @@ class App(tk.Tk):
             # title/lyrics fields at all here -- pitch_refresh has none.
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             isolate_vocals=self.pitch_refresh_isolate_vocals.get(),
+            demucs_model=self.demucs_model.get().strip() or config.DEFAULT_DEMUCS_MODEL,
             pitch_source=self.pitch_refresh_source.get(),
             key_nudge=self.pitch_refresh_key_nudge.get(),
             musicxml_pitch=self.pitch_refresh_musicxml.get(),
-            musicxml_force_calibration=self.pitch_refresh_musicxml_force_calibration.get(),
             delete_work_files=self.pitch_refresh_delete_work_files.get(),
             batch=is_batch,
             cancel_requested=self._cancel_event.is_set,

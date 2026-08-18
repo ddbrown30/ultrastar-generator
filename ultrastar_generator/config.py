@@ -259,10 +259,9 @@ MIN_NOTE_GAP_SEC = 0.01
 # outright (`_remove_orphan_short_melisma_tails`), leaving a gap on the
 # beat grid rather than being folded into anything. A single 1-beat "~"
 # is too short to carry real melodic information and is more often
-# tracking noise than a genuine melisma continuation. Same flag controls
-# both steps (both are "final lyric-placement cleanup", generation
-# pipeline only).
-MERGE_CONNECTED_MELISMA_TAILS = True
+# tracking noise than a genuine melisma continuation. Both steps run
+# unconditionally together (both are "final lyric-placement cleanup",
+# generation pipeline only).
 
 # Pass 1's pitch source: "rmvpe" or "swiftf0" -- see
 # note_detection.PITCH_SOURCES. Exactly ONE source supplies both the
@@ -487,9 +486,9 @@ REFERENCE_DELETE_MAX_RUN = 5
 # timing/pitch/text); Great Big Sea - Ordinary Day (forced onto the
 # standard, non-MXL+LRC path via --no-mxl-lrc-primary since it has a
 # valid MXL+LRC candidate that would otherwise skip this code entirely)
-# -- byte-identical output with the flag on vs off, confirming a true
-# no-op on a song with nothing for it to fix.
-ENABLE_TIME_BASED_LINE_ASSIGNMENT = True
+# -- byte-identical output with this mechanism on vs off, confirming a
+# true no-op on a song with nothing for it to fix. Unconditional
+# (rolled into core 2026-08-17 -- no CLI/GUI off-switch anymore).
 # When splitting a pass-1 note at a word boundary (_split_notes_by_word_
 # boundaries) leaves a word's leading piece shorter than this, it's DROPPED
 # instead of becoming its own syllable (see _drop_leading_slivers) -- a real
@@ -901,14 +900,12 @@ REALIGN_VALIDATE_TOLERANCE_SEC = 0.3
 # case (roughly half the true peak's 0.19 margin over baseline) -- not
 # yet validated across multiple songs.
 #
-# ON by default everywhere (2026-08-10) -- real-validated across 12 total
-# runs (8 realign-mode songs, 4 full generation-pipeline songs), zero
-# regressions, 6 genuine verified fixes carried through to the actual
-# written output (not just the intermediate ASR score). See CLAUDE.md's
-# "Long-segment re-windowing" section for the full validation history.
-# `--no-rewindow-long-segments` (CLI, both realign.py and main.py) opts
-# back out if ever needed.
-REWINDOW_ENABLED = True
+# Unconditional (2026-08-10, rolled into core 2026-08-17 -- no CLI/GUI
+# off-switch anymore) -- real-validated across 12 total runs (8
+# realign-mode songs, 4 full generation-pipeline songs), zero regressions,
+# 6 genuine verified fixes carried through to the actual written output
+# (not just the intermediate ASR score). See CLAUDE.md's "Long-segment
+# re-windowing" section for the full validation history.
 REWINDOW_MIN_SEGMENT_DURATION_SEC = 10.0
 REWINDOW_CANDIDATE_WIDTH_SEC = 10.0
 REWINDOW_STEP_SEC = 1.0
@@ -942,7 +939,7 @@ REWINDOW_MIN_SCORE_IMPROVEMENT = 0.10
 # match this audio at all), the original transcription's result is kept.
 #
 # PROTOTYPE -- needs real-audio validation before being trusted the way
-# `REWINDOW_ENABLED` now is. ON by default per this project's own
+# long-segment re-windowing now is. ON by default per this project's own
 # convention (a feature that only spends extra time when a run already
 # looks bad is low-risk by construction, and only ever pays that cost
 # once per song) -- `--no-retry-low-quality-asr` opts out.
@@ -987,7 +984,8 @@ RETRY_ASR_MIN_REFERENCE_MATCH_RATIO = 0.6
 RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN = 5
 RETRY_ASR_MIN_UNCONFIDENT_RUN = 5
 
-# --- Force-align known-text gaps (PROTOTYPE, 2026-08-10) --------------------
+# --- Force-align known-text gaps (unconditional, 2026-08-10, rolled into
+# core 2026-08-17 -- no CLI/GUI off-switch anymore) --------------------------
 # Adapted from UltraStarKaraokeMaker (github.com/walterfr/UltraStarKaraokeMaker,
 # python-sidecar/pipeline/align.py's `realign_gap_windows`) after comparing
 # its real output on "Trixie Mattel - Gold" against ours -- it correctly
@@ -1014,7 +1012,6 @@ RETRY_ASR_MIN_UNCONFIDENT_RUN = 5
 # `MIN_WINDOW_BASE_SEC`/`MIN_WINDOW_SEC_PER_WORD` and `WINDOW_SLOP_SEC`
 # are carried over from USKMaker's own values as a starting point, not
 # independently re-derived.
-FORCE_ALIGN_GAPS = True
 FORCE_ALIGN_MIN_WINDOW_BASE_SEC = 0.10
 FORCE_ALIGN_MIN_WINDOW_SEC_PER_WORD = 0.08
 FORCE_ALIGN_WINDOW_SLOP_SEC = 0.5
@@ -1047,14 +1044,9 @@ class PipelineOptions:
         # decoder entirely, force-align a pinned LRC candidate's own known
         # line text instead -- see transcription.force_align_reference_lyrics
     whisperx_no_vad: bool = ENABLE_WHISPERX_NO_VAD
-    rewindow_long_segments: bool = REWINDOW_ENABLED
     retry_low_quality_asr: bool = RETRY_LOW_QUALITY_ASR
-    force_align_gaps: bool = FORCE_ALIGN_GAPS
-    time_based_line_assignment: bool = ENABLE_TIME_BASED_LINE_ASSIGNMENT
-    merge_connected_melisma: bool = MERGE_CONNECTED_MELISMA_TAILS
     musicxml_reference: Optional[str] = None
     musicxml_part: Optional[str] = None
-    musicxml_force_calibration: bool = ENABLE_MUSICXML_FORCE_CALIBRATION
     lrc_timing_check: bool = ENABLE_LRC_TIMING_CHECK
     pitch_smooth_window: float = PITCH_SMOOTH_WINDOW_SEC
     note_split_semitones: float = NOTE_SPLIT_SEMITONES

@@ -353,7 +353,7 @@ def largest_unmatched_reference_run(ref_lines: List[str], words: List[Word]) -> 
 
 def recover_dropped_reference_words(ref_lines: List[str], words: List[Word], vocals_path: Path,
                                      *, debug_log=None) -> Tuple[List[Word], int]:
-    """PROTOTYPE, see config.FORCE_ALIGN_GAPS's docstring. For each
+    """For each
     contiguous run of reference words with NO corresponding ASR word at
     all (a difflib 'insert' opcode -- the SAME one `largest_unmatched_
     reference_run` measures the size of), forces that KNOWN reference
@@ -892,8 +892,8 @@ def align_words_to_reference(
         # nothing to attach them to (no ASR timing exists for them), so
         # they're simply not represented. Their line boundary is still
         # captured by whatever comes before/after in the ASR sequence.
-        # (`recover_dropped_reference_words`/force_align_gaps, run BEFORE
-        # this function, is the real recovery mechanism for this case --
+        # (`recover_dropped_reference_words`, run BEFORE this function, is
+        # the real recovery mechanism for this case --
         # by the time we get here, most genuinely-missing content should
         # already be filled in.)
 

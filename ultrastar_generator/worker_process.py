@@ -156,7 +156,6 @@ def _do_transcribe_words(kwargs: dict, debug_log):
         debug_log=debug_log,
         vad_filter=kwargs.get("vad_filter", True),
         whisperx_vad_options=kwargs.get("whisperx_vad_options"),
-        rewindow_long_segments=kwargs.get("rewindow_long_segments", True),
     )
     return _serialize_words(words)
 
