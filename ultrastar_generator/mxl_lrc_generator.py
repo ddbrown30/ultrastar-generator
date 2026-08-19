@@ -1448,6 +1448,54 @@ class MxlLrcResult:
     pitch_calibration_confidence: float = 0.0
 
 
+def apply_gap_anchor_override(
+    corrected_lines: List[Tuple[float, str]],
+    time_candidates: List[Tuple[int, float, float]],
+    tolerance_sec: float = config.GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC,
+    debug_log=None,
+) -> List[Tuple[float, str]]:
+    """GAP anchor safety net (2026-08-19, real "Stars" bug -- see
+    config.GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC's own comment and CLAUDE.md's
+    "Fix Start Note Beat mode" section for the full diagnosis). Returns
+    `corrected_lines` (already-calibrated LRC lines) with line 0 possibly
+    overridden back to its own DIRECT real-ASR anchor.
+
+    The file's FIRST LRC line determines #GAP once syllables are built
+    (`gap_ms = first_syllable.start * 1000`), so an error there corrupts
+    GAP for the WHOLE FILE -- a much larger blast radius than an error on
+    any other single line. If `match_asr_to_lrc_lines` already found a
+    DIRECT, real-ASR-observed anchor for line 0 (`time_candidates[0][0]
+    == 0` -- the forward cursor's very first match, before any global
+    calibration is applied), and the globally-calibrated version of line 0
+    disagrees with that direct evidence by more than `tolerance_sec`, the
+    direct evidence wins. This doesn't depend on tier 1/2/3's own global
+    fit, which can mistake per-line timestamp noise for a systematic
+    offset (confirmed real case: Stars' own line-0 delta was +0.057s, i.e.
+    already accurate, but tier 1's whole-song constant-offset model moved
+    it a false +1.0s late, based on a spurious 1-second-bucket mode over
+    per-line deltas that were mostly noise, not a real recording-lead-in
+    offset). Every OTHER line still uses the normal global calibration
+    untouched -- this never second-guesses calibration in general, only
+    the one line with the largest single-point blast radius, and only
+    when we have equally-direct counter-evidence for it."""
+    if not (time_candidates and time_candidates[0][0] == 0):
+        return corrected_lines
+    _, direct_lrc_start, direct_delta = time_candidates[0]
+    direct_anchor = direct_lrc_start + direct_delta
+    calibrated_start = corrected_lines[0][0]
+    if abs(calibrated_start - direct_anchor) <= tolerance_sec:
+        return corrected_lines
+    msg = (f"[mxl-lrc] GAP anchor override: line 0's calibrated start "
+           f"({calibrated_start:.3f}) disagrees with its own direct ASR anchor "
+           f"({direct_anchor:.3f}) by {abs(calibrated_start - direct_anchor):.2f}s "
+           f"(> {tolerance_sec}s) -- using the direct anchor instead, since it corrupts "
+           f"#GAP for the whole file otherwise")
+    print(msg)
+    if debug_log is not None:
+        debug_log.line(msg)
+    return [(direct_anchor, corrected_lines[0][1])] + corrected_lines[1:]
+
+
 def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_duration: float,
                                asr_words: List[Word], forced_candidate: Optional[LrcLibCandidate] = None,
                                preferred_part_name: Optional[str] = None,
@@ -1496,7 +1544,8 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
                                 kind=kind, skipped_reason=skipped_reason, correction_fn=correction_fn,
                                 holdout_residual_sec=holdout)
     if offset is not None:
-        lrc_match.lrc_lines = [(correction_fn(t), text) for t, text in lrc_match.lrc_lines]
+        corrected_lines = [(correction_fn(t), text) for t, text in lrc_match.lrc_lines]
+        lrc_match.lrc_lines = apply_gap_anchor_override(corrected_lines, time_candidates, debug_log=debug_log)
 
     word_lines, word_clean_text, word_group, word_group_text, word_syllable_override, word_lrc_candidate = \
         assign_words_to_lines(mxl_words, lrc_match.lrc_lines)

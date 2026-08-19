@@ -1507,24 +1507,64 @@ after the fix: every entry's real start/end time round-trips to within
 byte-identical before and after (confirmed via a masked-diff of the two
 real files, not just spot-checked).
 
-Also confirmed, real root-cause investigation (informational, not yet
-acted on — see below): reproduced the "Stars" GAP error itself (our own
-MXL+LRC-path generation put GAP at 8630ms; the real ASR/ground-truth
-onset is ~7.65-7.69s) down to `lrc_timing.two_tier_time_calibration`'s
-tier-1 "constant offset" model. Real per-line ASR-vs-LRC deltas for this
-song range ~0.05s–1.3s (mostly noise in the LRC's own hand-authored line
-timestamps, not a true systematic recording offset) with one clean
-outlier at 3.85s; the 1-second-bucket mode still landed on a spuriously
-confident +1.0s "constant" (69% of lines round to that bucket, clears
-the 40% `LRC_TIMING_MIN_CALIBRATION_CONFIDENCE` bar) and shifted the
-FIRST line — whose own directly-observed delta was +0.057s, i.e.
-already accurate — a full second late, corrupting GAP. Not yet fixed at
-the calibration-algorithm level: `two_tier_time_calibration` is a
-shared function (see its own entry above) used by both
-`mxl_lrc_generator.py` and `realign.py`, and a change to tier-1's
-confidence/bucketing would need the same real multi-song re-validation
-this project always requires before touching a shared calibration path
-— flagged here rather than attempted speculatively.
+**Root cause fixed 2026-08-19**: reproduced the "Stars" GAP error itself
+(our own MXL+LRC-path generation put GAP at 8630ms; the real ASR/
+ground-truth onset is ~7.65-7.69s) down to `lrc_timing.
+two_tier_time_calibration`'s tier-1 "constant offset" model. Real
+per-line ASR-vs-LRC deltas for this song range ~0.05s–1.3s (mostly noise
+in the LRC's own hand-authored line timestamps, not a true systematic
+recording offset) with one clean outlier at 3.85s; the 1-second-bucket
+mode still landed on a spuriously confident +1.0s "constant" (69% of
+lines round to that bucket, clears the 40%
+`LRC_TIMING_MIN_CALIBRATION_CONFIDENCE` bar) and shifted the FIRST line
+— whose own directly-observed delta was +0.057s, i.e. already accurate
+— a full second late, corrupting GAP.
+
+**Deliberately NOT fixed by retuning `two_tier_time_calibration` itself**
+— that function is shared by both `mxl_lrc_generator.py` and
+`realign.py` (see its own entry above), already tuned against a wide
+real-song roster, and this project's own history shows retuning a
+shared threshold to fix one song's false positive tends to regress
+another song's true positive (`--verify-placement`,
+`--zone-boundary-snap`, the attack-trim/confidence-floor tuning
+attempt — see "Removed / rejected approaches" above). Instead, fixed
+narrowly at the ONE place the blast radius is unbounded: `mxl_lrc_
+generator.apply_gap_anchor_override` (new function, called right after
+`correction_fn` is applied in `generate_from_mxl_and_lrc`). The file's
+first LRC line determines `#GAP` for the WHOLE FILE (`gap_ms =
+first_syllable.start * 1000`) — an error on any OTHER line only
+mis-times that one line's own words, but an error on line 0 corrupts
+every note in the file relative to the real audio. `match_asr_to_lrc_
+lines` already computes a DIRECT, real-ASR-observed anchor for line 0
+(`time_candidates[0]`, when its own `li == 0`) independent of whatever
+the global tier-1/2/3 fit decides — if the globally-calibrated line 0
+disagrees with that direct anchor by more than `config.
+GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC` (0.5s), the direct anchor wins;
+every OTHER line still uses the normal global calibration, completely
+untouched. Threshold chosen from the two real cases available: Stars'
+own line-0 direct-vs-calibrated disagreement is 0.94s (must trigger,
+does); Ordinary Day's (`gt.gap_ms`/`gt.bpm` already-validated real
+lead-in-silence case) is 0.39s (must NOT trigger, doesn't) — comfortable
+margin on both sides, and deliberately much tighter than tier 2's own
+`LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC` (1.5s), since this is a narrow
+override for the single highest-stakes line, not a general per-line
+tolerance.
+
+**Real end-to-end validation** (both via real regeneration runs, not
+just the isolated calibration function): Stars' own real GAP went
+8630ms → 7687ms (the override fires, logs `[mxl-lrc] GAP anchor
+override: ...`), landing within 32ms of the real ground-truth-implied
+value (7654.8ms, computed from the hand-corrected ground-truth file's
+own beat -14/GAP 8630/BPM 215.34) — down from a ~975ms error before the
+fix. Verified against the real Stars ground-truth file via `verify_
+existing_song.py`: 100% pitch-class accuracy, 89% timing agreement,
+PASS. Ordinary Day re-verified against its own real ground truth after
+the fix: 95% pitch-class accuracy, 99% timing agreement, PASS (matches
+the previously-documented ~94% baseline — the override correctly never
+fires for this song, confirmed by the absence of the override log line
+in a real run). `apply_gap_anchor_override` also has dedicated
+regression tests in `test_dry_run.py` using these exact real numbers
+from both songs.
 
 ## Environment
 

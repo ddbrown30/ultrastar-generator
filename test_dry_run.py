@@ -5469,3 +5469,48 @@ with _tempfile.TemporaryDirectory() as _fsnb_dir2:
     assert _fsnb_run_result.new_gap_ms == 0
     assert _fsnb_run_result.output_path.read_text(encoding="utf-8") == fsnb_new_text
 print("  OK: run_fix_start_note_beat writes the expected output file end-to-end")
+
+print("\n--- mxl_lrc_generator.apply_gap_anchor_override: GAP anchor safety net (2026-08-19, real 'Stars' "
+      "bug) -- line 0's calibrated LRC start is overridden back to its own DIRECT real-ASR anchor when "
+      "tier-1/2/3's global calibration disagrees with it by more than GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC, "
+      "since line 0 alone determines #GAP for the WHOLE FILE ---")
+from ultrastar_generator.mxl_lrc_generator import apply_gap_anchor_override
+
+# Real "Stars" numbers (see CLAUDE.md): line 0's own direct delta was
+# +0.057s (lrc_start 7.630 -> direct anchor 7.687, i.e. already accurate),
+# but tier 1's global constant-offset model mistook per-line noise for a
+# systematic +1.0s offset, corrupting the calibrated line 0 to 8.630 --
+# a 0.943s disagreement, comfortably over the 0.5s tolerance -> override.
+gao_stars_lines = [(8.630, "There, out in the darkness"), (13.980, "A fugitive running")]
+gao_stars_candidates = [(0, 7.630, 0.057), (1, 12.980, 0.930)]
+gao_stars_out = apply_gap_anchor_override(gao_stars_lines, gao_stars_candidates, tolerance_sec=0.5)
+assert abs(gao_stars_out[0][0] - 7.687) < 1e-9, gao_stars_out[0][0]
+assert gao_stars_out[0][1] == "There, out in the darkness"
+assert gao_stars_out[1] == gao_stars_lines[1], "every OTHER line must be untouched"
+print("  OK: line 0 overridden to its own direct anchor (7.687) when the calibrated version (8.630) "
+      "disagrees by 0.943s (> 0.5s tolerance); line 1 (not line 0) is completely untouched")
+
+# Real "Ordinary Day" numbers: line 0's own direct delta was +2.611s
+# (lrc_start 14.530 -> direct anchor 17.141), and tier 1's global offset
+# (+3.0s, imprecise but already-validated) calibrates line 0 to 17.530 --
+# only 0.389s off, UNDER the 0.5s tolerance -> must NOT override (this is
+# the already-shipped, already-validated behavior for a genuine
+# systematic offset; the safety net must stay silent here).
+gao_od_lines = [(17.530, "Well I'm sitting here")]
+gao_od_candidates = [(0, 14.530, 2.611)]
+gao_od_out = apply_gap_anchor_override(gao_od_lines, gao_od_candidates, tolerance_sec=0.5)
+assert gao_od_out == gao_od_lines, "must be a no-op when the disagreement is within tolerance"
+print("  OK: no override when the calibrated line 0 (17.530) is within tolerance (0.389s) of its own "
+      "direct anchor (17.141) -- Ordinary Day's already-validated calibration is left untouched")
+
+# No direct anchor for line 0 at all (e.g. a garbled/unmatched opening
+# line) -- nothing to compare against, so the calibrated value is trusted
+# as-is, same as before this safety net existed.
+gao_none_lines = [(9.0, "opening line")]
+gao_none_candidates = [(2, 20.0, 0.1)]  # first real match is line 2, not line 0
+gao_none_out = apply_gap_anchor_override(gao_none_lines, gao_none_candidates, tolerance_sec=0.5)
+assert gao_none_out == gao_none_lines
+gao_empty_out = apply_gap_anchor_override(gao_none_lines, [], tolerance_sec=0.5)
+assert gao_empty_out == gao_none_lines
+print("  OK: no override when line 0 itself has no direct match at all (empty candidates, or the first "
+      "real match is a LATER line) -- falls back to the calibrated value unchanged, same as before")

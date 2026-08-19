@@ -860,6 +860,28 @@ MXL_LRC_BLOCK_MAX_WORDS = 6
 # (t0, t1) window to derive a rate from; this is a last-resort floor).
 MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3
 
+# GAP anchor safety net (2026-08-19, real "Stars" bug -- see CLAUDE.md's
+# "Fix Start Note Beat mode" section for the full diagnosis): the file's
+# FIRST LRC line determines #GAP once syllables are built (main.py/
+# mxl_lrc_generator's own `gap_ms = first_syllable.start * 1000` rule), so
+# an error there corrupts GAP for the WHOLE FILE -- a much larger blast
+# radius than an error on any other single line. If match_asr_to_lrc_lines
+# already found a DIRECT, real-ASR-observed anchor for line 0 (before
+# calibration), and the calibrated version would move line 0 further than
+# this many seconds from that direct evidence, the direct evidence wins --
+# it doesn't depend on tier 1's global fit, which can mistake per-line
+# noise for a systematic offset (confirmed real case: Stars' own line-0
+# delta was +0.057s, i.e. already accurate, but tier 1's whole-song
+# constant-offset model moved it a false +1.0s). Deliberately much
+# TIGHTER than LRC_TIMING_DRIFT_INLIER_TOLERANCE_SEC (1.5s, tier 2's own
+# per-line acceptance gate) -- this is a narrow override for the single
+# highest-stakes line, not a general per-line tolerance. Chosen from real
+# data: Ordinary Day's own already-validated line-0 calibration differs
+# from its direct anchor by 0.39s (must NOT trigger, and doesn't); Stars'
+# by 0.94s (must trigger, and does) -- comfortable margin on both sides.
+# Every OTHER line still uses the normal global calibration untouched.
+GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC = 0.5
+
 
 # --- realign.py "validate" strategy (PROTOTYPE, 2026-08-09) ----------------
 # A word's own ORIGINAL start (after the single global GAP/drift correction
