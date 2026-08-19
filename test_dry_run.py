@@ -5357,3 +5357,115 @@ print("OK: the tie-break only ever replaces the pitch-CLASS digit -- an ambiguou
 # Empty note list / disabled-path safety: never crashes, never fabricates notes.
 assert apply_ambiguity_tiebreak([], _pa_activation, _pa_rtime, _pa_cents_mapping, 0.35, verbose=False) == []
 print("OK: apply_ambiguity_tiebreak on an empty note list returns an empty list, no crash")
+
+print("\n--- fix_start_note_beat: rebases an existing .txt's #GAP so the first note lands on beat 0 -- "
+      "pure integer-beat arithmetic, never touches real audio timing/pitch/text/note sequence ---")
+from ultrastar_generator.fix_start_note_beat import (
+    fix_start_note_beat_text, resolve_fix_start_note_beat_output_path, check_output_not_existing_file,
+    run_fix_start_note_beat,
+)
+from ultrastar_generator.usdx_parser import parse_usdx_file, UsdxParseError
+
+# Real motivating case, reproduced synthetically: a hand-authored file
+# where the first note sits on a NEGATIVE beat (e.g. a corrected pickup
+# note starting before the file's own GAP anchor) -- confirmed for real
+# against the actual "Stars" ground-truth file (first note beat -14,
+# GAP 8630, BPM 215.34 -> fixed GAP 7655), reproduced here in miniature
+# so the regression suite needs no real audio/files.
+fsnb_text = (
+    "#TITLE:Test\n#ARTIST:Test\n#BPM:120\n#GAP:1000\n"
+    ": -8 4 5 Hel\n: -4 4 7 lo\n- 0\n: 10 4 9  world\nE\n"
+)
+fsnb_new_text, fsnb_result = fix_start_note_beat_text(fsnb_text)
+assert fsnb_result.beat_shift == -8, fsnb_result.beat_shift
+assert fsnb_result.old_gap_ms == 1000, fsnb_result.old_gap_ms
+# beat_duration_ms(120) = 60000/(120*4) = 125ms/beat; shift=+8 beats ->
+# GAP moves EARLIER by 8*125=1000ms (first note's own beat -8 means it
+# started BEFORE the old GAP anchor, so GAP must be pulled back to meet
+# it at the new beat 0).
+assert fsnb_result.new_gap_ms == 0, fsnb_result.new_gap_ms
+fsnb_lines = fsnb_new_text.splitlines()
+assert "#GAP:0" in fsnb_lines, fsnb_lines
+assert ": 0 4 5 Hel" in fsnb_lines, fsnb_lines
+assert ": 4 4 7 lo" in fsnb_lines, fsnb_lines
+assert "- 8" in fsnb_lines, fsnb_lines
+assert ": 18 4 9  world" in fsnb_lines, fsnb_lines
+print("  OK: every note/break beat shifts by the same constant (+8) and GAP is pulled back by the "
+      "equivalent milliseconds (1000ms -> 0ms) so the first note lands exactly on beat 0")
+
+# Real-timing equivalence: re-parsing before/after must agree on every
+# entry's REAL start/end time (within float/ms-rounding noise), proving
+# this is a pure re-encoding, not an actual timing change -- this is
+# the exact property the first (rejected) seconds-round-trip
+# implementation FAILED at real scale (see fix_start_note_beat.py's own
+# module docstring for the real "Stars" float-floor bug this replaced).
+import tempfile as _tempfile
+with _tempfile.TemporaryDirectory() as _fsnb_dir:
+    _fsnb_orig_path = Path(_fsnb_dir) / "orig.txt"
+    _fsnb_orig_path.write_text(fsnb_text, encoding="utf-8")
+    _fsnb_fixed_path = Path(_fsnb_dir) / "fixed.txt"
+    _fsnb_fixed_path.write_text(fsnb_new_text, encoding="utf-8")
+    _fsnb_orig_parsed = parse_usdx_file(_fsnb_orig_path)
+    _fsnb_fixed_parsed = parse_usdx_file(_fsnb_fixed_path)
+    for _a, _b in zip(_fsnb_orig_parsed.entries, _fsnb_fixed_parsed.entries):
+        assert abs(_a.start - _b.start) < 0.001, (_a, _b)
+print("  OK: every entry's real start time (re-derived from the written beat/GAP) is unchanged to "
+      "sub-millisecond precision")
+
+# Already on beat 0 -- a true no-op, text returned byte-identical.
+fsnb_noop_text = "#TITLE:Test\n#ARTIST:Test\n#BPM:120\n#GAP:500\n: 0 4 5 Hi\nE\n"
+fsnb_noop_new_text, fsnb_noop_result = fix_start_note_beat_text(fsnb_noop_text)
+assert fsnb_noop_result.beat_shift == 0
+assert fsnb_noop_new_text == fsnb_noop_text
+print("  OK: a file whose first note is already on beat 0 is returned unchanged (true no-op)")
+
+# Missing #GAP tag (legitimate -- usdx itself treats it as 0, see
+# usdx_parser.py's own comment) -- a real shift still inserts a fresh
+# #GAP line rather than silently dropping the correction. First note at
+# beat +4 (some silence before the first note, GAP implicitly 0) -> GAP
+# is pushed forward to 500ms (4 beats * 125ms) and every beat shifts
+# back by 4 so the first note lands on beat 0.
+fsnb_nogap_text = "#TITLE:Test\n#ARTIST:Test\n#BPM:120\n: 4 4 5 Hi\nE\n"
+fsnb_nogap_new_text, fsnb_nogap_result = fix_start_note_beat_text(fsnb_nogap_text)
+assert fsnb_nogap_result.old_gap_ms == 0
+assert fsnb_nogap_result.new_gap_ms == 500, fsnb_nogap_result.new_gap_ms
+assert "#GAP:500" in fsnb_nogap_new_text.splitlines()
+assert ": 0 4 5 Hi" in fsnb_nogap_new_text.splitlines()
+print("  OK: a file with no #GAP tag at all still gets a correct one inserted when a shift is needed")
+
+# Missing #BPM / no note lines both fail closed (never guess).
+try:
+    fix_start_note_beat_text("#TITLE:Test\n#GAP:0\n: 0 4 5 Hi\nE\n")
+    assert False, "must raise on missing #BPM"
+except UsdxParseError:
+    pass
+try:
+    fix_start_note_beat_text("#TITLE:Test\n#BPM:120\n#GAP:0\nE\n")
+    assert False, "must raise when no note lines exist"
+except UsdxParseError:
+    pass
+print("  OK: missing #BPM or zero note lines both fail closed with UsdxParseError, never guess")
+
+# Input file is always read-only -- same guard pattern as realign.py.
+fsnb_existing_path = Path("C:/Songs/Some Artist - Some Song.txt")
+fsnb_default_out = resolve_fix_start_note_beat_output_path(fsnb_existing_path, None)
+assert fsnb_default_out.name == "Some Artist - Some Song [START BEAT FIXED].txt", fsnb_default_out
+assert check_output_not_existing_file(fsnb_default_out, fsnb_existing_path) is None
+fsnb_same_out = resolve_fix_start_note_beat_output_path(fsnb_existing_path, str(fsnb_existing_path))
+fsnb_guard_error = check_output_not_existing_file(fsnb_same_out, fsnb_existing_path)
+assert fsnb_guard_error is not None and "read-only" in fsnb_guard_error, fsnb_guard_error
+print("  OK: the default output is a separate '[START BEAT FIXED]' file; an explicit --output "
+      "resolving to the existing file's own path is refused, same as realign.py")
+
+# End-to-end run_fix_start_note_beat over a real temp file (still no
+# audio/models needed -- pure text I/O).
+with _tempfile.TemporaryDirectory() as _fsnb_dir2:
+    _fsnb_run_path = Path(_fsnb_dir2) / "Some Artist - Some Song.txt"
+    _fsnb_run_path.write_text(fsnb_text, encoding="utf-8")
+    _fsnb_run_result = run_fix_start_note_beat(_fsnb_run_path, log=lambda *a: None)
+    assert _fsnb_run_result.success
+    assert _fsnb_run_result.output_path.name == "Some Artist - Some Song [START BEAT FIXED].txt"
+    assert _fsnb_run_result.beat_shift == -8
+    assert _fsnb_run_result.new_gap_ms == 0
+    assert _fsnb_run_result.output_path.read_text(encoding="utf-8") == fsnb_new_text
+print("  OK: run_fix_start_note_beat writes the expected output file end-to-end")

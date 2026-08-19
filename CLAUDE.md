@@ -1457,6 +1457,75 @@ all of them.
   Re-test: `test_dry_run.py` in full — exercised transitively through
   both callers' own existing test coverage, same as `lrc_line_window`.
 
+## Fix Start Note Beat mode (`fix_start_note_beat.py`, shipped 2026-08-19)
+
+A third "existing .txt" mode, alongside `realign.py`/`pitch_refresh.py`
+(same GUI radio-button group, same `find_existing_txt_in_folder`/
+`check_output_not_existing_file`/`[MARKER]`-output conventions, own
+`--batch`): rebases an existing file's `#GAP` so its first note lands on
+beat 0 — the hard invariant `usdx_writer.py` already guarantees for
+everything THIS project generates (GAP is defined as the first
+syllable's own start time, so `seconds_to_beat` always lands on 0 by
+construction), but not guaranteed for a file authored or manually
+corrected some other way. Needs no audio, ASR, or CUDA at all — pure
+GAP/beat-grid arithmetic on the `.txt` text itself, the cheapest mode in
+the whole project.
+
+**Motivating real case**: the real "Stars" ground-truth file (see
+`project_stars_reference_notes` memory) has its first note on beat -14
+— a human, in the UltraStar editor, extended the first note backward to
+match the real audio rather than editing GAP directly (moving GAP would
+shift every other note along with it; extending just the one note
+doesn't). This mode is the general-purpose reverse operation: take a
+file with a nonzero first-note beat and fold it back into this
+project's own beat-0/GAP convention, so the note's real audio timing is
+unchanged either way — only which integer represents "beat 0" moves.
+
+**Implementation note (a real bug caught before shipping)**: the first
+implementation reused `usdx_parser.parse_usdx_file` (raw beat → real
+seconds) + a new `gap_ms` + `usdx_writer.render_song` (real seconds →
+re-quantized beat, via `math.floor` for length). This looked correct
+(GAP is defined by the exact same `first_syllable.start * 1000` rule
+`main.py`/`realign.py` already use) but FAILED real validation against
+the actual "Stars" file: re-quantizing a value that came from an EXACT
+integer beat, through `seconds_to_beat_length`'s `floor()`, can round a
+length down by one whenever float imprecision leaves the recovered
+seconds value a hair under the true integer boundary — a classic
+floor-of-a-should-be-integer trap. `_quantize_entries`'s own
+non-overlap push-forward (`occupied_until`) then cascaded that
+single-beat loss into much larger drift on later notes/line-breaks (one
+line-break landed 1.045s / 15 beats off from a supposedly pure
+re-encoding). Fixed by abandoning the seconds round-trip entirely:
+`fix_start_note_beat_text` operates directly on the file's RAW INTEGER
+beat values via regex (`usdx_parser`'s own `_NOTE_RE`/`_BREAK_RE`/
+`_TAG_RE`, reused not reimplemented) — every note/break beat number gets
+the same integer constant added, and `#GAP` is adjusted by the
+equivalent milliseconds (`beat_duration_ms`, the one unavoidable
+rounding, capped at <0.5ms). Re-validated against the real "Stars" file
+after the fix: every entry's real start/end time round-trips to within
+0.2ms (pure GAP-ms rounding), and every note's type/length/pitch/text is
+byte-identical before and after (confirmed via a masked-diff of the two
+real files, not just spot-checked).
+
+Also confirmed, real root-cause investigation (informational, not yet
+acted on — see below): reproduced the "Stars" GAP error itself (our own
+MXL+LRC-path generation put GAP at 8630ms; the real ASR/ground-truth
+onset is ~7.65-7.69s) down to `lrc_timing.two_tier_time_calibration`'s
+tier-1 "constant offset" model. Real per-line ASR-vs-LRC deltas for this
+song range ~0.05s–1.3s (mostly noise in the LRC's own hand-authored line
+timestamps, not a true systematic recording offset) with one clean
+outlier at 3.85s; the 1-second-bucket mode still landed on a spuriously
+confident +1.0s "constant" (69% of lines round to that bucket, clears
+the 40% `LRC_TIMING_MIN_CALIBRATION_CONFIDENCE` bar) and shifted the
+FIRST line — whose own directly-observed delta was +0.057s, i.e.
+already accurate — a full second late, corrupting GAP. Not yet fixed at
+the calibration-algorithm level: `two_tier_time_calibration` is a
+shared function (see its own entry above) used by both
+`mxl_lrc_generator.py` and `realign.py`, and a change to tier-1's
+confidence/bucketing would need the same real multi-song re-validation
+this project always requires before touching a shared calibration path
+— flagged here rather than attempted speculatively.
+
 ## Environment
 
 - Windows, venv at `E:\Projects\ultrastar_generator\venv`.

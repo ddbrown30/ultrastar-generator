@@ -33,6 +33,7 @@ from .media_extract import probe_duration_sec
 from .realign import RealignPipelineOptions, run_realign_batch, run_realign_pipeline
 from .pitch_refresh import (DEFAULT_KEY_NUDGE, PITCH_SOURCES, PitchRefreshOptions,
                              run_pitch_refresh_batch, run_pitch_refresh_pipeline)
+from .fix_start_note_beat import run_fix_start_note_beat_pipeline, run_fix_start_note_beat_batch
 
 _DONE = object()  # sentinel, distinct from any real log line
 _OUTPUT_PARENT = "__OUTPUT_PARENT__"  # queue-item tag: payload is the Path to open on "Open Output Folder"
@@ -404,12 +405,13 @@ class App(tk.Tk):
         self._settings = _load_settings()
         self._launch_dir = str(Path.cwd())
 
-        self.mode = tk.StringVar(value="generate")  # "generate" | "youtube" | "realign" | "pitch_refresh"
+        self.mode = tk.StringVar(value="generate")  # "generate" | "youtube" | "realign" | "pitch_refresh" | "fix_start_beat"
         # Batch is a MODIFIER, orthogonal to mode -- usable with "generate",
-        # "realign", and "pitch_refresh" (each processes every immediate
-        # subfolder of the input folder instead of the input folder itself),
-        # meaningless for "youtube" (a single URL can't populate N
-        # subfolders), where it's disabled outright rather than just ignored.
+        # "realign", "pitch_refresh", and "fix_start_beat" (each processes
+        # every immediate subfolder of the input folder instead of the input
+        # folder itself), meaningless for "youtube" (a single URL can't
+        # populate N subfolders), where it's disabled outright rather than
+        # just ignored.
         self.batch_mode = tk.BooleanVar(value=False)
         self.input_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
@@ -625,7 +627,8 @@ class App(tk.Tk):
         mode_frame = ttk.LabelFrame(self, text="Mode")
         mode_frame.pack(fill="x", **pad)
         for text, value in [("Generate song file", "generate"), ("YouTube URL", "youtube"),
-                             ("Realign existing file", "realign"), ("Refresh pitch", "pitch_refresh")]:
+                             ("Realign existing file", "realign"), ("Refresh pitch", "pitch_refresh"),
+                             ("Fix Start Note Beat", "fix_start_beat")]:
             rb = ttk.Radiobutton(mode_frame, text=text, value=value, variable=self.mode,
                                   command=self._on_mode_change)
             rb.pack(side="left", padx=8, pady=4)
@@ -639,9 +642,14 @@ class App(tk.Tk):
                              "or the note sequence itself.\n"
                              "Refresh pitch: pitch-only mode -- re-detect an EXISTING .txt's own notes' PITCH "
                              "from its audio, without touching timing, text, or the note sequence itself.\n"
+                             "Fix Start Note Beat: rebases an EXISTING .txt's #GAP so its first note lands "
+                             "on beat 0 (this project's own hard invariant) -- pure GAP/beat-grid arithmetic, "
+                             "no audio needed at all. Every note shifts by the same constant beat count; no "
+                             "note's real audio timing, pitch, text, or the note sequence itself changes.\n"
                              "Batch: process every immediate subfolder of the input folder the same way, "
-                             "instead of the input folder itself. Usable with Generate, Realign, or Refresh "
-                             "pitch -- not with YouTube (a single URL can't populate multiple subfolders).")
+                             "instead of the input folder itself. Usable with Generate, Realign, Refresh "
+                             "pitch, or Fix Start Note Beat -- not with YouTube (a single URL can't populate "
+                             "multiple subfolders).")
 
         io_frame = ttk.LabelFrame(self, text="Folders")
         io_frame.pack(fill="x", **pad)
@@ -696,7 +704,10 @@ class App(tk.Tk):
                                           "only GAP and note start/length are adjusted to better match the "
                                           "audio. Refresh pitch: its timing/text/note sequence are kept "
                                           "exactly as-is; only each note's PITCH is re-detected from the "
-                                          "audio. Optional -- leave blank to auto-detect the single .txt file "
+                                          "audio. Fix Start Note Beat: its notes/pitches/text are kept exactly "
+                                          "as-is; only GAP and every note's BEAT NUMBER shift by the same "
+                                          "constant so the first note lands on beat 0 -- no audio needed. "
+                                          "Optional -- leave blank to auto-detect the single .txt file "
                                           "in the input folder (if more than one exists, tries '<folder "
                                           "name>.txt' before giving up).")
 
@@ -1010,11 +1021,13 @@ class App(tk.Tk):
         is_youtube = mode == "youtube"
         is_realign = mode == "realign"
         is_pitch_refresh = mode == "pitch_refresh"
-        # Both realign and pitch_refresh work from an EXISTING .txt (never
-        # generate from scratch) and write next to it by default -- grouped
-        # together for the several checks below that treat them identically,
-        # even though their own OPTIONS frames are completely different.
-        uses_existing_txt = is_realign or is_pitch_refresh
+        is_fix_start_beat = mode == "fix_start_beat"
+        # Realign, pitch_refresh, and fix_start_beat all work from an
+        # EXISTING .txt (never generate from scratch) and write next to it
+        # by default -- grouped together for the several checks below that
+        # treat them identically, even though their own OPTIONS frames are
+        # completely different (fix_start_beat has none at all).
+        uses_existing_txt = is_realign or is_pitch_refresh or is_fix_start_beat
         # Batch is a checkbox, orthogonal to mode -- but meaningless for
         # YouTube (a single URL can't populate multiple subfolders), so
         # it's disabled AND ignored there regardless of its own raw state.
@@ -1036,17 +1049,24 @@ class App(tk.Tk):
             self.youtube_label.grid_remove()
             self.youtube_entry.grid_remove()
             self.youtube_audio_only_check.grid_remove()
-            # Audio file is meaningful for BOTH generate and realign, but a
-            # single bare filename can't apply across multiple batch
+            # Audio file is meaningful for generate/realign/pitch_refresh,
+            # but a single bare filename can't apply across multiple batch
             # subfolders -- DISABLED (greyed out, stays visible) rather than
             # hidden when batch is on, so it's clear the field still exists,
-            # just isn't usable in this combination.
-            self.audio_file_label.grid(row=2, column=0, sticky="w", padx=8, pady=4)
-            self.audio_file_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
-            self.audio_file_browse.grid(row=2, column=2, padx=8, pady=4)
-            audio_file_state = tk.DISABLED if is_batch else tk.NORMAL
-            self.audio_file_entry.config(state=audio_file_state)
-            self.audio_file_browse.config(state=audio_file_state)
+            # just isn't usable in this combination. fix_start_beat needs no
+            # audio at all (pure GAP/beat-grid arithmetic on the .txt) --
+            # hidden entirely, not just disabled.
+            if is_fix_start_beat:
+                self.audio_file_label.grid_remove()
+                self.audio_file_entry.grid_remove()
+                self.audio_file_browse.grid_remove()
+            else:
+                self.audio_file_label.grid(row=2, column=0, sticky="w", padx=8, pady=4)
+                self.audio_file_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=4)
+                self.audio_file_browse.grid(row=2, column=2, padx=8, pady=4)
+                audio_file_state = tk.DISABLED if is_batch else tk.NORMAL
+                self.audio_file_entry.config(state=audio_file_state)
+                self.audio_file_browse.config(state=audio_file_state)
             if uses_existing_txt:
                 self.existing_txt_label.grid(row=3, column=0, sticky="w", padx=8, pady=4)
                 self.existing_txt_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
@@ -1084,10 +1104,10 @@ class App(tk.Tk):
             self.artist_frame.config(text="Artist / Title")
         # A single artist/title override doesn't make sense across multiple
         # batch subfolders either -- disabled, not hidden, same as above.
-        # pitch_refresh has no artist/title CONCEPT at all (no lyrics lookup
-        # of any kind -- see PitchRefreshOptions), so its fields are always
+        # pitch_refresh and fix_start_beat have no artist/title CONCEPT at
+        # all (no lyrics lookup of any kind), so their fields are always
         # disabled regardless of batch.
-        artist_title_state = tk.DISABLED if (is_batch or is_pitch_refresh) else tk.NORMAL
+        artist_title_state = tk.DISABLED if (is_batch or is_pitch_refresh or is_fix_start_beat) else tk.NORMAL
         self.artist_entry.config(state=artist_title_state)
         self.title_entry.config(state=artist_title_state)
         # Mode switch changes what _artist_placeholder_text/
@@ -1127,6 +1147,18 @@ class App(tk.Tk):
             self.realign_lyrics_frame.pack_forget()
             self.realign_options_frame.pack_forget()
             self.pitch_refresh_options_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
+        elif is_fix_start_beat:
+            # No option surface at all -- pure GAP/beat-grid arithmetic on
+            # the existing .txt, nothing to configure.
+            self.artist_frame.pack_forget()
+            self.lyrics_frame.pack_forget()
+            self.musicxml_frame.pack_forget()
+            self.opts_frame.pack_forget()
+            self.advanced_toggle.pack_forget()
+            self.advanced_frame.pack_forget()
+            self.realign_lyrics_frame.pack_forget()
+            self.realign_options_frame.pack_forget()
+            self.pitch_refresh_options_frame.pack_forget()
         else:
             self.artist_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
             self.realign_lyrics_frame.pack_forget()
@@ -1472,9 +1504,10 @@ class App(tk.Tk):
             messagebox.showerror("Missing folder", "An input folder is required.")
             return
         # None -> run_pipeline computes its own default; not used at all by
-        # realign/pitch_refresh modes, which write directly next to the
-        # existing file.
-        output_dir_value = self.output_dir_entry.effective_value() if mode not in ("realign", "pitch_refresh") else None
+        # realign/pitch_refresh/fix_start_beat modes, which write directly
+        # next to the existing file.
+        output_dir_value = (self.output_dir_entry.effective_value()
+                             if mode not in ("realign", "pitch_refresh", "fix_start_beat") else None)
         if mode == "youtube" and not (self.artist_entry.effective_value() and self.title_entry.effective_value()):
             messagebox.showerror("Missing artist/title", "YouTube mode requires both Artist and Title to be typed in "
                                                             "(not left as the grey preview).")
@@ -1492,7 +1525,7 @@ class App(tk.Tk):
         # -- same as batch mode's own per-subfolder auto-detection, just for
         # one folder.
         existing_txt_path = None
-        if mode in ("realign", "pitch_refresh") and not is_batch:
+        if mode in ("realign", "pitch_refresh", "fix_start_beat") and not is_batch:
             existing_txt_value = self.existing_txt_entry.effective_value()
             if existing_txt_value:
                 existing_txt_path = Path(existing_txt_value)
@@ -1504,6 +1537,8 @@ class App(tk.Tk):
             opts = self._build_realign_opts()
         elif mode == "pitch_refresh":
             opts = self._build_pitch_refresh_opts()
+        elif mode == "fix_start_beat":
+            opts = None  # no option surface at all -- pure GAP/beat-grid arithmetic
         else:
             opts = self._build_opts()
         self.log_text.delete("1.0", tk.END)
@@ -1561,6 +1596,24 @@ class App(tk.Tk):
                         q.put((_OUTPUT_PARENT, input_dir))
                     else:
                         result = run_pitch_refresh_pipeline(input_dir, existing_txt_path, opts, log=q.put)
+                        if result.success:
+                            q.put(f"\n=== Done: {result.output_path} ===")
+                            if result.output_path is not None:
+                                q.put((_OUTPUT_PARENT, result.output_path.parent))
+                        else:
+                            q.put(f"\n=== FAILED: {result.error} ===")
+                elif mode == "fix_start_beat":
+                    if is_batch:
+                        results = run_fix_start_note_beat_batch(input_dir, log=q.put)
+                        ok = sum(1 for _, r in results if r.success)
+                        q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")
+                        # Same reasoning as realign/pitch_refresh's own batch
+                        # branches above -- each result is written next to
+                        # its OWN subfolder's existing file, no output-folder
+                        # mirroring.
+                        q.put((_OUTPUT_PARENT, input_dir))
+                    else:
+                        result = run_fix_start_note_beat_pipeline(input_dir, existing_txt_path, log=q.put)
                         if result.success:
                             q.put(f"\n=== Done: {result.output_path} ===")
                             if result.output_path is not None:
