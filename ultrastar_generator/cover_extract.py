@@ -1,13 +1,4 @@
-"""Extracts embedded cover art from an audio/video file's own metadata
-tags, via `mutagen` (already an installed dependency -- requirements.txt
-has listed it since early in this project, but nothing ever actually
-called it until this module).
-
-Only ever invoked when file_discovery.find_companions found no
-.jpg/.jpeg companion next to the resolved audio source (see
-song_input.resolve_song_folder) -- an embedded picture is a fallback, not
-a replacement for a hand-placed cover file.
-"""
+"""Extracts embedded cover art from an audio/video file's metadata tags via `mutagen`. Fallback for when no .jpg companion file exists."""
 
 from __future__ import annotations
 
@@ -19,12 +10,7 @@ from . import config
 
 
 def _sniff_image_ext(data: bytes) -> Optional[str]:
-    """Real file type from magic bytes, not whatever MIME type the
-    container's own tag claims (tags lie/are stale often enough that this
-    project's own convention elsewhere is to verify content, not trust a
-    claimed type -- see file_discovery._looks_like_musicxml). Also reused
-    by cover_fetch.py (downloaded image bytes need the same real-type
-    check, not just this module's own embedded-tag bytes)."""
+    """Real file type from magic bytes, not the tag's claimed MIME type."""
     if data[:3] == b"\xff\xd8\xff":
         return ".jpg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -48,9 +34,7 @@ def _from_flac_native(mutagen_file) -> Optional[bytes]:
 
 
 def _from_vorbis_comment_block(tags) -> Optional[bytes]:
-    """OGG/Opus store embedded art as a base64-encoded FLAC-style Picture
-    block under the 'metadata_block_picture' vorbis comment key -- not
-    exposed as a `.pictures` list the way native FLAC files are."""
+    """OGG/Opus store embedded art as a base64-encoded FLAC Picture block under 'metadata_block_picture'."""
     if not tags or "metadata_block_picture" not in tags:
         return None
     try:
@@ -90,16 +74,7 @@ def _extract_raw_picture(audio_path: Path) -> Optional[bytes]:
 
 
 def extract_embedded_cover(audio_path: Path, dest_dir: Path) -> Optional[Path]:
-    """Tries every embedded-picture convention this project's supported
-    formats use (ID3 APIC for mp3, MP4 'covr' atom, FLAC's native picture
-    list, and OGG/Opus's base64 vorbis-comment picture block), sniffs the
-    real image type from magic bytes, and writes
-    dest_dir/'<audio stem><COVER_TAG_SUFFIX>.<ext>' -- reusing
-    file_discovery.find_companions' own "[CO]" tag convention so a later
-    find_companions call over the same folder reads this identically to a
-    hand-placed cover file. Returns None (never raises) on any failure:
-    unsupported container, no embedded picture, corrupt tag data, unknown
-    image format, mutagen not installed."""
+    """Tries every supported embedded-picture convention (ID3 APIC, MP4 'covr', FLAC, OGG/Opus) and writes dest_dir/'<audio stem><COVER_TAG_SUFFIX>.<ext>'. Returns None (never raises) on any failure."""
     data = _extract_raw_picture(Path(audio_path))
     if not data:
         return None

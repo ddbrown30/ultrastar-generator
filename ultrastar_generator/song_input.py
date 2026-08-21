@@ -1,10 +1,5 @@
-"""Orchestrates folder-based input resolution: figures out which file in a
-song folder is the primary audio/video source (file_discovery.
-resolve_primary_source), extracts real decodable audio from it when
-needed (media_extract.py), finds companions (file_discovery.
-find_companions), and falls back to embedded cover art (cover_extract.py)
-when no cover image was found. See CLAUDE.md for the full feature writeup.
-"""
+"""Orchestrates folder-based input resolution: finds the primary audio/video source, extracts real
+decodable audio when needed, finds companion files, and falls back to embedded cover art."""
 
 from __future__ import annotations
 
@@ -26,23 +21,14 @@ class ResolvedInput:
     cover: Optional[Path] = None
     background: Optional[Path] = None
     musicxml: List[Path] = field(default_factory=list)
-    videogap_applicable: bool = True    # False when video and audio are the same
-                                          # file or one was extracted directly from
-                                          # the other -- correlating either against
-                                          # itself would be a degenerate no-op, not
-                                          # a real VIDEOGAP measurement.
+    videogap_applicable: bool = True    # False when video and audio are the same/derived file
     notes: List[str] = field(default_factory=list)  # human-readable decisions, for the log
 
 
 def resolve_song_folder(input_dir: Path, work_dir: Path, *,
                          audio_file_override: Optional[str] = None) -> ResolvedInput:
-    """Resolves everything about a song folder needed to run the pipeline.
-    Never mutates input_dir. Any file this function synthesizes (an
-    extracted analysis wav, an avi's extracted standalone mp3, an
-    extracted embedded cover) is cached under work_dir/extracted/, keyed
-    by name so re-runs skip re-extraction -- same check-then-extract
-    idiom separation.isolate_vocals already uses for Demucs's own cache.
-    """
+    """Resolves everything about a song folder needed to run the pipeline. Never mutates input_dir;
+    synthesized files are cached under work_dir/extracted/ so re-runs skip re-extraction."""
     input_dir = Path(input_dir)
     work_dir = Path(work_dir)
     extracted_dir = work_dir / "extracted"
@@ -72,17 +58,14 @@ def resolve_song_folder(input_dir: Path, work_dir: Path, *,
                     f"(no audio stream, or ffmpeg unavailable)."
                 )
             notes.append(f"Extracted analysis audio from {primary_path.name} -> {analysis_wav.name}")
-        # Same file serves as both #MP3 and #VIDEO -- config.VIDEO_DIRECT_AUDIO_EXTS
-        # (.mp4/.mpg/.mpeg) are all confirmed usable as #MP3 directly in
-        # UltraStar Deluxe (.avi is NOT -- that's the separate "avi_extract"
-        # branch below, which extracts a real standalone mp3 first).
+        # Same file serves as both #MP3 and #VIDEO (.mp4/.mpg/.mpeg only; .avi uses avi_extract below).
         resolved = ResolvedInput(
             primary_source_kind=kind,
             output_mp3_source=primary_path,
             output_video_source=primary_path,
             analysis_audio=analysis_wav,
             cover=companions.cover, background=companions.background, musicxml=companions.musicxml,
-            videogap_applicable=False,  # video IS the audio -- nothing to correlate against
+            videogap_applicable=False,  # video is the audio, nothing to correlate against
             notes=notes,
         )
 
@@ -107,8 +90,8 @@ def resolve_song_folder(input_dir: Path, work_dir: Path, *,
             output_video_source=primary_path,      # the avi itself becomes #VIDEO
             analysis_audio=extracted_mp3,           # already real, decodable audio
             cover=companions.cover, background=companions.background, musicxml=companions.musicxml,
-            videogap_applicable=False,  # the mp3 came directly from this avi's own audio --
-            notes=notes,                # correlating them would be a trimmed copy of itself
+            videogap_applicable=False,  # mp3 came directly from this avi's own audio
+            notes=notes,
         )
 
     else:

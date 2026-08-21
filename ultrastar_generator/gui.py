@@ -1,15 +1,7 @@
-"""Tkinter GUI (feature 8) -- wraps the exact same `run_pipeline`/
-`run_batch` functions the CLI uses, so there is only ever one real
-pipeline implementation. Runs the pipeline on a background thread (Tk
-itself is not thread-safe -- only the main thread may touch widgets) and
-captures ALL of its output, including `print()` calls from deep inside
-pitch/timing submodules that were deliberately NOT rewired to accept a
-`log` callback (see main.py's own docstring for why), via
-`contextlib.redirect_stdout` at the call boundary instead.
+"""Tkinter GUI -- wraps the same `run_pipeline`/`run_batch` functions the CLI uses.
 
-Launch with `python -m ultrastar_generator.gui`, or via the `run_gui.bat`
-launcher at the repo root (uses `pythonw`, so no console window appears).
-"""
+Runs the pipeline on a background thread and captures all print output via `contextlib.redirect_stdout`.
+Launch with `python -m ultrastar_generator.gui`, or via `run_gui.bat` (no console window)."""
 
 from __future__ import annotations
 
@@ -53,14 +45,11 @@ def _save_settings(settings: dict) -> None:
         _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         _SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     except OSError:
-        pass  # best-effort -- a failed save just means no persistence this run
+        pass  # best-effort, no persistence on failure
 
 
 class Tooltip:
-    """Small hover tooltip -- a borderless Toplevel near the cursor,
-    shown on <Enter> and destroyed on <Leave>. Text is fixed at
-    construction (this codebase's tooltips are all static, condensed
-    versions of the CLI's own --help strings)."""
+    """Small hover tooltip: borderless Toplevel shown on <Enter>, destroyed on <Leave>."""
 
     def __init__(self, widget: tk.Widget, text: str):
         self.widget = widget
@@ -88,24 +77,10 @@ class Tooltip:
 
 
 class LrcLibSearchDialog(tk.Toplevel):
-    """Modal candidate picker: an editable Artist/Title search bar at the
-    top (pre-filled from the current run's own artist/title when known,
-    but freely editable -- lets the user search for anything, not just
-    what was auto-detected), LRCLIB results listed on the left, the
-    selected one's lyrics preview on the right. Used by the manual
-    pre-run "Search Lyrics..." button -- the caller decides how/when to
-    show it and what to do with `.result` afterward; this class only
-    handles the search/picking UI itself. `.result` is the chosen
-    LrcLibCandidate, or None if the user cancelled (closed the window or
-    clicked Cancel).
+    """Modal LRCLIB candidate picker: editable Artist/Title search, results list, lyrics preview.
 
-    `audio_duration`, if known, is used to pick a winner among candidates
-    that turn out to have 100% identical synced lyrics (see
-    `_dedupe_identical_synced`) -- the one closest to it is kept, the
-    rest hidden as pure clutter (same content, just a different
-    source/album entry). None (audio not resolved yet -- no folder
-    picked, an ambiguous folder, batch mode, etc.) falls back to keeping
-    whichever of the duplicates appeared first."""
+    `.result` is the chosen LrcLibCandidate, or None if cancelled. `audio_duration`, if known, picks
+    the closest-duration winner among candidates with identical synced lyrics."""
 
     def __init__(self, parent: tk.Misc, *, initial_artist: str = "", initial_title: str = "",
                  title: str = "Select lyrics", audio_duration: Optional[float] = None):
@@ -182,8 +157,7 @@ class LrcLibSearchDialog(tk.Toplevel):
         preview_scroll.pack(side="right", fill="y")
         paned.add(preview_frame)
 
-        # PanedWindow only knows real widget sizes after a layout pass, so
-        # this is deferred; the user can freely drag it afterward regardless.
+        # Deferred: PanedWindow only knows real widget sizes after a layout pass.
         self.after_idle(lambda: paned.sash_place(0, 350, 0))
 
         button_frame = ttk.Frame(self)
@@ -217,10 +191,7 @@ class LrcLibSearchDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Search failed", str(e), parent=self)
             return
-        # Synced-only: an LRCLIB entry with no per-line timestamps is
-        # useless to this project's own line/word-timing pipeline (see
-        # lyrics_lookup.py's own hard synced-lyrics requirement), so it's
-        # not worth ever showing here as a pickable option.
+        # Synced-lyrics only; unsynced entries are useless to this pipeline.
         results = [c for c in results if not c.instrumental and c.synced_lyrics]
         self._set_candidates(results)
         if not results:
@@ -229,20 +200,8 @@ class LrcLibSearchDialog(tk.Toplevel):
                                  parent=self)
 
     def _dedupe_identical_synced(self, candidates: List[LrcLibCandidate]) -> List[LrcLibCandidate]:
-        """Collapses candidates whose synced lyrics are 100% identical
-        (exact same words AND times, no extra/missing lines -- i.e. the
-        raw LRC text matches exactly) down to just one per group, since
-        the rest are pure clutter (same content, different source/album
-        entry). Within a group, keeps whichever candidate's own
-        effective duration (lyrics_lookup.effective_lrc_duration, not
-        the raw possibly-untrustworthy `duration` field) is closest to
-        `self.audio_duration`; falls back to keeping the group's first
-        entry (original list order) when the audio duration isn't known
-        (no folder picked yet, an ambiguous folder, batch mode, etc.) or
-        no candidate in the group has a usable duration either. A
-        candidate with no synced lyrics at all has nothing to compare,
-        so it's never merged with anything, including another
-        synced-lyrics-less candidate."""
+        """Collapses candidates with byte-identical synced lyrics to one, keeping the closest-duration match
+        (or the first, if audio duration is unknown). Unsynced candidates are never merged."""
         groups: dict = {}
         for i, c in enumerate(candidates):
             key = (c.synced_lyrics or "").strip()
@@ -335,16 +294,7 @@ class LrcLibSearchDialog(tk.Toplevel):
 
 
 class PlaceholderEntry(ttk.Entry):
-    """An Entry that shows grey preview text when empty and unfocused.
-    The preview is DISPLAY-ONLY -- `is_placeholder` tells callers whether
-    the currently-shown text is a real user value or just a preview, so
-    opts-building can treat a placeholder-showing field as None and let
-    run_pipeline's own real logic (resolve_artist_title, the output-dir
-    default) compute the authoritative value once, not twice.
-
-    `get_placeholder` is called lazily, only when a refresh is needed
-    (construction, FocusOut, or an explicit external refresh_placeholder()
-    call) -- never on every keystroke."""
+    """An Entry that shows grey preview text when empty and unfocused; `is_placeholder` flags display-only text."""
 
     def __init__(self, master, textvariable: tk.StringVar, get_placeholder: Callable[[], str], **kwargs):
         super().__init__(master, textvariable=textvariable, **kwargs)
@@ -365,12 +315,9 @@ class PlaceholderEntry(ttk.Entry):
         self.refresh_placeholder()
 
     def refresh_placeholder(self):
-        """Re-shows the (possibly changed) preview if this field is empty
-        and not currently being edited. Safe to call any time something
-        the preview depends on (input folder, artist, title, ...) changes
-        -- a no-op if the user has real text here or is actively typing."""
+        """Re-shows the (possibly changed) preview if this field is empty and not focused."""
         if self.focus_get() is self:
-            return  # actively being edited -- don't stomp on it
+            return  # actively being edited
         if self.is_placeholder or not self._var.get().strip():
             self._var.set(self._get_placeholder())
             self.configure(foreground="grey50")
@@ -381,14 +328,8 @@ class PlaceholderEntry(ttk.Entry):
         return None if self.is_placeholder else (self._var.get().strip() or None)
 
     def set_real_value(self, value: str) -> None:
-        """Sets a REAL value programmatically (e.g. from a Browse dialog,
-        which never focuses the entry itself so <FocusIn> never fires) --
-        unlike setting the underlying StringVar directly, this correctly
-        clears `is_placeholder` too. A raw `.set()` left it stale, so
-        `effective_value()` kept returning None even though the var now
-        held a real value -- confirmed a real, pre-existing bug for
-        `_browse_output` before this method existed; use this instead of
-        `.set()` on the var for any future browse-style handler too."""
+        """Sets a real value programmatically (e.g. from a Browse dialog). Use instead of `.set()` on the var
+        directly -- a Browse callback never focuses the entry, so only this clears `is_placeholder`."""
         self.is_placeholder = False
         self.configure(foreground="black")
         self._var.set(value)
@@ -406,12 +347,7 @@ class App(tk.Tk):
         self._launch_dir = str(Path.cwd())
 
         self.mode = tk.StringVar(value="generate")  # "generate" | "youtube" | "realign" | "pitch_refresh" | "fix_start_beat"
-        # Batch is a MODIFIER, orthogonal to mode -- usable with "generate",
-        # "realign", "pitch_refresh", and "fix_start_beat" (each processes
-        # every immediate subfolder of the input folder instead of the input
-        # folder itself), meaningless for "youtube" (a single URL can't
-        # populate N subfolders), where it's disabled outright rather than
-        # just ignored.
+        # Batch is a modifier orthogonal to mode; disabled (not just ignored) for "youtube".
         self.batch_mode = tk.BooleanVar(value=False)
         self.input_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
@@ -421,54 +357,26 @@ class App(tk.Tk):
         self.artist = tk.StringVar()
         self.title_var = tk.StringVar()
 
-        # Realign (alignment-only) mode -- see realign.py. A separate mode
-        # rather than a checkbox on the normal pipeline: it needs a
-        # fundamentally different input (an EXISTING .txt to re-time, not
-        # generate from scratch) and shares almost none of the normal
-        # pipeline's own options (pass 1-4 are skipped entirely).
+        # Realign (alignment-only) mode -- see realign.py.
         self.existing_txt_path = tk.StringVar()
         self.realign_use_lrc = tk.BooleanVar(value=True)
         self.lrc_mode = tk.StringVar(value="windowed")
         self.realign_strategy = tk.StringVar(value="validate")
         self.realign_delete_work_files = tk.BooleanVar(value=False)
 
-        # Pitch-refresh mode -- see pitch_refresh.py. Also a separate mode,
-        # same reasoning as realign above but for the opposite half of an
-        # UltraStar file: re-detects only each note's PITCH from an EXISTING
-        # file's already-trusted timing, never touching timing/text/note
-        # count. Has no lyrics/LRCLIB functionality at all (no ASR, so no
-        # artist/title lookup either) -- a much smaller option surface than
-        # either generate or realign.
+        # Pitch-refresh mode -- see pitch_refresh.py. Re-detects only pitch from existing timing, no lyrics/ASR.
         self.pitch_refresh_source = tk.StringVar(value=config.DEFAULT_PITCH_SOURCE)
         self.pitch_refresh_isolate_vocals = tk.BooleanVar(value=True)
         self.pitch_refresh_key_nudge = tk.BooleanVar(value=DEFAULT_KEY_NUDGE)
         self.pitch_refresh_musicxml = tk.BooleanVar(value=True)
         self.pitch_refresh_delete_work_files = tk.BooleanVar(value=False)
 
-        # Curated main-surface options -- the GUI deliberately doesn't
-        # mirror every CLI flag. Three categories stay CLI-only:
-        # (1) diagnostic/isolation-only flags meant for chasing a specific
-        # bug, not normal use (--no-transcribe, --whisperx-vad, --no-pass1-
-        # debug, --no-debug-log, --no-whisperx); (2) expert numeric tuning
-        # knobs with no existing GUI float-entry widget pattern to mirror
-        # (same reasoning --ambiguity-margin-threshold's own CLI help
-        # already gives: the 7 pass-1 knobs -- pitch-smooth-window, note-
-        # split-semitones, min-note-beat-fraction, silence-threshold-db,
-        # silence-floor-db, spike-max-duration, spike-jump-semitones -- plus
-        # pitch_refresh.py's attack-trim-sec/confidence-floor-percentile/
-        # voicing-threshold); (3) rare/advanced overrides with a real but
-        # narrow use case (--bpm, --skip-separation/--vocals-path,
-        # --retry-low-quality-asr -- already default-on and --batch-gated
-        # specifically so it doesn't need a knob, see its own CLI help).
-        # Everything else genuinely user-facing lives below, either here or
-        # under the Advanced/experimental section further down.
+        # Curated main-surface options; diagnostic/expert-only flags stay CLI-only.
         self.fetch_lyrics = tk.BooleanVar(value=True)
         self.fetch_cover = tk.BooleanVar(value=True)
         self.whisper_model = tk.StringVar(value=config.DEFAULT_WHISPER_MODEL)
         self.pitch_source = tk.StringVar(value=config.DEFAULT_PITCH_SOURCE)
         self.demucs_model = tk.StringVar(value=config.DEFAULT_DEMUCS_MODEL)
-        # Default ON, quality-gated with automatic fallback to the standard
-        # pass 1-4 pipeline -- see --mxl-lrc-primary's own CLI help.
         self.mxl_lrc_primary = tk.BooleanVar(value=config.ENABLE_MXL_LRC_PRIMARY)
 
         # Advanced/experimental -- collapsed by default.
@@ -479,46 +387,26 @@ class App(tk.Tk):
         self._advanced_visible = False
 
         self.delete_work_files = tk.BooleanVar(value=False)
-        self._last_output_parent: Optional[Path] = None  # set after a successful run, for "Open Output Folder"
+        self._last_output_parent: Optional[Path] = None  # for "Open Output Folder"
 
-        # Interactive LRCLIB disambiguation: pinned_lyrics is a manual
-        # pre-run pick (via the "Search Lyrics..." button) that always
-        # wins outright -- single-song-mode only, batch mode always
-        # auto-picks silently.
+        # Manual pre-run pick via "Search Lyrics..."; always wins. Single-song mode only.
         self.pinned_lyrics: Optional[LrcLibCandidate] = None
-        # LRCLIB numeric id override -- lets a user who browsed lrclib.net
-        # directly and confirmed a perfect match paste the id back in,
-        # bypassing search/scoring entirely for both the MXL+LRC primary
-        # path and the standard pipeline's own reference-lyrics fetch.
+        # Explicit LRCLIB id override, bypasses search/scoring.
         self.lrclib_id = tk.StringVar(value="")
-        # Local .lrc file override -- bypasses LRCLIB search/fetch entirely,
-        # wins over both search and --lrclib-id if given. Same shared-var
-        # pattern as lrclib_id above (one Entry per Lyrics frame, single
-        # source of truth). See lyrics_lookup.load_lrc_file.
+        # Local .lrc file override, wins over search and --lrclib-id.
         self.lrc_file = tk.StringVar(value="")
-        # MusicXML reference override -- normally auto-detected from the
-        # input folder's own companion files; only needed when that picks
-        # the wrong file (or none at all). musicxml_part is a rarely-needed
-        # hint for multi-part/duet arrangements. Both feed pass 4 AND the
-        # MXL+LRC primary path below.
+        # MusicXML reference override; auto-detected otherwise. musicxml_part is for multi-part/duet arrangements.
         self.musicxml_reference = tk.StringVar(value="")
         self.musicxml_part = tk.StringVar(value="")
 
         self._running = False
-        # Set by _on_stop (after user confirmation) and polled via
-        # PipelineOptions.cancel_requested at stage boundaries inside the
-        # pipeline itself -- see config.PipelineCancelled's docstring for
-        # why this only takes effect between stages, not instantly.
-        # Cleared at the start of every new run.
+        # Set by _on_stop, polled at stage boundaries -- only takes effect between stages, not instantly.
         self._cancel_event = threading.Event()
         self._build_widgets()
         self._on_mode_change()
 
-        # Placeholders depend on each other (output folder's preview needs
-        # artist/title, which need input_dir) -- wire refresh via trace_add
-        # on the SOURCE vars only (input_dir, audio_file, artist, title),
-        # never on a var a PlaceholderEntry itself writes to as part of
-        # showing its OWN preview, to avoid a self-referential trace loop.
+        # Wire refresh on the SOURCE vars only, never a var a PlaceholderEntry writes to itself
+        # (avoids a self-referential trace loop).
         self.input_dir.trace_add("write", lambda *_: self._refresh_artist_title_placeholders())
         self.audio_file.trace_add("write", lambda *_: self._refresh_artist_title_placeholders())
         self.artist.trace_add("write", lambda *_: self.output_dir_entry.refresh_placeholder())
@@ -533,14 +421,8 @@ class App(tk.Tk):
     # --- placeholder preview computation --------------------------------
 
     def _resolved_artist_title(self) -> tuple:
-        """Real artist/title if the user typed them, else auto-detected
-        via the SAME real function run_pipeline itself uses
-        (file_discovery.resolve_artist_title -- the INPUT FOLDER's own
-        name is the sole source now that input is folder-based; a file
-        inside can be named anything at all) -- never a separate guess.
-        Headline-cased either way (see headline_case's own docstring),
-        matching what run_pipeline will actually use for the output
-        folder/file names. Returns (artist_or_None, title_or_None)."""
+        """Real artist/title if typed, else auto-detected via the same function run_pipeline uses.
+        Returns (artist_or_None, title_or_None), headline-cased."""
         artist = self.artist_entry.effective_value() if hasattr(self, "artist_entry") else None
         title = self.title_entry.effective_value() if hasattr(self, "title_entry") else None
         if not (artist and title):
@@ -559,17 +441,8 @@ class App(tk.Tk):
                 headline_case(title) if title else title)
 
     def _resolved_audio_duration(self) -> Optional[float]:
-        """Best-effort real audio duration for the currently-selected
-        input folder, used by LrcLibSearchDialog to pick a winner among
-        candidates with 100% identical synced lyrics (closest duration
-        wins) -- see its own _dedupe_identical_synced. Returns None
-        (never raises) whenever the audio isn't resolvable yet -- no
-        folder picked, an ambiguous folder, batch mode (no single song),
-        no ffprobe, etc. -- the dialog falls back to keeping whichever
-        duplicate came first in that case. Probes the container directly
-        via ffprobe (media_extract.probe_duration_sec), which works the
-        same for a real audio file or a video-as-audio/avi source -- no
-        need to know which kind resolve_primary_source returned."""
+        """Best-effort audio duration for the selected input folder, used by LrcLibSearchDialog's dedupe.
+        Returns None if not resolvable."""
         input_dir = self.input_dir.get().strip()
         if not input_dir or not Path(input_dir).is_dir() or self._is_batch():
             return None
@@ -581,11 +454,7 @@ class App(tk.Tk):
         return probe_duration_sec(audio_path)
 
     def _artist_placeholder_text(self) -> str:
-        # YouTube mode can't auto-detect anything (a video's own title isn't
-        # a reliable "Artist - Title" source, see the mode tooltip) -- both
-        # fields are actually REQUIRED there, so the usual "auto-detected"
-        # ghost text would be actively misleading. No placeholder at all
-        # (blank field) reads as "you must type something" instead.
+        # YouTube mode requires artist/title explicitly; no auto-detect placeholder.
         if self.mode.get() == "youtube":
             return ""
         artist, _ = self._resolved_artist_title()
@@ -598,20 +467,11 @@ class App(tk.Tk):
         return title or "(auto-detected from input folder)"
 
     def _output_dir_placeholder_text(self) -> str:
-        # The output folder is now the PARENT under which "<Artist> -
-        # <Title>" gets created (see run_pipeline's own docstring) --
-        # shown as a relative path (always ".\Output\", relative to
-        # whatever the input folder ends up being), not an absolute one,
-        # since it's the same relationship regardless of where the input
-        # folder actually lives.
+        # Parent folder under which "<Artist> - <Title>" gets created; shown relative to the input folder.
         return ".\\Output\\"
 
     def _existing_txt_placeholder_text(self) -> str:
-        # A static hint, not a resolved real value (unlike artist/title's
-        # own placeholder) -- the actual file is only found by touching
-        # the filesystem (find_existing_txt_in_folder), which can fail
-        # (ambiguous/missing), so it isn't predicted here on every
-        # keystroke; the real outcome is reported in the run log instead.
+        # Static hint; the real file is only resolved at run time.
         return "(auto-detected from input folder)"
 
     def _refresh_artist_title_placeholders(self):
@@ -750,9 +610,7 @@ class App(tk.Tk):
         self.lrc_file_browse_button.pack(side="left", padx=(2, 0))
         self._update_pinned_lyrics_label()
 
-        # MusicXML reference override -- separate frame from Lyrics above
-        # (a different concept -- pitch/score reference, not lyrics text),
-        # same Entry+Browse shape as the LRC file field.
+        # MusicXML reference override, separate from Lyrics -- same Entry+Browse shape.
         self.musicxml_frame = ttk.LabelFrame(self, text="MusicXML (single-song mode only)")
         musicxml_frame = self.musicxml_frame
         ttk.Label(musicxml_frame, text="Reference file:").pack(side="left", padx=(8, 2), pady=4)
@@ -774,11 +632,7 @@ class App(tk.Tk):
                                             "rarely needed. Falls back to the lyric-bearing part with the most "
                                             "notes if left blank.")
 
-        # Mirrors the normal pipeline's own Lyrics/Options split immediately
-        # below (same LabelFrame styling/naming convention) rather than one
-        # combined "Realign options" frame -- LRCLIB candidate selection
-        # (Lyrics) is conceptually separate from behavioral toggles
-        # (Options), same distinction the normal pipeline already draws.
+        # Mirrors the normal pipeline's Lyrics/Options split.
         self.realign_lyrics_frame = ttk.LabelFrame(self, text="Lyrics (single-song mode only)")
         realign_lyrics_frame = self.realign_lyrics_frame
         self.realign_search_lyrics_button = ttk.Button(realign_lyrics_frame, text="Search Lyrics...", command=self._on_search_lyrics)
@@ -842,9 +696,7 @@ class App(tk.Tk):
                                                    "Leave off if you'll re-run this song again soon -- it "
                                                    "avoids re-paying separation cost.")
 
-        # Pitch-refresh mode has no lyrics functionality at all (no ASR, no
-        # LRCLIB) -- a single Options frame is its whole surface, no
-        # matching "Lyrics" frame the way realign/generate have.
+        # Pitch-refresh mode has no lyrics functionality, so no matching "Lyrics" frame.
         self.pitch_refresh_options_frame = ttk.LabelFrame(self, text="Options")
         pr_options_frame = self.pitch_refresh_options_frame
         ttk.Label(pr_options_frame, text="Pitch source:").grid(row=0, column=0, sticky="w", padx=8, pady=2)
@@ -919,11 +771,7 @@ class App(tk.Tk):
         demucs_entry.pack(side="left", padx=(4, 0))
         Tooltip(demucs_entry, f"Vocal-separation model name (default: {config.DEFAULT_DEMUCS_MODEL}), e.g. "
                                "htdemucs_ft (higher quality, slower). Passed straight through to Demucs.")
-        # Each label + its own input lives in a small sub-frame (packed
-        # tightly together) rather than sharing the outer grid's columns
-        # directly -- those columns are also shared with the wider
-        # checkbox rows above/below, which pushed the label and input
-        # apart whenever a column's width came from a different row.
+        # Sub-frame per label+input so the wider checkbox rows don't push them apart.
         whisper_frame = ttk.Frame(opts_frame)
         whisper_frame.grid(row=2, column=0, sticky="w", padx=8, pady=2)
         ttk.Label(whisper_frame, text="Whisper model:").pack(side="left")
@@ -1022,15 +870,9 @@ class App(tk.Tk):
         is_realign = mode == "realign"
         is_pitch_refresh = mode == "pitch_refresh"
         is_fix_start_beat = mode == "fix_start_beat"
-        # Realign, pitch_refresh, and fix_start_beat all work from an
-        # EXISTING .txt (never generate from scratch) and write next to it
-        # by default -- grouped together for the several checks below that
-        # treat them identically, even though their own OPTIONS frames are
-        # completely different (fix_start_beat has none at all).
+        # Realign, pitch_refresh, and fix_start_beat all work from an existing .txt and write next to it.
         uses_existing_txt = is_realign or is_pitch_refresh or is_fix_start_beat
-        # Batch is a checkbox, orthogonal to mode -- but meaningless for
-        # YouTube (a single URL can't populate multiple subfolders), so
-        # it's disabled AND ignored there regardless of its own raw state.
+        # Batch is meaningless for YouTube; disabled and ignored there.
         self.batch_check.config(state=tk.DISABLED if is_youtube else tk.NORMAL)
         is_batch = self.batch_mode.get() and not is_youtube
 
@@ -1049,13 +891,7 @@ class App(tk.Tk):
             self.youtube_label.grid_remove()
             self.youtube_entry.grid_remove()
             self.youtube_audio_only_check.grid_remove()
-            # Audio file is meaningful for generate/realign/pitch_refresh,
-            # but a single bare filename can't apply across multiple batch
-            # subfolders -- DISABLED (greyed out, stays visible) rather than
-            # hidden when batch is on, so it's clear the field still exists,
-            # just isn't usable in this combination. fix_start_beat needs no
-            # audio at all (pure GAP/beat-grid arithmetic on the .txt) --
-            # hidden entirely, not just disabled.
+            # Audio file: disabled (not hidden) in batch mode; hidden entirely for fix_start_beat (needs no audio).
             if is_fix_start_beat:
                 self.audio_file_label.grid_remove()
                 self.audio_file_entry.grid_remove()
@@ -1071,10 +907,7 @@ class App(tk.Tk):
                 self.existing_txt_label.grid(row=3, column=0, sticky="w", padx=8, pady=4)
                 self.existing_txt_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=4)
                 self.existing_txt_browse.grid(row=3, column=2, padx=8, pady=4)
-                # Same reasoning as audio file above: a single explicit
-                # existing-file path can't apply across multiple batch
-                # subfolders (each is auto-detected instead) -- disabled,
-                # not hidden.
+                # Same reasoning as audio file: disabled, not hidden, in batch mode.
                 existing_txt_state = tk.DISABLED if is_batch else tk.NORMAL
                 self.existing_txt_entry.config(state=existing_txt_state)
                 self.existing_txt_browse.config(state=existing_txt_state)
@@ -1083,10 +916,7 @@ class App(tk.Tk):
                 self.existing_txt_entry.grid_remove()
                 self.existing_txt_browse.grid_remove()
 
-        # Realign and pitch_refresh both write directly next to the existing
-        # file by default -- the "parent folder for a fresh <Artist> -
-        # <Title> folder" meaning of Output folder doesn't apply to either
-        # (batch or not).
+        # Realign and pitch_refresh always write next to the existing file; Output folder doesn't apply.
         if uses_existing_txt:
             self.output_dir_label.grid_remove()
             self.output_dir_entry.grid_remove()
@@ -1102,31 +932,17 @@ class App(tk.Tk):
             self.artist_frame.config(text="Artist / Title (required for YouTube)")
         else:
             self.artist_frame.config(text="Artist / Title")
-        # A single artist/title override doesn't make sense across multiple
-        # batch subfolders either -- disabled, not hidden, same as above.
-        # pitch_refresh and fix_start_beat have no artist/title CONCEPT at
-        # all (no lyrics lookup of any kind), so their fields are always
-        # disabled regardless of batch.
+        # Artist/title: disabled in batch mode, same as above; always disabled for pitch_refresh/fix_start_beat
+        # (no artist/title concept there).
         artist_title_state = tk.DISABLED if (is_batch or is_pitch_refresh or is_fix_start_beat) else tk.NORMAL
         self.artist_entry.config(state=artist_title_state)
         self.title_entry.config(state=artist_title_state)
-        # Mode switch changes what _artist_placeholder_text/
-        # _title_placeholder_text would return (YouTube's own blank-vs-
-        # "auto-detected" branch above) -- refresh now rather than waiting
-        # for the entry's next FocusOut, so switching TO or AWAY FROM
-        # YouTube mode updates the ghost text immediately.
+        # Refresh now rather than waiting for FocusOut, so switching to/from YouTube updates ghost text immediately.
         self.artist_entry.refresh_placeholder()
         self.title_entry.refresh_placeholder()
 
-        # Realign mode skips pass 1-4 entirely, and pitch_refresh skips them
-        # PLUS realign's own ASR/LRC matching (it has no lyrics functionality
-        # at all) -- each uses a completely different, much smaller option
-        # surface, toggled as whole frames (not picked apart widget-by-widget
-        # the way audio_file/youtube rows are above). `io_frame` is always
-        # packed, so it's a safe `after=` anchor regardless of which set is
-        # currently showing -- `artist_frame` itself is hidden entirely in
-        # pitch_refresh mode (no artist/title concept at all there, see
-        # above), so it can't be used as the anchor unconditionally.
+        # Each mode toggles a whole options frame. `io_frame` is always packed, so it's a safe `after=`
+        # anchor; `artist_frame` isn't (hidden entirely in pitch_refresh mode).
         if is_realign:
             self.artist_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
             self.lyrics_frame.pack_forget()
@@ -1148,8 +964,7 @@ class App(tk.Tk):
             self.realign_options_frame.pack_forget()
             self.pitch_refresh_options_frame.pack(fill="x", padx=8, pady=4, after=self.io_frame)
         elif is_fix_start_beat:
-            # No option surface at all -- pure GAP/beat-grid arithmetic on
-            # the existing .txt, nothing to configure.
+            # No option surface -- pure GAP/beat-grid arithmetic, nothing to configure.
             self.artist_frame.pack_forget()
             self.lyrics_frame.pack_forget()
             self.musicxml_frame.pack_forget()
@@ -1171,19 +986,13 @@ class App(tk.Tk):
             if self._advanced_visible:
                 self.advanced_frame.pack(fill="x", padx=8, pady=4, after=self.advanced_toggle)
 
-        # A single pinned/searched-for lyrics candidate or LRCLIB id override
-        # doesn't make sense across multiple batch subfolders either --
-        # interactive disambiguation is single-song-mode only regardless.
-        # These are all hidden (not just disabled) for pitch_refresh anyway
-        # (no Lyrics frame of any kind shows in that mode), so their state
-        # here is moot for it but harmless to set consistently.
+        # Interactive lyrics disambiguation is single-song-mode only.
         lyrics_controls_state = tk.DISABLED if is_batch else tk.NORMAL
         self.search_lyrics_button.config(state=lyrics_controls_state)
         self.lrclib_id_entry.config(state=lyrics_controls_state)
         self.lrc_file_entry.config(state=lyrics_controls_state)
         self.lrc_file_browse_button.config(state=lyrics_controls_state)
-        # Same reasoning: a single explicit MusicXML file/part override
-        # can't apply across multiple batch subfolders either.
+        # Same reasoning: MusicXML file/part override is single-song-mode only.
         self.musicxml_reference_entry.config(state=lyrics_controls_state)
         self.musicxml_reference_browse_button.config(state=lyrics_controls_state)
         self.musicxml_part_entry.config(state=lyrics_controls_state)
@@ -1194,10 +1003,7 @@ class App(tk.Tk):
     # --- LRCLIB lyrics search / disambiguation -----------------------------
 
     def _on_search_lyrics(self):
-        # Pre-fills the dialog's own search fields with the resolved
-        # artist/title (real or auto-detected), but the dialog lets the
-        # user freely edit and re-search for anything -- these are just a
-        # starting point, not a requirement.
+        # Pre-fills the search fields with resolved artist/title; freely editable.
         artist, title = self._resolved_artist_title()
         dlg = LrcLibSearchDialog(self, initial_artist=artist or "", initial_title=title or "",
                                   title="Search lyrics", audio_duration=self._resolved_audio_duration())
@@ -1221,15 +1027,8 @@ class App(tk.Tk):
             self.clear_pinned_button.pack_forget()
 
     def _make_mxl_lrc_fallback_callback(self) -> Callable[[str], bool]:
-        """Returns a callback for PipelineOptions.mxl_lrc_fallback_callback.
-        Same thread-hop shape as `_make_no_lrc_fallback_callback` (the only
-        safe pattern for a blocking dialog from the background pipeline
-        thread):
-        `self.after(0, ...)` schedules a `messagebox.askyesno` on the main
-        thread, the background thread blocks on a `threading.Event` until
-        it's answered. Shown by default whenever the MXL+LRC quality gate
-        fails or nothing usable was found -- no separate opt-in checkbox,
-        per the user's explicit "ask what they want to do" requirement."""
+        """Callback for PipelineOptions.mxl_lrc_fallback_callback: schedules a blocking dialog on the main
+        thread via `self.after(0, ...)` + `threading.Event`, shown whenever the MXL+LRC quality gate fails."""
         def callback(reason: str) -> bool:
             result_holder = {}
             done_event = threading.Event()
@@ -1248,11 +1047,8 @@ class App(tk.Tk):
         return callback
 
     def _make_no_lrc_fallback_callback(self) -> Callable[[str], bool]:
-        """Returns a callback for PipelineOptions.no_lrc_fallback_callback.
-        Same thread-hop shape as `_make_mxl_lrc_fallback_callback` above --
-        shown by default whenever no valid (synced-lyrics) LRCLIB candidate
-        was found, no separate opt-in checkbox, same "ask what they want to
-        do" convention."""
+        """Callback for PipelineOptions.no_lrc_fallback_callback, shown whenever no valid LRCLIB candidate
+        was found. Same thread-hop shape as `_make_mxl_lrc_fallback_callback`."""
         def callback(reason: str) -> bool:
             result_holder = {}
             done_event = threading.Event()
@@ -1284,16 +1080,7 @@ class App(tk.Tk):
     def _browse_input(self):
         d = filedialog.askdirectory(title="Select input folder", initialdir=self.input_dir.get().strip() or self._last_dir("input_dir"))
         if d:
-            # tkinter's askdirectory always returns forward-slash paths on
-            # Windows, even though Explorer/native dialogs display and
-            # expect backslashes -- if the user copies this value back
-            # into a fresh Browse dialog's own address/filename box (a
-            # real thing people do), that classic Windows folder-picker
-            # rejects a forward-slash path as "not valid" even though
-            # it's a perfectly real folder. Normalizing to the native
-            # backslash form here (both what's shown AND what's
-            # persisted to gui_settings.json) avoids handing the user a
-            # value that breaks when pasted back into a picker.
+            # askdirectory returns forward-slash paths; normalize to native backslash form.
             d = str(Path(d))
             self.input_dir.set(d)
             self._remember_dir("input_dir", d)
@@ -1301,7 +1088,7 @@ class App(tk.Tk):
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder", initialdir=self.input_dir.get().strip() or self._last_dir("output_dir"))
         if d:
-            d = str(Path(d))  # see _browse_input's comment on why this normalization matters
+            d = str(Path(d))  # see _browse_input's comment
             self.output_dir_entry.set_real_value(d)
             self._remember_dir("output_dir", d)
 
@@ -1354,11 +1141,7 @@ class App(tk.Tk):
         messagebox.showinfo("Done", f"{work_dir} deleted")
 
     def _open_output_folder(self):
-        # Prefer the last real completed run's own path (exact, unambiguous).
-        # Otherwise, the output-folder FIELD now already holds the parent
-        # directly (see run_pipeline's own contract) -- a real typed value
-        # is used as-is; an untouched placeholder (always the relative
-        # ".\Output\" preview) is resolved against the current input folder.
+        # Prefer the last completed run's own path; else resolve the output-folder field against the input folder.
         target = self._last_output_parent
         if target is None:
             effective = self.output_dir_entry.effective_value()
@@ -1377,19 +1160,14 @@ class App(tk.Tk):
     # --- actions ---------------------------------------------------------
 
     def _is_batch(self) -> bool:
-        # Batch is meaningless for YouTube (a single URL can't populate
-        # multiple subfolders) -- ignored there regardless of the
-        # checkbox's own raw state, same as _on_mode_change disabling it.
+        # Batch is meaningless for YouTube; ignored there.
         return self.batch_mode.get() and self.mode.get() != "youtube"
 
     def _build_opts(self) -> config.PipelineOptions:
         mode = self.mode.get()
         is_batch = self._is_batch()
         return config.PipelineOptions(
-            # A single artist/title/audio-file override doesn't make sense
-            # across multiple batch subfolders -- forced None here to match
-            # the fields being DISABLED (not hidden) in _on_mode_change,
-            # regardless of whatever stale text is still sitting in them.
+            # Per-song overrides forced None in batch mode, matching the disabled fields in _on_mode_change.
             artist=None if is_batch else self.artist_entry.effective_value(),
             title=None if is_batch else self.title_entry.effective_value(),
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
@@ -1399,9 +1177,7 @@ class App(tk.Tk):
             pitch_source=self.pitch_source.get(),
             demucs_model=self.demucs_model.get().strip() or config.DEFAULT_DEMUCS_MODEL,
             mxl_lrc_primary=self.mxl_lrc_primary.get(),
-            # Single-song-mode only, same reasoning as pinned_lyrics/
-            # lrclib_id above -- a specific file/part override can't apply
-            # across multiple batch subfolders.
+            # Single-song-mode only.
             musicxml_reference=None if is_batch else (self.musicxml_reference.get().strip() or None),
             musicxml_part=None if is_batch else (self.musicxml_part.get().strip() or None),
             lrc_timing_check=self.lrc_timing_check.get(),
@@ -1412,25 +1188,13 @@ class App(tk.Tk):
             youtube_audio_only=self.youtube_audio_only.get(),
             delete_work_files=self.delete_work_files.get(),
             batch=is_batch,
-            # Interactive LRCLIB disambiguation -- single-song-mode only
-            # (see _on_mode_change, which also disables the controls
-            # themselves in batch mode). A manual pre-run pick always wins
-            # outright.
+            # Interactive LRCLIB disambiguation -- single-song-mode only; a manual pre-run pick always wins.
             pinned_lyrics=self._effective_pinned_lyrics() if not is_batch else None,
-            # LRCLIB id override -- single-song-mode only, same scoping as
-            # pinned_lyrics above (a per-song override doesn't make sense
-            # across a batch run of different songs).
+            # LRCLIB id override -- single-song-mode only.
             lrclib_id=self._effective_lrclib_id() if not is_batch else None,
-            # MXL+LRC fallback confirmation -- single-song-mode only, shown
-            # by default (no opt-in checkbox) whenever the quality gate
-            # fails, per the user's explicit "ask what they want to do".
-            # Batch mode always auto-falls-back silently with just the log
-            # warning, same convention as the lyrics ambiguity prompt above.
+            # MXL+LRC fallback confirmation -- single-song-mode only; batch always auto-falls-back silently.
             mxl_lrc_fallback_callback=self._make_mxl_lrc_fallback_callback() if not is_batch else None,
-            # No-valid-LRC fallback confirmation -- single-song-mode only,
-            # same shown-by-default convention as mxl_lrc_fallback_callback
-            # above (whenever fetch_reference_lyrics finds no valid synced
-            # candidate at all). Batch mode auto-falls-back silently.
+            # No-valid-LRC fallback confirmation -- same convention as above.
             no_lrc_fallback_callback=self._make_no_lrc_fallback_callback() if not is_batch else None,
             cancel_requested=self._cancel_event.is_set,
         )
@@ -1445,11 +1209,7 @@ class App(tk.Tk):
             return None
 
     def _effective_pinned_lyrics(self) -> Optional[LrcLibCandidate]:
-        """A typed LRC file path wins over a manual Search Lyrics... pick
-        (same precedence as the CLI's --lrc-file vs pinned_lyrics/
-        --lrclib-id -- see lyrics_lookup.load_lrc_file), since typing an
-        explicit local file is a more deliberate override than whatever
-        was picked earlier in the session."""
+        """A typed LRC file path wins over a manual Search Lyrics... pick."""
         raw = self.lrc_file.get().strip()
         if raw:
             candidate = load_lrc_file(raw, artist=self.artist_entry.effective_value() or "",
@@ -1461,8 +1221,7 @@ class App(tk.Tk):
     def _build_realign_opts(self) -> RealignPipelineOptions:
         is_batch = self._is_batch()
         return RealignPipelineOptions(
-            # Same "doesn't make sense across multiple batch subfolders"
-            # reasoning as _build_opts above.
+            # Same batch-mode reasoning as _build_opts above.
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             whisper_model=self.whisper_model.get().strip() or config.DEFAULT_WHISPER_MODEL,
             artist=None if is_batch else self.artist_entry.effective_value(),
@@ -1480,9 +1239,7 @@ class App(tk.Tk):
     def _build_pitch_refresh_opts(self) -> PitchRefreshOptions:
         is_batch = self._is_batch()
         return PitchRefreshOptions(
-            # Same "doesn't make sense across multiple batch subfolders"
-            # reasoning as _build_opts/_build_realign_opts above. No artist/
-            # title/lyrics fields at all here -- pitch_refresh has none.
+            # Same batch-mode reasoning as _build_opts/_build_realign_opts. No artist/title/lyrics fields here.
             audio_file=None if is_batch else (self.audio_file.get().strip() or None),
             isolate_vocals=self.pitch_refresh_isolate_vocals.get(),
             demucs_model=self.demucs_model.get().strip() or config.DEFAULT_DEMUCS_MODEL,
@@ -1503,9 +1260,7 @@ class App(tk.Tk):
         if not input_dir:
             messagebox.showerror("Missing folder", "An input folder is required.")
             return
-        # None -> run_pipeline computes its own default; not used at all by
-        # realign/pitch_refresh/fix_start_beat modes, which write directly
-        # next to the existing file.
+        # None -> run_pipeline's own default; unused by realign/pitch_refresh/fix_start_beat.
         output_dir_value = (self.output_dir_entry.effective_value()
                              if mode not in ("realign", "pitch_refresh", "fix_start_beat") else None)
         if mode == "youtube" and not (self.artist_entry.effective_value() and self.title_entry.effective_value()):
@@ -1515,15 +1270,8 @@ class App(tk.Tk):
         if mode == "youtube" and not self.youtube_url.get().strip():
             messagebox.showerror("Missing URL", "YouTube mode requires a URL.")
             return
-        # In batch mode, each subfolder auto-detects its own existing .txt
-        # (see find_existing_txt_in_folder) -- a single explicit path can't
-        # apply across multiple subfolders, so it's neither required nor read.
-        # A real typed value is used as-is; left blank (or still showing the
-        # placeholder), run_realign_pipeline/run_pitch_refresh_pipeline
-        # auto-detects the single .txt in the input folder itself (same
-        # find_existing_txt_in_folder, different exclude marker per module)
-        # -- same as batch mode's own per-subfolder auto-detection, just for
-        # one folder.
+        # In batch mode each subfolder auto-detects its own existing .txt; a real typed value is used as-is,
+        # otherwise it's auto-detected too (find_existing_txt_in_folder).
         existing_txt_path = None
         if mode in ("realign", "pitch_refresh", "fix_start_beat") and not is_batch:
             existing_txt_value = self.existing_txt_entry.effective_value()
@@ -1571,10 +1319,7 @@ class App(tk.Tk):
                         results = run_realign_batch(input_dir, opts, log=q.put)
                         ok = sum(1 for _, r in results if r.success)
                         q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")
-                        # Each result is written next to its OWN subfolder's
-                        # existing file (no output-folder mirroring the way
-                        # the normal pipeline's batch has) -- the parent
-                        # folder itself is the only sensible single target.
+                        # Each result is written next to its own subfolder's file; no output-folder mirroring.
                         q.put((_OUTPUT_PARENT, input_dir))
                     else:
                         result = run_realign_pipeline(input_dir, existing_txt_path, opts, log=q.put)
@@ -1589,10 +1334,7 @@ class App(tk.Tk):
                         results = run_pitch_refresh_batch(input_dir, opts, log=q.put)
                         ok = sum(1 for _, r in results if r.success)
                         q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")
-                        # Same reasoning as realign's own batch branch above
-                        # -- each result is written next to its OWN
-                        # subfolder's existing file, no output-folder
-                        # mirroring.
+                        # Same reasoning as realign's batch branch above.
                         q.put((_OUTPUT_PARENT, input_dir))
                     else:
                         result = run_pitch_refresh_pipeline(input_dir, existing_txt_path, opts, log=q.put)
@@ -1607,10 +1349,7 @@ class App(tk.Tk):
                         results = run_fix_start_note_beat_batch(input_dir, log=q.put)
                         ok = sum(1 for _, r in results if r.success)
                         q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")
-                        # Same reasoning as realign/pitch_refresh's own batch
-                        # branches above -- each result is written next to
-                        # its OWN subfolder's existing file, no output-folder
-                        # mirroring.
+                        # Same reasoning as realign/pitch_refresh's batch branches above.
                         q.put((_OUTPUT_PARENT, input_dir))
                     else:
                         result = run_fix_start_note_beat_pipeline(input_dir, existing_txt_path, log=q.put)
@@ -1624,9 +1363,7 @@ class App(tk.Tk):
                     results = run_batch(input_dir, output_dir, opts, log=q.put)
                     ok = sum(1 for _, r in results if r.success)
                     q.put(f"\n=== Batch finished: {ok}/{len(results)} succeeded ===")
-                    # "Open Output Folder" only has one obvious target in batch mode
-                    # when the user gave an explicit output_dir -- per-song defaults
-                    # scatter each result under its own subfolder.
+                    # Only a meaningful target if the user gave an explicit output_dir.
                     if output_dir is not None:
                         q.put((_OUTPUT_PARENT, output_dir))
                 else:

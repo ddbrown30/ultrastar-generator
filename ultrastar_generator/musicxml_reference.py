@@ -1,50 +1,9 @@
-"""Pass 4 (optional): confirms or corrects pass-3 syllable pitches using
-a MusicXML file (a sheet-music transcription of the same song, e.g.
-hand-downloaded from MuseScore -- see CLAUDE.md's "MuseScore reference
-data" section for why this isn't fetched automatically).
+"""Pass 4 (optional): confirms or corrects pass-3 syllable pitches using a MusicXML file.
 
-No automatic INTERNET lookup/fetch exists, unlike lyrics_lookup.py's
-LRCLIB call -- MuseScore access was found to be actively blocked
-platform-side (see CLAUDE.md). But a file already sitting in the song's
-own folder IS auto-detected (file_discovery.find_companions, matched by
-extension: .mxl/.musicxml/.xml -- see that module for why basename
-matching, used for video/cover, doesn't work for these), same as this
-project already does for video/cover companion files. `main.py` only
-falls back to auto-detection when `--musicxml-reference` isn't given
-explicitly; an explicit path always wins.
-
-If more than one reference file is found (or given), ALL of them are
-tried -- see `apply_musicxml_references` (plural). Different arrangements
-of the same song often lyric-tag different, only partially-overlapping
-portions (confirmed on Once Upon A Dream: one file covered 52.6% of the
-song, a second, different arrangement covered a different 25.1% -- using
-only one would leave real coverage on the table the other file has).
-Applied sequentially, each file's corrections feeding into the next, so
-coverage accumulates across files rather than only the first (or a
-single "best") file's own reach.
-
-Real validation this pass is based on (2026-08-08, manually downloaded
-MXL files for several already-validated songs, compared against their
-existing trusted ground truth): once a per-song PITCH-CLASS calibration
-offset is removed (arrangements are routinely transposed, or use
-inconsistent absolute octave notation -- neither is a real error), sheet
-music vocal-melody data agrees with ground truth on pitch class 93-98%
-of the time, far above any of this project's own audio-only pitch
-sources. Coverage (how much of the song a given arrangement actually
-lyric-tags) varies a lot more, 23-91% depending on the arrangement.
-
-Deliberately calibrates and corrects at the PITCH-CLASS level only (never
-absolute octave) for two reasons: (1) sheet-music octave notation across
-different parts/arrangements of the same song was found to be internally
-inconsistent even when transposition-corrected (e.g. Gaston: merging all
-3 vocal parts gave a bimodal +0/-12 semitone split against the SAME
-ground truth), so trusting it for octave decisions would be unfounded;
-(2) our own audio-derived pitch already comes from a real physical
-register the singer used, which pitch-class-only correction never
-overrides -- only the semitone-within-register gets nudged. This also
-matches how UltraStar Deluxe itself scores: pitch CLASS, octave-agnostic
-(confirmed by the user) -- so this is the level of accuracy that actually
-matters for the shipped output.
+Only a local companion file is used (file_discovery.find_companions), no network
+fetch. Multiple reference files are all applied sequentially, each one's corrections
+feeding into the next (`apply_musicxml_references`). Corrects pitch CLASS only, never
+octave -- matches how UltraStar Deluxe itself scores (octave-agnostic).
 """
 
 from __future__ import annotations
@@ -79,7 +38,7 @@ class MusicXMLStats:
     calibration_offset: Optional[int] = None    # pitch-class semitones, 0-11
     calibration_confidence: float = 0.0          # fraction of matches agreeing with the chosen offset
     corrections: List[MusicXMLCorrection] = None
-    skipped_reason: Optional[str] = None         # set if calibration wasn't trusted -- no corrections applied
+    skipped_reason: Optional[str] = None         # set if calibration wasn't trusted
 
     def __post_init__(self):
         if self.part_names_used is None:
@@ -92,29 +51,12 @@ class MusicXMLStats:
 def load_vocal_notes(
     mxl_path: str, preferred_part_name: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, int, str]], List[str]]:
-    """Parses a MusicXML/.mxl file and returns (notes, part_names_used):
-    notes is a time-ordered list of (score_offset, absolute_midi,
-    normalized_lyric_text) for every lyric-bearing, non-chord note in
-    whichever part(s) carry the vocal melody.
-
-    Part selection:
-      - Exactly one part has lyrics on any of its notes -> that part alone
-        (the common case: a "Piano" or "Voice"-labeled part carrying the
-        lead melody+lyrics, everything else is pure accompaniment).
-      - Multiple parts have lyrics (a duet/ensemble arrangement) ->
-        merged: if `preferred_part_name` matches a part by name, that
-        part's own notes are used wherever present, falling back to
-        whichever other lyric-bearing part has a note at a given score
-        offset where the preferred part has none (real case: Gaston,
-        where the "Gaston" part alone only covered 23% of his sung lines
-        despite being the character's own line -- merging with the other
-        2 vocal parts raised that to 88%, since they're mostly unison).
-        With no hint given, falls back to the single lyric-bearing part
-        with the MOST total notes as an imperfect generic default -- see
-        this function's caller-facing docs for why passing the hint when
-        known (e.g. the character's own name, if the arrangement labels
-        parts that way) gives better results than this fallback.
-    """
+    """Parses a MusicXML/.mxl file, returns (notes, part_names_used): notes is a
+    time-ordered list of (score_offset, absolute_midi, normalized_lyric_text) for
+    every lyric-bearing, non-chord note in the vocal part(s). If multiple parts have
+    lyrics, merges them, preferring `preferred_part_name` where present and falling
+    back to whichever other part has a note at that offset (or the part with the
+    most notes, if no preference given)."""
     import music21
 
     score = music21.converter.parse(mxl_path)
@@ -128,14 +70,7 @@ def load_vocal_notes(
     if not lyric_parts:
         return [], []
 
-    # `chosen` is always EVERY lyric-bearing part -- merging needs all of
-    # them available to fill gaps. `preferred_part_name` only decides
-    # which one wins at an offset where more than one has a note (see
-    # `primary_name` below) -- it must NOT narrow `chosen` down to just
-    # that one part, or merging never happens at all (a real bug found
-    # during validation: with a part-name hint given, this used to
-    # silently drop back to single-part coverage instead of merging).
-    chosen = [p for p, _ in lyric_parts]
+    chosen = [p for p, _ in lyric_parts]  # all lyric-bearing parts, needed to fill gaps when merging
 
     by_offset: dict = defaultdict(dict)
     for part in chosen:
@@ -147,8 +82,7 @@ def load_vocal_notes(
     valid_names = {p.partName for p in chosen}
     primary_name = preferred_part_name if preferred_part_name in valid_names else None
     if primary_name is None and len(chosen) > 1:
-        # No hint (or the hint didn't match any real part name): fall
-        # back to the part with the most total notes as primary.
+        # No matching hint: fall back to the part with the most notes.
         primary_name = max(((p.partName, cnt) for p, cnt in lyric_parts), key=lambda x: x[1])[0]
 
     notes_out = []
@@ -165,13 +99,8 @@ def load_vocal_notes(
 
 
 def nearest_pitch_for_class(our_pitch: int, target_pc: int) -> int:
-    """Nearest UltraStar-convention pitch (MIDI - 60) to `our_pitch` with
-    pitch CLASS `target_pc` (0-11) -- moves by at most +-6 semitones,
-    staying in the same octave region `our_pitch` is already in rather
-    than jumping to a distant octave that happens to share the target
-    class. Shared by `apply_musicxml_reference` and
-    `pitch_refresh.apply_mxl_pitch_reference` (same "correct pitch class
-    only, never octave" rule both places)."""
+    """Nearest UltraStar-convention pitch to `our_pitch` with pitch CLASS `target_pc`
+    (0-11) -- moves at most +-6 semitones, never jumping octave."""
     our_pc = (our_pitch + 60) % 12
     if our_pc == target_pc:
         return our_pitch
@@ -189,19 +118,11 @@ def _calibrate_pitch_class(
     verbose: bool,
     log_prefix: str = "[musicxml]",
 ) -> Tuple[Optional[int], float, List[Tuple[int, int, float]], Optional[str]]:
-    """Shared by `apply_musicxml_reference` (matches syllable-for-syllable
-    via `load_vocal_notes`) and `pitch_refresh.apply_mxl_pitch_reference`
-    (matches word-for-word via `mxl_lrc_generator.load_mxl_vocal_words`,
-    then position-aligns each matched word's own syllables) -- both need
-    the exact same per-song PITCH-CLASS calibration-offset logic (full
-    population, then a high-confidence-subset retry, then optional
-    force_calibration fallback), just fed from a different alignment
-    mechanism. See `apply_musicxml_reference`'s own docstring for the
-    full rationale (real Gaston-based validation of the two-tier retry).
-
-    Returns (offset, confidence, population_used, skipped_reason) --
-    offset is None (with skipped_reason set) whenever calibration isn't
-    trusted and `force_calibration` is False."""
+    """Shared per-song pitch-class calibration-offset logic (full population, then a
+    high-confidence-subset retry, then optional force_calibration fallback), used by
+    `apply_musicxml_reference` and `pitch_refresh.apply_mxl_pitch_reference`.
+    Returns (offset, confidence, population_used, skipped_reason); offset is None
+    (with skipped_reason set) when calibration isn't trusted and not forced."""
     if len(matches) < min_calibration_samples:
         reason = (f"only {len(matches)} matched note(s) (< {min_calibration_samples} required) -- "
                    f"not enough to trust a calibration offset")
@@ -265,46 +186,14 @@ def apply_musicxml_reference(
     verbose: bool = True,
     debug_log=None,
 ) -> Tuple[List[Syllable], MusicXMLStats]:
-    """Aligns `syllables` (pass 3's final output) against the vocal-melody
-    notes in `mxl_path` by lyric text (same whole-sequence difflib
-    technique lyrics_lookup.py uses for reference-lyric alignment), and
-    corrects a syllable's PITCH CLASS (never its octave or timing) where
-    the two disagree -- but only once a per-song calibration offset
-    (transposition and/or octave-notation quirks) is established with
-    real confidence (>= min_calibration_samples matched notes, and the
-    modal offset accounting for >= min_calibration_confidence of them);
-    otherwise this is a no-op and `stats.skipped_reason` explains why.
-
-    `force_calibration=True` (ON by default, `config.
-    ENABLE_MUSICXML_FORCE_CALIBRATION` -- unconditional in both callers as
-    of 2026-08-17, no CLI/GUI off-switch anymore) skips the confidence bar
-    entirely and always applies the
-    best available calibration offset (full population, or the high-
-    confidence-subset fallback if that was tried), however weak.
-    Validated real end-to-end on all 7 MXL-having songs in the test set
-    before being made the default: 0 regressions (4 songs unaffected --
-    their normal calibration already clears the bar on its own, so this
-    is provably a no-op for them), 1 small real gain (+1.9pp), 2 large
-    real gains (+21.6pp, +19.0pp). Built for a specific real case: songs
-    where OUR OWN pass-1 pitch detection is confirmed unreliable for
-    acoustic reasons unrelated to any pitch-source choice
-    (real case, 2026-08-08: little_mermaid/jungle_book_bare_necessities
-    -- FOUR independently-trained/architected pitch estimators (pyin,
-    CREPE-class, RMVPE, SwiftF0, PENN) all converged on the SAME wrong
-    answer, pointing at genuine acoustic ambiguity in rough/character
-    vocal production, not a detector-choice problem) -- for those songs
-    the normal confidence bar can never be met, because it's measuring
-    agreement against a baseline that's the actual problem. When our own
-    pitch is this unreliable, an MXL reference's pitch is a better bet
-    even calibrated with low confidence than trusting pass 1 at all.
-
-    Never touches timing. Never guesses an absolute octave -- a
-    correction only ever moves a syllable's pitch to the nearest MIDI
-    value with the target pitch class, staying within a few semitones of
-    where our own (audio-derived, real-register) detection already had
-    it -- this stays true even under force_calibration, since octave
-    doesn't affect real UltraStar scoring anyway (pitch-class only).
-    """
+    """Aligns `syllables` against the vocal-melody notes in `mxl_path` by lyric text
+    (difflib), and corrects a syllable's pitch class (never octave or timing) where
+    they disagree -- only once a per-song calibration offset clears the confidence
+    bar (>= min_calibration_samples matches, modal offset covering
+    >= min_calibration_confidence of them); otherwise a no-op, `stats.skipped_reason`
+    explains why. `force_calibration=True` (default, unconditional) skips the
+    confidence bar and applies the best available offset regardless -- useful when
+    pass-1 pitch itself is unreliable enough that the confidence bar can never clear."""
     stats = MusicXMLStats(mxl_path=mxl_path)
 
     vocal_notes, part_names = load_vocal_notes(mxl_path, preferred_part_name)
@@ -338,14 +227,8 @@ def apply_musicxml_reference(
               f"{len(matches)}/{len(comparable_indices)} syllables matched by lyric text "
               f"(ratio={sm.ratio():.3f})")
 
-    # Calibrate at the PITCH-CLASS level (mod 12) -- absorbs both genuine
-    # transpositions (e.g. +2, +5 semitones, confirmed on real files) and
-    # octave-only notation inconsistency (e.g. -12), which a plain
-    # semitone-offset calibration would treat as conflicting evidence.
-    # See `_calibrate_pitch_class`'s own docstring for the two-tier
-    # retry/force_calibration logic (real Gaston-based validation: full-
-    # population 39.5% agreement vs. 46.1% over the top-confidence half,
-    # same winning offset both times, just less noise around it).
+    # Calibrate at the pitch-class level (mod 12) to absorb transposition and
+    # octave-only notation inconsistency.
     calibration, confidence, _, skipped_reason = _calibrate_pitch_class(
         [(our_p, mxl_p, conf) for (_, our_p, mxl_p, conf) in matches],
         min_calibration_samples, min_calibration_confidence, force_calibration, verbose,
@@ -356,13 +239,8 @@ def apply_musicxml_reference(
         stats.skipped_reason = skipped_reason
         return syllables, stats
 
-    # Correction applies to EVERY matched syllable once calibration is
-    # trusted, regardless of that syllable's own confidence -- a
-    # disagreement at a low-confidence syllable is exactly the case this
-    # is FOR (our own detection is least trustworthy there), and a
-    # disagreement at a high-confidence syllable, once a real per-song
-    # calibration is established, is still evidence of an actual error
-    # rather than something to leave alone just because we were sure.
+    # Applies to every matched syllable once calibration is trusted, regardless
+    # of that syllable's own confidence.
     new_syllables = list(syllables)
     for syl_idx, our_p, mxl_p, _ in matches:
         target_pc = (mxl_p - calibration) % 12
@@ -374,12 +252,7 @@ def apply_musicxml_reference(
         new_syllables[syl_idx] = Syllable(
             text=old.text, start=old.start, end=old.end, midi_note=new_pitch,
             is_word_start=old.is_word_start, note_type=old.note_type, line_id=old.line_id,
-            # Boosted, not left as-is -- this pitch is now independently
-            # confirmed by a second source, so a syllable that came in
-            # low-confidence (the case this whole mechanism targets)
-            # shouldn't still read as uncertain after being corrected.
-            # Not set to 1.0: still a DIFFERENT source's data, calibrated
-            # by inference, not a direct pass-1 acoustic measurement.
+            # Boosted (not to 1.0) since it's now confirmed by a second, inferred source.
             confidence=max(old.confidence, config.MUSICXML_CORRECTED_CONFIDENCE),
         )
         if debug_log is not None:
@@ -402,17 +275,10 @@ def apply_musicxml_references(
     verbose: bool = True,
     debug_log=None,
 ) -> Tuple[List[Syllable], List[MusicXMLStats]]:
-    """Applies `apply_musicxml_reference` for EVERY path in `mxl_paths`,
-    in order, each one's output syllables feeding into the next --
-    coverage accumulates across files rather than stopping at whichever
-    file happens to be tried first. Each file gets its OWN independent
-    calibration (different arrangements can be transposed differently,
-    or have different octave-notation quirks -- see the module
-    docstring), so a file that can't establish confident calibration is
-    skipped on its own (same graceful no-op as the single-file function)
-    without blocking the others. Returns (final_syllables, stats_per_file)
-    -- same order as `mxl_paths`.
-    """
+    """Applies `apply_musicxml_reference` for every path in `mxl_paths` in order, each
+    one's output feeding into the next; each file gets its own independent
+    calibration, and a file that can't calibrate is skipped without blocking the
+    others. Returns (final_syllables, stats_per_file), same order as `mxl_paths`."""
     all_stats: List[MusicXMLStats] = []
     for path in mxl_paths:
         if verbose and len(mxl_paths) > 1:
@@ -426,11 +292,7 @@ def apply_musicxml_references(
                 verbose=verbose, debug_log=debug_log,
             )
         except Exception as e:
-            # A companion file that LOOKED like a usable reference (right
-            # extension, or passed find_companions' MusicXML content
-            # sniff) but still fails to parse shouldn't take down the
-            # whole run -- skip just this file, same as a low-confidence
-            # calibration would.
+            # A file that fails to parse shouldn't take down the whole run.
             stats = MusicXMLStats(mxl_path=path, skipped_reason=f"failed to parse: {e}")
             if verbose:
                 print(f"[musicxml] {path}: skipped -- failed to parse: {e}")

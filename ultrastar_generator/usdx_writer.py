@@ -4,11 +4,7 @@ Note-line format:   "<Type> <StartBeat> <Length> <Pitch> <Text>"
 Line-break format:  "- <StartBeat>" or "- <StartBeat> <EndBeat>"
 File ends with a lone "E".
 
-Duet support (P1/P2) is deliberately NOT written in v1 even though the
-Song model supports `parts`, per the current requirements. If/when duet
-support is added, this function only needs a branch that writes "P1"/"P2"
-markers before each part's entries -- everything else (beat math, syllable
-spacing) is reusable as-is.
+Duet support (P1/P2) is not written even though the Song model supports `parts`.
 """
 
 from __future__ import annotations
@@ -22,26 +18,14 @@ from .tempo import seconds_to_beat, seconds_to_beat_length
 
 
 def _fmt_bpm(bpm: float) -> str:
-    # UltraStar files in the wild use either '.' or ',' as decimal sep
-    # depending on locale of the tool that made them; '.' is safest/most
-    # broadly supported by UltraStar Deluxe itself.
-    s = f"{bpm:.2f}".rstrip("0").rstrip(".")
+    s = f"{bpm:.2f}".rstrip("0").rstrip(".")  # '.' decimal sep, most broadly supported
     return s
 
 
 def _quantize_entries(entries: List[object], bpm: float, gap_ms: int) -> List[tuple]:
-    """Converts Syllable/LineBreak entries (float seconds) into integer
-    beat values, AND enforces the "a note must never start before the
-    previous note ends" rule at the integer-beat level.
-
-    This is deliberately separate from postprocess.enforce_monotonic,
-    which only guarantees non-overlap in continuous seconds. Two notes
-    that are non-overlapping by a few milliseconds in seconds can still
-    round to the *same* beat once quantized to a coarse beat grid (this
-    is exactly what produced the duplicate-start-beat bug in practice) --
-    so the final, authoritative non-overlap check has to happen here, in
-    the same integer space the .txt file actually uses.
-    """
+    """Converts entries to integer beat values and enforces non-overlap at the integer-beat level
+    (separate from postprocess.enforce_monotonic's seconds-level check, since quantization can round
+    two non-overlapping seconds-level notes onto the same beat)."""
     out: List[tuple] = []
     occupied_until: int = None
 
@@ -72,17 +56,9 @@ def _quantize_entries(entries: List[object], bpm: float, gap_ms: int) -> List[tu
 
 
 def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
-    """See config.py's "Final-step cleanup" comment (near MIN_NOTE_GAP_SEC)
-    for the real motivating case. Folds a 'syl'
-    entry into the immediately preceding 'syl' entry when they're beat-
-    adjacent (no gap), same pitch, and THIS entry's own text is the
-    melisma-continuation placeholder -- extending the previous entry's
-    length and dropping this one. A single left-to-right pass, updating
-    the last kept entry in place, correctly chains multiple consecutive
-    same-pitch continuation notes into one (each new candidate is checked
-    against whatever the previous one already collapsed into). Never
-    merges across a LineBreak ('break') entry, and never touches the
-    very first entry."""
+    """Folds a beat-adjacent, same-pitch melisma-continuation 'syl' entry into the preceding 'syl'
+    entry (chains consecutive ones). Runs at the integer-beat level, post-quantization. Never merges
+    across a 'break' entry."""
     out: List[tuple] = []
     for item in quantized:
         if (item[0] == "syl" and out and out[-1][0] == "syl"
@@ -97,18 +73,8 @@ def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
 
 
 def _remove_orphan_short_melisma_tails(quantized: List[tuple]) -> List[tuple]:
-    """Second, more aggressive cleanup step (user's explicit request,
-    2026-08-10): after _merge_connected_melisma_tails, any melisma-
-    continuation ('~') entry that's STILL only 1 beat long -- it didn't
-    get absorbed because it wasn't beat-adjacent+same-pitch to its
-    predecessor -- is deleted outright, leaving a gap on the beat grid
-    rather than being merged into anything. A single isolated 1-beat '~'
-    carries almost no real musical information (too short to actually
-    sing) and is more often onset/release tracking noise than a genuine
-    melisma continuation. Runs at the same INTEGER BEAT level as the
-    merge pass, after it (so a '~' the merge pass already folded into a
-    longer note is untouched -- only entries that SURVIVED as their own
-    1-beat note are candidates here)."""
+    """Deletes any melisma-continuation ('~') entry still only 1 beat long after
+    _merge_connected_melisma_tails -- likely tracking noise, not a real continuation."""
     return [
         item for item in quantized
         if not (item[0] == "syl" and item[4].strip() == config.MELISMA_CONTINUATION_TEXT and item[2] == 1)

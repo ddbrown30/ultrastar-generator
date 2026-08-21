@@ -1,7 +1,4 @@
-"""Small pitch-related helpers shared by note_detection.py and
-lyric_alignment.py. The actual note segmentation lives in
-note_detection.py -- this module is just utility functions.
-"""
+"""Pitch helpers shared by note_detection.py and lyric_alignment.py."""
 
 from __future__ import annotations
 
@@ -21,8 +18,7 @@ _NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
 def ultrastar_pitch_to_note_name(pitch: int) -> str:
-    """Converts an UltraStar pitch value (MIDI - 60) back into a
-    human-readable note name like "G#3", for diagnostics/debug output."""
+    """Converts an UltraStar pitch value (MIDI - 60) into a note name like "G#3"."""
     midi = pitch + 60
     name = _NOTE_NAMES[midi % 12]
     octave = midi // 12 - 1
@@ -34,20 +30,7 @@ def median_pitch_in_span(
     fmin: float = 65.0, fmax: float = 1046.5,
     pitch_source: Optional[str] = None,
 ) -> Optional[float]:
-    """Best-effort median pitch (Hz) over a short, specific time span, using
-    whichever pitch source pass 1 itself uses (see
-    note_detection.PITCH_SOURCES; defaults to config.DEFAULT_PITCH_SOURCE).
-
-    Used only as a fallback for words that the primary, whole-track note
-    detector didn't find any note for (e.g. very short/quiet function
-    words) AND that have no neighboring note anywhere in the whole song to
-    borrow a pitch from instead (see lyric_alignment.py's
-    _nearest_note_pitch, which is tried first). Less reliable than the
-    whole-track pass since the pitch source has far less context to work
-    with on a short, isolated clip (see CLAUDE.md's "never run inference
-    on a tiny isolated clip" lesson) -- this is a last-resort fallback,
-    not a general-purpose short-clip pitch detector.
-    """
+    """Best-effort median pitch (Hz) over a short span; last-resort fallback when no note or neighboring pitch is available."""
     from .note_detection import PITCH_SOURCES
 
     if pitch_source is None:

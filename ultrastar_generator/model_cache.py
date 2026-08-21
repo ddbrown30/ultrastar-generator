@@ -1,18 +1,4 @@
-"""Process-wide cache for expensive-to-load ASR/alignment models.
-
-Without this, a single pipeline run could load the same model multiple
-times: once for the main transcription pass (transcription.py), again for
-a later force-alignment call (lyrics_lookup.py/realign.py) -- each of
-which would otherwise call whisperx.load_model()/load_align_model() or
-faster_whisper.WhisperModel() fresh. Loading is a meaningful fraction of
-total runtime for a large model (e.g. --whisper-model large-v3), so this
-caches by (model_name, device, compute_type, ...) and hands back the
-already-loaded model on every call after the first.
-
-Deliberately a plain module-level dict, not a class -- there's exactly one
-pipeline running per process, so a process-wide cache is the right scope;
-no need for anything more elaborate.
-"""
+"""Process-wide cache for expensive-to-load ASR/alignment models, keyed by (model_name, device, compute_type, ...)."""
 
 from __future__ import annotations
 
@@ -24,11 +10,7 @@ _faster_whisper_cache: dict = {}
 def get_whisperx_asr_model(model_name: str, device: str = "cuda",
                             compute_type: str = "float16", language: str = "en",
                             vad_options: dict = None):
-    """`vad_options` (e.g. {"vad_onset": 0.01, "vad_offset": 0.01}) is part
-    of the cache key -- a near-zero onset/offset makes pyannote VAD treat
-    almost everything as speech, the closest whisperx's API gets to
-    "disabled" (it has no true off switch; vad_model/vad_method is
-    mandatory in whisperx.load_model())."""
+    """`vad_options` is part of the cache key."""
     key = (model_name, device, compute_type, language, tuple(sorted((vad_options or {}).items())))
     if key not in _whisperx_asr_cache:
         import whisperx
@@ -60,10 +42,7 @@ def get_faster_whisper_model(model_name: str, device: str = "cuda", compute_type
 
 
 def reset() -> None:
-    """Clears all cached models. Not used by the pipeline itself (one
-    process = one run = no reason to evict) -- exists for tests that swap
-    out the underlying whisperx/faster_whisper modules between cases, so a
-    later fake doesn't silently reuse an earlier case's cached instance."""
+    """Clears all cached models. Used by tests, not the pipeline itself."""
     _whisperx_asr_cache.clear()
     _whisperx_align_cache.clear()
     _faster_whisper_cache.clear()

@@ -1,13 +1,4 @@
-"""Lightweight time-based progress reporting for long-running loops.
-
-Reports at most once every `min_interval_sec` (default 5s), not on every
-item -- a fast run (small model, few words) stays quiet, but a slow run
-(e.g. --whisper-model large-v3 re-transcribing hundreds of words) doesn't
-go silent for minutes with no sign anything is happening. Always flushes,
-since stdout piped through anything other than a live terminal (a log
-file, `| grep`, etc.) defaults to full block buffering in Python and can
-otherwise sit invisible until the process exits.
-"""
+"""Time-based progress reporting for long-running loops; reports at most once every `min_interval_sec`."""
 
 from __future__ import annotations
 

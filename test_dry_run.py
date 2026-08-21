@@ -1,12 +1,5 @@
-"""Exercises everything that doesn't require ML models / real audio, plus
-targeted regression tests for the reported bugs:
-
-  1. Overlapping notes must never occur in the final output.
-  2. lyric_alignment fits words onto audio-detected notes, not the other
-     way around (so word-timing imprecision can't distort pitch/timing).
-  3. Melisma (fewer syllables than notes) and merged syllables (more
-     syllables than notes) are both handled without creating overlaps.
-"""
+"""Synthetic regression suite (no ML models/audio needed): notes never overlap, words fit onto
+detected notes not vice versa, melisma/merged syllables never overlap."""
 import sys
 from pathlib import Path
 
@@ -34,10 +27,7 @@ assert comp.video and comp.video.name == "Bon Jovi - Its My Life.mp4"
 assert comp.cover and "[CO]" in comp.cover.name
 assert comp.background and "[BG]" in comp.background.name
 
-print("\n--- file_discovery.resolve_artist_title: the INPUT FOLDER's own name is the sole "
-      "source now (folder-based input) -- a file inside can be named anything at all, real "
-      "case: a ripped/downloaded song keeps a generic filename like 'music.ogg' while its "
-      "folder is 'Artist - Title' ---")
+print("\n--- file_discovery.resolve_artist_title: folder name is the sole artist/title source ---")
 import tempfile as _tempfile_artist_title
 with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     named_folder = Path(_tmp) / "Bon Jovi - Its My Life"
@@ -64,9 +54,7 @@ with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     assert (artist4, title4) == (None, None), (artist4, title4)
 print("OK: a folder name that doesn't parse returns (None, None) rather than raising")
 
-# A dot inside the folder name must not be misread as a file extension
-# (Path.stem would strip it; resolve_artist_title uses the folder's raw
-# .name specifically to avoid that).
+# A dot in the folder name must not be misread as a file extension.
 with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     dotted_folder = Path(_tmp) / "Mr. Roboto - Styx"
     dotted_folder.mkdir()
@@ -77,8 +65,7 @@ print("OK: a dot inside the folder name (e.g. 'Mr. Roboto - Styx') is NOT misrea
       "extension")
 print("OK:", artist, title, comp)
 
-print("\n--- file_discovery.headline_case: minor words lowercased unless first/last, but "
-      "ALL CAPS or unusually-cased words are left completely untouched ---")
+print("\n--- file_discovery.headline_case: minor words lowercased, unusual casing untouched ---")
 from ultrastar_generator.file_discovery import headline_case
 assert headline_case("Beauty And The Beast") == "Beauty and the Beast"
 assert headline_case("Under The Sea") == "Under the Sea"
@@ -87,17 +74,12 @@ assert headline_case("A Bug's Life") == "A Bug's Life"  # first word "A" stays c
 assert headline_case("Kill It With Fire, Or Not") == "Kill It with Fire, or Not"  # last word always capitalized
 assert headline_case("KPop Demon Hunters") == "KPop Demon Hunters"  # mixed-case word untouched
 assert headline_case("SHOUT AND WHISPER") == "SHOUT AND WHISPER"  # ALL CAPS words untouched
-assert headline_case("aND weird CaSe") == "aND Weird CaSe"  # unusual casing untouched, but a
-                                                                # normal (simple-case) word still
-                                                                # gets normalized regardless of
-                                                                # its neighbors' casing
+assert headline_case("aND weird CaSe") == "aND Weird CaSe"  # unusual casing untouched; normal words still normalize
 assert headline_case("Don't Stop Believin'") == "Don't Stop Believin'"  # apostrophes preserved
 print("OK: 'Beauty And The Beast' -> 'Beauty and the Beast', 'KPop'/'AND'/'aND' all left "
       "untouched, first/last word always capitalized")
 
-print("\n--- file_discovery.find_companions: falls back to a single unambiguous video/image "
-      "even when its name doesn't match the audio file's basename (real case: a SingStar-style "
-      "rip with audio 'music.ogg' + unrelated 'video.mpg'/'cover.jpg' names) ---")
+print("\n--- file_discovery.find_companions: falls back to a single unambiguous video/image ---")
 with _tempfile_artist_title.TemporaryDirectory() as _tmp:
     rip_folder = Path(_tmp) / "Beauty And The Beast - Beauty And The Beast"
     rip_folder.mkdir()
@@ -113,9 +95,7 @@ print("OK: a single non-matching-name video (.mpg) and image are both picked up 
       "unambiguous-single-candidate fallback")
 
 with _tempfile_artist_title.TemporaryDirectory() as _tmp:
-    # TWO non-matching, untagged images -- genuinely ambiguous, must NOT
-    # guess (same principle as the existing "multiple untagged images"
-    # case, just extended to the no-basename-match case too).
+    # Ambiguous images: must not guess.
     ambiguous_folder = Path(_tmp) / "Some Song"
     ambiguous_folder.mkdir()
     ambiguous_audio = ambiguous_folder / "track.mp3"
@@ -127,8 +107,7 @@ with _tempfile_artist_title.TemporaryDirectory() as _tmp:
 print("OK: two non-matching, untagged images stays ambiguous -- correctly finds nothing rather than "
       "guessing which one is the cover")
 
-print("\n--- file_discovery: MusicXML reference files matched by EXTENSION, not basename "
-      "(unlike video/cover -- a downloaded score keeps its own source filename) ---")
+print("\n--- file_discovery: MusicXML reference files matched by extension, not basename ---")
 mxl_a = audio.parent / "some-random-arrangement-name.mxl"
 mxl_b = audio.parent / "another-arrangement.musicxml"
 for p in (mxl_a, mxl_b):
@@ -231,11 +210,9 @@ print("\n--- tempo math vs. real reference files ---")
 assert abs(beat_duration_ms(300) - 50.0) < 1e-6
 assert seconds_to_beat(23.0, 23000, 300) == 0
 assert seconds_to_beat_length(0.400, 300) == 8
-# FLOORS, never rounds up (2026-08-10, user's explicit request: undershoot
-# note length rather than overshoot). beat_duration_ms(300)=50ms exactly;
-# 427ms/50ms = 8.54 beats -- round() would give 9 (overshoot), floor must give 8.
+# Floors, never rounds up.
 assert seconds_to_beat_length(0.427, 300) == 8, seconds_to_beat_length(0.427, 300)
-# Still guarantees at least 1 beat even for a near-zero duration.
+# Minimum 1 beat even for a near-zero duration.
 assert seconds_to_beat_length(0.001, 300) == 1
 t = 8300 + 200 * beat_duration_ms(120)
 assert seconds_to_beat(t / 1000.0, 8300, 120) == 200
@@ -245,8 +222,7 @@ print("OK: beat math matches all 3 spot-checks")
 for t_sec, gap_ms, bpm in [(23.0, 23000, 300), (48.030, 48030, 382.7), (100.456, 8300, 120)]:
     beat = seconds_to_beat(t_sec, gap_ms, bpm)
     round_tripped = beat_to_seconds(beat, gap_ms, bpm)
-    # round-trip through an integer beat necessarily loses sub-beat precision --
-    # must land back within one beat's own duration, not exactly at t_sec.
+    # Round-trip loses sub-beat precision; must land within one beat's duration.
     assert abs(round_tripped - t_sec) <= beat_duration_ms(bpm) / 1000.0 + 1e-9, (t_sec, round_tripped)
 print("OK: beat_to_seconds round-trips seconds_to_beat within one beat's own duration")
 
@@ -256,70 +232,26 @@ for w in ["reciprocity", "mothering", "cowboy", "I'm", "highway,", "always"]:
     assert "".join(parts) == w, (w, parts)
 print("OK")
 
-print("\n--- syllables.hyphenate (2026-08-18, four rounds): hybrid of pyphen + a from-scratch sonority-"
-      "sequencing syllabifier (which itself prefers a REAL WORD boundary over pure maximal-onset for an "
-      "inter-vowel consonant cluster, user's own proposed design), keeping whichever gives MORE real "
-      "pieces, ties favoring PYPHEN -- real-world-scale-validated against 413 unique real words from 55 "
-      "downloaded songs (70.5% exact-match / 90.8% count-match, beating plain pyphen's own 64.9%/72.2% on "
-      "BOTH metrics at once) -- see hyphenate()'s own docstring for the full staged validation, including "
-      "why ties flipped BACK to favoring pyphen after an earlier 56-word-only pass wrongly favored "
-      "sonority (86-vs-14 on the full corpus vs. 3-vs-2 on the tiny sample) ---")
-# Real reported symptom (Les Miserables - Stars, 2026-08-18): pyphen alone
-# under-counts these -- "Lucifer" -> only 2 pieces ("Lu"/"cifer"), "fugitive"
-# -> only 2 ("fugi"/"tive") -- both the WRONG syllable count, not just a
-# wrong break point. Resolved by the "more pieces wins" COUNT rule, so
-# unaffected by which way the tie-break points.
+print("\n--- syllables.hyphenate: pyphen + sonority-sequencing hybrid, more-pieces-wins ---")
+# pyphen alone under-counts these.
 assert hyphenate("Lucifer") == ["Lu", "ci", "fer"], hyphenate("Lucifer")
 assert hyphenate("fugitive") == ["fu", "gi", "tive"], hyphenate("fugitive")
-# The real word-boundary counterexample that motivated round 2 (Video
-# Games, same song): "filling" keeps its doubled 'l' WHOLE with the first
-# syllable ("fill" alone is a real word) but "running" splits its doubled
-# 'n' one-each ("runn" isn't a real word, "run" is) -- identical letter
-# shape, opposite real splits. Both still pass with ties favoring pyphen
-# because pyphen's OWN answer already happens to agree here -- confirmed
-# directly, not assumed, before reverting the tie-break in round 4.
+# Real-word-boundary counterexample: "filling" vs "running" split differently.
 assert hyphenate("filling") == ["fill", "ing"], hyphenate("filling")
 assert hyphenate("running,") == ["run", "ning,"], hyphenate("running,")
-# "never" itself is NOT asserted here on purpose: the 413-word real-song
-# corpus shows it's a genuine, roughly even split in real notation
-# ("nev"/"er" 3x, "ne"/"ver" 4x across different shows) -- not a case
-# with one right answer for plain hyphenate() to chase. The Stars-
-# specific mis-notated occurrence still gets its own correct "ne"/"ver"
-# via the MXL's own real note data (see mxl_lrc_generator's own tests),
-# which never depends on this general-purpose guesser at all.
-# Real bug found via a real-audio validation run (Magic Dance, 2026-08-18)
-# right after shipping the word-boundary rule above: the bundled common-
-# word list is frequency-derived from web text, so it's contaminated with
-# calendar/title ABBREVIATIONS that are common strings but not real
-# standalone spoken/sung words ("thu" for Thursday, "mon"/"tue"/"wed"/
-# "fri"/"sat", "mr"/"dr"/"st"/"nd"/"rd"/"th" etc.) -- "Thunder" was
-# splitting as "Thu"/"nder" (a false-positive "real word" match on the
-# abbreviation) instead of the correct "Thun"/"der". Fixed by stripping
-# these specific entries from data/common_words.txt (not a blanket
-# length/frequency filter -- a real independent word that also happens
-# to double as an abbreviation, e.g. "sun"/"mar", is deliberately kept).
+# "never" not asserted: real notation splits it both ways, no single right answer.
+# Common-word list must exclude abbreviations like "thu".
 assert hyphenate("Thunder") == ["Thun", "der"], hyphenate("Thunder")
-# Two more real refinements the user identified directly, 2026-08-18:
-# (1) a word-final "y" acting as a vowel is never sung as its own bare
-# syllable -- "bully" must split "bul"/"ly", not "bull"/"y", even though
-# "bull" (the longer, doubled-consonant-intact prefix) IS a real word;
-# "duty"/"rely" already worked but are re-asserted here as the same code
-# path. (2) a DOUBLED consonant only ever keeps the whole pair with the
-# first syllable or splits it one-each down the middle -- never pushes
-# the whole pair to the SECOND syllable: "happy" was wrongly matching
-# "ha" (a real short interjection) and splitting "ha"/"ppy" instead of
-# "hap"/"py".
+# (1) word-final "y" is never its own syllable. (2) doubled consonant splits evenly
+# or stays whole, never pushed entirely onto the second syllable.
 assert hyphenate("bully") == ["bul", "ly"], hyphenate("bully")
 assert hyphenate("duty") == ["du", "ty"], hyphenate("duty")
 assert hyphenate("rely") == ["re", "ly"], hyphenate("rely")
 assert hyphenate("happy") == ["hap", "py"], hyphenate("happy")
-# A genuinely monosyllabic word must never be force-split into fake
-# syllables just because the sonority splitter can find internal
-# consonant clusters to carve up.
+# A monosyllabic word must never be force-split.
 for w in ["go", "grace", "code", "fire"]:
     assert hyphenate(w) == [w], (w, hyphenate(w))
-# Every result must still reconstruct the input exactly (punctuation
-# included) regardless of which of the two splitters won.
+# Result must always reconstruct the input exactly.
 for w in ["reciprocity", "double-edged", "Ev'rything", "buzzin'", "necessities,"]:
     parts = hyphenate(w)
     assert "".join(parts) == w, (w, parts)
@@ -345,11 +277,7 @@ for s in fixed:
     print(f"    {s.start:.3f}-{s.end:.3f}  {s.text!r}")
 
 print("\n--- BUG REGRESSION 2/3: lyric_alignment fits words onto NOTE timing, not word timing ---")
-# Simulate: ASR thinks "hello" spans 0.0-1.0s with sloppy timing, but the
-# audio-only note detector found the *real* two notes at 0.05-0.45 and
-# 0.50-0.95 (typical case: ASR word boundary is a rough guess; the note
-# grid is closer to truth). Final syllable timing must come from the
-# notes, not from the word.
+# ASR word timing is sloppy; final syllable timing must come from the notes.
 words = [Word(text="hello", start=0.0, end=1.0, confidence=0.9)]
 notes = [
     NoteEvent(start=0.05, end=0.45, pitch=3),
@@ -387,12 +315,8 @@ assert len(syls3) == 2, syls3
 assert "".join(s.text for s in syls3) == "wonderful"
 print("OK:", [s.text for s in syls3])
 
-print("\n--- BUG REGRESSION (round 2): beat-grid quantization can't create duplicate/overlapping beats ---")
-# This reproduces the exact failure mode from the "Stars" output: two
-# notes non-overlapping in seconds by only a few ms can round to the SAME
-# beat once quantized, at a slow-ish beat grid. BPM 105.47 -> beat_ms
-# ~= 142ms (matches the real file). Build several near-simultaneous
-# syllables and confirm the written beats never collide.
+print("\n--- BUG REGRESSION: beat-grid quantization can't create duplicate/overlapping beats ---")
+# Near-simultaneous notes can round to the same beat once quantized.
 bpm_stars = 105.47
 gap_stars_ms = 7767
 close_syls = [
@@ -412,10 +336,8 @@ for i in range(1, len(starts)):
     assert starts[i] >= ends[i - 1], f"BEAT COLLISION: note {i-1} ends {ends[i-1]}, note {i} starts {starts[i]}\n{txt_stars}"
 print(f"OK: {len(starts)} notes quantized to beats {list(zip(starts, lengths))}, no collisions")
 
-print("\n--- BUG REGRESSION (round 2): vibrato must not fragment a sustained note ---")
-# Mock librosa so detect_notes() sees a pitch contour that wobbles +/-1
-# semitone at ~6.5Hz (a realistic vibrato rate) for 1.4s, matching the
-# "There," example from feedback where the correct output is ONE note.
+print("\n--- BUG REGRESSION: vibrato must not fragment a sustained note ---")
+# Mock librosa: vibrato-wobbling pitch contour should merge into ONE note.
 import sys as _sys, types as _types
 
 sr = 22050
@@ -434,14 +356,7 @@ fake_librosa = _types.ModuleType("librosa")
 
 
 def _make_fake_pitch_source(f0_hz, voiced, conf):
-    """Registers a note_detection.PITCH_SOURCES entry that returns fixed
-    midi/conf/voiced arrays (pad/truncated to whatever n_frames the real
-    detect_notes() asks for, same convention as the real _*_source
-    functions) -- replaces the old approach of mocking librosa.pyin, since
-    pyin/CREPE/PENN and the whole ensemble/cross-check architecture were
-    removed and detect_notes() now always goes through exactly one
-    PITCH_SOURCES entry. Pass pitch_source="_fake_test_source" to
-    detect_notes() to use it."""
+    """Fake PITCH_SOURCES entry returning fixed midi/conf/voiced arrays."""
     f0_hz = np.asarray(f0_hz, dtype=float)
     voiced = np.asarray(voiced, dtype=bool)
     conf = np.asarray(conf, dtype=float)
@@ -472,9 +387,7 @@ class _FakeOnset:
 
     @staticmethod
     def onset_strength(y, sr, hop_length):
-        # Flat/zero everywhere -- irrelevant to these tests (they're not
-        # about same-pitch re-articulation splitting), but note_detection
-        # always calls this now, so every fake needs to answer it.
+        # Flat/zero: irrelevant here, but note_detection always calls this.
         return np.zeros(max(1, len(y) // hop_length + 1))
 
 
@@ -484,10 +397,7 @@ fake_librosa.onset = _FakeOnset()
 class _FakeFeature:
     @staticmethod
     def rms(y, frame_length, hop_length):
-        # This test is specifically about vibrato/segmentation behavior,
-        # not the energy gate (that has its own dedicated test below) --
-        # report constant "loud" energy for every frame so the energy
-        # gate never rejects anything here.
+        # Constant "loud" energy so the energy gate never rejects here.
         return np.full((1, n_frames), 1.0).reshape(1, -1)
 
 
@@ -498,9 +408,7 @@ _sys.modules["librosa"] = fake_librosa
 import importlib
 import ultrastar_generator.note_detection as note_detection_mod
 importlib.reload(note_detection_mod)
-# importlib.reload() re-executes the module top level, which recreates
-# PITCH_SOURCES fresh -- so the fake source must be (re-)registered AFTER
-# every reload, not before, in every block below.
+# reload() recreates PITCH_SOURCES fresh; re-register the fake source after every reload.
 note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
     f0_contour, np.ones(n_frames, dtype=bool), np.full(n_frames, 0.95)
 )
@@ -516,13 +424,8 @@ assert notes[0].pitch == base_midi - 60, notes[0].pitch
 assert (notes[0].end - notes[0].start) > dur_s * 0.8, "merged note lost too much duration"
 print("OK: vibrato collapsed into a single sustained note")
 
-print("\n--- BUG REGRESSION (round 5): silence must not produce hallucinated notes ---")
-# Reproduces the reported bug directly: the pitch source can report
-# confident, real-looking pitch on audio that's actually silent
-# (quantization noise, resampling artifacts, a faint hum all have enough
-# incidental periodicity to fool a pure pitch/periodicity detector). The
-# energy gate must reject these regardless of what the source's own
-# voicing flag says.
+print("\n--- BUG REGRESSION: silence must not produce hallucinated notes ---")
+# Energy gate must reject confident-looking pitch on genuinely silent audio.
 n_frames_silent = 200
 fake_librosa_silent = _types.ModuleType("librosa")
 fake_librosa_silent.onset = _FakeOnset()
@@ -531,16 +434,14 @@ fake_librosa_silent.onset = _FakeOnset()
 class _FakeFeatureSilent:
     @staticmethod
     def rms(y, frame_length, hop_length):
-        # The actual audio is silent -- near-zero RMS throughout, same as
-        # what the user found when checking vocals.wav directly.
+        # Near-zero RMS throughout.
         return np.full((1, n_frames_silent), 1e-9)
 
 
 fake_librosa_silent.feature = _FakeFeatureSilent()
 _sys.modules["librosa"] = fake_librosa_silent
 importlib.reload(note_detection_mod)
-# The pitch source confidently reports a real-looking pitch (G#3) as
-# "voiced" for the ENTIRE clip, exactly like the reported bug.
+# Pitch source confidently reports voiced G#3 throughout.
 note_detection_mod.PITCH_SOURCES["_fake_test_source"] = _make_fake_pitch_source(
     np.full(n_frames_silent, 440.0 * 2 ** ((56 - 69) / 12)),
     np.ones(n_frames_silent, dtype=bool),
@@ -555,10 +456,7 @@ assert len(silent_notes) == 0, f"energy gate failed to reject hallucinated notes
 print("OK: silence correctly produced zero notes despite the pitch source reporting confident voicing")
 
 print("\n--- energy gate: real (loud) singing still passes through untouched ---")
-# A track with a silent intro (matching the real "Stars" bug report:
-# nothing should exist before the singing starts) followed by genuinely
-# loud singing -- confirms the gate rejects the silent part but does NOT
-# also reject the real content once it starts.
+# Silent intro + loud singing: gate rejects only the silent part.
 n_silent = 80
 n_loud = 80
 n_frames_mixed = n_silent + n_loud
@@ -591,14 +489,8 @@ assert mixed_notes[0].start >= silent_duration_sec - 0.05, \
 print(f"OK: silent lead-in correctly produced no note; real singing starting at "
       f"{mixed_notes[0].start:.2f}s (silent section was {silent_duration_sec:.2f}s) was preserved")
 
-print("\n--- BUG REGRESSION (round 3): word order is preserved even with imprecise/fallback timing ---")
-# Reproduces the reported "He knows his way in the dark" scrambling:
-# pass-1 detected notes that (due to imprecise ASR word spans) could
-# best-overlap the wrong word under the old algorithm, and the old
-# enforce_monotonic re-sorted by timestamp, which could then reorder the
-# words themselves. The fix: note->word assignment now uses a monotonic
-# zone partition, and enforce_monotonic no longer sorts -- it trusts the
-# given (word/reading) order and only pushes overlaps forward.
+print("\n--- BUG REGRESSION: word order is preserved even with imprecise/fallback timing ---")
+# Trusts given order; never sorts, only pushes overlaps forward.
 words_order = [
     Word(text="He", start=10.50, end=10.70, confidence=0.9),
     Word(text="knows", start=10.70, end=10.95, confidence=0.9),
@@ -606,9 +498,7 @@ words_order = [
     Word(text="way", start=11.15, end=11.45, confidence=0.9),
     Word(text="in", start=11.45, end=11.60, confidence=0.9),
     Word(text="the", start=11.60, end=11.75, confidence=0.9),
-    # ASR mistimed "dark"'s span to start EARLIER than it should
-    # (overlapping "the"/"in") -- exactly the kind of imprecision that
-    # broke the old max-overlap assignment.
+    # ASR mistimed "dark" to overlap "the"/"in".
     Word(text="dark", start=11.50, end=13.20, confidence=0.9),
 ]
 notes_order = [
@@ -622,16 +512,14 @@ notes_order = [
 ]
 dummy_y2 = np.zeros(16000)
 result, _stats_order = align_words_to_notes(words_order, notes_order, dummy_y2, 16000)
-# Check reading order of actual words (ignore melisma "~" filler notes,
-# which are an expected side effect of this test's deliberately-bad ASR
-# timing for "dark", not a reordering bug).
+# Ignore melisma "~" filler notes (expected side effect, not a reordering bug).
 result_words = [s.text.strip() for s in result if s.text.strip() != "~"]
 assert result_words == ["He", "knows", "his", "way", "in", "the", "dark"], result_words
 for i in range(1, len(result)):
     assert result[i].start >= result[i - 1].end, f"still overlapping/reordered at {i}: {result}"
 print("OK: word order preserved:", result_words)
 
-print("\n--- BUG REGRESSION (round 3): merge no longer flattens real stepwise melody ---")
+print("\n--- BUG REGRESSION: merge no longer flattens real stepwise melody ---")
 from ultrastar_generator.note_detection import _merge_similar_adjacent
 stepwise = [
     NoteEvent(start=0.00, end=0.20, pitch=-6),
@@ -645,8 +533,7 @@ assert len(merged) > 1, f"a real 3-semitone melodic run got flattened into one n
 assert set(pitches_out) != {pitches_out[0]}, f"all notes collapsed to the same pitch: {pitches_out}"
 print(f"OK: 4-note stepwise run (-6,-7,-8,-9) stayed as {len(merged)} notes: {pitches_out}")
 
-# But genuine vibrato-scale noise (tiny alternation around one pitch)
-# should still collapse.
+# Genuine vibrato-scale noise should still collapse.
 noisy_same_note = [
     NoteEvent(start=0.00, end=0.15, pitch=-4),
     NoteEvent(start=0.16, end=0.30, pitch=-5),
@@ -692,9 +579,7 @@ assert "\n: 0 " in txt
 print(txt)
 print("OK: writer output structurally correct")
 
-print("\n--- usdx_writer._merge_connected_melisma_tails (2026-08-10): a beat-adjacent, same-pitch '~' "
-      "melisma-continuation note gets folded into the note before it instead of staying a separate note "
-      "-- real user-reported example ('Barely even friends') ---")
+print("\n--- usdx_writer._merge_connected_melisma_tails: beat-adjacent same-pitch '~' folds into preceding note ---")
 from ultrastar_generator.usdx_writer import _merge_connected_melisma_tails, render_song as _render_merge
 
 mcm_input = [
@@ -702,9 +587,8 @@ mcm_input = [
     ("syl", 263, 1, 3, "ly", False, ":"),
     ("syl", 264, 3, 3, "~", False, ":"),        # same pitch (3) as "ly", adjacent -> merges into "ly"
     ("syl", 268, 1, 5, " even", True, ":"),
-    ("syl", 269, 1, 6, "~", False, ":"),        # different pitch than "even" (6 vs 5) -- stays separate...
-    ("syl", 270, 1, 6, "~", False, ":"),        # ...but THIS one is same pitch as the previous '~' (6==6),
-                                                 # adjacent -> the two '~' notes merge into one
+    ("syl", 269, 1, 6, "~", False, ":"),        # different pitch than "even" -- stays separate...
+    ("syl", 270, 1, 6, "~", False, ":"),        # ...but same pitch as previous '~', adjacent -> merges into one
     ("syl", 272, 2, 8, " friends", True, ":"),
     ("syl", 274, 3, 8, "~", False, ":"),        # same pitch (8) as "friends", adjacent -> merges into "friends"
 ]
@@ -720,7 +604,7 @@ print("OK:", mcm_out)
 
 mcm_gap_input = [
     ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 3, 2, 4, "~", False, ":"),   # same pitch, but NOT adjacent (0+2=2 != 3) -- a real gap/pause -> no merge
+    ("syl", 3, 2, 4, "~", False, ":"),   # same pitch but not adjacent -> no merge
 ]
 assert _merge_connected_melisma_tails(mcm_gap_input) == mcm_gap_input, _merge_connected_melisma_tails(mcm_gap_input)
 print("OK: a same-pitch '~' separated by even a 1-beat gap is left alone (not a genuine continuation)")
@@ -735,19 +619,14 @@ print("OK: an adjacent but different-pitch '~' is left alone (a real pitch chang
 mcm_linebreak_input = [
     ("syl", 0, 2, 4, "held", True, ":"),
     ("break", 2, 2),
-    ("syl", 2, 2, 4, "~", False, ":"),   # same pitch, "adjacent" only by ignoring the LineBreak -- must NOT merge
+    ("syl", 2, 2, 4, "~", False, ":"),   # same pitch but across a LineBreak -> must not merge
 ]
 assert _merge_connected_melisma_tails(mcm_linebreak_input) == mcm_linebreak_input
 print("OK: a '~' right after a LineBreak never merges backward across it, even at the same pitch")
 
-# End-to-end option wiring: render_song(merge_connected_melisma=True/False) actually changes the output.
+# End-to-end: option actually changes output.
 mcm_song = Song(
-    # bpm=240 -> beat = 1/(240*4/60) = 0.0625s exactly; all timestamps below are
-    # exact multiples of that, so quantization can't introduce a rounding-tie gap
-    # (an earlier version of this test picked bpm/timestamps that landed exactly
-    # on a beat's midpoint, which Python's banker's rounding resolved differently
-    # for the two adjacent notes and spuriously introduced a 1-beat gap between
-    # them -- not a bug in the merge logic itself, just an unlucky test input).
+    # bpm=240 keeps timestamps exact multiples of one beat, avoiding rounding ties.
     title="T", artist="A", mp3="a.mp3", bpm=240.0, gap_ms=0,
     entries=[
         Syllable("Bare", 0.0, 0.25, 1, is_word_start=True),
@@ -763,14 +642,12 @@ assert mcm_txt_on != mcm_txt_off
 print("OK: render_song(merge_connected_melisma=True) actually removes the redundant '~'; "
       "=False (the function's own default) leaves it untouched")
 
-print("\n--- usdx_writer._remove_orphan_short_melisma_tails (2026-08-10): a '~' that's STILL only "
-      "1 beat long after the same-pitch merge above is deleted outright (leaves a gap, not merged) ---")
+print("\n--- usdx_writer._remove_orphan_short_melisma_tails: a lone 1-beat '~' is deleted, not merged ---")
 from ultrastar_generator.usdx_writer import _remove_orphan_short_melisma_tails
 
 orphan_input = [
     ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 2, 1, 6, "~", False, ":"),   # adjacent but DIFFERENT pitch (6 vs 4) -- merge pass leaves this alone,
-                                          # but it's still only 1 beat long -> this pass deletes it
+    ("syl", 2, 1, 6, "~", False, ":"),   # different pitch so merge pass leaves it, but 1 beat -> deleted here
     ("syl", 4, 2, 4, "held", True, ":"),
 ]
 orphan_out = _remove_orphan_short_melisma_tails(orphan_input)
@@ -782,19 +659,18 @@ print("OK: a 1-beat, different-pitch '~' is deleted outright, leaving a gap:", o
 
 orphan_multi_beat_input = [
     ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 2, 2, 6, "~", False, ":"),   # 2 beats -- NOT a 1-beat orphan, must survive untouched
+    ("syl", 2, 2, 6, "~", False, ":"),   # 2 beats: not an orphan, survives
 ]
 assert _remove_orphan_short_melisma_tails(orphan_multi_beat_input) == orphan_multi_beat_input
 print("OK: a '~' longer than 1 beat is never touched by this pass, only the same-pitch merge above can shrink it")
 
 orphan_texted_input = [
-    ("syl", 0, 1, 4, "a", True, ":"),    # a real, 1-beat WORD syllable (not '~') -- must never be deleted
+    ("syl", 0, 1, 4, "a", True, ":"),    # real 1-beat word syllable, must never be deleted
 ]
 assert _remove_orphan_short_melisma_tails(orphan_texted_input) == orphan_texted_input
 print("OK: a genuine 1-beat WORD syllable (not the melisma-continuation placeholder) is left alone")
 
-# End-to-end: render_song(merge_connected_melisma=True) chains BOTH steps -- a same-pitch adjacent
-# '~' still gets folded in (not deleted), while a different-pitch 1-beat orphan '~' disappears entirely.
+# End-to-end: both steps chain -- same-pitch '~' folds in, different-pitch orphan '~' disappears.
 orphan_song = Song(
     title="T", artist="A", mp3="a.mp3", bpm=240.0, gap_ms=0,
     entries=[
@@ -887,18 +763,9 @@ assert aligned[2].start == 0.4 and aligned[2].end == 0.6
 print("OK: corrected words:", diffs)
 print("OK: line ids:", [w.line_id for w in aligned])
 
-print("\n--- lyrics_lookup.align_words_to_reference: a LONG unmatched (delete) run is KEPT, not "
-      "dropped -- real regression (Trixie Mattel - Video Games, 2026-08-13): a repeat-heavy song's "
-      "own repeated chorus ('It's you, it's you, it's all for you' x4+) made difflib's global "
-      "alignment misclassify 219 of 355 REAL, correctly-transcribed words as one giant delete "
-      "block, which the unconditional drop then mass-deleted from the final file. Past "
-      "config.REFERENCE_DELETE_MAX_RUN words in one run, dropping is more likely to destroy real "
-      "content than remove genuine hallucination -- fall back to keeping them (old behavior) ---")
+print("\n--- lyrics_lookup.align_words_to_reference: a long unmatched run is kept, not dropped ---")
 long_delete_ref_lines = ["Swinging in the backyard"]
-# 8 unmatched ASR words in a row (> REFERENCE_DELETE_MAX_RUN=5) representing
-# content genuinely absent from this tiny reference -- the function can't
-# tell "real alignment failure" from "genuinely long non-lyrical passage"
-# apart, which is exactly why the cap treats a long run conservatively.
+# 8 unmatched words (> REFERENCE_DELETE_MAX_RUN) treated conservatively.
 long_delete_words = [
     Word(text=w, start=float(i), end=float(i) + 0.2, confidence=0.9)
     for i, w in enumerate(["It's", "you,", "it's", "you,", "it's", "all", "for", "you"])
@@ -915,13 +782,8 @@ assert [w.text for w in long_delete_aligned[:8]] == ["It's", "you,", "it's", "yo
 print(f"OK: a {8}-word unmatched run (> REFERENCE_DELETE_MAX_RUN) is kept in full, not dropped:",
       [w.text for w in long_delete_aligned])
 
-print("\n--- lyrics_lookup.align_words_to_reference: repeat-clamp caps + wraps instead of freezing "
-      "(real case: David Bowie - Magic Dance, 2026-08-10 -- decoder hallucinated a 'Dance, magic, dance' "
-      "x5 passage into ~90 garbage ASR tokens, all clamped onto the SAME reference token; the syllable "
-      "cursor froze on the last syllable ('ic') and verify_words then stamped that onto ~89 real notes as "
-      "if it were confirmed reference text) ---")
-# Below the cap: repeats should WRAP across the reference token's own syllables
-# instead of freezing on the last one once the cursor runs out.
+print("\n--- lyrics_lookup.align_words_to_reference: repeat-clamp caps and wraps instead of freezing ---")
+# Below the cap, repeats wrap across the token's own syllables.
 wrap_ref_lines = ["magic"]
 wrap_asr_words = [Word(text="dance", start=float(i), end=float(i) + 0.2, confidence=0.9) for i in range(4)]
 wrap_aligned = align_words_to_reference(wrap_asr_words, wrap_ref_lines)
@@ -929,10 +791,7 @@ wrap_texts = [w.reference_text for w in wrap_aligned]
 assert wrap_texts == ["mag", "ic", "mag", "ic"], wrap_texts
 print("OK: below the cap, syllables wrap:", wrap_texts)
 
-# Above the cap: this many ASR words clamping onto one reference token is
-# itself the hallucination signal -- don't fabricate a reference_text at all,
-# keep the ASR word's own (still garbage, but at least not falsely
-# "confirmed") text untouched.
+# Above the cap, don't fabricate reference_text; keep ASR's own text.
 runaway_ref_lines = ["magic"]
 runaway_asr_words = [Word(text="ic", start=float(i), end=float(i) + 0.2, confidence=0.9) for i in range(20)]
 runaway_aligned = align_words_to_reference(runaway_asr_words, runaway_ref_lines)
@@ -944,22 +803,7 @@ print(f"OK: {len(runaway_asr_words)} words clamping onto one reference token (> 
       f"config.REFERENCE_CLAMP_MAX_REPEAT={_config_mod.REFERENCE_CLAMP_MAX_REPEAT}) leaves reference_text "
       f"unset, keeps ASR's own text, still tags line_id for phrase grouping")
 
-print("\n--- lyrics_lookup.align_words_to_reference: repeat-clamp gap guard is checked against BOTH "
-      "GLOBAL neighbors (not block-relative, and not just the previous one) -- real confirmed bug "
-      "(Trixie Mattel - Video Games, 2026-08-13): a non-lyrical audio intro hallucinated as 'You're "
-      "welcome.' landed as the song's first 2 ASR words, clamped onto reference word 0 ('Swingin'') "
-      "along with the real 'Swinging' ~16s later; a backward-only gap check correctly rejected "
-      "'welcome.' but let 'You're' (the very first word, no previous neighbor to compare against) "
-      "through with a bogus reference_text that verification.py's own fallback then trusted and used "
-      "to overwrite it. Hallucinated words are now flagged word.dropped=True -- STILL KEPT in the "
-      "returned sequence (not omitted), because removing a word from the sequence entirely let a "
-      "NEIGHBORING real word's pass-1 note zone silently swallow its ~16s of notes instead (real "
-      "confirmed regression, Video Games, 2026-08-14 -- see Word.dropped's own docstring); "
-      "lyric_alignment.py is what actually keeps a dropped word's text/notes out of the final output. "
-      "The real, correctly-transcribed 'Swinging' (last word of THIS opcode block, clamped onto the "
-      "same reference token) must NOT be flagged dropped, because its real close neighbor 'in' sits "
-      "just outside the block, in the NEXT opcode -- a block-relative-only neighbor check would have "
-      "wrongly flagged it too ---")
+print("\n--- lyrics_lookup.align_words_to_reference: gap guard checks both global neighbors, not just block-relative ---")
 leading_outlier_ref_lines = ["Swingin'", "in"]
 leading_outlier_words = [
     Word(text="You're", start=9.595, end=10.035, confidence=0.9),
@@ -977,15 +821,7 @@ print("OK: 'You're'/'welcome.' (no real reference correspondence, isolated in ti
       "neighbor 'in' just outside its own opcode block) is NOT flagged:",
       [(w.text, w.dropped) for w in leading_outlier_aligned])
 
-print("\n--- lyrics_lookup.align_words_to_reference: an ASR word with NO reference counterpart at "
-      "all is flagged dropped (word.dropped=True), not kept as visible text -- real case (Trixie "
-      "Mattel - Video Games, 2026-08-13): WhisperX decoded a non-lyrical audio intro as 'You're... "
-      "welcome.', which used to become the song's own first two 'lyric' words even though nothing in "
-      "the reference remotely matches them; a real trailing hallucination ('you' after the song's "
-      "last real word) had the same problem. Still KEPT in the returned sequence (not omitted) -- see "
-      "Word.dropped's own docstring for why omitting it broke downstream note-zone boundaries; "
-      "lyric_alignment.py is what actually excludes a dropped word's text/notes from the final "
-      "output ---")
+print("\n--- lyrics_lookup.align_words_to_reference: words with no reference counterpart are flagged dropped, kept in sequence ---")
 drop_ref_lines = ["Swinging in the backyard"]
 drop_asr_words = [
     Word(text="You're", start=9.6, end=10.0, confidence=0.9),     # leading hallucination, no ref match
@@ -1012,9 +848,7 @@ print("OK: leading+trailing hallucinated words with no reference match are flagg
       dropped_texts)
 print("OK: alignment_diff_summary reports drops explicitly:", drop_diffs)
 
-print("\n--- lyrics_lookup.align_words_to_reference: a word inside an UNEVEN replace block (a real, "
-      "if imprecisely-mapped, reference correspondence -- NOT the same as having none at all) is "
-      "still kept, only a clean 'delete' block (zero correspondence anywhere) is dropped ---")
+print("\n--- lyrics_lookup.align_words_to_reference: words in an uneven replace block are kept, only a clean delete block is dropped ---")
 uneven_ref_lines = ["double-edged knife"]
 uneven_asr_words = [
     Word(text="double", start=0.0, end=0.2, confidence=0.9),
@@ -1026,15 +860,7 @@ assert len(uneven_aligned) == 3, [w.text for w in uneven_aligned]
 print("OK: uneven-block words are kept (not dropped), only zero-correspondence words are:",
       [w.text for w in uneven_aligned])
 
-print("\n--- lyrics_lookup.assign_lrc_line_ids_sequentially: sequential, cursor-based LRC line "
-      "assignment -- user's explicit design (2026-08-14): 'going through each line of the LRC, one "
-      "by one, finding the matching words, and then inserting line breaks accordingly.' Replaces two "
-      "earlier, REJECTED time/gap-based attempts (see config.py's own history note) that both caused "
-      "real regressions. Real motivating case (Trixie Mattel - Video Games): '...on earth with you' "
-      "(end of one LRC line) flows into 'Tell me all the things...' (start of the NEXT line, same "
-      "starting word as the line before it) with only a 0.14s gap -- invisible to any gap-based "
-      "grouping, but the cursor-based design still gets it right because the split comes from how "
-      "many words each line's OWN text matches, not from a time boundary or an audio pause ---")
+print("\n--- lyrics_lookup.assign_lrc_line_ids_sequentially: sequential cursor-based LRC line assignment ---")
 from ultrastar_generator.lyrics_lookup import assign_lrc_line_ids_sequentially
 
 
@@ -1056,10 +882,7 @@ for _i, _line in enumerate(_seql_lines):
     _seql_line_times.append(_seql_t)
     _w, _seql_t = _seql_words(_line.split(), _seql_t)
     _seql_words_all.extend(_w)
-    # Every transition has a generous 2s pause EXCEPT line 3 -> line 4,
-    # which gets only 0.05s -- the real no-pause case this test exists
-    # to verify, deliberately chosen so line 3 and line 4 both start
-    # with the SAME word ("tell") too.
+    # Line 3->4 has only a 0.05s pause (both start with "tell") -- the no-pause case tested.
     _seql_t += 0.05 if _i == 3 else 2.0
 _seql_synced = "\n".join(f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}"
                           for t, txt in zip(_seql_line_times, _seql_lines))
@@ -1073,39 +896,34 @@ print("OK: every word resolves to its own correct line, including the zero-pause
       "transition between two lines that both start with the same word:",
       [(w.text, w.line_id) for w in _seql_out if w.text in ("heaven", "tell", "me")])
 
-# No synced lyrics / not enough lines to calibrate -> None, caller falls back to the whole-song match.
+# Too few lines to calibrate -> None, caller falls back to the whole-song match.
 assert assign_lrc_line_ids_sequentially(_seql_words_all, "\n".join(
     f"[{int(t // 60):02d}:{t % 60:05.2f}] {txt}" for t, txt in zip(_seql_line_times[:2], _seql_lines[:2]))) is None
 print("OK: too few LRC lines to calibrate returns None (caller falls back to the whole-song match)")
 
-print("\n--- phrasing.build_lines: a held/melisma note never gets split from its own word by a line "
-      "break, regardless of which line the WORD is assigned to -- a break can only ever be considered "
-      "before an is_word_start=True syllable, and every continuation syllable of a word shares that "
-      "SAME word's line_id, so 'Stars~~~' can never become 'Stars' / '~~~' on two different lines ---")
+print("\n--- phrasing.build_lines: a melisma note is never split from its own word by a line break ---")
 _melisma_syls = [
     Syllable("He", 0.0, 0.2, 4, True, line_id=0),
-    # "Stars" sung as one word with 3 held continuation notes, all line_id=0 (same word).
+    # "Stars" sung as one word with 3 held continuation notes, all line_id=0.
     Syllable("Stars", 0.2, 0.4, 4, True, line_id=0),
     Syllable("~", 0.4, 1.0, 4, False, line_id=0),
     Syllable("~", 1.0, 1.6, 4, False, line_id=0),
     Syllable("~", 1.6, 2.2, 4, False, line_id=0),
-    # a real line_id change right after -- must break BEFORE "But", never inside "Stars"'s own holds.
+    # line_id change: break before "But", never inside "Stars"'s own holds.
     Syllable("But", 2.2, 2.4, 4, True, line_id=1),
 ]
 _melisma_entries = build_lines(_melisma_syls, strict_reference_lines=True)
 _melisma_kinds = [type(e).__name__ for e in _melisma_entries]
 assert _melisma_kinds.count("LineBreak") == 1, _melisma_kinds
 _break_idx = _melisma_kinds.index("LineBreak")
-# Everything before the break must be "He", "Stars", and its 3 holds -- 5 syllables, no split.
+# Everything before the break: "He", "Stars", 3 holds -- 5 syllables, no split.
 assert _melisma_kinds[:_break_idx] == ["Syllable"] * 5, _melisma_kinds
 assert [e.text for e in _melisma_entries[:_break_idx]] == ["He", "Stars", "~", "~", "~"], \
     [getattr(e, "text", None) for e in _melisma_entries[:_break_idx]]
 print("OK: 'Stars' and its 3 held continuation notes all stay together before the break:",
       [getattr(e, "text", type(e).__name__) for e in _melisma_entries])
 
-print("\n--- lyrics_lookup.align_words_to_reference: synced_lyrics_text integration -- with no synced "
-      "lyrics at all, behavior is byte-identical to the 2-arg call; a real per-song run only reaches "
-      "the time-based fill when the whole-song match actually left some word(s) unmatched ---")
+print("\n--- lyrics_lookup.align_words_to_reference: synced_lyrics_text integration, no-lyrics case matches the 2-arg call ---")
 _tbli_ref_lines = ["Swinging in the backyard"]
 _tbli_words = [
     Word(text=w, start=float(i), end=float(i) + 0.2, confidence=0.9)
@@ -1121,9 +939,7 @@ _tbli_none_lrc = align_words_to_reference(_tbli_words, _tbli_ref_lines, synced_l
 assert [w.line_id for w in _tbli_no_lrc] == [w.line_id for w in _tbli_none_lrc]
 print("OK: synced_lyrics_text=None (the default) is byte-identical to the 2-arg call")
 
-print("\n--- lyrics_lookup.reference_matches_transcript: rejects a wrong-song/wrong-language "
-      "reference before it's ever trusted (real case: Gaston's lyrics.ovh lookup silently "
-      "returned Spanish lyrics for an English song) ---")
+print("\n--- lyrics_lookup.reference_matches_transcript: rejects wrong-song/wrong-language reference ---")
 from ultrastar_generator.lyrics_lookup import reference_matches_transcript
 matching_words = [Word(text=w, start=float(i), end=float(i) + 0.5, confidence=0.9)
                    for i, w in enumerate(["He", "knows", "his", "way", "in", "the", "dark"])]
@@ -1133,17 +949,7 @@ wrong_language_words = [Word(text=w, start=float(i), end=float(i) + 0.5, confide
 assert reference_matches_transcript(ref_lines_test, wrong_language_words) is False
 print("OK: right-language reference accepted, wrong-language reference rejected")
 
-print("\n--- lyrics_lookup.largest_unmatched_reference_run: measures the LARGEST contiguous run of "
-      "reference words with NO corresponding ASR word at all -- real case (Trixie Mattel - Gold, "
-      "2026-08-10): a whole chorus repeat's 'Do-do-do-do-do' backing vocal produced ZERO ASR words at one "
-      "occurrence while the rest of a 306-word real transcript (including this SAME phrase correctly "
-      "transcribed at a LATER repeat) was fine -- hidden from reference_match_ratio's own aggregate (89.3%, "
-      "well above the retry bar). LRCLIB writes the repeat as ONE hyphenated token, not 5 space-separated "
-      "words -- `_tokenize_lines` splits on '-' (2026-08-10 fix) specifically so this counts as 5 reference "
-      "words missing, not 1 -- confirmed against the real fetched reference + real parsed ASR debug-log "
-      "output for this exact song: largest_unmatched_reference_run went from 1 (pre-fix, split into two "
-      "even-smaller 1-token gaps by the correctly-matched 'They start to play' line sitting between them) "
-      "to 7 (post-fix) ---")
+print("\n--- lyrics_lookup.largest_unmatched_reference_run: largest contiguous unmatched-reference run, a local signal vs. aggregate ratio ---")
 from ultrastar_generator.lyrics_lookup import largest_unmatched_reference_run
 lur_ref_lines = [
     "Will you grow from those cold blood wrongs",
@@ -1175,18 +981,14 @@ print("OK: a hyphenated 'Do-do-do-do-do' reference passage (5 real sung words, O
       "ASR words scores a run of 5, not 1 -- with only ONE of its two real occurrences transcribed, the "
       "still-missing occurrence still scores 5; with both transcribed, scores 0")
 
-print("\n--- lyrics_lookup._tokenize_lines: splits a hyphenated token into separate words generally, not "
-      "just for the run-detection case above -- benefits align_words_to_reference's own alignment too ---")
+print("\n--- lyrics_lookup._tokenize_lines: splits a hyphenated token into separate words ---")
 from ultrastar_generator.lyrics_lookup import _tokenize_lines
 tl_norm, tl_orig, tl_line_ids = _tokenize_lines(["Do-do-do-do-do", "well-known fact"])
 assert tl_orig == ["Do", "do", "do", "do", "do", "well", "known", "fact"], tl_orig
 assert tl_line_ids == [0, 0, 0, 0, 0, 1, 1, 1], tl_line_ids
 print("OK:", tl_orig)
 
-print("\n--- transcription.force_align_words_in_window (PROTOTYPE, 2026-08-10, adapted from "
-      "UltraStarKaraokeMaker's realign_gap_windows): forces KNOWN text onto an audio window via a real "
-      "wav2vec2 CTC call -- validates the result before ever trusting it (word count, timestamps present, "
-      "within window, monotonic), never applies a partial/ambiguous result ---")
+print("\n--- transcription.force_align_words_in_window: forces known text via wav2vec2 CTC, validates before trusting ---")
 import sys as _sys_fa
 import types as _types_fa
 
@@ -1214,14 +1016,14 @@ assert fa_result is not None and len(fa_result) == 3, fa_result
 assert fa_result[0][:2] == (10.0, 10.2) and fa_result[2][:2] == (10.4, 10.6), fa_result
 print("OK: clean forced-alignment result accepted, per-word (start, end, score) returned in order")
 
-# (b) word-count mismatch (e.g. whisperx expanded/collapsed a token) -> rejected, None.
+# (b) word-count mismatch -> rejected.
 _fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
     {"word": "Do", "start": 10.0, "end": 10.2, "score": 0.7},
 ]}]}
 assert force_align_words_in_window(["Do", "do", "do"], 10.0, 11.0, None, None, None) is None
 print("OK: word-count mismatch (asked for 3, got 1) -> rejected rather than guessing a mapping")
 
-# (c) a word placed outside the window (beyond slop) -> rejected, None.
+# (c) word outside the window -> rejected.
 _fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
     {"word": "Do", "start": 10.0, "end": 10.2, "score": 0.7},
     {"word": "do", "start": 10.2, "end": 10.4, "score": 0.6},
@@ -1230,7 +1032,7 @@ _fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
 assert force_align_words_in_window(["Do", "do", "do"], 10.0, 11.0, None, None, None) is None
 print("OK: a word landing well outside the window -> rejected")
 
-# (d) non-monotonic output (a later word starting before an earlier one) -> rejected, None.
+# (d) non-monotonic output -> rejected.
 _fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
     {"word": "Do", "start": 10.4, "end": 10.6, "score": 0.7},
     {"word": "do", "start": 10.0, "end": 10.2, "score": 0.6},  # earlier than the word before it
@@ -1238,21 +1040,21 @@ _fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
 assert force_align_words_in_window(["Do", "do"], 10.0, 11.0, None, None, None) is None
 print("OK: non-monotonic word order -> rejected")
 
-# (e) missing timestamp on one word -> rejected, None.
+# (e) missing timestamp -> rejected.
 _fake_whisperx_fa.align_fn = lambda seg: {"segments": [{"words": [
     {"word": "Do", "start": None, "end": None, "score": 0.0},
 ]}]}
 assert force_align_words_in_window(["Do"], 10.0, 11.0, None, None, None) is None
 print("OK: a word with no measured timestamp -> rejected")
 
-# (f) window too short for the given word count -> rejected WITHOUT even calling whisperx.align.
+# (f) window too short -> rejected without calling whisperx.align.
 def _fa_boom(seg):
     raise AssertionError("whisperx.align must not be called when the window is too short to bother")
 _fake_whisperx_fa.align_fn = _fa_boom
 assert force_align_words_in_window(["one", "two", "three", "four", "five"], 10.0, 10.05, None, None, None) is None
 print("OK: a window too short for the word count -> rejected before ever calling whisperx.align")
 
-# (g) whisperx.align itself raising -> caught, None, never crashes the pipeline.
+# (g) whisperx.align raising -> caught, never crashes.
 def _fa_raises(seg):
     raise RuntimeError("simulated alignment backtrack failure")
 _fake_whisperx_fa.align_fn = _fa_raises
@@ -1261,9 +1063,7 @@ print("OK: whisperx.align() raising is caught, not propagated")
 
 del _sys_fa.modules["whisperx"]
 
-print("\n--- lyrics_lookup.recover_dropped_reference_words (PROTOTYPE, 2026-08-10): splices force-aligned "
-      "words into a copy of the ASR word list at each reference 'insert' gap -- real case (Trixie Mattel - "
-      "Gold): recovers a whole 'Do-do-do-do-do' passage ASR produced zero words for ---")
+print("\n--- lyrics_lookup.recover_dropped_reference_words: splices force-aligned words into gaps ASR missed ---")
 from ultrastar_generator.lyrics_lookup import recover_dropped_reference_words
 import ultrastar_generator.transcription as transcription_mod_fa
 import ultrastar_generator.model_cache as model_cache_mod_fa
@@ -1274,7 +1074,7 @@ rdr_words = [
     Word(text="grow", start=0.5, end=0.8), Word(text="from", start=0.8, end=1.0),
     Word(text="those", start=1.0, end=1.3), Word(text="cold", start=1.3, end=1.5),
     Word(text="blood", start=1.5, end=1.8), Word(text="wrongs", start=1.8, end=2.0),
-    # <-- "Do-do-do-do-do" (5 words after hyphen-splitting) completely missing here -->
+    # "Do-do-do-do-do" (5 words) missing here.
     Word(text="They", start=5.0, end=5.3), Word(text="start", start=5.3, end=5.6),
     Word(text="to", start=5.6, end=5.7), Word(text="play", start=5.7, end=6.0),
 ]
@@ -1308,10 +1108,9 @@ print("  OK: an unrecoverable gap (no usable alignment result) is left dropped, 
 transcription_mod_fa.force_align_words_in_window = _orig_force_align_fa
 model_cache_mod_fa.get_whisperx_align_model = _orig_align_model_fa
 
-print("\n--- transcription.force_align_reference_lyrics (DIAGNOSTIC, 2026-08-10, --no-transcribe): builds "
-      "the ENTIRE word list by force-aligning a pinned LRC candidate's own KNOWN per-line text, never "
-      "running the WhisperX decoder at all -- motivated by the David Bowie - Magic Dance case where the "
-      "decoder hallucinated a real repeated 'Dance, magic, dance' passage into ~90 garbage tokens ---")
+print("\n--- transcription.force_align_reference_lyrics (diagnostic, --no-transcribe): builds the "
+      "entire word list by force-aligning a pinned LRC candidate's own known per-line text, never "
+      "running the WhisperX decoder at all -- avoids decoder hallucination on repeat-heavy passages ---")
 from ultrastar_generator.transcription import force_align_reference_lyrics
 
 _orig_force_align_fr = transcription_mod_fa.force_align_words_in_window
@@ -1365,8 +1164,8 @@ class _FakeRequestsModule:
     """Deterministic fake for the `requests` module -- lyrics_lookup.py
     does `import requests` lazily inside each fetch function, so
     installing this in sys.modules before calling is enough. LRCLIB is
-    the only source (lyrics.ovh removed 2026-08-15), so only its two
-    endpoints (/api/search, /api/get/<id>) are ever actually requested."""
+    the only source, so only its two endpoints (/api/search, /api/get/<id>)
+    are ever actually requested."""
     def __init__(self, search_payload=None, search_status=200,
                  get_by_id_payload=None, get_by_id_status=200):
         self.search_payload = search_payload
@@ -1396,15 +1195,13 @@ lrclib_candidates = [
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=lrclib_candidates)
 best = _fetch_from_lrclib("Beauty and the Beast", "Gaston", duration_sec=180.0)
 assert best is not None and best.source == "lrclib"
-# The non-synced candidate has the EXACT duration match (would win on pure
-# duration-closeness scoring) but is invalid outright for lacking synced
-# lyrics -- the close-but-not-exact synced candidate must win instead.
+# Non-synced candidate has the exact duration match but is invalid outright; synced must win instead.
 assert best.plain_lyrics == "close duration, synced", best.plain_lyrics
 assert best.synced_lyrics == "[00:01.00]line one\n[00:05.00]line two", best.synced_lyrics
 print("OK: a non-synced candidate loses even with a PERFECT duration match -- synced lyrics is a "
       "hard requirement, not just a tiebreak")
 
-print("\n--- lyrics_lookup.search_lrclib: returns ALL raw candidates unfiltered (for the manual search UI) ---")
+print("\n--- lyrics_lookup.search_lrclib: returns all raw candidates unfiltered ---")
 from ultrastar_generator.lyrics_lookup import search_lrclib, LrcLibCandidate
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=lrclib_candidates)
 all_candidates = search_lrclib("Beauty and the Beast", "Gaston")
@@ -1418,8 +1215,7 @@ print("\n--- lyrics_lookup.search_lrclib: q= does a broader free-text search INS
 
 
 class _ParamRecordingRequestsModule:
-    """Records exactly what params were sent, to confirm q= is used alone
-    (not combined with artist_name/track_name) when given."""
+    """Records the params sent, to confirm q= is used alone."""
     def __init__(self, payload):
         self.payload = payload
         self.last_params = None
@@ -1444,23 +1240,16 @@ assert fake_at_module.last_params == {"artist_name": "Some Artist", "track_name"
 print("OK: search_lrclib(artist, title) without q still sends artist_name/track_name as before")
 del _sys.modules["requests"]
 
-print("\n--- mxl_lrc_generator.select_lrc_candidate: ranks a same-artist candidate DECISIVELY over a "
-      "different-artist one, regardless of content-match ratio -- BUG REGRESSION (real case: Trixie "
-      "Mattel - Video Games, 2026-08-15): the correct candidate (Trixie Mattel's own cover, duration "
-      "within 0.7s of ours) was being passed over for a different performer's original (duration 14.5s "
-      "off) purely because difflib's own ratio happened to score the wrong-performer candidate higher ---")
+print("\n--- mxl_lrc_generator.select_lrc_candidate: same-artist candidate wins decisively over different-artist ---")
 from ultrastar_generator.mxl_lrc_generator import select_lrc_candidate, MxlWord
 
 slc_our_words = [MxlWord(text=w, norm=w.lower(), offset=float(i), syllables=[])
                  for i, w in enumerate(["hello", "world", "this", "is", "a", "song"])]
 slc_candidates = [
-    # Wrong artist, but a much higher content-match ratio AND still within
-    # duration tolerance -- the old ratio-first ranking picked this one.
+    # Wrong artist but higher content-match ratio -- old ranking picked this.
     {"trackName": "Song", "artistName": "Some Other Performer", "duration": 114,
      "instrumental": False, "plainLyrics": "hello world this is a song", "syncedLyrics": "[00:01.00]line"},
-    # Correct artist (our own "Right Artist"), near-exact duration, but a
-    # deliberately WORSE (still-clears-the-floor) content ratio -- must
-    # still win outright.
+    # Correct artist, near-exact duration, worse content ratio -- must still win.
     {"trackName": "Song", "artistName": "Right Artist", "duration": 100,
      "instrumental": False, "plainLyrics": "hello world this is completely different",
      "syncedLyrics": "[00:01.00]hello world"},
@@ -1471,9 +1260,9 @@ del _sys.modules["requests"]
 assert slc_match is not None and slc_match.candidate.artist_name == "Right Artist", slc_match
 print("OK: the same-artist candidate won despite a worse content-match ratio")
 
-print("  select_lrc_candidate: with NO candidate resembling our own artist at all (e.g. a cast "
-      "recording credited to individual performers, not the show name we use as our own artist tag -- "
-      "real case: Chicago), falls through to ranking by duration then ratio among what's left, unaffected:")
+print("  select_lrc_candidate: with no candidate resembling our own artist at all (e.g. a cast "
+      "recording credited to individual performers, not the show name used as our own artist tag), "
+      "falls through to ranking by duration then ratio among what's left:")
 slc_no_artist_match = [
     {"trackName": "Song", "artistName": "Cast Member A", "duration": 108,
      "instrumental": False, "plainLyrics": "hello world this is a song", "syncedLyrics": "[00:01.00]line"},
@@ -1486,9 +1275,7 @@ del _sys.modules["requests"]
 assert slc_match2 is not None and slc_match2.candidate.artist_name == "Cast Member B", slc_match2  # closer duration
 print("OK: no artist match anywhere -> falls back to duration-then-ratio ranking as before")
 
-print("\n--- lyrics_lookup.effective_lrc_duration: don't trust LRCLIB's own `duration` metadata blindly -- "
-      "cross-check it against the candidate's OWN synced lyrics (user's own request, 2026-08-15: a song "
-      "can't have real lyrics ending after it supposedly ends, so that's a sign the metadata is wrong) ---")
+print("\n--- lyrics_lookup.effective_lrc_duration: cross-checks LRCLIB's duration against its own synced lyrics ---")
 from ultrastar_generator.lyrics_lookup import effective_lrc_duration
 
 eld_consistent = LrcLibCandidate(
@@ -1529,9 +1316,7 @@ print("  select_lrc_candidate: a candidate with a wrong (too-short) reported dur
       "otherwise fail the duration-tolerance filter outright -- is correctly kept once its OWN last real "
       "lyric timestamp (close to our real audio length) is used instead:")
 slc_bad_duration_candidates = [
-    # Reported duration (50s) is 50s off from our own audio (100s) -- would
-    # fail MXL_LRC_DURATION_TOLERANCE_SEC (15s) if trusted as-is. But its
-    # own last real lyric line is at 98s, only 2s off -- well within tolerance.
+    # Reported duration is 50s off and would fail tolerance, but the last real lyric line is only 2s off.
     {"trackName": "Song", "artistName": "Right Artist", "duration": 50,
      "instrumental": False, "plainLyrics": "hello world this is a song",
      "syncedLyrics": "[00:01.00]hello world\n[01:38.00]this is a song"},
@@ -1545,16 +1330,14 @@ assert abs(slc_bad_duration_match.duration_delta - 2.0) < 1e-6, slc_bad_duration
 print("  OK: candidate survived the duration filter and scoring using its own real last-lyric timestamp "
       "(98s, 2s off), not its untrustworthy reported duration (50s, 50s off, would have failed the filter)")
 
-print("\n--- lyrics_lookup.fetch_reference_lyrics: LRCLIB is the only source (lyrics.ovh removed "
-      "2026-08-15) -- an empty search returns None, no fallback source left to try ---")
+print("\n--- lyrics_lookup.fetch_reference_lyrics: empty search returns None, no fallback source ---")
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=[])
 empty_result = fetch_reference_lyrics("Some Artist", "Some Title", duration_sec=120.0)
 assert empty_result is None, empty_result
 print("OK: empty LRCLIB search result returns None (nothing to fall back to)")
 del _sys.modules["requests"]
 
-print("\n--- lyrics_lookup: a candidate with NO synced lyrics is invalid, same as no candidate at "
-      "all (2026-08-15, was previously just a small scoring tiebreak) ---")
+print("\n--- lyrics_lookup: a candidate with NO synced lyrics is invalid, same as no candidate at all ---")
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=[
     {"trackName": "Song", "artistName": "Artist", "duration": 100,
      "instrumental": False, "plainLyrics": "plain only, no sync", "syncedLyrics": None},
@@ -1618,10 +1401,7 @@ assert word_clean_text == ["hello", "world", "good", "bye", "now"], word_clean_t
 print("OK: assign_words_to_lines correctly tags each word with its own LRC line index AND its own "
       "matched clean LRC token text")
 
-# Fuzzy matching: an MXL word that's close-but-not-exact to a single LRC
-# word, anchored by correctly-matched context on both sides (a real 1:1
-# "replace" slot), is a real confirmed case -- "systern" for "system" --
-# and must get the CLEAN text, not stay stuck on OCR garbage.
+# A close-but-not-exact MXL word in a 1:1 replace slot gets clean text, not OCR garbage.
 fuzzy_words = [
     MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
     MxlWord(text="systern", norm="systern", offset=1.0,
@@ -1635,13 +1415,8 @@ assert fuzzy_candidate == {}, fuzzy_candidate
 print("OK: an OCR-garbled MXL word in a 1:1 replace slot gets fuzzy-matched to the clean LRC text "
       "('systern' -> 'system'), not left stuck on the MXL's own OCR garbage")
 
-# But a GENUINELY different word in the same kind of slot (not just an OCR
-# spelling variant) must NOT be fuzzy-matched -- the ratio gate has to
-# actually reject low-similarity pairs, not just be a formality. The
-# rejected LRC token is still captured in word_lrc_candidate though (real
-# case, Ordinary Day, 2026-08-19: MXL OCR'd "sink" as "souk", ratio 0.5 <
-# 0.6 -- too different to trust directly, but place_words_via_asr can
-# still try it against real ASR as an unconfirmed candidate).
+# A genuinely different word must not be fuzzy-matched; the rejected token is still captured
+# as an unconfirmed word_lrc_candidate.
 unrelated_words = [
     MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
     MxlWord(text="xyz", norm="xyz", offset=1.0, syllables=[(1.0, 1.0, 60, "xyz")]),
@@ -1654,21 +1429,11 @@ print("OK: a genuinely unrelated word in the same kind of slot is correctly REJE
       "ratio gate, not fuzzy-matched just because it landed in a replace slot -- but the rejected LRC "
       "token is still captured as an unconfirmed word_lrc_candidate")
 
-# BUG REGRESSION (real cases, "Great Big Sea - Ordinary Day", lrclib id
-# 6210269): a REPLACE block that isn't a clean 1:1 shape used to be left
-# entirely unmatched, even when both sides are anchored by real matches
-# and the whole block's content is clearly the same, just OCR-garbled or
-# word-segmented differently than the real lyric. Three real shapes, all
-# from this one song's actual MXL:
+# A non-1:1 replace block with real anchors on both sides must still resolve. Three shapes below:
 from ultrastar_generator.mxl_lrc_generator import _distribute_words_to_slots
 
-# 1: N -- one MXL word (OCR-merged) covers TWO real LRC words ("winnes"
-# for "win now"). Real case (Ordinary Day, 2026-08-19): the single note
-# has no spare slot to reuse (unlike right,it's/ellipsis, which borrow an
-# already-existing blank NEXT note) -- so its own (offset, duration) span
-# is split proportionally by weights=[3, 3] (len("win"), len("now")) into
-# two new note slots, both real words become their own note/word instead
-# of being crammed together with a literal space into one slot.
+# 1:N -- one OCR-merged MXL word ("winnes") covers two real words ("win now"); its span
+# splits proportionally into two new note slots.
 merge_words = [
     MxlWord(text="I", norm="i", offset=0.0, syllables=[(0.0, 1.0, 60, "I")]),
     MxlWord(text="winnes", norm="winnes", offset=1.0, syllables=[(1.0, 1.5, 69, "winnes")]),
@@ -1679,21 +1444,8 @@ assert merge_clean == ["I", None, "and"], merge_clean
 assert merge_override == {1: [("win", True), ("now", True)]}, merge_override
 assert merge_words[1].syllables == [(1.0, 0.75, 69, "win"), (1.75, 0.75, 69, "now")], merge_words[1].syllables
 
-# N: N (same count, individually too garbled) -- "stomty"+"in" for
-# "stop"+"trying," -- BUG REGRESSION (real case, "Great Big Sea -
-# Ordinary Day", 2026-08-18, user-identified): word-level 1:1 assignment
-# alone gives "stomty" (2 real MXL syllable slots) the WHOLE word "stop"
-# (1 real target syllable) and "in" (1 slot) the WHOLE "trying," (2
-# target syllables) -- scrambling the displayed text ("sto"/"p" and an
-# un-split "trying,") even though the block match itself is correct.
-# Fixed with a SYLLABLE-LEVEL reconciliation tried first: flatten the
-# block's own real per-note syllables ("stom"/"ty"/"in") against the
-# recovered LRC words' own hyphenated pieces ("stop"/"try"/"ing,") --
-# same length, each pair individually fuzzy-close enough ("stom"~"stop",
-# "ty"~"try", "in"~"ing,") -- so each syllable lands on its own real
-# note directly via `word_syllable_override`, crossing the "stomty"/"in"
-# word boundary as needed. `word_clean_text` is correctly left unset for
-# these two words (the override supersedes it in `build_syllables`).
+# N:N -- "stomty"+"in" for "stop"+"trying,": syllable-level reconciliation lands each real
+# syllable on its own note via word_syllable_override, crossing the word boundary correctly.
 same_count_words = [
     MxlWord(text="won't", norm="won't", offset=0.0, syllables=[(0.0, 1.0, 60, "won't")]),
     MxlWord(text="stomty", norm="stomty", offset=1.0,
@@ -1704,15 +1456,8 @@ same_count_words = [
 same_count_lines = [(10.0, "won't stop trying, oh")]
 _, same_count_clean, _, _, same_count_override, _ = assign_words_to_lines(same_count_words, same_count_lines)
 assert same_count_clean == ["won't", None, None, "oh"], same_count_clean
-# Each override entry is (text, is_word_start) -- "stop" and "try" are
-# each their own real word (both True), even though they land on the
-# SAME "stomty" MXL word's own 2 syllable slots; "ing," is a
-# CONTINUATION of "trying," (False), even though it's the "in" MXL
-# word's own only/first slot -- word-start tracks the RECOVERED LRC
-# token boundary, never the underlying MXL word's own slot position,
-# once an override is in play (real bug, 2026-08-18: without this,
-# "try" wrongly showed as a continuation of "stop" and "ing," wrongly
-# showed as its own new word, backwards from the real sung phrasing).
+# Each override entry is (text, is_word_start); word-start follows the recovered LRC token
+# boundary, not the underlying MXL slot position.
 assert same_count_override == {1: [("stop", True), ("try", True)], 2: [("ing,", False)]}, same_count_override
 print("OK: assign_words_to_lines resolves a multi-word block via SYLLABLE-LEVEL reconciliation when the "
       "flattened real-syllable count matches the recovered LRC's own hyphenated syllable count, correctly "
@@ -1720,14 +1465,8 @@ print("OK: assign_words_to_lines resolves a multi-word block via SYLLABLE-LEVEL 
       "each syllable's own word-start flag matching the RECOVERED word phrasing) instead of scrambling "
       "text via whole-word assignment")
 
-# N: M -- three MXL words for two real (one hyphenated) LRC words
-# ("double"+"edged"+"kide" for "double-edged"+"knife,") -- fewer real
-# words than slots, recovered by splitting the hyphenated word first
-# rather than falling straight to melisma-padding. Each MXL word here
-# has exactly 1 real syllable of its own, so the flattened syllable-level
-# path (see the "stomty"/"in" test above) also applies cleanly and takes
-# priority -- same semantic result (each word gets its own right text),
-# just delivered via `word_syllable_override` instead of `word_clean_text`.
+# N:M -- three MXL words for two real (one hyphenated) LRC words; recovered by splitting
+# the hyphenated word first, delivered via word_syllable_override.
 split_words = [
     MxlWord(text="a", norm="a", offset=0.0, syllables=[(0.0, 1.0, 60, "a")]),
     MxlWord(text="double", norm="double", offset=1.0, syllables=[(1.0, 1.0, 60, "double")]),
@@ -1738,18 +1477,13 @@ split_words = [
 split_lines = [(10.0, "a double-edged knife, but")]
 _, split_clean, split_group, split_group_text, split_override, _ = assign_words_to_lines(split_words, split_lines)
 assert split_clean == ["a", None, None, None, "but"], split_clean
-# "edged" is a CONTINUATION (False) of the SAME hyphenated token
-# "double-edged", not its own new word -- a real compound word reads as
-# one connected unit when sung, matching how a literal "-" is already
-# treated as an internal word boundary elsewhere in this module.
+# "edged" continues the hyphenated "double-edged" as one connected unit.
 assert split_override == {1: [("double", True)], 2: [("edged", False)], 3: [("knife,", True)]}, split_override
 print("OK: assign_words_to_lines recovers a MULTI-word replace block anchored by real matches on both "
       "sides -- 1-MXL-word-merges-2-real-words, same-count-but-individually-garbled, and "
-      "fewer-real-words-than-slots-via-hyphen-split, all real 'Ordinary Day' cases")
+      "fewer-real-words-than-slots-via-hyphen-split")
 
-# A genuinely unrelated multi-word block (not just OCR noise) must still
-# be rejected -- the block-level ratio gate has to actually reject, not
-# just be a formality the way the 1:1 gate already is.
+# A genuinely unrelated multi-word block must still be rejected by the block-level ratio gate.
 unrelated_block_words = [
     MxlWord(text="the", norm="the", offset=0.0, syllables=[(0.0, 1.0, 60, "the")]),
     MxlWord(text="zzz", norm="zzz", offset=1.0, syllables=[(1.0, 1.0, 60, "zzz")]),
@@ -1762,25 +1496,14 @@ assert unrelated_block_clean[1] is None and unrelated_block_clean[2] is None, un
 print("OK: a genuinely unrelated multi-word block is correctly rejected by the block-level similarity "
       "ratio gate too, not fuzzy-matched just because it's bounded by real anchors")
 
-# The "double"+"edged"+"kide" -> "double-edged"+"knife," case recovers TWO
-# distinct real words (2 real LRC tokens for its own 3 MXL slots) -- each
-# MXL slot keeps its OWN distinct identity, must NOT be grouped as one
-# semantic word the way the real Stars "never" case (below) is.
+# Two distinct recovered real words must not be grouped as one semantic word (unlike "never" below).
 assert split_group == [0, 1, 2, 3, 4] and split_group_text == {}, (split_group, split_group_text)
 print("OK: assign_words_to_lines does NOT group a multi-MXL-word block that recovers MULTIPLE distinct "
       "real LRC words -- grouping is reserved for the 'one real word split across several separate MXL "
       "word entries' shape only")
 
-# Real bug (Les Miserables - Stars, 2026-08-18, user's own correction): a
-# word spanning several MXL NOTES is a normal, intentional sheet-music
-# pattern -- but the MXL's own syllabic markers can still mis-notate a
-# word as several separate single-syllable WORDS (this exact case: "ne"
-# and "ver" each syllabic="single" instead of one word split
-# "begin"/"end"). Fixing only the DISPLAYED text (already covered above)
-# isn't enough -- place_words_via_asr must also treat "ne"+"ver" as ONE
-# semantic word for ASR matching, or it can never match a real transcript
-# that only ever has "never" as a single token, permanently losing a
-# real, confident ASR anchor to a less-reliable interpolated guess.
+# MXL can mis-notate one word ("never") as two separate single-syllable words ("ne"/"ver");
+# place_words_via_asr must still treat them as one semantic word for ASR matching.
 never_words = [
     MxlWord(text="I", norm="i", offset=0.0, syllables=[(0.0, 1.0, 60, "I")]),
     MxlWord(text="ne", norm="ne", offset=1.0, syllables=[(1.0, 0.25, 60, "ne")]),
@@ -1790,16 +1513,10 @@ never_words = [
 never_lines = [(9.5, "I never shall")]  # close to the fake ASR words' own real timestamps below
 never_word_lines, never_clean, never_group, never_group_text, never_override, _ = assign_words_to_lines(
     never_words, never_lines)
-# The DISPLAYED text now comes via the syllable-level override (weight-
-# sliced from the MXL's own real letters, "ne"+"ver" -- NOT `hyphenate
-# ("never")`'s own genuinely-ambiguous guess, which currently favors
-# "nev"/"er" -- see this function's own docstring), not word_clean_text.
+# Displayed text comes from the syllable-level override (MXL's own letters), not hyphenate()'s
+# ambiguous guess.
 assert never_clean[1] is None and never_clean[2] is None, never_clean
-# "ne" is the real word start (True), "ver" is a continuation (False) --
-# both land on their own separate MXL word ("ne"'s and "ver"'s own only
-# slot are each their own MxlWord), so without word-start coming from
-# the override itself (not the underlying MXL slot position) "ver"
-# would wrongly get its own leading space too.
+# "ne" is word start, "ver" is continuation; word-start must come from the override, not the MXL slot.
 assert never_override == {1: [("ne", True)], 2: [("ver", False)]}, never_override
 # Grouping must STILL apply regardless of which text path fired --
 # place_words_via_asr needs it to search ASR for "never" as a whole.
@@ -1847,16 +1564,9 @@ assert _distribute_words_to_slots(["go"], 3) == ["go", mxl_lrc_config.MELISMA_CO
 print("OK: _distribute_words_to_slots handles more-words-than-slots (merge), fewer (hyphen-split, then "
       "melisma-pad), and equal counts (direct positional) correctly in isolation")
 
-# Real bug (Les Miserables - Stars, 2026-08-18): the MXL's own syllabic
-# markers mis-notated "never" as two separate SINGLE-syllable words ("ne",
-# "ver") instead of one word split "begin"/"end" -- assign_words_to_lines
-# correctly recovered the clean LRC word "never" for this 2-MXL-word
-# block, but _distribute_words_to_slots used to just melisma-pad a single
-# real word short of its slot count ("never"+"~") instead of trying to
-# split it. Fixed via `mxl_slot_texts`: uses the MXL's own two
-# mis-segmented "words"' OWN character lengths ("ne"=2, "ver"=3) to slice
-# the recovered clean word -- NOT a linguistic hyphenation guess, so it
-# lands on the real notated split exactly (not hyphenate's "nev"/"er").
+# BUG REGRESSION: the MXL's own syllabic markers mis-notated "never" as two
+# _distribute_words_to_slots splits "never" via mxl_slot_texts' own character lengths
+# ("ne"=2, "ver"=3), not a hyphenation guess.
 never_split_from_mxl = _distribute_words_to_slots(["never"], 2, mxl_slot_texts=["ne", "ver"])
 assert never_split_from_mxl == ["ne", "ver"], never_split_from_mxl
 # Without a usable `mxl_slot_texts` hint (e.g. an older/other caller),
@@ -1902,9 +1612,9 @@ print("OK: place_words_via_asr uses real ASR timestamps AND durations where conf
       "stretching a word across what should be a real rest), falls back to MXL-note-value/local-tempo "
       "estimated placement and duration otherwise")
 
-# BUG REGRESSION (real case: Chicago "favors" OCR'd as "favere" in the MXL,
-# but transcribed correctly by ASR) -- matching on the raw MXL norm alone
-# missed this word entirely, even though assign_words_to_lines had already
+# BUG REGRESSION: an MXL word OCR'd wrong ("favere" for "favors") but
+# transcribed correctly by ASR -- matching on the raw MXL norm alone missed
+# this word entirely, even though assign_words_to_lines had already
 # resolved a clean "favors" for it. place_words_via_asr must reuse that
 # clean text for its own ASR matching, not just for display.
 garbled_mxl_words = [
@@ -1922,12 +1632,11 @@ g_starts, g_ends, g_quality = place_words_via_asr(
     garbled_mxl_words, garbled_word_lines, garbled_lrc_lines, garbled_asr, word_clean_text=garbled_clean_text)
 assert g_starts[1] == 11.0 and g_ends[1] == 11.6, (g_starts[1], g_ends[1])
 assert g_quality.n_asr_placed == 2 and g_quality.n_fallback == 0, g_quality
-# Without the clean text (old behavior), a DOUBLY-garbled word -- MXL OCR'd
-# it as "favere" AND ASR separately mis-transcribed it as "favorites" (real
-# case: the user's own re-run) -- must NOT match, since "favere"~"favorites"
-# (ratio 0.53) falls below the fuzzy threshold even with the fuzzy-replace
-# fallback active. Confirms clean-text reuse is still doing real work of its
-# own, not just fuzzy matching alone.
+# Without the clean text, a DOUBLY-garbled word -- MXL OCR'd it as "favere"
+# AND ASR separately mis-transcribed it as "favorites" -- must NOT match,
+# since "favere"~"favorites" (ratio 0.53) falls below the fuzzy threshold
+# even with the fuzzy-replace fallback active. Confirms clean-text reuse is
+# still doing real work of its own, not just fuzzy matching alone.
 mishear_asr = [
     _Word(text="hello", start=10.0, end=10.3),
     _Word(text="favorites", start=11.0, end=11.6),
@@ -1939,15 +1648,12 @@ print("OK: place_words_via_asr matches an MXL word against ASR using its already
       "(\"favere\"->\"favors\") when available, recovering a real confident ASR match that raw-OCR-norm "
       "matching alone would miss entirely")
 
-# BUG REGRESSION (real case: the user's own re-run mis-transcribed "favors"
-# as "favorites" -- a real ASR mishearing, independent of any MXL OCR
-# issue) -- even the clean text ("favors") doesn't EXACTLY match ASR's own
-# output ("favorites") here, so the exact-match fix above isn't enough on
-# its own; a close-but-not-identical 1:1 pairing must still be trusted via
-# the same fuzzy-ratio technique assign_words_to_lines already uses for
-# display text. Reuses the same `mishear_asr` data used above to prove
-# clean-text-reuse alone isn't enough for THIS word -- fuzzy matching
-# against the clean text is what closes the gap.
+# BUG REGRESSION: a real ASR mishearing ("favors" transcribed as
+# "favorites"), independent of any MXL OCR issue -- even the clean text
+# ("favors") doesn't exactly match ASR's own output here, so the exact-match
+# fix above isn't enough on its own; a close-but-not-identical 1:1 pairing
+# must still be trusted via the same fuzzy-ratio technique
+# assign_words_to_lines already uses for display text.
 m_starts, m_ends, m_quality = place_words_via_asr(
     garbled_mxl_words, garbled_word_lines, garbled_lrc_lines, mishear_asr, word_clean_text=garbled_clean_text)
 assert m_starts[1] == 11.0 and m_ends[1] == 11.6, (m_starts[1], m_ends[1])
@@ -1965,14 +1671,13 @@ print("OK: place_words_via_asr also trusts a close-but-not-identical 1:1 ASR pai
       "a real ASR mishearing) via the same fuzzy-ratio technique used for display text, while still rejecting "
       "a genuinely unrelated word in the same slot")
 
-# BUG REGRESSION (real case: "Great Big Sea - Ordinary Day", 2026-08-19):
-# MXL OCR'd "sink" as "souk" -- ratio 0.5 < the 0.6 display-text bar, so
-# assign_words_to_lines correctly declines to trust it directly (word_clean_
-# text stays None), but the REJECTED LRC candidate ("sink") is captured in
-# word_lrc_candidate. Real ASR independently transcribed the word correctly
-# as "sink" -- place_words_via_asr must try the candidate (not just the raw
-# MXL OCR norm "souk", which real ASR "sink" would never match either) and,
-# once ASR confirms it, upgrade BOTH timing AND display text to "sink".
+# BUG REGRESSION: MXL OCR'd "sink" as "souk" -- ratio 0.5 < the 0.6
+# display-text bar, so assign_words_to_lines correctly declines to trust it
+# directly (word_clean_text stays None), but the rejected LRC candidate
+# ("sink") is captured in word_lrc_candidate. Real ASR independently
+# transcribed the word correctly as "sink" -- place_words_via_asr must try
+# the candidate (not just the raw MXL OCR norm, which ASR would never match
+# either) and, once ASR confirms it, upgrade both timing AND display text.
 candidate_mxl_words = [
     MxlWord(text="you", norm="you", offset=0.0, syllables=[(0.0, 0.5, 64, "you")]),
     MxlWord(text="souk", norm="souk", offset=0.5, syllables=[(0.5, 0.5, 64, "souk")]),
@@ -2012,18 +1717,14 @@ print("OK: place_words_via_asr tries a REJECTED MXL<->LRC fuzzy candidate (\"sou
       "against real ASR, upgrading both timing AND display text once ASR independently confirms it, while "
       "leaving display text untouched when ASR doesn't confirm it either")
 
-# BUG REGRESSION (real case: the user's own re-run, "There's a lot of
-# favors, I'm prepared..." -- the fuzzy-replace fix above only checked a
-# CLEAN 1:1 replace block, but `asr_in_window` is time-bounded, not
-# line-bounded (a deliberate +-0.5s slop so a match landing just outside
-# the LRC line's own window isn't missed) -- so a word belonging to the
-# NEXT line ("I'm") can spill into the same window and turn what should be
-# a clean 1:1 mismatch into a 1:2 replace block (['favors'] vs
-# ['favorites', 'im']), which the old `(b2 - b1) == 1` check rejected
-# outright even though the correct candidate ("favorites") was sitting
-# right there at the start of the block. Real debug-log-confirmed case:
-# this silently fell through to nearest-anchor interpolation and produced
-# a ~1.85s span for a word whose real ASR duration was 0.66s.
+# BUG REGRESSION: the fuzzy-replace fix above only checked a clean 1:1
+# replace block, but `asr_in_window` is time-bounded, not line-bounded (a
+# deliberate +-0.5s slop so a match landing just outside the LRC line's own
+# window isn't missed) -- so a word belonging to the NEXT line can spill
+# into the same window and turn what should be a clean 1:1 mismatch into a
+# 1:2 replace block, which the old `(b2 - b1) == 1` check rejected outright
+# even though the correct candidate was sitting right there at the start
+# of the block.
 spillover_lrc_lines = [(10.0, "hello favors"), (12.0, "im here")]
 spillover_asr = [
     _Word(text="hello", start=10.0, end=10.3),
@@ -2039,8 +1740,8 @@ print("OK: place_words_via_asr still recovers a fuzzy 1:1 match when a NEXT-line
       "alongside a spilled-over \"I'm\")")
 
 # Confidence gating: a text match with LOW confidence must be treated as no
-# match at all (real case this was built for: a 0.003-confidence match had a
-# genuinely wrong timestamp, independent of anything else in the pipeline).
+# match at all -- a near-zero-confidence match can have a genuinely wrong
+# timestamp.
 low_conf_asr = [
     _Word(text="hello", start=10.2, end=10.5, confidence=0.9),
     _Word(text="world", start=10.6, end=10.9, confidence=0.05),  # text matches, but confidence too low to trust
@@ -2087,14 +1788,12 @@ print("OK: _text_for_mxl_syllables prefers clean LRC text reconciled to the MXL'
       "(merging or melisma-padding as needed), falling back to MXL's own raw text only when no clean "
       "match exists at all")
 
-# Real bug (Les Miserables - Stars, 2026-08-18): a MELISMA -- the MXL's
-# own real note data is ONE real syllable ("flame,") plus untexted
-# tied/slurred continuation notes ("") -- is structurally NOT a multi-
-# syllable word, even though it has multiple slots. Real reported case:
-# the matched clean LRC token was "flames" (a genuine plural vs. the
-# MXL's own singular "flame,", not OCR garbage), which used to fall into
-# the weight-slicing path meant for genuine multi-syllable words and
-# fragment "flames" into meaningless letter pieces ("fla"/"m"/"e"/"s")
+# BUG REGRESSION: a MELISMA -- the MXL's own real note data is ONE real
+# syllable plus untexted tied/slurred continuation notes -- is structurally
+# NOT a multi-syllable word, even though it has multiple slots. A matched
+# clean LRC token that's a plural vs. the MXL's own singular (not OCR
+# garbage) used to fall into the weight-slicing path meant for genuine
+# multi-syllable words and fragment it into meaningless letter pieces
 # instead of keeping it whole. A word with only ONE real (non-empty) MXL
 # syllable slot must always keep the whole clean word on that one slot,
 # regardless of any spelling mismatch, and melisma-pad the rest.
@@ -2111,21 +1810,20 @@ print("OK: _text_for_mxl_syllables never slices a clean word's letters across a 
       "continuation slots (real 'flame,'/'flames' Stars case) -- the whole word stays on the ONE real "
       "syllable slot, wherever it is, with the rest melisma-padded")
 
-# Real bugs (Great Big Sea - Ordinary Day, 2026-08-18), both with 2+ real
-# syllable slots so the n_real<=1 case above doesn't cover them:
+# Two more bugs, both with 2+ real syllable slots so the n_real<=1 case
+# above doesn't cover them:
 # (1) a melisma WITHIN a multi-syllable word ("al"+""+"right." -- "al"
 # held across 2 notes, then a real second syllable) must still melisma-
 # pad its empty middle slot even when the clean text is a genuinely
-# DIFFERENT word ("all" for the MXL's own "alright.") -- the OLD
-# behavior sliced "all"'s raw letters across all 3 raw slots and
-# produced "a"/"l"/"l" (an invented extra syllable, a doubled letter,
-# and a lost melisma marker).
+# DIFFERENT word ("all" for the MXL's own "alright.") -- the old behavior
+# sliced "all"'s raw letters across all 3 raw slots and produced
+# "a"/"l"/"l" (an invented extra syllable, a doubled letter, and a lost
+# melisma marker).
 alright_mismatch = _text_for_mxl_syllables("all", ["al", "", "right."])
 assert alright_mismatch == ["al", mxl_lrc_config.MELISMA_CONTINUATION_TEXT, "right."], alright_mismatch
-# (2) a clean LRC token with an internal SPACE ("all right," for the
-# MXL's own single word "alright,") must never have that space sliced
-# into the middle of a display syllable ("al"/"l right," -- a literal
-# space inside one syllable's text, the OLD bug).
+# (2) a clean LRC token with an internal SPACE ("all right," for the MXL's
+# own single word "alright,") must never have that space sliced into the
+# middle of a display syllable (a literal space inside one syllable's text).
 alright_two_words = _text_for_mxl_syllables("all right,", ["al", "right,"])
 assert alright_two_words == ["al", "right,"], alright_two_words
 print("OK: _text_for_mxl_syllables restricts slicing to the MXL's own REAL syllable slots only (never "
@@ -2133,14 +1831,10 @@ print("OK: _text_for_mxl_syllables restricts slicing to the MXL's own REAL sylla
       "isn't plausibly the SAME WORD as the MXL's own text (multi-word phrase, or too dissimilar) -- "
       "falling back to the MXL's own raw syllables instead of guessing")
 
-# Real bug (Les Miserables - Stars, 2026-08-18): the MXL's own notated
-# syllable split IS musically correct and must be used directly whenever
-# it actually matches the clean word, ARCHITECTURALLY (never routed
-# through `hyphenate` at all for this fast path) -- not merely because
-# `hyphenate` happens to agree today. `hyphenate` itself was ALSO fixed
-# the same day (see its own section below) and now gets "never"/
-# "Lucifer" right too, but `_text_for_mxl_syllables`'s exact-match branch
-# must not depend on that coincidence holding.
+# The MXL's own notated syllable split IS musically correct and must be
+# used directly whenever it actually matches the clean word, ARCHITECTURALLY
+# (never routed through `hyphenate` at all for this fast path) -- not merely
+# because `hyphenate` happens to agree.
 matches_notated = _text_for_mxl_syllables("never", ["ne", "ver"])
 assert matches_notated == ["ne", "ver"], matches_notated
 lucifer = _text_for_mxl_syllables("Lucifer", ["Lu", "ci", "fer"])
@@ -2155,14 +1849,13 @@ print("OK: _text_for_mxl_syllables uses the MXL's own notated syllable split dir
       "display as '~', never blank")
 
 print("\n--- mxl_lrc_generator: nearest-anchor interpolation replaces whole-line-stretch fallback ---")
-# Reproduces the real confirmed bug: an LRC line whose own window includes a
-# long trailing silence (an instrumental gap before the NEXT line) used to
-# stretch every un-ASR-matched word in it across the WHOLE window, pushing
-# them far later than their real position. One line, 4 MXL words: "one" gets
-# a real ASR match early, "two"/"three" have none (must fall back), "four"
-# gets a real ASR match near the START of the line's own real content --
-# even though the LRC line's own declared window extends much further
-# (mimicking a long trailing rest before the next line).
+# BUG REGRESSION: an LRC line whose own window includes a long trailing
+# silence (an instrumental gap before the NEXT line) used to stretch every
+# un-ASR-matched word in it across the WHOLE window, pushing them far later
+# than their real position. One line, 4 MXL words: "one" gets a real ASR
+# match early, "two"/"three" have none (must fall back), "four" gets a real
+# ASR match near the start of the line's own real content -- even though
+# the LRC line's own declared window extends much further.
 anchor_words = [
     MxlWord(text="one", norm="one", offset=0.0, syllables=[(0.0, 1.0, 60, "one")]),
     MxlWord(text="two", norm="two", offset=1.0, syllables=[(1.0, 1.0, 60, "two")]),
@@ -2187,9 +1880,8 @@ print(f"OK: fallback words between two confident anchors interpolate from the LO
       f"not the whole line's window including its trailing silence")
 
 print("\n--- lrc_timing: match_asr_to_lrc_lines + two_tier_time_calibration recover a systematic "
-      "LRC/audio offset -- BUG REGRESSION for real 'Ordinary Day' (lrclib id 6210269) case, where our own "
-      "audio has ~2.4s of extra lead-in silence vs. whichever recording LRCLIB's synced lyrics were timed "
-      "against ---")
+      "LRC/audio offset (e.g. extra lead-in silence in our recording vs. whichever recording LRCLIB's "
+      "synced lyrics were timed against) ---")
 from ultrastar_generator.lrc_timing import match_asr_to_lrc_lines
 
 # 6 LRC lines 2s apart (distinct single-word content so text matching is
@@ -2216,15 +1908,14 @@ print("OK: match_asr_to_lrc_lines recovers a per-line real-ASR-vs-LRC delta stra
       "word stream, and two_tier_time_calibration confidently calibrates the constant +3.0s offset from it "
       "(correction_fn agrees: 10.0 -> 13.0)")
 
-print("  BUG REGRESSION (real case, Chappell Roan - Pink Pony Club, 2026-08-15, a song whose chorus repeats "
-      "3 full times): match_asr_to_lrc_lines rewritten to a forward-only CURSOR (mirroring reconcile_line_"
-      "structure/assign_lrc_line_ids_sequentially) instead of one global, non-chronological SequenceMatcher "
-      "diff over the whole song -- the global diff let a later line get anchored to an EARLIER occurrence of "
-      "a repeated phrase whenever a real garbled/ad-lib stretch broke up clean matching, corrupting every "
-      "delta after that point by the same ~135s. Also confirms the window-growth SAFETY NET this rewrite "
-      "needed (found in the SAME real validation): a long real garbled stretch must still let the cursor "
-      "recover once real content resumes, without a coincidentally-shared common word being mistaken for a "
-      "real anchor along the way:")
+print("  BUG REGRESSION (a song whose chorus repeats several times): match_asr_to_lrc_lines rewritten "
+      "to a forward-only CURSOR (mirroring reconcile_line_structure/assign_lrc_line_ids_sequentially) "
+      "instead of one global, non-chronological SequenceMatcher diff over the whole song -- the global "
+      "diff let a later line get anchored to an EARLIER occurrence of a repeated phrase whenever a real "
+      "garbled/ad-lib stretch broke up clean matching, corrupting every delta after that point. Also "
+      "confirms the window-growth SAFETY NET this rewrite needed: a long real garbled stretch must "
+      "still let the cursor recover once real content resumes, without a coincidentally-shared common "
+      "word being mistaken for a real anchor along the way:")
 mall_lrc_lines = [(0.0, "start marker")]
 for _i in range(25):
     mall_lrc_lines.append((5.0 + _i, f"zzq{_i:03d} zzr{_i:03d}"))  # 25 unique, never-in-ASR garbled lines
@@ -2390,13 +2081,12 @@ cal_starts, cal_ends, cal_quality = place_words_via_asr(off_mxl_words, off_word_
 assert cal_quality.asr_placement_rate == 1.0, cal_quality
 assert cal_starts == [3.0, 5.0, 7.0, 9.0, 11.0, 13.0], cal_starts
 print("OK: applying the recovered offset to LRC line timestamps before matching turns an almost-total ASR "
-      "placement failure (uncalibrated, {:.0%}) into a full recovery (calibrated, {:.0%}) -- the real fix "
-      "for the 'Ordinary Day' lead-in-silence case".format(raw_quality.asr_placement_rate, cal_quality.asr_placement_rate))
+      "placement failure (uncalibrated, {:.0%}) into a full recovery (calibrated, {:.0%})".format(
+          raw_quality.asr_placement_rate, cal_quality.asr_placement_rate))
 
 print("\n--- mxl_lrc_generator: quality gate correctly rejects a wrong-recording-style result ---")
-# Mirrors the real BATB/Stars failure this session found: a candidate that
-# passes duration+content filtering but whose LRC line timings don't
-# correspond to what our own audio actually says -- ASR barely matches.
+# A candidate that passes duration+content filtering but whose LRC line timings
+# don't correspond to what our own audio actually says -- ASR barely matches.
 n_words_gate = 10
 low_quality = MxlLrcQuality(n_words=n_words_gate, n_asr_placed=2, n_fallback=8, non_monotonic_fix_count=0)
 assert low_quality.asr_placement_rate < mxl_lrc_config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
@@ -2406,8 +2096,7 @@ print("OK: MxlLrcQuality.asr_placement_rate correctly separates a low-confidence
       "result from a high-confidence one, against the real shipped threshold")
 
 print("\n--- load_mxl_vocal_words: untexted continuation notes (tied hold / slurred slide) are kept, "
-      "not silently dropped -- BUG REGRESSION for real 'reciprocity' (G#->C# slide+fermata) and "
-      "'fa'/'favors' (tied hold undershooting duration) cases ---")
+      "not silently dropped ---")
 import tempfile as _tempfile
 import os as _os
 import music21 as _music21
@@ -2466,8 +2155,7 @@ print("OK: tied same-pitch continuation merges into one extended-duration syllab
       "correctly left unattached")
 
 print("\n--- load_mxl_vocal_words: OCR/engraving defect repair -- two real words merged onto ONE "
-      "note's own lyric text, missing the space/note split, real 'Great Big Sea - Ordinary Day' case "
-      "('right,it\\'s' on one note) ---")
+      "note's own lyric text, missing the space/note split ---")
 _merge_part = _music21.stream.Part()
 _merge_part.partName = "Voice 1"
 
@@ -2498,14 +2186,12 @@ _m6 = _music21.note.Note(69, quarterLength=0.5)
 _m6.lyric = "already"
 _merge_part.append(_m6)
 
-# Real bug (Great Big Sea - Ordinary Day, 2026-08-18): a trailing
-# ellipsis engraved as its OWN separate note ("..") immediately after
-# "know."'s own note (contiguous, same pitch, real confirmed case) --
-# must be ABSORBED onto "know."'s own trailing text ("know..."), not
-# treated as an independent word. Also confirms the merge-repair regex
-# fix above doesn't mistake "know..."'s own internal periods for a
-# real-word merge (the char after each period is more punctuation, not
-# alphanumeric, so it must never split "know..." itself).
+# A trailing ellipsis engraved as its own separate note ("..") immediately
+# after "know."'s own note (contiguous, same pitch) must be ABSORBED onto
+# "know."'s own trailing text ("know..."), not treated as an independent
+# word. Also confirms the merge-repair regex above doesn't mistake
+# "know..."'s own internal periods for a real-word merge (the char after
+# each period is more punctuation, not alphanumeric).
 _m7 = _music21.note.Note(65, quarterLength=1.0)
 _m7.lyric = "know."
 _merge_part.append(_m7)
@@ -2558,9 +2244,7 @@ assert [type(e).__name__ for e in line_entries[:break_pos]] == ["Syllable", "Syl
 print("OK: line break inserted exactly at the line_id change:", kinds2)
 
 print("\n--- BUG REGRESSION: a long silence gap WITHIN a single confirmed reference line no longer "
-      "forces a spurious mid-line break (real case: \"Just a little change\" was being split into "
-      "\"Just a little\" / \"change\" because of an audible pause before \"change\", even though "
-      "both words shared the same reference line_id) ---")
+      "forces a spurious mid-line break, even though both words shared the same reference line_id ---")
 same_line_gap_syls = [
     Syllable("Just", 0.0, 0.2, 4, True, line_id=0),
     Syllable(" a", 0.2, 0.4, 4, True, line_id=0),
@@ -2576,18 +2260,11 @@ print("OK: no break inserted despite the long gap, since line_id confirmed it's 
       [type(e).__name__ for e in same_line_entries])
 
 print("\n--- phrasing.build_lines(strict_reference_lines=True): removes the implausible-length safety "
-      "net entirely -- real confirmed case (Trixie Mattel - Video Games, 2026-08-14): a long, "
-      "melisma-heavy reference line (many held '~' notes per word) was still getting split by the old "
-      "MAX_SYLLABLES_PER_LINE*1.5 safety net even though its line_id was confidently, correctly "
-      "tracked throughout via calibrated LRC timing -- user's explicit directive: when using LRC, "
-      "match it 100%, no exceptions. Real-audio validated as a clear net improvement (line-break "
-      "agreement 81.7%->87.8%, spurious breaks 29->7), not just a wash ---")
+      "net entirely -- when a reference line's own line_id is confidently tracked throughout, it wins "
+      "even over a long, melisma-heavy line that would otherwise trip the length safety net ---")
 
-# A comma on the word nearest the middle (2026-08-19: the default-mode
-# safety net now needs interior punctuation to fire at all -- see the
-# "punctuation-near-middle" test block below) so default mode's own
-# break still has somewhere to land, keeping this test's own point
-# (strict mode changes the outcome) meaningful.
+# A comma on the word nearest the middle, so default mode's own break still has
+# somewhere to land, keeping this test's own point (strict mode changes the outcome) meaningful.
 _long_line_syls = [Syllable(f"w{i}," if i == 10 else f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0)
                     for i in range(20)]
 _strict_entries = build_lines(_long_line_syls, strict_reference_lines=True)
@@ -2603,12 +2280,11 @@ assert any(type(e).__name__ == "LineBreak" for e in _default_entries), \
 print("OK: default (non-strict) mode still applies the safety net on the identical data, confirming "
       "the flag is what changed the outcome")
 
-print("\n--- BUG REGRESSION (real case, \"Great Big Sea - Ordinary Day\", 2026-08-19): the default-mode "
-      "overflow safety net used to break mechanically at whichever word boundary the running syllable "
-      "count first crossed 1.5x MAX_SYLLABLES_PER_LINE, landing on an arbitrary position (real case: right "
-      "before the line's own trailing \"day,\") instead of a real clause boundary. It now scans the WHOLE "
-      "overflowing reference-line segment up front for interior punctuation nearest the middle, or skips "
-      "the break entirely if none exists ---")
+print("\n--- BUG REGRESSION: the default-mode overflow safety net used to break mechanically at "
+      "whichever word boundary the running syllable count first crossed 1.5x MAX_SYLLABLES_PER_LINE, "
+      "landing on an arbitrary position instead of a real clause boundary. It now scans the whole "
+      "overflowing reference-line segment up front for interior punctuation nearest the middle, or "
+      "skips the break entirely if none exists ---")
 # 20 words, all one known reference line (overflows 1.5x8=12) -- a comma
 # sits just past the middle (word 11 of 20) and nowhere else. The break
 # must land right after "w11,", not at word 12 (where the old mechanical
@@ -2627,9 +2303,7 @@ print("OK: the overflow break lands right after the interior word nearest the mi
 # The line's own FINAL word almost always carries trailing punctuation
 # (a sentence-ending period/comma) -- that must NOT count as an interior
 # candidate, or every long line with no real internal punctuation would
-# still get split off into a trivial one-word trailing line. Real case:
-# "I've got a smile on my face and I've got four walls around me," has
-# exactly one comma, on its own last word -- must stay whole, unbroken.
+# still get split off into a trivial one-word trailing line.
 _trailing_only_syls = [Syllable(f"w{i}," if i == 19 else f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0)
                         for i in range(20)]
 _trailing_only_entries = build_lines(_trailing_only_syls, strict_reference_lines=False)
@@ -2639,8 +2313,8 @@ print("OK: punctuation on ONLY the segment's own final word is correctly ignored
       "own terminal punctuation, not an interior clause boundary) -- the overflowing line is left whole "
       "rather than splitting off a trivial trailing one-word line")
 
-# No punctuation anywhere in a long, one-reference-line segment -- the
-# user's explicit rule: "if none is found, don't break the line."
+# No punctuation anywhere in a long, one-reference-line segment: if none
+# is found, don't break the line.
 _no_punct_syls = [Syllable(f"w{i}", float(i), float(i) + 0.2, 4, True, line_id=0) for i in range(20)]
 _no_punct_entries = build_lines(_no_punct_syls, strict_reference_lines=False)
 assert all(type(e).__name__ == "Syllable" for e in _no_punct_entries), \
@@ -2674,25 +2348,19 @@ assert [type(e).__name__ for e in _strict_two_entries].count("LineBreak") == 1, 
     [type(e).__name__ for e in _strict_two_entries]
 print("OK: a real line_id change still forces a break in strict mode")
 
-print("\n--- BUG REGRESSION (round 6): a bad interior ASR timestamp no longer swallows a whole line's notes ---")
-# Reproduces the reported "Stars" bug directly: within a matched
-# reference line, one interior word's ASR timing is badly wrong ("Stars"
-# is reported as a tiny sliver) -- under the OLD per-word-zone algorithm
-# this would dump a huge stretch of real, musically-distinct notes onto
-# "Stars" as one giant melisma. The current algorithm instead SPLITS
-# notes at each word's own ASR start/end boundary (see
-# lyric_alignment._split_notes_by_word_boundaries), so a note spanning
-# more than one word's zone gets cut into same-pitch pieces rather than
-# handed whole to whichever word's timestamp happens to contain its
-# midpoint -- a tiny/bad timestamp can only ever claim the sliver of
-# note-time that actually falls inside it. Gaps between words are kept
-# small (<= config.NOTE_ASSIGNMENT_MAX_GAP_SEC) so grouping (purely
-# gap-based, see lyric_alignment._group_words_by_gap) keeps them as ONE
-# group -- a real multi-second gap between interior words of the same
-# line would now correctly be treated as a real phrase boundary, not
-# this bug; the real "Stars" bug's actual raw ASR data (found later, see
-# [[project-stars-reference-notes]]) looked exactly like this: several
-# words compressed with SMALL gaps between them, not one big gap.
+print("\n--- BUG REGRESSION: a bad interior ASR timestamp no longer swallows a whole line's notes ---")
+# Within a matched reference line, one interior word's ASR timing is badly
+# wrong (reported as a tiny sliver) -- under the old per-word-zone algorithm
+# this would dump a huge stretch of real, musically-distinct notes onto that
+# word as one giant melisma. The current algorithm instead SPLITS notes at
+# each word's own ASR start/end boundary (see
+# lyric_alignment._split_notes_by_word_boundaries), so a note spanning more
+# than one word's zone gets cut into same-pitch pieces rather than handed
+# whole to whichever word's timestamp happens to contain its midpoint -- a
+# tiny/bad timestamp can only ever claim the sliver of note-time that
+# actually falls inside it. Gaps between words are kept small (<=
+# config.NOTE_ASSIGNMENT_MAX_GAP_SEC) so grouping (purely gap-based, see
+# lyric_alignment._group_words_by_gap) keeps them as one group.
 line_words = [
     Word(text="Stars", start=34.2, end=34.7, confidence=0.9, line_id=5),        # 1 syllable
     Word(text="in", start=34.8, end=34.9, confidence=0.9, line_id=5),           # 1 syllable, compressed but same phrase
@@ -2729,12 +2397,11 @@ assert counts_by_word.get("multitudes", 0) >= counts_by_word.get("Stars", 0), co
 assert sum(counts_by_word.values()) >= 12
 print("OK: line notes split by each word's own ASR boundary, not swallowed by one bad interior timestamp")
 
-print("\n--- BUG REGRESSION (round 7): isolated pitch spike gets removed ---")
+print("\n--- BUG REGRESSION: isolated pitch spike gets removed ---")
 from ultrastar_generator.note_detection import _remove_pitch_spikes
-# Reproduces the reported "The" bug's shape directly: a brief, isolated
-# jump to a very different pitch that then returns to the surrounding
-# pitch. Neighbors are close in time and pitch to each other; the spike
-# is short and far from both.
+# A brief, isolated jump to a very different pitch that then returns to the
+# surrounding pitch. Neighbors are close in time and pitch to each other;
+# the spike is short and far from both.
 spiky = [
     NoteEvent(start=0.00, end=0.30, pitch=0),
     NoteEvent(start=0.30, end=0.35, pitch=8),    # spike: 50ms, 8 semitones away
@@ -2764,13 +2431,12 @@ kept = _remove_pitch_spikes(real_short_note, max_duration=0.25, min_jump_semiton
 assert len(kept) == 3, f"a real note between two DIFFERENT pitches should not be treated as a spike: {kept}"
 print("OK: short note between two different-pitched neighbors correctly kept:", [n.pitch for n in kept])
 
-print("\n--- BUG REGRESSION (round 7): fallback pitch borrows nearest pass-1 note, not fresh noisy analysis ---")
-# Reproduces the "The" bug's OTHER half: a word with zero notes in its
-# own zone now borrows the pitch of the nearest pass-1 note (from the
-# FULL note list) instead of running a fresh, isolated pitch read.
-# Needs surrounding words so zone partitioning actually excludes the
-# nearby notes from "the"'s own zone (with only one word in the whole
-# list, everything trivially falls in its one zone).
+print("\n--- BUG REGRESSION: fallback pitch borrows nearest pass-1 note, not fresh noisy analysis ---")
+# A word with zero notes in its own zone borrows the pitch of the nearest
+# pass-1 note (from the full note list) instead of running a fresh,
+# isolated pitch read. Needs surrounding words so zone partitioning
+# actually excludes the nearby notes from "the"'s own zone (with only one
+# word in the whole list, everything trivially falls in its one zone).
 fallback_words = [
     Word(text="start", start=90.0, end=94.9, confidence=0.9, line_id=None),
     Word(text="the", start=100.0, end=100.15, confidence=0.9, line_id=None),
@@ -2789,7 +2455,7 @@ assert the_syllable.midi_note == 0, the_syllable
 print(f"OK: fallback word borrowed pitch {the_syllable.midi_note} from the nearest pass-1 note "
       f"(neighbor-borrow count={fb_stats.fallback_used_neighbor}, fresh-analysis count={fb_stats.fallback_used_fresh_analysis})")
 
-print("\n--- BUG REGRESSION (round 7): spike removal end-to-end through detect_notes() collapses fully ---")
+print("\n--- BUG REGRESSION: spike removal end-to-end through detect_notes() collapses fully ---")
 # Same spike shape as above, but through the real detect_notes() pipeline
 # (mocked librosa, same technique as the earlier vibrato test), to
 # confirm the post-spike-removal re-merge actually produces ONE note.
@@ -2922,10 +2588,9 @@ assert len(weak_onset_notes) == 1, \
     f"a uniformly weak onset (no strength signal to distinguish it) should NOT split, got {weak_onset_notes}"
 print("OK: weak/undifferentiated onset did not spuriously split a sustained note")
 
-# pYIN/CREPE cross-check machinery was removed entirely (2026-08-14) --
-# detect_notes() now always uses exactly one PITCH_SOURCES entry, no
-# cross-check/ensemble/agree-disagree logic to test here anymore. Kept
-# import (used by several later tests further down the file).
+# detect_notes() always uses exactly one PITCH_SOURCES entry, no
+# cross-check/ensemble/agree-disagree logic to test here. Kept import
+# (used by several later tests further down the file).
 import ultrastar_generator.config as config_mod
 
 print("\n--- lyric_alignment flags suspicious words: any word whose own ASR span gets zero note pieces ---")
@@ -2949,9 +2614,7 @@ assert 0 not in susp_stats.suspicious_word_indices, susp_stats.suspicious_word_i
 print(f"OK: suspicious word indices correctly identified: {sorted(set(susp_stats.suspicious_word_indices))}")
 
 print("\n--- verification.apply_reference_text: forces a word's text to match its reference "
-      "whenever they disagree -- no audio/ASR involved at all (removed the old re-transcription "
-      "recheck 2026-08-15, see verification.py's own docstring for why: it never actually gated "
-      "the replacement on anything the recheck said) ---")
+      "whenever they disagree -- no audio/ASR involved at all ---")
 import ultrastar_generator.verification as verification_mod
 
 art_test_words = [
@@ -3048,13 +2711,12 @@ with _tempfile.TemporaryDirectory() as tmpdir:
     assert few_stats.corrections == []
     print("OK: too few matched notes correctly skipped calibration:", few_stats.skipped_reason)
 
-    # --- force_calibration: a genuinely ambiguous population (4 different
-    # offsets, each covering exactly 1/4 of matches -- below both the
-    # full-population AND high-confidence-subset bars either way) is
-    # skipped normally, but force_calibration=True applies the best
-    # available offset anyway rather than giving up -- built for songs
-    # where our own pass-1 pitch is confirmed unreliable for acoustic
-    # reasons, so even a weak MXL-based calibration beats none at all.
+    # force_calibration: a genuinely ambiguous population (4 different offsets,
+    # each covering exactly 1/4 of matches -- below both the full-population AND
+    # high-confidence-subset bars either way) is skipped normally, but
+    # force_calibration=True applies the best available offset anyway rather
+    # than giving up -- for songs where pass-1 pitch is unreliable enough that
+    # even a weak MXL-based calibration beats none at all.
     ambiguous_our = [
         Syllable(text=w, start=float(i), end=float(i) + 0.4, midi_note=0, is_word_start=True)
         for i, w in enumerate(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"])
@@ -3089,8 +2751,7 @@ with _tempfile.TemporaryDirectory() as tmpdir:
 
 print("\n--- musicxml_reference.apply_musicxml_references (plural): applies multiple reference "
       "files SEQUENTIALLY so coverage accumulates across files with different, only partly "
-      "overlapping lyric coverage -- real case: Once Upon A Dream, two arrangements covering "
-      "different fractions of the song ---")
+      "overlapping lyric coverage ---")
 from ultrastar_generator.musicxml_reference import apply_musicxml_references
 
 multi_syllables = [
@@ -3183,17 +2844,16 @@ assert few_lines_stats.skipped_reason is not None
 assert few_lines_stats.flags == []
 print("OK: too few matched lines correctly skipped calibration:", few_lines_stats.skipped_reason)
 
-# --- real per-song DRIFT (not just a constant offset) -- confirmed on real
-# audio (stars, tarzan, little_mermaid all showed this, see CLAUDE.md 0k-0m):
-# delta = offset + slope*lrc_start, spread widely enough that no single
-# 1-second bucket covers the required fraction, so the constant-offset
-# tier must fail before the robust drift-fit tier is tried. Also folds in
-# a word-level-recall check: line 3's LRC text has one word deliberately
-# wrong ("gamma3" instead of "beta3"), which the old whole-line-exact
-# match would have dropped entirely -- majority-vote word-level matching
-# should still recover it as a candidate. One genuine outlier (a
-# wrong-instance-style mismatch) should get flagged without dragging the
-# robust fit off course.
+# --- a per-song DRIFT (not just a constant offset): delta = offset +
+# slope*lrc_start, spread widely enough that no single 1-second bucket
+# covers the required fraction, so the constant-offset tier must fail
+# before the robust drift-fit tier is tried. Also folds in a
+# word-level-recall check: line 3's LRC text has one word deliberately
+# wrong ("gamma3" instead of "beta3"), which a whole-line-exact match
+# would have dropped entirely -- majority-vote word-level matching should
+# still recover it as a candidate. One genuine outlier (a wrong-instance-
+# style mismatch) should get flagged without dragging the robust fit off
+# course.
 drift_syllables = []
 for i in range(11):
     t0 = 10.5 * i + 5.0
@@ -3294,8 +2954,7 @@ with _tempfile.TemporaryDirectory() as d:
     assert out_path.read_bytes() == _JPEG_BYTES
 print(f"OK: extracted cover written with find_companions' own [CO] tag convention: {out_path.name}")
 
-print("\n--- cover_fetch: online cover download (MusicBrainz/CAA -> iTunes -> Deezer), "
-      "adapted from UltraStarKaraokeMaker's own cascade (see CLAUDE.md/project memory) ---")
+print("\n--- cover_fetch: online cover download (MusicBrainz/CAA -> iTunes -> Deezer) ---")
 from ultrastar_generator import cover_fetch
 
 
@@ -3644,8 +3303,7 @@ with _tempfile.TemporaryDirectory() as d:
     parsed_no_gap = parse_usdx_file(missing_gap_path)
     assert parsed_no_gap.gap_ms == 0, parsed_no_gap.gap_ms
 print("OK: a missing #GAP tag defaults to 0 rather than raising -- unlike #BPM, #GAP is NOT required by "
-      "the real UltraStar Deluxe format (real usdx itself treats an absent #GAP as 0); confirmed real case: "
-      "some SingStar-ripped files never write #GAP at all")
+      "the real UltraStar Deluxe format (some SingStar-ripped files never write #GAP at all)")
 
 print("\n--- verify_existing_song: compares an existing .txt's pitch/timing against a fresh pipeline run ---")
 from ultrastar_generator.verify_existing_song import verify_existing_song
@@ -3708,17 +3366,15 @@ print(f"OK: perfect pitch/timing on the matched subset does NOT mean PASS when c
       f"(coverage_fresh={result.coverage_fresh:.0%}, {len(result.unmatched_fresh)} unmatched word(s)) -- "
       f"the real bug this gate catches (a real ~10% failure rate was previously invisible)")
 
-# Case 6: a text-matched pair with a WILDLY wrong timing delta (real shape:
-# a repeated line/chorus pairing against the wrong sung instance -- see
-# CLAUDE.md's "repeated-phrase disambiguation" lessons) must count directly
-# against timing_within_tolerance_pct/recall/precision, not vanish from the
-# denominator. Real confirmed bug (2026-08-14, user's own catch): an EARLIER
-# version of this module bucketed candidate deltas and silently EXCLUDED
-# any pair more than 3.0s from the dominant cluster before scoring pitch/
-# timing accuracy at all -- this exact case (14/15 words correct, 1 matched
-# pair 50s off) used to report 100% pitch/timing accuracy on the "guarded"
-# subset, hiding the real failure. Same root cause independently confirmed
-# in scratchpad/compare_video_games.py's own design notes.
+# Case 6: a text-matched pair with a WILDLY wrong timing delta (e.g. a
+# repeated line/chorus pairing against the wrong sung instance) must count
+# directly against timing_within_tolerance_pct/recall/precision, not vanish
+# from the denominator. BUG REGRESSION: an earlier version of this module
+# bucketed candidate deltas and silently excluded any pair more than 3.0s
+# from the dominant cluster before scoring pitch/timing accuracy at all --
+# this exact case (14/15 words correct, 1 matched pair 50s off) used to
+# report 100% pitch/timing accuracy on the "guarded" subset, hiding the
+# real failure.
 mismatch_words = base_words + [("echo", 500.0, 0)]
 existing_mismatch = ParsedSong(title="T", artist="A", bpm=200.0, gap_ms=0,
                                 entries=_mk_word_syllables(mismatch_words))
@@ -3732,9 +3388,10 @@ print(f"OK: a single 50s-off matched pair correctly drags down timing_within_tol
       f"({result.timing_within_tolerance_pct:.0%}, not the old bucket-excluded 100%), "
       f"recall={result.recall:.0%}, precision={result.precision:.0%} -- nothing silently excluded")
 
-print("\n--- usdx_parser.parse_usdx_file: TRAILING-space word convention (real SingStar-shipped ground "
-      "truth files, e.g. Beauty and the Beast's notes.txt) parses word boundaries correctly -- BUG "
-      "REGRESSION for the leading-space-only heuristic silently merging a whole line into one word ---")
+print("\n--- usdx_parser.parse_usdx_file: TRAILING-space word convention (some externally-authored "
+      "files mark a word boundary with a trailing space on the last syllable instead of a leading "
+      "space) parses word boundaries correctly -- BUG REGRESSION for the leading-space-only "
+      "heuristic silently merging a whole line into one word ---")
 with _tempfile.TemporaryDirectory() as d:
     trailing_path = Path(d) / "Test Artist - Trailing Space.txt"
     # Mirrors real notes.txt exactly: "Bare"+"ly " -> "Barely", "e"+"ven " -> "even",
@@ -3802,17 +3459,13 @@ _, _, mwa_unrelated_confident = match_words_to_asr(mwa_existing, mwa_unrelated_a
 assert mwa_unrelated_confident == [True, False, True], mwa_unrelated_confident
 print("  OK: a genuinely unrelated ASR word ('xyz' for 'favors') is correctly rejected, not fuzzy-matched")
 
-print("  BUG REGRESSION (real case, Chappell Roan - Pink Pony Club, 2026-08-15, a song whose chorus repeats "
-      "3 full times): match_words_to_asr rewritten to a forward-only CURSOR over REAL LINES (via a new "
-      "line_of_word param, from _word_line_indices) instead of one global, non-chronological SequenceMatcher "
-      "diff over the whole song -- the global diff let a REPEATED line get matched to an EARLIER occurrence "
-      "than a correctly-placed line right next to it, confidently mis-marking the words wrong instead of "
-      "leaving them for interpolate_fallback. Real end-to-end validation on the actual reported song: GAP "
-      "check agreement 49%->96%, and the previously-broken repeated-chorus stretch (deltas of -104s to -136s) "
-      "now lands within 0.1-0.8s. An earlier fixed-size-6-word-chunk version of this same rewrite was tried "
-      "first and, even after several rounds of tightening its own guards, still occasionally mismatched this "
-      "exact stretch -- an arbitrary chunk boundary can slice a real line in half; real LINE boundaries (this "
-      "final design) fixed it cleanly:")
+print("  BUG REGRESSION (a song whose chorus repeats several times): match_words_to_asr rewritten to a "
+      "forward-only CURSOR over REAL LINES (via a new line_of_word param, from _word_line_indices) "
+      "instead of one global, non-chronological SequenceMatcher diff over the whole song -- the global "
+      "diff let a REPEATED line get matched to an EARLIER occurrence than a correctly-placed line right "
+      "next to it, confidently mis-marking the words wrong instead of leaving them for "
+      "interpolate_fallback. Chunking by real line boundaries (rather than a fixed word count, which can "
+      "slice a real line in half) is what made this reliable:")
 from ultrastar_generator.realign import _word_line_indices as _mwa_word_line_indices
 
 mwa_rep_entries = []
@@ -3853,15 +3506,13 @@ print("  OK: the repeated 'chorus one two three' line correctly matched its OWN 
       "occurrence, never re-matching the first line's already-claimed occurrence; the unmatchable bridge "
       "line in between correctly stayed unconfident rather than guessing")
 
-print("  BUG REGRESSION (real case, Our Lady Peace - 'Somewhere Out There', 2026-08-15, a song with several "
-      "lines repeating BACK-TO-BACK 3-4 times in a row): even a FRESH chunk's own base search window is "
-      "already wide enough to reach past a nearby but only PARTIALLY-transcribed correct occurrence into a "
-      "LATER, more COMPLETE repeat of the same line -- a difflib search doesn't inherently prefer the "
-      "nearest valid match over a fuller one it finds further away. Fixed with a tight-preferred-when-"
-      "substantial window tried before the normal (wider) one -- two rejected threshold designs are also "
-      "covered by this same test: requiring a FULLY complete tight match was too strict (this exact case's "
-      "correct near occurrence is only 2 of 4 words, ASR having missed the other 2), while letting ANY "
-      "passing tight match win outright was too loose (regressed a different real song, Chicago):")
+print("  BUG REGRESSION (a song with several lines repeating BACK-TO-BACK 3-4 times in a row): even a "
+      "fresh chunk's own base search window is already wide enough to reach past a nearby but only "
+      "partially-transcribed correct occurrence into a LATER, more complete repeat of the same line -- a "
+      "difflib search doesn't inherently prefer the nearest valid match over a fuller one it finds "
+      "further away. Fixed with a tight-preferred-when-substantial window tried before the normal (wider) "
+      "one -- requiring a fully complete tight match was too strict, and letting any passing tight match "
+      "win outright was too loose:")
 mwa_dense_entries = []
 for _t in ["same", "start"]:
     mwa_dense_entries.append(Syllable(text=_t, start=0.0, end=1.0, midi_note=0, is_word_start=True))
@@ -3942,15 +3593,14 @@ assert none_starts == [0.0, 10.0, 20.0] and none_ends == [0.5, 10.5, 20.5], (non
 print("    OK: NO anchor anywhere in the whole song -> original timing kept completely unchanged, never "
       "guessed from nothing (this mode always has a safe fallback, unlike mxl_lrc_generator's equivalent)")
 
-print("  BUG REGRESSION (real case: David Bowie - I'm Afraid of Americans, a song with many near-"
-      "identical repeated short lines): a fallback word's own interpolated estimate must NEVER drag "
-      "an already-CONFIDENT neighbor's own real match forward -- confirmed real case: a mis-aimed LRC "
-      "line window (windowed matching picked the wrong occurrence of a repeated line) put a CONFIDENT "
-      "anchor chronologically EARLIER than the confident anchor before it (a real inversion between two "
-      "'confident' matches), which sends interpolate_fallback's own rate formula negative -- its "
-      "degenerate fallback (shift from the earlier anchor alone, ignoring the later one entirely) then "
-      "overshot PAST several subsequent genuinely-confident matches, and the old forward-only clamp "
-      "flattened every one of them to that one wrong value:")
+print("  BUG REGRESSION (a song with many near-identical repeated short lines): a fallback word's own "
+      "interpolated estimate must NEVER drag an already-CONFIDENT neighbor's own real match forward -- a "
+      "mis-aimed LRC line window (windowed matching picked the wrong occurrence of a repeated line) can "
+      "put a confident anchor chronologically earlier than the confident anchor before it (an inversion "
+      "between two 'confident' matches), which sends interpolate_fallback's own rate formula negative -- "
+      "its degenerate fallback (shift from the earlier anchor alone) then overshoots past several "
+      "subsequent genuinely-confident matches, and an unguarded forward-only clamp would flatten every "
+      "one of them to that one wrong value:")
 cb_words = [ExistingWord(entry_indices=[], text=f"w{i}", norm=f"w{i}", orig_start=float(i), orig_end=float(i) + 0.5)
             for i in range(5)]
 # w0 confident at real t=10.0. w2/w3/w4 confident at real t=5.0/5.3/5.6 --
@@ -3969,11 +3619,10 @@ print("  OK: confident words w2/w3/w4 keep their own real values exactly, comple
       "still remain -- one of the two confident ANCHORS is itself wrong here, which this pass can't "
       "resolve -- but it no longer drags w2/w3/w4 down with it")
 
-print("  _force_align_unconfident_runs (PROTOTYPE, 2026-08-10, adapted from UltraStarKaraokeMaker): forces "
-      "the EXISTING file's own text for a still-unconfident run onto the audio window between its nearest "
-      "confident neighbors via a real forced alignment -- doesn't need ASR to have transcribed anything "
-      "there at all, so it can recover a run a text-search-based rematch genuinely can't (real case: "
-      "'mystery' below, never transcribed by ASR at all):")
+print("  _force_align_unconfident_runs: forces the existing file's own text for a still-unconfident run "
+      "onto the audio window between its nearest confident neighbors via a real forced alignment -- "
+      "doesn't need ASR to have transcribed anything there at all, so it can recover a run a "
+      "text-search-based rematch genuinely can't:")
 from ultrastar_generator.realign import _force_align_unconfident_runs
 import ultrastar_generator.transcription as transcription_mod_rg
 import ultrastar_generator.model_cache as model_cache_mod_rg
@@ -4049,8 +3698,7 @@ assert sla_starts[2] == 20.0, sla_starts  # this song's single ASR anchor isn't 
 print("  OK: 'charlie' (first word of the second LRC line) gets a real-time anchor from the line's own "
       "timestamp; 'bravo'/'delta' (not line-first) are untouched, left for interpolation")
 
-print("  seed_lrc_anchors returns None (no mutation) when no usable candidate exists -- confirmed real "
-      "case: Beauty and the Beast has NO valid LRCLIB candidate at all:")
+print("  seed_lrc_anchors returns None (no mutation) when no usable candidate exists:")
 sla_none_starts, sla_none_ends, sla_none_confident = match_words_to_asr(sla_existing, sla_asr)
 _sys.modules["requests"] = _FakeRequestsModule(search_payload=[])  # deterministic empty search, no real network
 sla_none_result = seed_lrc_anchors(sla_existing, sla_asr, sla_none_starts, sla_none_ends, sla_none_confident,
@@ -4060,9 +3708,9 @@ assert sla_none_confident == [True, False, False, False], sla_none_confident  # 
 print("  OK: no usable LRC candidate -> starts/ends/confident left completely untouched, falls through to "
       "ASR-only interpolation")
 
-print("  match_words_to_asr_windowed (PROTOTYPE 'windowed' lrc_mode): LRC line starts window the ASR "
-      "search per-line -- a same-text ASR word far outside the line's own window is correctly ignored, "
-      "unlike whole-song matching which has no time information to reject it with:")
+print("  match_words_to_asr_windowed ('windowed' lrc_mode): LRC line starts window the ASR search "
+      "per-line -- a same-text ASR word far outside the line's own window is correctly ignored, unlike "
+      "whole-song matching which has no time information to reject it with:")
 from ultrastar_generator.realign import match_words_to_asr_windowed, prepare_lrc
 
 mww_existing = extract_words([
@@ -4094,11 +3742,9 @@ assert mww_prep is not None and mww_prep.word_lines == [0, 0, 1, 1], mww_prep
 print("  OK: prepare_lrc returns the calibrated lines + per-word line assignment both strategies build on")
 
 print("  check_repeat_structure: rejects an LRC candidate whose REPEAT STRUCTURE doesn't match ours -- "
-      "BUG REGRESSION (real case: David Bowie - I'm Afraid of Americans, an LRC candidate from a "
-      "different edition/box-set mix with 9 extra chorus repeats): the real signal can't be a single "
-      "exact-repeated LINE, since a real chorus is often split across several near-duplicate variants "
-      "(e.g. 'I'm afraid of Americans'/'...of the world'/'...I can't help it'), each individually "
-      "landing within tolerance on its own -- the shared distinctive WORD across all of them is needed:")
+      "the signal can't be a single exact-repeated LINE, since a real chorus is often split across "
+      "several near-duplicate variants, each individually landing within tolerance on its own -- the "
+      "shared distinctive WORD across all of them is needed:")
 from ultrastar_generator.realign import _reconstruct_our_lines, check_repeat_structure
 
 crs_entries = []
@@ -4128,9 +3774,9 @@ print("  OK: mismatched repeat structure ('chorus' 6x vs 8x, split across TWO ne
 assert check_repeat_structure(["alpha", "bravo", "charlie"], ["anything", "goes", "here"]) is None
 print("  OK: no repeated line in our own file at all -> nothing to check, never rejects")
 
-print("  reconcile_line_structure (2026-08-14, user's own design): RECONCILES a repeat-structure "
-      "mismatch instead of rejecting the whole candidate -- walks both line sequences forward "
-      "together, dropping whichever side's extra lines don't correspond to anything on the other:")
+print("  reconcile_line_structure: RECONCILES a repeat-structure mismatch instead of rejecting the "
+      "whole candidate -- walks both line sequences forward together, dropping whichever side's extra "
+      "lines don't correspond to anything on the other:")
 from ultrastar_generator.lrc_timing import reconcile_line_structure
 
 rls_matching = reconcile_line_structure(crs_our_lines, [(float(i), t) for i, t in enumerate(crs_lrc_matching)])
@@ -4156,12 +3802,10 @@ assert rls_unrelated is None, rls_unrelated
 print("  OK: genuinely unrelated content (not just a differing repeat count) still declines -- "
       "match ratio falls below the minimum, same fail-closed behavior check_repeat_structure used to give")
 
-print("  BUG REGRESSION (real case, found via reconcile_line_structure's own real-audio validation on "
-      "David Bowie - I'm Afraid of Americans, 2026-08-15): an existing file's CURLY apostrophes "
-      "(’, e.g. “Johnny’s”) must normalize the same as LRCLIB's straight ones -- the old "
-      "regex-only _normalize silently deleted every curly apostrophe, desyncing an otherwise byte-"
-      "identical line ('johnnys' vs \"johnny's\") and making EVERY apostrophe-containing line fail to "
-      "match, even on a real, well-matched candidate:")
+print("  BUG REGRESSION: an existing file's CURLY apostrophes (', e.g. “Johnny’s”) must "
+      "normalize the same as LRCLIB's straight ones -- the old regex-only _normalize silently deleted "
+      "every curly apostrophe, desyncing an otherwise byte-identical line and making EVERY "
+      "apostrophe-containing line fail to match, even on a real, well-matched candidate:")
 rls_curly = reconcile_line_structure(
     ["Johnny’s in America", "I’m afraid of Americans", "can’t help it"],
     [(0.0, "Johnny's in America"), (1.0, "I'm afraid of Americans"), (2.0, "can't help it")],
@@ -4169,11 +3813,10 @@ rls_curly = reconcile_line_structure(
 assert rls_curly is not None and rls_curly.n_matched == 3 and rls_curly.n_our_unmatched == 0, rls_curly
 print("  OK: curly vs. straight apostrophes no longer block an otherwise-identical line from matching")
 
-print("  reconcile_line_structure: a real LRC line-MERGE (real case, Trixie Mattel - Video Games, "
-      "2026-08-15): the candidate writes TWO of our own lines as one combined LRC line. User's own "
-      "design: split the one real timestamp into per-our-line synthetic anchors (proportional to word "
-      "count, bounded within the real [this line, next line) window), so BOTH of our lines get a real "
-      "anchor instead of neither:")
+print("  reconcile_line_structure: a real LRC line-MERGE -- the candidate writes TWO of our own lines "
+      "as one combined LRC line. Splits the one real timestamp into per-our-line synthetic anchors "
+      "(proportional to word count, bounded within the real [this line, next line) window), so BOTH of "
+      "our lines get a real anchor instead of neither:")
 rls_merge_our = ["It's you, it's you, it's all for you,", "Everything I do", "Tell you all the time,"]
 rls_merge_lrc = [
     (10.0, "It's you, it's you, it's all for you, everything I do"),
@@ -4229,10 +3872,9 @@ print("  OK: prepare_lrc succeeded using the reconciled 6-line subset (matching 
 print("  OK: prepare_lrc itself rejects the candidate (returns None, same as 'no candidate found') and "
       "logs the specific reason when our_lines/log are provided")
 
-print("  BUG REGRESSION (real case, Trixie Mattel - Video Games, 2026-08-15): reconcile_line_structure's "
-      "equality check must compare WHITESPACE-FLATTENED text, not space-joined tokens -- our own file had "
-      "a genuine typo ('livin'if' for 'livin' if', a missing space) that made an otherwise byte-identical "
-      "line fail to match at all (different token count/boundaries):")
+print("  BUG REGRESSION: reconcile_line_structure's equality check must compare WHITESPACE-FLATTENED "
+      "text, not space-joined tokens -- a stray missing/extra space in our own file's text can otherwise "
+      "make a byte-identical line fail to match at all (different token count/boundaries):")
 from ultrastar_generator.lrc_timing import _flat_fuzzy_equal
 
 rls_typo = reconcile_line_structure(
@@ -4244,9 +3886,7 @@ print("  OK: a missing/extra space no longer desyncs an otherwise byte-identical
 
 print("  reconcile_line_structure: a JOINT (p, q) recovery search -- a stretch where BOTH sides have "
       "genuinely DIFFERENT content before the next shared line needs BOTH cursors to move together to "
-      "find the resync point; single-axis-only search (only ever drop from one side) can never reach it "
-      "(real case, Video Games: our own repeated ad-lib has no exact counterpart in the candidate's "
-      "differently-worded lines just before the same chorus repeat):")
+      "find the resync point; single-axis-only search (only ever drop from one side) can never reach it:")
 rls_joint_our = ["same start", "our extra A", "our extra B", "shared resync", "same end"]
 rls_joint_lrc = [
     (0.0, "same start"), (1.0, "lrc extra 1"), (2.0, "lrc extra 2"),
@@ -4260,9 +3900,9 @@ assert [t for _t, t in rls_joint.lrc_lines] == ["same start", "shared resync", "
 print("  OK: neither side alone (p=0 or q=0) ever matches 'shared resync' -- only the joint p=2,q=3 jump "
       "finds it, correctly dropping the 3 candidate-only lines while leaving our own 2 unmatched lines as-is")
 
-print("  _flat_fuzzy_equal / fuzzy _consume_as_merge (user's own request, 2026-08-15): tolerate a common "
-      "lyric-transcription spelling variant -- a dropped/elided letter marked with an apostrophe -- as the "
-      "SAME line, not a genuinely different one ('Ev'rything' for 'Everything', 'livin'' for 'living'):")
+print("  _flat_fuzzy_equal / fuzzy _consume_as_merge: tolerate a common lyric-transcription spelling "
+      "variant -- a dropped/elided letter marked with an apostrophe -- as the SAME line, not a "
+      "genuinely different one ('Ev'rything' for 'Everything', 'livin'' for 'living'):")
 assert _flat_fuzzy_equal("ev'rythingido", "everythingido") is True
 assert _flat_fuzzy_equal("livin'ontheedge", "livingontheedge") is True
 assert _flat_fuzzy_equal("livin'ontheedge", "dancinginthedark") is False, \
@@ -4275,10 +3915,10 @@ assert rls_fuzzy is not None and rls_fuzzy.n_matched == 3 and rls_fuzzy.n_our_un
 print("  OK: 'Ev'rything'/'Everything' and 'livin''/'living' both matched via bounded character-level "
       "fuzzy tolerance; genuinely different text still correctly declines")
 
-print("  reconcile_line_structure: FILLER-WORD tolerance (user's own explicit request, 2026-08-15) -- "
-      "an LRC's own author and our existing file's own author may each choose differently whether to "
-      "write an ad-lib ('ooh'/'mmm') or a filler connector ('yeah'/'and'/'but'); that's a transcription "
-      "choice, not the line actually being different content, and is specifically common in realignment:")
+print("  reconcile_line_structure: FILLER-WORD tolerance -- an LRC's own author and our existing "
+      "file's own author may each choose differently whether to write an ad-lib ('ooh'/'mmm') or a "
+      "filler connector ('yeah'/'and'/'but'); that's a transcription choice, not the line actually "
+      "being different content:")
 from ultrastar_generator.lrc_timing import _strip_filler_flat
 
 assert _strip_filler_flat("yeah i love you") == "iloveyou", _strip_filler_flat("yeah i love you")
@@ -4323,12 +3963,12 @@ print("  OK: LRC-merge detection also tolerates a filler word ('Yeah,') present 
       "but absent from the candidate's merged line -- still resolves as a real merge, and the kept output "
       "text keeps our own original wording (filler word included), only the COMPARISON ignored it")
 
-print("  BUG REGRESSION (real case, Trixie Mattel - Video Games, 2026-08-15): prepare_lrc's word_lines "
-      "must be built DIRECTLY from reconcile_line_structure's own our_line_index (via our_line_of_word), "
-      "not re-derived by calling assign_words_to_lines -- its own independent whole-song WORD-level diff "
-      "has no line-boundary information and can disagree with (and corrupt) the already-correct line-level "
-      "correspondence. Critically, a genuinely-unmatched our-own-line's words must come out as None, not "
-      "silently inherit the nearest PRECEDING matched line's index:")
+print("  BUG REGRESSION: prepare_lrc's word_lines must be built DIRECTLY from "
+      "reconcile_line_structure's own our_line_index (via our_line_of_word), not re-derived by calling "
+      "assign_words_to_lines -- its own independent whole-song WORD-level diff has no line-boundary "
+      "information and can disagree with (and corrupt) the already-correct line-level correspondence. "
+      "Critically, a genuinely-unmatched our-own-line's words must come out as None, not silently "
+      "inherit the nearest PRECEDING matched line's index:")
 from ultrastar_generator.realign import _word_line_indices
 
 wlow_entries = [
@@ -4389,14 +4029,12 @@ assert [s.midi_note for s in rsw_syllables] == [1, 2, 3, 4], rsw_syllables  # pi
 print("  OK: realign_song(lrc_mode='windowed') end-to-end also correctly rejects the far-away decoy via "
       "the LRC line window, pitch untouched")
 
-print("  BUG REGRESSION (real case: David Bowie - Heroes): lrc_mode='seed' must ALSO refuse to seed "
-      "anchors from an LRC candidate whose time calibration failed -- a wrong-recording candidate's "
-      "uncalibrated line timestamp seeded as an anchor can land LATER than several already-correctly-"
-      "ASR-matched neighbors, and interpolate_fallback's forward-only monotonic clamp then drags those "
-      "correct neighbors forward to match the bad anchor, corrupting real matches, not just filling a "
-      "genuine gap. Confirmed real case: an LRCLIB candidate for 'Heroes' by a completely different "
-      "artist (a choral cover, calibration_confidence=0.0) seeded 'Then' at a time LATER than 'Just for "
-      "one day', which was already correctly ASR-matched -- corrupting that whole passage:")
+print("  BUG REGRESSION (a wrong-recording LRC candidate, e.g. a choral cover): lrc_mode='seed' must "
+      "ALSO refuse to seed anchors from an LRC candidate whose time calibration failed -- an uncalibrated "
+      "line timestamp seeded as an anchor can land LATER than several already-correctly-ASR-matched "
+      "neighbors, and interpolate_fallback's forward-only monotonic clamp then drags those correct "
+      "neighbors forward to match the bad anchor, corrupting real matches, not just filling a genuine "
+      "gap:")
 bg_existing = extract_words([
     Syllable(text="alpha", start=0.0, end=1.0, midi_note=0, is_word_start=True),
     Syllable(text="bravo", start=1.0, end=2.0, midi_note=0, is_word_start=True),
@@ -4563,7 +4201,7 @@ assert any("WARNING" in line and "may not match" in line for line in rs_bad_log)
 print("  OK: 0% real anchor rate still produces a valid (unchanged-timing) output rather than crashing, "
       "with a clear warning logged for the user to review")
 
-print("  _retry_asr_if_low_quality (PROTOTYPE): a low anchor rate triggers a re-transcription with "
+print("  _retry_asr_if_low_quality: a low anchor rate triggers a re-transcription with "
       "config.RETRY_ASR_MODEL, keeping whichever attempt has the higher anchor rate -- never fires when "
       "already using the retry model, or when the anchor rate is already above the bar:")
 from ultrastar_generator.realign import _retry_asr_if_low_quality, RealignPipelineOptions
@@ -4587,8 +4225,8 @@ assert any("improved" in line for line in rq_log), rq_log
 print(f"  OK: original 0% anchor rate, --batch mode -> retry with '{config_mod.RETRY_ASR_MODEL}' finds all "
       f"10 words, retry result adopted")
 
-# (a2) SAME low anchor rate, but NOT --batch mode (2026-08-10, user's explicit request) -> logs a WARNING
-# suggesting --batch instead, never actually calls transcribe_words, returns the original unchanged.
+# (a2) SAME low anchor rate, but NOT --batch mode -> logs a WARNING suggesting --batch
+# instead, never actually calls transcribe_words, returns the original unchanged.
 def _rq_boom_not_batch(*a, **kw):
     raise AssertionError("transcribe_words must not be called outside --batch mode")
 transcription_mod.transcribe_words = _rq_boom_not_batch
@@ -4625,10 +4263,10 @@ rq_noop2 = _retry_asr_if_low_quality(
 assert rq_noop2 is rs_result, "must be a no-op when the anchor rate is already above the retry bar"
 print("  OK: anchor rate already above the retry bar -> no retry attempted")
 
-print("  _retry_asr_if_low_quality per-PASSAGE trigger (PROTOTYPE, 2026-08-10): a long consecutive run of "
-      "unconfident words must ALSO trigger a retry even when the whole-song anchor rate is already fine -- "
-      "real case: David Bowie - Magic Dance with small.en had a 58% anchor rate (well above the bar) while "
-      "one hallucinated decoder segment still left a real passage ~12-14s off in the final output:")
+print("  _retry_asr_if_low_quality per-PASSAGE trigger: a long consecutive run of unconfident words "
+      "must ALSO trigger a retry even when the whole-song anchor rate is already fine -- a single "
+      "hallucinated decoder segment can leave a real passage badly misplaced while the aggregate rate "
+      "stays healthy:")
 from ultrastar_generator.realign import RealignQuality, RealignResult
 
 # (d) anchor rate clears the whole-song bar, but longest_unconfident_run alone clears ITS OWN bar -> fires.
@@ -4686,9 +4324,9 @@ ro_different_out = resolve_realign_output_path(ro_existing_path, "C:/Songs/somew
 assert check_output_not_existing_file(ro_different_out, ro_existing_path) is None
 print("  OK: an explicit --output pointing somewhere genuinely different is allowed")
 
-print("\n--- realign: 'validate' strategy (PROTOTYPE) -- a word CONFIRMED by ASR near its own "
-      "(GAP-corrected) original position is left completely untouched instead of being replaced "
-      "with ASR's own value ---")
+print("\n--- realign: 'validate' strategy -- a word CONFIRMED by ASR near its own (GAP-corrected) "
+      "original position is left completely untouched instead of being replaced with ASR's own "
+      "value ---")
 from ultrastar_generator.realign import (
     compute_gap_calibration, validate_words_against_asr, realign_song_validate, GapCalibration,
 )
@@ -4713,15 +4351,13 @@ print("  OK: a uniform +5.0s shift across all 5 words is recovered as one confid
       "offset, using the SAME robust two-tier calibration already validated for LRC line timing")
 
 print("  validate_words_against_asr: a word whose (GAP-corrected) original START is CONFIRMED by ASR "
-      "(within tolerance) validates using ASR's OWN start (more precise than the original -- real bug "
-      "found via real hand-timed ground truth, 2026-08-15, Our Lady Peace - 'Somewhere Out There': keeping "
-      "the original's own start exactly, discarding ASR's already-known-close reading entirely, let a "
-      "small systematic bias in the original file's own timing propagate through every validated word AND "
-      "every interpolated word between them -- real comparison against hand-timed truth.txt: only 27.6%/"
-      "51.2% of words within 100ms/150ms, vs. 51.9%/74.2% for --strategy replace on the SAME audio). The "
-      "word's own ORIGINAL LENGTH is still always kept (ASR's end timestamp is never trusted -- see the "
-      "function's own docstring); a word ASR disagrees with beyond tolerance is left unvalidated, same "
-      "safety net as before -- this is NOT the same as --strategy replace, which has no such guardrail:")
+      "(within tolerance) validates using ASR's OWN start (more precise than the original -- keeping the "
+      "original's own start exactly, discarding ASR's already-known-close reading, would let a small "
+      "systematic bias in the original file's own timing propagate through every validated word AND "
+      "every interpolated word between them). The word's own ORIGINAL LENGTH is still always kept "
+      "(ASR's end timestamp is never trusted -- see the function's own docstring); a word ASR disagrees "
+      "with beyond tolerance is left unvalidated, same safety net as before -- this is NOT the same as "
+      "--strategy replace, which has no such guardrail:")
 gc_words2 = extract_words([
     Syllable(text="alpha", start=10.0, end=10.5, midi_note=0, is_word_start=True),
     Syllable(text="bravo", start=11.0, end=11.5, midi_note=0, is_word_start=True),
@@ -4773,8 +4409,7 @@ assert gc4.correction_fn is None
 vw4_starts, _vw4_ends, vw4_validated = validate_words_against_asr(
     extract_words([Syllable(text="alpha", start=10.0, end=10.5, midi_note=0, is_word_start=True)]), gc4)
 assert vw4_validated == [True] and vw4_starts[0] == 15.0, (vw4_validated, vw4_starts)
-print("  OK: correction_fn=None (default) falls back to the offset+slope formula, unchanged from before "
-      "this session's tier-3 addition")
+print("  OK: correction_fn=None (default) falls back to the offset+slope formula")
 
 print("  realign_song_validate end-to-end: an already-correct file whose ONLY problem is a wrong GAP -- "
       "every word's own relative timing/length is preserved EXACTLY, just uniformly shifted, and pitch/"
@@ -4998,8 +4633,7 @@ print("OK: a download failure (network/private/removed video) raises YoutubeDown
 del _sys.modules["yt_dlp"]
 
 print("\n--- CLI smoke test: both entry points' build_arg_parser() must not crash "
-      "(catches a missing config constant an argparse default references, e.g. FORCE_ALIGN_GAPS "
-      "went missing from config.py once this session without any other test catching it) ---")
+      "(catches a missing config constant an argparse default references) ---")
 from ultrastar_generator.main import build_arg_parser as _main_build_arg_parser
 _main_build_arg_parser().parse_args(["dummy_input_dir"])
 print("OK: main.py's build_arg_parser() builds and parses without error")
@@ -5010,8 +4644,7 @@ from ultrastar_generator.pitch_refresh import build_arg_parser as _pitch_refresh
 _pitch_refresh_build_arg_parser().parse_args(["dummy_input_dir"])
 print("OK: pitch_refresh.py's build_arg_parser() builds and parses without error")
 
-print("\n--- pitch_refresh: pitch-only refresh of an existing usdx timing base (same basic idea as "
-      "the external ultrastar_pitch/usp tool, see CLAUDE.md/project memory) ---")
+print("\n--- pitch_refresh: pitch-only refresh of an existing usdx timing base ---")
 import ultrastar_generator.pitch_refresh as pitch_refresh_mod
 from ultrastar_generator.pitch_refresh import (
     refresh_song_pitch, compute_pitch_class_predictions, resolve_pitch_refresh_output_path,
@@ -5083,7 +4716,7 @@ try:
     print("OK: every note's pitch CLASS was replaced with the (fallback-filled) prediction:", new_pcs)
 
     new_midis = [n.midi_note for n in result_notes]
-    # octave preserved: only the pitch-CLASS component changes, same convention as usp itself
+    # octave preserved: only the pitch-CLASS component changes
     assert new_midis == [63, 63, 69, 81], new_midis
     print("OK: each note's OCTAVE is preserved -- only the pitch-class digit changed "
           f"(orig midi [60,61,62,74] -> {new_midis})")
@@ -5126,8 +4759,7 @@ with _tempfile_pr.TemporaryDirectory() as _tmp_pr2:
 print("OK: a folder with a previous pitch-refresh output AND a previous realign output still "
       "correctly picks the ORIGINAL file, never either module's own prior output as the next input")
 
-print("\n--- pitch_refresh._KeyNudge: vendored port of usp's own StochasticPostprocessor (OFF by "
-      "default in this module -- see key_nudge=False default and project memory on why) ---")
+print("\n--- pitch_refresh._KeyNudge: a ±1-semitone key-based pitch nudge (off by default) ---")
 key0 = _KeyNudge.detect_key([0] * 10)
 assert key0 == 0, key0
 print(f"OK: a pitch-class distribution concentrated entirely at class 0 detects pseudo-key {key0} "
@@ -5275,8 +4907,7 @@ print("OK: apply_mxl_pitch_references skips an unparseable file (doesn't abort t
       "applies the next, genuinely usable one")
 
 print("\n--- pitch_ambiguity: ambiguity-gated Krumhansl-Kessler key tie-break for pass-1's own "
-      "RMVPE-based note detection (2026-08-16, real-audio validated, see config."
-      "ENABLE_AMBIGUITY_KEY_TIEBREAK) ---")
+      "RMVPE-based note detection (config.ENABLE_AMBIGUITY_KEY_TIEBREAK) ---")
 from ultrastar_generator.pitch_ambiguity import (
     bin_pitch_classes, note_pc_mass, detect_key, apply_ambiguity_tiebreak,
 )
@@ -5366,12 +4997,8 @@ from ultrastar_generator.fix_start_note_beat import (
 )
 from ultrastar_generator.usdx_parser import parse_usdx_file, UsdxParseError
 
-# Real motivating case, reproduced synthetically: a hand-authored file
-# where the first note sits on a NEGATIVE beat (e.g. a corrected pickup
-# note starting before the file's own GAP anchor) -- confirmed for real
-# against the actual "Stars" ground-truth file (first note beat -14,
-# GAP 8630, BPM 215.34 -> fixed GAP 7655), reproduced here in miniature
-# so the regression suite needs no real audio/files.
+# A hand-authored file where the first note sits on a NEGATIVE beat (e.g. a
+# corrected pickup note starting before the file's own GAP anchor).
 fsnb_text = (
     "#TITLE:Test\n#ARTIST:Test\n#BPM:120\n#GAP:1000\n"
     ": -8 4 5 Hel\n: -4 4 7 lo\n- 0\n: 10 4 9  world\nE\n"
@@ -5394,11 +5021,8 @@ print("  OK: every note/break beat shifts by the same constant (+8) and GAP is p
       "equivalent milliseconds (1000ms -> 0ms) so the first note lands exactly on beat 0")
 
 # Real-timing equivalence: re-parsing before/after must agree on every
-# entry's REAL start/end time (within float/ms-rounding noise), proving
-# this is a pure re-encoding, not an actual timing change -- this is
-# the exact property the first (rejected) seconds-round-trip
-# implementation FAILED at real scale (see fix_start_note_beat.py's own
-# module docstring for the real "Stars" float-floor bug this replaced).
+# entry's real start/end time (within float/ms-rounding noise), proving
+# this is a pure re-encoding, not an actual timing change.
 import tempfile as _tempfile
 with _tempfile.TemporaryDirectory() as _fsnb_dir:
     _fsnb_orig_path = Path(_fsnb_dir) / "orig.txt"
@@ -5470,17 +5094,16 @@ with _tempfile.TemporaryDirectory() as _fsnb_dir2:
     assert _fsnb_run_result.output_path.read_text(encoding="utf-8") == fsnb_new_text
 print("  OK: run_fix_start_note_beat writes the expected output file end-to-end")
 
-print("\n--- mxl_lrc_generator.apply_gap_anchor_override: GAP anchor safety net (2026-08-19, real 'Stars' "
-      "bug) -- line 0's calibrated LRC start is overridden back to its own DIRECT real-ASR anchor when "
-      "tier-1/2/3's global calibration disagrees with it by more than GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC, "
-      "since line 0 alone determines #GAP for the WHOLE FILE ---")
+print("\n--- mxl_lrc_generator.apply_gap_anchor_override: GAP anchor safety net -- line 0's calibrated "
+      "LRC start is overridden back to its own DIRECT real-ASR anchor when tier-1/2/3's global "
+      "calibration disagrees with it by more than GAP_ANCHOR_OVERRIDE_TOLERANCE_SEC, since line 0 "
+      "alone determines #GAP for the whole file ---")
 from ultrastar_generator.mxl_lrc_generator import apply_gap_anchor_override
 
-# Real "Stars" numbers (see CLAUDE.md): line 0's own direct delta was
-# +0.057s (lrc_start 7.630 -> direct anchor 7.687, i.e. already accurate),
-# but tier 1's global constant-offset model mistook per-line noise for a
-# systematic +1.0s offset, corrupting the calibrated line 0 to 8.630 --
-# a 0.943s disagreement, comfortably over the 0.5s tolerance -> override.
+# Line 0's own direct delta was +0.057s (already accurate), but a global
+# constant-offset model mistook per-line noise for a systematic +1.0s
+# offset, corrupting the calibrated line 0 -- a 0.943s disagreement,
+# comfortably over the 0.5s tolerance -> override.
 gao_stars_lines = [(8.630, "There, out in the darkness"), (13.980, "A fugitive running")]
 gao_stars_candidates = [(0, 7.630, 0.057), (1, 12.980, 0.930)]
 gao_stars_out = apply_gap_anchor_override(gao_stars_lines, gao_stars_candidates, tolerance_sec=0.5)
@@ -5490,12 +5113,9 @@ assert gao_stars_out[1] == gao_stars_lines[1], "every OTHER line must be untouch
 print("  OK: line 0 overridden to its own direct anchor (7.687) when the calibrated version (8.630) "
       "disagrees by 0.943s (> 0.5s tolerance); line 1 (not line 0) is completely untouched")
 
-# Real "Ordinary Day" numbers: line 0's own direct delta was +2.611s
-# (lrc_start 14.530 -> direct anchor 17.141), and tier 1's global offset
-# (+3.0s, imprecise but already-validated) calibrates line 0 to 17.530 --
-# only 0.389s off, UNDER the 0.5s tolerance -> must NOT override (this is
-# the already-shipped, already-validated behavior for a genuine
-# systematic offset; the safety net must stay silent here).
+# A genuine systematic offset case: line 0's own direct delta was +2.611s,
+# and tier 1's global offset (imprecise but already-validated) calibrates
+# line 0 to only 0.389s off, under the 0.5s tolerance -> must NOT override.
 gao_od_lines = [(17.530, "Well I'm sitting here")]
 gao_od_candidates = [(0, 14.530, 2.611)]
 gao_od_out = apply_gap_anchor_override(gao_od_lines, gao_od_candidates, tolerance_sec=0.5)

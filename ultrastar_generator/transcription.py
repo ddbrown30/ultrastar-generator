@@ -1,16 +1,4 @@
-"""Word-level lyric transcription.
-
-Timing accuracy matters a lot here, since lyric_alignment.py fits words
-onto an already-accurate note grid using these timestamps. Whisper's own
-decoder-derived word timestamps (what faster-whisper reports by default)
-are frequently off by a noticeable fraction of a second, because they're
-a byproduct of cross-attention weights, not an actual alignment model.
-
-WhisperX fixes this by running a second pass: a wav2vec2 CTC model does a
-proper forced alignment of the transcript against the audio, which is
-dramatically more accurate for word boundaries. We use it when available
-and fall back to faster-whisper's own timestamps (with a warning) if not.
-"""
+"""Word-level lyric transcription. Prefers WhisperX (forced alignment, accurate word boundaries) over faster-whisper's decoder timestamps (less precise); falls back to the latter if WhisperX isn't available."""
 
 from __future__ import annotations
 
@@ -25,54 +13,32 @@ from . import config
 from . import model_cache
 from .models import Word
 
-# pyannote.audio (pulled in by whisperx's VAD) tries to use torchcodec for
-# audio decoding and warns loudly when torchcodec's compiled DLLs can't find
-# a compatible FFmpeg build on this machine. Harmless: WhisperX always hands
-# pyannote a preloaded in-memory waveform, which is the documented fallback
-# path this same warning points to -- never triggers the broken decode path.
+# Harmless: pyannote/torchcodec warning about FFmpeg detection; WhisperX always feeds it a preloaded waveform.
 warnings.filterwarnings(
     "ignore",
     message=r"\s*torchcodec is not installed correctly.*",
     category=UserWarning,
 )
 
-# torch's CUDA allocator warns that `expandable_segments` (a Linux-only
-# allocator optimization) isn't supported on this platform. We never set
-# that config option ourselves -- this fires purely because we're on
-# Windows -- so it's a platform statement, not something actionable.
+# Harmless: torch noting a Linux-only allocator optimization isn't available on Windows.
 warnings.filterwarnings(
     "ignore",
     message=r".*expandable_segments not supported on this platform.*",
     category=UserWarning,
 )
 
-# pyannote.audio (pulled in by whisperx's VAD) intentionally disables TF32
-# for reproducible alignment results and warns when it does so. This is the
-# behavior we want, not a problem to fix.
+# Harmless: pyannote intentionally disables TF32 for reproducibility.
 warnings.filterwarnings(
     "ignore",
     message=r".*TensorFloat-32 \(TF32\) has been disabled.*",
     category=UserWarning,
 )
 
-# WhisperX's bundled align-model checkpoint is in an older Lightning
-# checkpoint format; Lightning auto-upgrades it in memory on every load and
-# logs an INFO note about it (harmless -- nothing on disk is touched unless
-# the suggested one-time conversion command is run manually). Silence it at
-# the logger level since it's emitted via `logging`, not `warnings.warn`.
+# Harmless: WhisperX's align-model checkpoint auto-upgrades in memory on load; nothing on disk changes.
 logging.getLogger("lightning.pytorch.utilities.migration.utils").setLevel(logging.WARNING)
 
-# whisperx.audio.load_audio() shells out to ffmpeg via a bare
-# `subprocess.run(cmd, ...)` call inside the third-party package -- a call
-# site we don't own, unlike separation.py/media_extract.py's own ffmpeg/
-# Demucs calls, which pass CREATE_NO_WINDOW directly. On Windows, a
-# subprocess spawned by a parent with no console of its own (the GUI,
-# launched via pythonw.exe per run_gui.bat) otherwise pops up a new console
-# window for the moment it runs. Since we can't pass creationflags into
-# whisperx's own call, patch subprocess.Popen.__init__ itself, once, so
-# every child process this python process ever spawns picks up the flag by
-# default -- harmless for calls that already set creationflags explicitly
-# (ours), a no-op on non-Windows.
+# whisperx shells out to ffmpeg via a bare subprocess.run we can't pass creationflags into.
+# Patch Popen so every child gets CREATE_NO_WINDOW (avoids a console flash under pythonw.exe); no-op on non-Windows.
 if os.name == "nt" and not getattr(subprocess.Popen, "_ultrastar_no_window_patched", False):
     _real_popen_init = subprocess.Popen.__init__
 
@@ -91,14 +57,9 @@ def _mean_word_score(words: list) -> float:
 
 def _find_best_window(segment: dict, align_model, metadata, audio, device: str,
                        debug_log=None) -> tuple:
-    """See `_rewindow_long_segments`'s own docstring for the real case this
-    fixes and its validation history. Sweeps fixed-width candidate windows across `segment`'s own
-    declared [start, end] span, re-running wav2vec2 CTC alignment of the
-    SAME text against each, and keeps whichever gives the best mean word
-    score -- provided it clears the baseline (whole-segment) score by
-    `config.REWINDOW_MIN_SCORE_IMPROVEMENT`. Returns (start, end, improved)
-    -- `improved=False` means the caller should keep the segment's own
-    original bounds untouched."""
+    """Sweeps candidate windows across `segment`'s span, re-aligning the same text against each, and
+    returns the best-scoring window if it beats baseline by `config.REWINDOW_MIN_SCORE_IMPROVEMENT`.
+    Returns (start, end, improved)."""
     import whisperx
 
     t1, t2 = segment["start"], segment["end"]
@@ -140,32 +101,10 @@ def _find_best_window(segment: dict, align_model, metadata, audio, device: str,
 
 def _rewindow_long_segments(segments: list, align_model, metadata, audio, device: str,
                              debug_log=None) -> list:
-    """Returns a NEW segment list with corrected (start, end) for any
-    segment at least `config.REWINDOW_MIN_SEGMENT_DURATION_SEC` long --
-    everything else (text, downstream whisperx.align()/Word construction)
-    is untouched; this only fixes segment BOUNDARIES before they're used,
-    so it composes with the normal pipeline for free. Unconditional
-    (rolled into core 2026-08-17, no CLI/GUI off-switch anymore) --
-    real-validated across 12 total runs (8 realign-mode songs, 4 full
-    generation-pipeline songs), zero regressions, 6 genuine verified
-    fixes carried through to the actual written output (not just the
-    intermediate ASR score). See CLAUDE.md's "Long-segment
-    re-windowing" section for the full validation history.
-
-    The sweep in `_find_best_window` deliberately probes many implausible
-    candidate windows (including narrow tail-end ones as short as
-    `REWINDOW_STEP_SEC`, clamped against the segment's own end) -- most of
-    these predictably fail whisperx's own forced-alignment backtrack (too
-    little audio for the given text), score 0.0 via `_mean_word_score`, and
-    are correctly never selected. That's expected, not a real problem, but
-    whisperx logs each one as a WARNING regardless -- real case (David Bowie
-    - Absolute Beginners) produced ~20 of these in one run, all from sweep
-    candidates, none from the segment bounds actually used downstream.
-    Suppresses `whisperx.alignment`'s own WARNING logging for the duration of
-    this sweep so expected candidate failures don't spam the console/GUI log;
-    restored before returning, so a genuine failure in the FINAL alignment
-    call (on the segment bounds this function actually returns) still
-    surfaces normally."""
+    """Returns a new segment list with corrected (start, end) for any segment at least
+    `config.REWINDOW_MIN_SEGMENT_DURATION_SEC` long; text and everything else is untouched.
+    Suppresses whisperx's WARNING logging during the sweep (many probed windows are expected to fail
+    alignment) and restores it before returning."""
     align_logger = logging.getLogger("whisperx.alignment")
     prev_level = align_logger.level
     align_logger.setLevel(logging.ERROR)
@@ -187,39 +126,10 @@ def _rewindow_long_segments(segments: list, align_model, metadata, audio, device
 def force_align_words_in_window(words_text: List[str], window_start: float, window_end: float,
                                  align_model, metadata, audio, device: str = "cuda"
                                  ) -> Optional[List[Tuple[float, float, float]]]:
-    """Forces KNOWN `words_text` onto the audio inside [window_start,
-    window_end] via a real wav2vec2 CTC forced alignment (whisperx.
-    align()) -- unlike a normal ASR pass, this doesn't need the decoder to
-    have "heard" these words at all; it directly measures where the GIVEN
-    text best fits within the window. This is what recovers content a
-    free transcription pass can drop outright (a decoder segment that
-    silently omits real sung words -- see `_rewindow_long_segments`'s
-    docstring for the same underlying failure mode), rather than hoping a
-    bigger model happens to transcribe it (config.RETRY_ASR_MODEL, which
-    real-world testing found doesn't reliably recover a specific dropped
-    passage even when it does help other parts of a song) or re-searching
-    an ASR transcript that may never have had these words in it at all
-    (a text-search rematch was tried and rejected as `realign.
-    rematch_local_gaps` for exactly this reason -- see CLAUDE.md's
-    "Removed / rejected approaches").
-
-    Approach and validation directly adapted from UltraStarKaraokeMaker's
-    own `realign_gap_windows` (github.com/walterfr/UltraStarKaraokeMaker,
-    python-sidecar/pipeline/align.py, MIT-style OSS) -- real case that
-    motivated bringing this over: their output on "Trixie Mattel - Gold"
-    correctly recovered a "Do-do-do-do-do" backing-vocal passage our own
-    pipeline dropped outright, via exactly this mechanism (their own
-    song_data.json tags the recovered words `"source": "realign"`).
-
-    Returns None (caller should keep whatever fallback -- interpolation
-    -- it already had) if: the window is too short to plausibly hold
-    this many words; whisperx.align() raises (a genuinely bad window
-    shouldn't crash the pipeline); the returned word count doesn't match
-    `words_text` (ambiguous mapping -- e.g. a word split into multiple
-    tokens); any word is missing a timestamp; or any word falls outside
-    the window (with `config.FORCE_ALIGN_WINDOW_SLOP_SEC` slop) or out of
-    order relative to the previous word -- never applies a partial/
-    ambiguous result."""
+    """Forces known `words_text` onto the audio inside [window_start, window_end] via wav2vec2 CTC
+    forced alignment, without needing the decoder to have transcribed them. Returns None (caller
+    keeps its fallback) on a too-short window, alignment failure, word-count mismatch, missing
+    timestamp, or a word out of bounds/order."""
     import whisperx
 
     if not words_text:
@@ -258,36 +168,10 @@ def force_align_words_in_window(words_text: List[str], window_start: float, wind
 
 def force_align_reference_lyrics(vocals_path: Path, synced_lyrics: str, audio_duration: float,
                                   debug_log=None) -> List[Word]:
-    """DIAGNOSTIC/EXPERIMENTAL (config.PipelineOptions.no_transcribe /
-    --no-transcribe, 2026-08-10): builds the ENTIRE initial Word list
-    without ever running the WhisperX DECODER (`model.transcribe()`, the
-    component that guesses what was sung and can hallucinate/drop content
-    -- see the David Bowie - Magic Dance 'ic ic ic...' case in CLAUDE.md,
-    where a decoder hallucination on a real repeated passage ultimately
-    corrupted output text even after reference-lyrics correction). Only
-    the SEPARATE wav2vec2 CTC forced-alignment model runs here
-    (`force_align_words_in_window`, same mechanism
-    `recover_dropped_reference_words` already uses to recover
-    known-but-undetected words), driven entirely
-    by the KNOWN text from a pinned LRC candidate's own synced lyrics --
-    there is no ASR output at all for anything downstream to inherit
-    hallucinated text from.
-
-    This is meant for isolating whether ASR-decoder hallucination is
-    bleeding into output some OTHER way this project hasn't found yet --
-    not a replacement for the normal transcription path in general (it
-    requires a trustworthy pinned LRC candidate with per-line timestamps,
-    and gives up whatever real information the decoder would have added
-    for content the LRC doesn't cover, e.g. ad-libs).
-
-    Each LRC line gets its own window: [this line's timestamp, next
-    line's timestamp), last line to `audio_duration`. A line whose
-    force-alignment fails (window implausibly short for its word count,
-    whisperx.align() itself raises, or the result is out-of-order/
-    ambiguous -- see force_align_words_in_window's own contract) is
-    skipped entirely and logged; never guessed or interpolated here --
-    downstream stages (force-align-gaps, pass 3's own fallback-to-
-    nearest-note handling) already exist to cope with missing words."""
+    """DIAGNOSTIC (--no-transcribe): builds the whole Word list via forced alignment of a pinned LRC
+    candidate's known line text only, never running the WhisperX decoder -- isolates whether ASR
+    hallucination is bleeding into output. Each LRC line gets its own window; a line that fails to
+    force-align is skipped and logged, never guessed."""
     import whisperx
     from .lrc_timing import parse_lrc
 
@@ -383,7 +267,7 @@ def _transcribe_with_whisperx(vocals_path: Path, model_name: str, debug_log=None
             start = w.get("start")
             end = w.get("end")
             if not text or start is None or end is None:
-                continue  # whisperx leaves timing out for a few unaligned words
+                continue  # unaligned word
             words.append(Word(
                 text=text,
                 start=float(start),
@@ -443,23 +327,8 @@ def transcribe_words(
     vad_filter: bool = True,
     whisperx_vad_options: dict = None,
 ) -> List[Word]:
-    """Returns a flat, time-ordered list of Word objects for the whole track.
-
-    Note: these timestamps are a starting point for lyric_alignment.py, not
-    the final note timing -- final timing comes from note_detection.py's
-    audio-only analysis. Still, more accurate word boundaries here mean
-    fewer/less-drastic corrections needed during alignment.
-
-    `debug_log` records the RAW model output (every word/score, including
-    ones later dropped for missing text/timing) before any of our own
-    filtering -- see debug_log.DebugLog. `vad_filter` only applies to the
-    faster-whisper path. `whisperx_vad_options` only applies to the
-    whisperx path -- see config.WHISPERX_NO_VAD_OPTIONS's docstring for
-    why this fixed a real, confirmed timing bug (word timestamps up to
-    ~6s wrong around sustained/held notes). The whisperx path always
-    re-windows long decoder segments (see `_rewindow_long_segments`'s own
-    docstring for the real case this fixes and its validation history).
-    """
+    """Returns a flat, time-ordered list of Word objects for the whole track. `vad_filter` applies
+    only to the faster-whisper path; `whisperx_vad_options` only to the whisperx path."""
     if prefer_whisperx:
         try:
             return _transcribe_with_whisperx(vocals_path, model_name, debug_log=debug_log,

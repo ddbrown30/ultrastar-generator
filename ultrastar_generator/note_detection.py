@@ -1,62 +1,23 @@
-"""Pass 1 of the pipeline: detect a sequence of sung notes (start, end,
-pitch) directly from the isolated vocal audio, with NO dependency on
-transcription. Lyrics get fitted onto this grid afterwards
-(see lyric_alignment.py).
+"""Pass 1: detects sung notes (start, end, pitch) from isolated vocal audio
+alone, no transcription. Lyrics are fitted onto this grid later (see
+lyric_alignment.py).
 
-v2 changes (fixing reported bugs: overlapping notes, vibrato causing a
-single sustained syllable to fragment into many near-duplicate notes):
+Segmentation: pitch contour is median-filtered to remove vibrato before
+splitting; a note splits only on a real pitch change (a bare onset alone
+isn't enough); two merge passes then clean up over-segmentation (similar-
+adjacent-pitch merge, short-note merge); each note's final pitch is a
+confidence-weighted mode over its frames.
 
-  1. The pitch contour is median-filtered in semitone space BEFORE
-     segmentation. Vocal vibrato is typically a 4-8 Hz wobble (a
-     125-250ms period); a ~110ms filter window removes it while still
-     passing genuine note changes, which are usually sustained far
-     longer than one vibrato cycle. This was the single biggest source
-     of over-segmentation before (pYIN's raw frame-to-frame pitch was
-     being treated as ground truth).
-  2. An onset event alone no longer forces a split -- only an onset that
-     ALSO coincides with a real pitch change does. Consonant/attack
-     transients inside a single sustained note were previously causing
-     spurious splits.
-  3. Two explicit merge passes run after initial segmentation:
-       - merge_similar_adjacent: collapses consecutive, near-contiguous
-         notes whose pitch differs by only a semitone or two -- this is
-         exactly the "There," example from feedback: several ~150ms
-         fragments alternating by 1 semitone should become ONE note.
-       - merge_short_notes: any note shorter than half a beat (given the
-         song's tempo) gets folded into whichever neighbor has the
-         closer pitch, since a note that short can't even be
-         represented distinctly on the beat grid anyway.
-  4. Each note's final pitch is a confidence-weighted mode over its
-     frames (rounded to the nearest semitone) rather than a plain
-     median, which is more robust when a note's frames straddle two
-     adjacent pitches (e.g. vibrato that didn't fully get filtered out).
+Output is non-overlapping/monotonic by construction (notes appended
+forward-only, merges only combine adjacent notes); usdx_writer.py also
+enforces this at the integer-beat level as a last resort.
 
-Because notes are only ever appended as the scan walks forward in time,
-and the merge passes only ever combine adjacent notes (never reorder or
-create overlaps), the output remains start/end monotonic and
-non-overlapping by construction. usdx_writer.py additionally enforces
-this at the integer-beat level as a last-resort safety net.
+Voicing requires BOTH the pitch source's own periodicity AND an
+independent RMS-energy gate to agree (periodicity alone can look
+confident during silence).
 
-v3 addition (fixing reported hallucinated notes during actual silence):
-the pitch source's own voicing decision is based on pitch/periodicity
-evidence alone, NOT loudness -- a genuinely silent instrumental intro, or
-the quiet gap between phrases, can still contain quantization noise,
-resampling ringing, or a faint hum with enough incidental periodicity for
-the source to report a confident, real-looking pitch. An explicit
-RMS-energy gate (_energy_gate) now runs alongside the source's own
-voicing flag, and a frame is only treated as voiced if BOTH agree. The
-energy floor is relative to the track's own 90th-percentile RMS (not the
-absolute peak, so one loud transient can't quietly raise the bar for
-everything else), tunable via --silence-threshold-db.
-
-Pass 1 has exactly ONE pitch source at a time (`pitch_source`, "rmvpe" or
-"swiftf0" -- see PITCH_SOURCES below): that source alone supplies both
-the pitch VALUE and the voicing decision for every frame. No ensemble, no
-cross-checking, no consensus vote between sources -- pYIN, CREPE, PENN,
-and the whole cross-check/consensus-override machinery that used to sit
-on top of a source were tried and removed (see CLAUDE.md's "Removed /
-rejected approaches"); a single well-chosen source in true isolation
-outperformed the ensemble on real end-to-end validation.
+Exactly ONE pitch source runs at a time (`pitch_source`, see
+PITCH_SOURCES) supplying both pitch and voicing -- no ensemble/cross-check.
 """
 
 from __future__ import annotations
@@ -76,18 +37,11 @@ class NoteEvent:
     end: float                # seconds
     pitch: int                 # UltraStar pitch (MIDI - 60)
     confidence: float = 1.0     # mean pitch-source confidence over the note
-    protected_start: bool = False  # True if this note's start is a deliberate
-                                     # re-articulation split (see
-                                     # config.REARTICULATION_STRENGTH_PERCENTILE)
-                                     # -- the merge passes must never fold it
-                                     # back into its predecessor just because
-                                     # the pitch happens to match.
+    protected_start: bool = False  # deliberate re-articulation split; merge passes must never fold it into its predecessor
 
 
 def _smooth_midi_contour(midi: np.ndarray, voiced: np.ndarray, window: int) -> np.ndarray:
-    """Median-filters `midi` in-place per contiguous voiced run (never
-    smoothing across a silence gap, which would blur real note
-    boundaries at phrase edges)."""
+    """Median-filters `midi` per contiguous voiced run; never smooths across a silence gap."""
     if window <= 1:
         return midi.copy()
 
@@ -116,9 +70,7 @@ def _smooth_midi_contour(midi: np.ndarray, voiced: np.ndarray, window: int) -> n
 
 
 def _weighted_mode_pitch(pitches: List[float], confs: List[float]) -> int:
-    """Confidence-weighted mode of rounded semitone values -- more robust
-    than a plain median when a note's frames straddle two adjacent
-    pitches (residual vibrato, or a genuinely ambiguous boundary)."""
+    """Confidence-weighted mode of rounded semitone values."""
     rounded = np.round(pitches).astype(int)
     weights = np.asarray(confs, dtype=float)
     if weights.sum() <= 0:
@@ -132,24 +84,9 @@ def _weighted_mode_pitch(pitches: List[float], confs: List[float]) -> int:
 def _trim_attack(
     pitches: List[float], confs: List[float], frame_dur: float, trim_sec: float,
 ) -> tuple:
-    """Drops the first trim_sec worth of frames from a note's pitch/
-    confidence lists before its final pitch is computed -- counters a
-    systematic FLAT bias measured against real sheet music (OMR
-    cross-validation, 2026-08-07): pYIN's per-word pitch reads flat of
-    the correct semitone roughly 3x as often as sharp (18 of 39 misses
-    exactly -1 semitone vs 6 at +1, out of 91 whole-song anchors),
-    consistent with legato/portamento singing where a note is
-    approached with a rising glide FROM the previous (lower) pitch --
-    a confidence-weighted mode over the WHOLE note, attack included,
-    gets pulled toward that glide's lower pitches rather than the note's
-    true settled value.
-
-    Falls back to the full, untrimmed lists if trimming would leave too
-    few frames to be a meaningful vote (a very short note's entire
-    duration effectively IS its attack -- there is no separate "settled"
-    portion to trim toward, and discarding most/all of a short note's
-    only evidence would make its pitch estimate LESS reliable, not more).
-    """
+    """Drops the first trim_sec of a note's frames before its pitch is computed,
+    countering a flat-pitch bias from a legato glide into the note. Falls back
+    to the full lists if trimming would leave too few frames to be meaningful."""
     trim_frames = int(round(trim_sec / frame_dur)) if frame_dur > 0 else 0
     if trim_frames <= 0 or len(pitches) - trim_frames < max(3, trim_frames):
         return pitches, confs
@@ -157,30 +94,9 @@ def _trim_attack(
 
 
 def _confidence_floor_filter(pitches: List[float], confs: List[float], percentile: float) -> tuple:
-    """Drops the bottom `percentile`% of a note's frames BY CONFIDENCE
-    (wherever they land within the note) before its final pitch is
-    computed -- unlike _trim_attack (which drops a fixed time window
-    regardless of where the actual low-quality frames are), this
-    adaptively removes whichever frames are least trustworthy.
-
-    Motivated by a confirmed RMVPE-specific finding (direct cents-level
-    analysis against Beauty and the Beast ground truth, bypassing
-    detect_notes entirely -- 2026-08-07): RMVPE's low-confidence frames
-    carry a systematic FLAT bias (typically the attack/release portion
-    of a note, where the pitch estimate is still "in transit" via
-    portamento into/out of the target). Unfiltered median error across
-    140 ground-truth notes was -27.3 cents; keeping only the top 50% of
-    frames by confidence per note brought it to -16.6 cents and raised
-    exact-semitone match from 54% to 59%. Going further (top 25% or 10%)
-    reversed the gain -- too few frames left makes the estimate noisier
-    than the bias it removes, especially on short notes. 50th percentile
-    was the measured sweet spot on that song; not yet re-validated per-
-    song, see config.CONFIDENCE_FLOOR_PERCENTILE's own docstring.
-
-    Falls back to the full, unfiltered lists if filtering would leave
-    too few frames to be a meaningful vote (same reasoning as
-    _trim_attack).
-    """
+    """Drops the bottom `percentile`% of a note's frames by confidence before its
+    pitch is computed, adaptively rather than by fixed time window like
+    _trim_attack. Falls back to the full lists if too few frames would remain."""
     if percentile <= 0 or len(pitches) < 4:
         return pitches, confs
     confs_arr = np.asarray(confs, dtype=float)
@@ -195,20 +111,10 @@ def _confidence_floor_filter(pitches: List[float], confs: List[float], percentil
 def _merge_similar_adjacent(
     notes: List[NoteEvent], max_pitch_diff: int, max_gap: float
 ) -> List[NoteEvent]:
-    """Merges consecutive, near-contiguous notes whose pitch is close
-    enough to be the same note (residual vibrato/tracking noise), while
-    refusing to let a chain of small steps drift into one giant note.
-
-    Comparing each candidate only to the immediately preceding note's
-    pitch is NOT enough: a real stepwise melodic run (e.g. -6, -8, -9,
-    -11, each only 1-2 semitones from its neighbor) can pass a per-step
-    threshold at every link and transitively collapse into a single
-    note spanning the whole run -- this was a real bug (a 4-word phrase
-    with real melodic movement was flattened into one ~6-second note,
-    all reported at the same pitch). To prevent that, each merged
-    group's pitch RANGE (min to max of everything folded into it, not
-    just the latest step) must also stay within max_pitch_diff.
-    """
+    """Merges consecutive, near-contiguous notes whose pitch is close enough to
+    be the same note. Checks each merged group's total pitch RANGE (not just
+    the latest step) against max_pitch_diff, so a chain of small steps can't
+    transitively collapse a whole stepwise melodic run into one note."""
     if not notes:
         return notes
     merged: List[NoteEvent] = [notes[0]]
@@ -247,48 +153,15 @@ def _merge_similar_adjacent(
 
 
 def _merge_short_notes(notes: List[NoteEvent], min_duration: float, max_gap: float) -> List[NoteEvent]:
-    """Folds notes shorter than min_duration into a neighbor (closer pitch
-    wins, among neighbors close enough in TIME to plausibly be the same
-    note -- see max_gap below), to clean up vibrato/tracking-noise
-    fragmentation.
-
-    Must never fold away a protected_start=True note's own start, and must
-    never fold a neighbor's protected_start=True start away either --
-    both are a deliberate re-articulation boundary (see NoteEvent's
-    protected_start docstring). This was a real bug: _merge_similar_adjacent
-    already honored protected_start, but this pass ran right after it and
-    didn't check the flag at all, so a genuinely re-attacked same-pitch
-    note (protected specifically so it wouldn't get silently re-merged)
-    could still be swallowed here whenever the real audio's re-attack
-    happened to produce a short segment -- which is common, since a
-    re-attack is often followed almost immediately by a brief unvoiced
-    dip in the singer's own articulation (confirmed on a real bug report:
-    "fall as Lucifer fell" collapsing back into one note on real audio
-    despite the split firing correctly, because this pass then undid it).
-
-    max_gap: a neighbor separated from this note by MORE than max_gap of
-    real silence is never eligible as a merge target, regardless of how
-    close its pitch is -- confirmed via a real bug (OMR cross-validation,
-    2026-08-07): "fu" (correct pitch, -6) and "gi" (own pitch -5, one
-    semitone of ordinary tracking noise) are two genuinely distinct fast
-    syllables separated by a real ~120ms unvoiced gap, but this function
-    used to consider ONLY pitch distance -- "fu" ended up merged into
-    "gi" (losing "fu"'s correct pitch entirely) purely because gi's pitch
-    happened to be 1 semitone closer than the contiguous previous note's,
-    with no awareness that a real silence gap separated them. Vibrato/
-    tracking-noise fragmentation (the case this pass exists to clean up)
-    does NOT typically produce a genuine unvoiced dropout between the
-    fragments -- the pitch wobbles while voicing stays continuous -- so
-    gap distance is a reliable, cheap signal for telling "one note that
-    briefly stuttered" apart from "two real short notes". Same threshold
-    _merge_similar_adjacent already uses for its own gap check, reused
-    here for consistency rather than a new tunable.
-    """
+    """Folds notes shorter than min_duration into whichever eligible neighbor
+    has the closer pitch, to clean up vibrato/tracking-noise fragmentation.
+    Never folds away a protected_start note's own boundary. max_gap: a
+    neighbor beyond max_gap of real silence is never an eligible merge target."""
     if not notes:
         return notes
     changed = True
     notes = list(notes)
-    # Repeat until stable: merging can create new short-adjacent situations.
+    # Repeat until stable -- merging can create new short-adjacent situations.
     guard = 0
     while changed and guard < 10:
         changed = False
@@ -348,19 +221,10 @@ def _remove_pitch_spikes(
     max_neighbor_gap: float,
     debug_log=None,
 ) -> List[NoteEvent]:
-    """Removes an isolated short note that jumps far in pitch from BOTH
-    its neighbors and whose neighbors are close to each other in pitch --
-    i.e. "a brief detour to a very different pitch that then returns to
-    where it was", which is a strong signature of a tracking glitch
-    rather than a real, intentional note. Confirmed useful in practice:
-    caught exactly this pattern in a real fallback-note case (see
-    lyric_alignment.py's neighbor-borrowing fix for the other half of
-    that story).
-
-    A removed spike gets folded into the PREVIOUS note (extending its end
-    to cover the spike's duration) rather than dropped outright, so total
-    time coverage is preserved and nothing downstream sees a gap.
-    """
+    """Removes an isolated short note that jumps far in pitch from both
+    neighbors while they stay close to each other -- a tracking-glitch
+    signature. A removed spike is folded into the previous note (extends its
+    end) rather than dropped, preserving total time coverage."""
     if len(notes) < 3:
         return notes
 
@@ -393,9 +257,7 @@ def _remove_pitch_spikes(
                 confidence=max(prev.confidence, cur.confidence),
             )
             del out[i]
-            # Don't advance i: the new triplet at this position (in case
-            # of back-to-back spikes) needs checking too.
-            continue
+            continue  # re-check new triplet at this position for back-to-back spikes
         i += 1
 
     return out
@@ -409,23 +271,11 @@ def _absorb_trailing_artifacts(
     min_preceding_duration: float,
     debug_log=None,
 ) -> List[NoteEvent]:
-    """Absorbs a short, low-confidence note that trails a long sustained
-    note into that note (extends its end), instead of keeping it as its
-    own standalone note -- catches breath/release artifacts (a singer's
-    exhale after a held note, or a trailing "-uh" as a held vowel
-    releases) that neither _remove_pitch_spikes nor _merge_short_notes
-    currently catch (see config.TRAILING_ARTIFACT_* for the real
-    confirmed cases and why those two existing passes miss this specific
-    signature: close pitch to the neighbor, not a big jump; genuinely
-    low CONFIDENCE, which neither pass looks at at all).
-
-    Only ever absorbs FORWARD (into the immediately preceding note) --
-    never merges two candidate artifacts into each other directly (the
-    while-loop re-scan below handles a chain of them one at a time,
-    each absorption extending the SAME preceding note further), and
-    never touches a protected_start note (a deliberate re-articulation
-    boundary must never be silently swallowed).
-    """
+    """Absorbs a short, low-confidence note trailing a long sustained note into
+    that note (extends its end) -- catches breath/release artifacts that stay
+    close in pitch, which spike-removal/short-note merges don't catch since
+    they never look at confidence. Only ever absorbs forward, and never
+    touches a protected_start note."""
     if len(notes) < 2:
         return notes
     changed = True
@@ -467,24 +317,10 @@ def _absorb_trailing_artifacts(
 
 
 def _ensure_nonoverlapping(notes: List[NoteEvent], verbose: bool = True) -> List[NoteEvent]:
-    """Hard, final guarantee for pass 1: no note may start before the
-    previous one ends. The construction above (sequential frame walk +
-    only-ever-combine-adjacent merges) should make this a no-op in
-    practice -- but pass 1 is supposed to be the one place in the whole
-    pipeline that's allowed to assume its own output is correct, so this
-    checks that assumption explicitly instead of just trusting it. If
-    this ever has to fix something, that's a real bug upstream worth
-    looking into, not a normal occurrence -- hence the warning.
-
-    A tiny epsilon guards against pure floating-point noise: two adjacent
-    notes' boundary times are computed via different arithmetic paths
-    (times[start_frame] for one note's start vs. times[end_frame-1] +
-    frame_dur for the previous note's end), which are mathematically
-    equal but can land a few ULPs apart -- confirmed on a real run where
-    every "overlap" this caught was exactly 0.0000s to 4 decimal places.
-    That's not a real bug to warn about; an overlap of a real frame's
-    worth of time very much still is.
-    """
+    """Hard final guarantee: no note may start before the previous one ends.
+    Should be a no-op by construction -- if it fires, that's a real upstream
+    bug, hence the warning. Epsilon guards against float noise from two
+    boundary times computed via different, mathematically-equal arithmetic."""
     if not notes:
         return notes
     eps = 1e-6  # seconds -- far below any real frame duration (ms-scale)
@@ -510,13 +346,10 @@ def _energy_gate(
     reference_percentile: float, threshold_db_below_peak: float,
     absolute_floor_db: float = config.SILENCE_ABSOLUTE_FLOOR_DB,
 ) -> np.ndarray:
-    """Returns a boolean array (length n_frames) marking which frames have
-    enough RMS energy to plausibly contain a real sung note, independent
-    of whatever the pitch source's own voicing decision says. See the constant
-    docstrings in config.py for why this needs BOTH a relative threshold
-    (compared to the track's own loud sections) and an absolute one
-    (catches the case where there's no louder reference to compare
-    against at all, e.g. a long or fully silent clip)."""
+    """Boolean array marking frames with enough RMS energy to plausibly hold a
+    sung note, independent of the pitch source's own voicing decision. Needs
+    BOTH a relative threshold (vs. the track's loud sections) and an absolute
+    floor (for a clip with no louder reference at all)."""
     import librosa
 
     rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
@@ -537,29 +370,15 @@ def _rmvpe_pitch(
     y: np.ndarray, sr: int, hop_length: int, fmin: float, fmax: float,
     n_frames: int, device: str, activation_out: Optional[dict] = None,
 ) -> tuple:
-    """Runs RMVPE (rmvpe_onnx) over the whole track once, returning (midi,
-    confidence) arrays fit to n_frames.
+    """Runs RMVPE over the whole track once, returning (midi, confidence)
+    interpolated onto n_frames from RMVPE's own native grid. Pitch and
+    voicing are interpolated separately so blending can't fabricate a
+    pitch across a real unvoiced gap.
 
-    RMVPE has its OWN fixed internal grid (audio resampled to 16kHz,
-    160-sample/10ms hop) that does not line up with ours, so fitting it to
-    n_frames means real time-interpolation, not pad/truncate. Confidence
-    and a voiced/unvoiced mask are interpolated separately from pitch so
-    interpolation can't fabricate a pitch value by blending across a real
-    unvoiced gap in RMVPE's own output into a fictitious in-between
-    semitone.
-
-    `activation_out`, if given a dict, is populated (side effect) with
-    RMVPE's own RAW 360-bin salience distribution (`rmvpe.predict`'s own
-    4th return value -- otherwise discarded here) on ITS OWN native
-    ~10ms grid, plus its per-bin cents mapping -- used by
-    `pitch_ambiguity.apply_ambiguity_tiebreak` for a note-level
-    aggregation independent of (and finer-grained than) the single
-    interpolated `midi`/`confidence` values this function returns. Kept
-    as an optional side channel rather than widening this function's own
-    return tuple so every OTHER existing caller (there are several) is
-    completely unaffected -- costs nothing extra when not requested,
-    since it's the exact same already-computed `rmvpe.predict()` call
-    either way, never a second inference."""
+    `activation_out`, if given a dict, is populated with RMVPE's raw 360-bin
+    salience distribution and cents mapping, used by
+    pitch_ambiguity.apply_ambiguity_tiebreak. Free when not requested --
+    same underlying rmvpe.predict() call either way."""
     from rmvpe_onnx import RMVPE
 
     rmvpe = RMVPE(device=device)
@@ -567,7 +386,7 @@ def _rmvpe_pitch(
     if activation_out is not None:
         activation_out["rtime"] = rtime
         activation_out["activation"] = activation
-        activation_out["cents_mapping"] = rmvpe.cents_mapping[4:364]  # strip internal windowing padding
+        activation_out["cents_mapping"] = rmvpe.cents_mapping[4:364]  # strips internal windowing padding
 
     rmidi = np.where(
         (rfreq > 0) & (rfreq >= fmin) & (rfreq <= fmax),
@@ -586,52 +405,23 @@ def _rmvpe_pitch(
     return midi_out, conf_out
 
 
-# ---------------------------------------------------------------------------
-# Pluggable pitch-source registry (2026-08-07, pyin/CREPE/PENN removed +
-# ensemble/cross-check/consensus machinery removed entirely 2026-08-14 --
-# see CLAUDE.md's "Removed / rejected approaches"). Each entry is a fully
-# self-contained wrapper: it imports its OWN library (lazily, inside the
-# function -- nothing else gets imported as a side effect of calling it),
-# and returns its OWN independent (midi, confidence, voiced) triple,
-# INCLUDING its own voicing decision -- detect_notes() uses exactly ONE
-# of these at a time (see its `pitch_source` param), for pitch AND
-# voicing both: no other pitch library is ever loaded, computed, or
-# consulted for anything else. Adding a new pitch library going forward
-# should mean writing one more function with this same (y, sr,
-# hop_length, frame_length, fmin, fmax, n_frames) -> (midi, confidence,
-# voiced) signature and registering it in PITCH_SOURCES.
-# ---------------------------------------------------------------------------
+# Pluggable pitch-source registry. Each entry lazily imports its own library
+# and returns an independent (midi, confidence, voiced) triple; detect_notes()
+# uses exactly one at a time. New sources: match this signature, register below.
 
 def _rmvpe_source(y, sr, hop_length, frame_length, fmin, fmax, n_frames,
                    device="cpu", voicing_threshold=0.5, activation_out=None):
-    """RMVPE alone. voiced is derived from RMVPE's own confidence
-    clearing voicing_threshold -- _rmvpe_pitch already returns NaN below
-    its own internal 0.5 gate, so this is effectively `~isnan(midi)`
-    unless voicing_threshold is raised above that internal default.
-
-    `activation_out`: see _rmvpe_pitch's own docstring -- forwarded
-    as-is, not a second inference call."""
+    """RMVPE alone. voiced is derived from RMVPE's own confidence clearing
+    voicing_threshold. `activation_out` is forwarded as-is to _rmvpe_pitch."""
     midi, conf = _rmvpe_pitch(y, sr, hop_length, fmin, fmax, n_frames, device, activation_out=activation_out)
     voiced = ~np.isnan(midi) & (conf >= voicing_threshold)
     return midi, conf, voiced
 
 
 def _swiftf0_source(y, sr, hop_length, frame_length, fmin, fmax, n_frames):
-    """SwiftF0 alone (github.com/lars76/swift-f0 -- lightweight CNN
-    monophonic pitch detector, ~95k params, reports 42x realtime speedup
-    over CREPE with better accuracy in the paper's own benchmarks).
-
-    Unlike RMVPE, SwiftF0 has a REAL native voicing decision of its own
-    (`PitchResult.voicing`), not just a confidence value needing a
-    manually-picked threshold -- used directly here, no derivation needed.
-
-    Own internal grid is 16kHz audio / 256-sample hop (~16ms/frame),
-    unrelated to our own hop_length/sr grid (same situation as RMVPE) --
-    interpolated onto our frame times the same way _rmvpe_pitch does:
-    voicing and pitch interpolated separately so interpolation can't
-    fabricate a pitch value by blending across a real unvoiced gap into a
-    fictitious in-between semitone.
-    """
+    """SwiftF0 alone -- a lightweight CNN pitch detector with its own native
+    voicing decision (`PitchResult.voicing`), used directly. Interpolated onto
+    our frame grid the same way _rmvpe_pitch does."""
     from swift_f0 import SwiftF0
 
     detector = SwiftF0(fmin=fmin, fmax=fmax)
@@ -689,27 +479,8 @@ def detect_notes(
     trailing_artifact_min_preceding_duration_sec: float = config.TRAILING_ARTIFACT_MIN_PRECEDING_DURATION_SEC,
     enable_ambiguity_key_tiebreak: bool = config.ENABLE_AMBIGUITY_KEY_TIEBREAK,
     ambiguity_margin_threshold: float = config.AMBIGUITY_MARGIN_THRESHOLD,
-    pitch_source: str = config.DEFAULT_PITCH_SOURCE,  # "rmvpe" or "swiftf0"
-                                   # -- the SOLE pitch source for this call:
-                                   # supplies both the pitch VALUE and the
-                                   # voicing decision, exclusively. No other
-                                   # pitch library is ever loaded, computed,
-                                   # or consulted for anything -- no cross-
-                                   # check, no ensemble, no consensus vote.
-                                   # See PITCH_SOURCES for available names
-                                   # and how to add a new one.
-    precomputed: Optional[dict] = None,  # {"times", "src_midi", "src_conf",
-                                   # "src_voiced", "label"} -- parameter-
-                                   # sweep fast path: skips the expensive
-                                   # PITCH_SOURCES[...] call (neural
-                                   # inference) and reuses a cached raw
-                                   # reading from a PRIOR call for the same
-                                   # audio, since that doesn't depend on any
-                                   # of the segmentation parameters being
-                                   # swept. `y`/`sr` are still required
-                                   # (onset detection and the energy gate
-                                   # both still need the real audio, and are
-                                   # cheap enough not to bother caching).
+    pitch_source: str = config.DEFAULT_PITCH_SOURCE,  # "rmvpe" or "swiftf0"; sole source of pitch AND voicing, no cross-check/ensemble
+    precomputed: Optional[dict] = None,  # {"times","src_midi","src_conf","src_voiced","label"}: parameter-sweep fast path reusing a cached raw reading instead of re-running inference; y/sr still needed for onset/energy-gate
     verbose: bool = True,
     debug_log=None,
 ) -> List[NoteEvent]:
@@ -718,16 +489,7 @@ def detect_notes(
     if pitch_source not in PITCH_SOURCES:
         raise ValueError(f"pitch_source must be one of {sorted(PITCH_SOURCES)}, got {pitch_source!r}")
 
-    # Exactly ONE pitch source is imported, computed, or consulted for
-    # ANYTHING -- pitch value AND voicing decision both come from it
-    # alone. No cross-checking, no ensemble, no consensus vote. See
-    # PITCH_SOURCES' module comment for why this exists and how to add a
-    # new source.
-    # Populated only when the ambiguity key tie-break is actually usable
-    # (RMVPE-only, and only outside the precomputed parameter-sweep fast
-    # path -- see pitch_ambiguity.py's own module docstring). Requesting
-    # it costs nothing extra: same single rmvpe.predict() call either
-    # way, never a second inference.
+    # Populated only when the ambiguity key tie-break is usable (RMVPE-only, not precomputed).
     activation_out: Optional[dict] = None
     want_ambiguity_tiebreak = enable_ambiguity_key_tiebreak and pitch_source == "rmvpe"
 
@@ -738,7 +500,7 @@ def detect_notes(
         )
         n_frames = len(times)
         source_label = precomputed.get("label", "precomputed")
-        want_ambiguity_tiebreak = False  # raw activation isn't part of the precomputed contract
+        want_ambiguity_tiebreak = False  # raw activation not part of the precomputed contract
     else:
         n_frames = 1 + len(y) // hop_length
         times = np.arange(n_frames) * (hop_length / sr)
@@ -816,12 +578,9 @@ def detect_notes(
     onset_frames_arr = np.round(onset_times / frame_dur).astype(int)
     onset_set = set(onset_frames_arr.tolist())
 
-    # Strong-onset detection for same-pitch re-articulation splits (see
-    # config.REARTICULATION_STRENGTH_PERCENTILE): a bare onset is only
-    # ever allowed to assist a real pitch change (below); to split two
-    # notes at the SAME pitch we additionally require the onset to be
-    # among the strongest this track actually has, since a weak one is
-    # much more likely a consonant/attack transient inside one held note.
+    # Strong-onset detection for same-pitch re-articulation splits: only the
+    # strongest onsets can split two same-pitch notes (a weak one is likely
+    # just a consonant transient inside one held note).
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
     strong_onset_set = set()
     n_frames_total = len(times)
@@ -832,10 +591,7 @@ def detect_notes(
             strengths = onset_env[valid]
             strength_floor = float(np.percentile(strengths, config.REARTICULATION_STRENGTH_PERCENTILE))
             strong_onset_set = set(valid[strengths >= strength_floor].tolist())
-            # Dilate strong onsets by a small window: a re-attack's onset
-            # often lands right at (or just inside) a brief unvoiced dip,
-            # not exactly on a voiced frame -- see
-            # config.REARTICULATION_ONSET_WINDOW_SEC.
+            # Dilate strong onsets by a small window: a re-attack's onset can land near a brief unvoiced dip, not exactly on a voiced frame.
             window_frames = max(0, int(round(config.REARTICULATION_ONSET_WINDOW_SEC / frame_dur)))
             for f in strong_onset_set:
                 lo = max(0, f - window_frames)
@@ -863,10 +619,7 @@ def detect_notes(
         cur_protected_start = False
 
     n = len(times)
-    # A weaker threshold is enough to notice a change once an onset has
-    # already flagged "something happened here"; without an onset we
-    # require the full jump threshold, since it's the only sustained-drift
-    # (legato) evidence we have.
+    # A weaker threshold suffices once an onset flags "something happened"; without one, the full jump threshold is required.
     onset_assist_semitones = pitch_jump_semitones * 0.5
     min_dur_before_rearticulation_frames = max(
         1, int(round(config.MIN_DURATION_BEFORE_REARTICULATION_SEC / frame_dur))
@@ -884,12 +637,7 @@ def detect_notes(
             cur_start_frame = i
             cur_pitches = [m]
             cur_confs = [float(voiced_prob[i]) if voiced_prob is not None else 1.0]
-            # This note is resuming right after a silence/unvoiced gap --
-            # if that gap sits at a strong onset, the gap itself IS the
-            # re-articulation boundary (a real, brief unvoiced dip at the
-            # attack), so protect it the same way an in-voicing split
-            # would be: otherwise the next merge pass sees "same pitch,
-            # small gap" and silently stitches it back to its predecessor.
+            # A gap at a strong onset is itself the re-articulation boundary; protect it or the merge pass stitches it back.
             cur_protected_start = bool(near_strong_onset[i])
             continue
 
@@ -923,36 +671,11 @@ def detect_notes(
     prev_raw_confs: Optional[List[float]] = None
     for idx, (start_frame, end_frame, pitches, confs, protected_start) in enumerate(raw_notes):
         start_t = float(times[start_frame])
-        # end_frame is EXCLUSIVE (frames [start_frame, end_frame) belong to
-        # this note -- see _flush): the note's end time is the end of the
-        # LAST included frame (end_frame - 1), not the end of end_frame
-        # itself, which isn't part of this note at all. Using end_frame
-        # directly here was a real, pre-existing off-by-one: it made every
-        # adjacent pair of raw segments overlap by exactly one frame_dur,
-        # silently "fixed" (and warned about) by _ensure_nonoverlapping on
-        # every run -- e.g. 49 fixes on a real ~200-note song, which is
-        # anything but the "shouldn't normally happen" case that guard is
-        # meant to catch.
+        # end_frame is EXCLUSIVE; end time must come from the last INCLUDED frame (end_frame - 1), not end_frame itself, or adjacent segments overlap.
         end_t = float(times[min(end_frame - 1, n - 1)]) + frame_dur
         if end_t - start_t < config.MIN_NOTE_DURATION_SEC:
             if protected_start:
-                # A deliberate re-articulation split (see NoteEvent's
-                # protected_start docstring) must not be silently erased
-                # just because the raw segment it produced happens to be
-                # very brief -- a real re-attack is often followed almost
-                # immediately by a natural articulation dip (confirmed on
-                # a real bug report: "fall as Lucifer fell" on real audio
-                # -- the split fired correctly but got dropped right here,
-                # before protected_start ever got a chance to protect it
-                # in the merge passes below). Stretch it to the minimum
-                # audible duration instead of dropping it -- but capped at
-                # the next raw segment's own start, never past it: an
-                # uncapped stretch here routinely created the exact
-                # overlaps _ensure_nonoverlapping's docstring calls "real
-                # bugs, not routine" when two protected splits landed close
-                # together (confirmed: 12 overlaps on one real song before
-                # this cap was added). If there's no room to stretch into,
-                # drop it same as an unprotected short segment would be.
+                # A deliberate re-articulation split must not be erased just for being brief; stretch to minimum duration, capped at the next segment's start, else drop it.
                 next_start_t = (
                     float(times[raw_notes[idx + 1][0]]) if idx + 1 < len(raw_notes) else None
                 )
@@ -970,33 +693,9 @@ def detect_notes(
         )
         pitch = _weighted_mode_pitch(trimmed_pitches, trimmed_confs) - 60
 
-        # Re-articulation pitch-rounding reconciliation (2026-08-07):
-        # a protected_start split whose independently-rounded pitch lands
-        # EXACTLY 1 semitone from its immediate predecessor, with near-
-        # zero gap, is more likely the SAME continuous note whose natural
-        # pitch drift (vibrato, a slow portamento within one sustained
-        # syllable) happened to straddle a semitone rounding boundary
-        # right where the split landed, than a genuine 1-semitone
-        # re-attack. A REAL same-pitch re-attack (the case protected_start
-        # exists for -- see is_rearticulation above, and NoteEvent's own
-        # docstring) has near-zero PITCH deviation by construction: that
-        # mechanism triggers on a strong ONSET regardless of how small the
-        # deviation is, specifically so it doesn't need should_split's
-        # full jump threshold. Confirmed real case (RMVPE isolation-mode
-        # investigation on Stars, 2026-08-07): "God" split into two
-        # protected fragments reading F#3 (168ms) then F3 (81ms), zero
-        # gap -- raw frame data confirms the whole syllable is F#3; the
-        # shorter, WRONG fragment happened to be longer than expected and
-        # won the downstream duration-weighted vote. Fix: pool BOTH
-        # fragments' own frame data (more evidence than either alone) and
-        # use that shared vote for both -- they remain separate NoteEvents
-        # (preserving the re-articulation timing/boundary a real re-attack
-        # deserves), only their reported PITCH is reconciled. Gated on a
-        # much tighter gap than the general merge passes
-        # (REARTICULATION_RECONCILE_MAX_GAP_SEC, not NOTE_MERGE_MAX_GAP_SEC)
-        # specifically so this can't accidentally fire on the OTHER
-        # protected_start path (resuming after a real silence gap at a
-        # strong onset), which by definition has a non-trivial gap.
+        # A protected_start split rounding 1 semitone from its predecessor, near-zero
+        # gap, is likely one note whose drift straddled a rounding boundary, not a real
+        # re-attack -- pool both fragments' frames for a shared pitch vote (NoteEvents stay separate).
         if (
             rearticulation_reconcile
             and protected_start
@@ -1066,9 +765,7 @@ def detect_notes(
                                      f"(<= {spike_max_duration_sec*1000:.0f}ms, "
                                      f">= {spike_min_jump_semitones} semitone jump from both neighbors)")
 
-    # Removing a spike can leave two same-pitch notes newly adjacent
-    # (the spike was the only thing between them) -- run the similar-
-    # adjacent merge once more to clean those back up into one note.
+    # Removing a spike can leave two same-pitch notes newly adjacent; re-merge.
     notes = _merge_similar_adjacent(notes, max_pitch_diff=merge_semitones, max_gap=merge_max_gap_sec)
     n_after_spike_merge = len(notes)
     if debug_log is not None:
@@ -1095,7 +792,7 @@ def detect_notes(
         debug_log.log_notes(notes, "pass 1 note segmentation, stage 6 (FINAL): after enforcing non-overlap")
 
     if want_ambiguity_tiebreak and activation_out and notes:
-        from .pitch_ambiguity import apply_ambiguity_tiebreak  # lazy: avoids a module-level circular import (pitch_ambiguity imports NoteEvent from here)
+        from .pitch_ambiguity import apply_ambiguity_tiebreak  # lazy: avoids circular import
         notes = apply_ambiguity_tiebreak(
             notes, activation_out["activation"], activation_out["rtime"], activation_out["cents_mapping"],
             ambiguity_margin_threshold, debug_log=debug_log, verbose=verbose,

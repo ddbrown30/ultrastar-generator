@@ -1,12 +1,4 @@
-"""Estimates #VIDEOGAP by cross-correlating the video's own audio track
-(if it has one) against the song's audio file.
-
-Per the format spec, #VIDEOGAP is the number of SECONDS to delay video
-playback, i.e. positive means the video should start later relative to
-the audio. If the video's audio leads the song audio by `offset` seconds,
-the video needs to be delayed by that same `offset` to line back up, so
-VIDEOGAP = offset.
-"""
+"""Estimates #VIDEOGAP (seconds to delay video playback) by cross-correlating video and song audio."""
 
 from __future__ import annotations
 
@@ -25,8 +17,7 @@ def estimate_videogap(
     max_lag_sec: float = 20.0,
     compare_window_sec: float = 60.0,
 ) -> Optional[float]:
-    """Returns the estimated VIDEOGAP in seconds, or None if the video has
-    no audio track / extraction fails."""
+    """Returns the estimated VIDEOGAP in seconds, or None on failure."""
     import librosa
     from scipy.signal import correlate
 
@@ -34,7 +25,7 @@ def estimate_videogap(
     with tempfile.TemporaryDirectory() as tmp:
         video_wav = Path(tmp) / "video_audio.wav"
         if not extract_audio_track(video_path, video_wav, as_mp3=False, sr=sr):
-            return None  # no audio track in the video, or ffmpeg unavailable
+            return None  # no audio track, or ffmpeg unavailable
 
         try:
             v, _ = librosa.load(str(video_wav), sr=sr, mono=True, duration=compare_window_sec)
@@ -45,7 +36,7 @@ def estimate_videogap(
         if len(v) == 0 or len(a) == 0:
             return None
 
-        # Normalize to avoid amplitude differences dominating correlation.
+        # Normalize so amplitude differences don't dominate correlation.
         v = (v - np.mean(v)) / (np.std(v) + 1e-9)
         a = (a - np.mean(a)) / (np.std(a) + 1e-9)
 
@@ -56,5 +47,5 @@ def estimate_videogap(
         mask = np.abs(lag_samples) <= max_lag_samples
         best_lag = lag_samples[mask][np.argmax(corr[mask])]
 
-        offset_sec = best_lag / sr  # positive: video's audio starts AFTER song audio
+        offset_sec = best_lag / sr  # positive: video audio starts after song audio
         return round(float(offset_sec), 2)

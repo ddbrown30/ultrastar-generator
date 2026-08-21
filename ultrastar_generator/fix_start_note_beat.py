@@ -1,41 +1,6 @@
-"""Rebases an existing UltraStar .txt's #GAP so its first note lands on
-beat 0 -- the format's own hard invariant (see usdx_writer.py: every
-generated song's first note is always beat 0 by construction, since GAP
-is defined as that note's own start time). Pure integer-beat arithmetic:
-every note/line-break's own beat NUMBER just shifts by a constant, and
-#GAP is adjusted by the equivalent number of milliseconds to compensate
--- BPM and every note's real-time position, pitch, text, and the note
-sequence itself are completely unchanged. No audio, ASR, or CUDA needed
-at all -- the cheapest mode in the whole project.
+"""Rebases an existing UltraStar .txt's #GAP so its first note lands on beat 0 (the format's hard invariant). Shifts every beat NUMBER by a constant and adjusts #GAP by the equivalent milliseconds; real-time position, pitch, text, and note order are unchanged. No audio/ASR/CUDA needed.
 
-Deliberately operates on the file's RAW INTEGER beat values via regex
-(the same patterns usdx_parser.py uses), not via usdx_parser's own
-seconds-converted ParsedSong + usdx_writer's render/re-quantize pipeline
--- a first attempt built on that round-trip (parse to seconds, rebuild a
-Song with a new gap_ms, re-render) looked correct in principle (GAP is
-defined by the exact same `first_syllable.start * 1000` rule main.py/
-realign.py already use) but FAILED real validation: re-quantizing a
-value that came from an EXACT integer beat, through
-seconds_to_beat_length's `math.floor()`, can round a beat length DOWN by
-one whenever float imprecision leaves the recovered seconds value a hair
-under the true integer boundary (e.g. 11.999999999997 beats instead of
-12.0) -- a classic floor-of-a-should-be-integer trap. Confirmed on the
-real "Stars" ground-truth file: several note lengths silently lost a
-beat, and `_quantize_entries`'s own non-overlap push-forward
-("occupied_until") then cascaded that single-beat loss into much larger
-drift on subsequent notes/line-breaks (one line-break landed 1.045s /
-15 beats off). Pure integer addition on the raw beat values -- no float
-round-trip anywhere except the single unavoidable GAP-in-milliseconds
-rounding -- has no such failure mode.
-
-Motivating real case: a hand-corrected "Stars" ground-truth file needed
-its first note moved to beat -14 to match the real audio (the file's
-existing GAP was for a slightly later moment than the true vocal onset).
-This mode is the general-purpose way to take a file that was authored
-(or manually corrected) with a nonzero first-note beat and convert it
-back into this project's own beat-0 convention, without touching any
-note's real audio timing, pitch, text, or the note sequence itself.
-"""
+Operates on raw integer beat values via regex, not via usdx_parser/usdx_writer's seconds round-trip: converting an exact integer beat through seconds and back can floor a beat length down by one on float imprecision, and `_quantize_entries`'s push-forward then cascades that into much larger drift. Pure integer addition avoids this."""
 
 from __future__ import annotations
 
@@ -55,14 +20,11 @@ class FixStartNoteBeatResult:
     output_path: Optional[Path] = None
     old_gap_ms: int = 0
     new_gap_ms: int = 0
-    beat_shift: int = 0  # the first note's ORIGINAL beat; 0 means no change was needed
+    beat_shift: int = 0  # first note's original beat; 0 = no change needed
 
 
 def fix_start_note_beat_text(text: str) -> Tuple[str, FixStartNoteBeatResult]:
-    """Pure function over the file's own text -- returns (new_text,
-    result-without-output_path). Raises UsdxParseError if #BPM or any
-    note line can't be found (same failure-closed convention as
-    usdx_parser.parse_usdx_file)."""
+    """Returns (new_text, result-without-output_path). Raises UsdxParseError if #BPM or any note line can't be found."""
     lines = text.splitlines()
 
     bpm = None
@@ -74,7 +36,7 @@ def fix_start_note_beat_text(text: str) -> Tuple[str, FixStartNoteBeatResult]:
         if not line:
             continue
         if not line.startswith("#"):
-            break  # header ends at the first non-tag, non-blank line
+            break
         m = _TAG_RE.match(line)
         if not m:
             continue
@@ -91,9 +53,7 @@ def fix_start_note_beat_text(text: str) -> Tuple[str, FixStartNoteBeatResult]:
     if bpm is None:
         raise UsdxParseError("Missing #BPM tag")
 
-    # The very first note line in the file is the anchor, regardless of
-    # a possible P1/P2 duet marker -- both parts share one GAP, so only
-    # ONE global shift is ever needed.
+    # Both P1/P2 duet parts share one GAP, so the file's first note line is the anchor.
     first_beat = None
     for raw in lines:
         m = _NOTE_RE.match(raw.rstrip("\r"))
@@ -130,29 +90,21 @@ def fix_start_note_beat_text(text: str) -> Tuple[str, FixStartNoteBeatResult]:
             continue
         out_lines.append(line)
         if i == bpm_line_idx and gap_line_idx is None:
-            # File had no #GAP tag at all (legitimate -- usdx itself
-            # treats a missing #GAP as 0, see usdx_parser.py's own
-            # comment) -- insert a real one now that one is needed.
-            out_lines.append(f"#GAP:{new_gap_ms}")
+            out_lines.append(f"#GAP:{new_gap_ms}")  # no #GAP tag existed (usdx treats missing as 0)
 
     return "\n".join(out_lines) + "\n", FixStartNoteBeatResult(
         success=True, old_gap_ms=gap_ms, new_gap_ms=new_gap_ms, beat_shift=first_beat)
 
 
 def resolve_fix_start_note_beat_output_path(existing_txt_path: Path, output_path_override: Optional[str]) -> Path:
-    """Where a fixed .txt gets written -- an explicit override if given,
-    else a NEW file alongside the existing one, never the existing file
-    itself (input files are always read-only, see check_output_not_existing_file)."""
+    """Where the fixed .txt gets written: an explicit override, else a new file alongside the existing one."""
     existing_txt_path = Path(existing_txt_path)
     return (Path(output_path_override).resolve() if output_path_override
             else existing_txt_path.with_name(existing_txt_path.stem + " [START BEAT FIXED].txt"))
 
 
 def check_output_not_existing_file(output_path: Path, existing_txt_path: Path) -> Optional[str]:
-    """HARD guarantee, not just a default: the existing file being fixed
-    is treated as read-only, unconditionally -- never overwritten, even
-    if an explicit output path happens to resolve to the same path. No
-    override exists for this on purpose -- don't add one."""
+    """The existing file is always read-only, even with an explicit output path -- no override."""
     if Path(output_path).resolve() == Path(existing_txt_path).resolve():
         return (f"Refusing to overwrite the existing file ({existing_txt_path}) -- "
                 f"the input file is always treated as read-only. Pass a different --output path.")
@@ -194,10 +146,7 @@ def run_fix_start_note_beat(existing_txt_path: Path, output_path_override: Optio
 def run_fix_start_note_beat_pipeline(input_dir: Path, existing_txt_path: Optional[Path] = None,
                                       output_path_override: Optional[str] = None,
                                       *, log=print) -> FixStartNoteBeatResult:
-    """Same `(input_dir, existing_txt_path, ...)` calling shape as
-    `realign.run_realign_pipeline`/`pitch_refresh.run_pitch_refresh_pipeline`
-    -- auto-detects the folder's single .txt when `existing_txt_path` is
-    None, so the GUI/CLI can dispatch to all three modes uniformly."""
+    """Auto-detects the folder's single .txt when `existing_txt_path` is None."""
     if existing_txt_path is None:
         try:
             existing_txt_path = find_existing_txt_in_folder(
@@ -258,7 +207,7 @@ def run(argv=None) -> int:
     elif input_path.is_file():
         existing_txt_path = input_path
     else:
-        existing_txt_path = None  # run_fix_start_note_beat_pipeline auto-detects
+        existing_txt_path = None  # auto-detected below
 
     result = run_fix_start_note_beat_pipeline(input_path, existing_txt_path, args.output)
     if not result.success:

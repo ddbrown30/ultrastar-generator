@@ -1,22 +1,9 @@
-"""CLI entry point.
-
-Usage:
-    python -m ultrastar_generator.main "C:\\Songs\\Bon Jovi - Its My Life" --output-dir "C:\\Output"
-
-The positional argument is a FOLDER (containing the audio -- or a video
-that stands in for it, see song_input.py -- and optionally a companion
-video/cover/background/MusicXML reference/existing .txt), not a single
-file. See README.md for the full option list and setup instructions.
-"""
+"""CLI entry point. Input is a song folder, not a single file -- see README.md."""
 
 from __future__ import annotations
 
 import os
-# Must be set before any CUDA context is created (i.e. before torch is
-# imported anywhere, even transitively) for torch.use_deterministic_
-# algorithms(True) to have full effect on cuBLAS ops -- confirmed
-# non-deterministic run-to-run on identical audio otherwise for CUDA
-# inference elsewhere in the pipeline (e.g. WhisperX).
+# Must be set before torch is imported anywhere, for reproducible CUDA inference.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import argparse
@@ -57,12 +44,7 @@ from .worker_process import run_cancellable, WorkerError
 
 @dataclass
 class PipelineResult:
-    """Outcome of one `run_pipeline` call. Never raises/exits on an
-    "expected" failure (no usable audio, no notes detected, etc.) -- those
-    all come back as success=False with a human-readable `error` instead,
-    so callers (the CLI wrapper below, `run_batch` in batch.py, gui.py)
-    can all handle failure uniformly without relying on process exit codes
-    or exceptions for ordinary control flow."""
+    """Outcome of one `run_pipeline` call. Expected failures come back as success=False+error, never raise."""
     success: bool
     output_txt_path: Optional[Path] = None
     error: Optional[str] = None
@@ -153,19 +135,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     default=config.ENABLE_WHISPERX_NO_VAD,
                     help="Force whisperx's own pyannote VAD to near-zero onset/offset thresholds "
                          "(no true off switch exists -- see config.WHISPERX_NO_VAD_OPTIONS) "
-                         "(default: on). Confirmed fix for word timestamps being wrong by up to "
-                         "~6 seconds around sustained/held sung notes -- VAD chunking appears to "
-                         "corrupt the downstream wav2vec2 alignment's context on a long held note; "
-                         "validated end-to-end (matches hand-verified reference timing exactly).")
+                         "(default: on). VAD chunking can corrupt the downstream wav2vec2 "
+                         "alignment's context around a long held note, throwing off word "
+                         "timestamps near sustained/held sung notes.")
     p.add_argument("--whisperx-vad", dest="whisperx_no_vad", action="store_false",
                     help="Use whisperx's own default pyannote VAD instead of the near-disabled "
-                         "workaround -- re-enables the confirmed sustained-note timestamp bug; "
-                         "kept only for comparison/debugging.")
+                         "workaround -- re-enables the sustained-note timestamp issue; kept only "
+                         "for comparison/debugging.")
     p.add_argument("--retry-low-quality-asr", dest="retry_low_quality_asr", action="store_true",
                     default=config.RETRY_LOW_QUALITY_ASR,
-                    # NOTE: literal '%' in argparse help text must be escaped as '%%' -- argparse
-                    # interpolates the stored help string with %-formatting when rendering --help.
-                    help=(f"PROTOTYPE, default: ON. Retries the whole transcription once with "
+                    # literal '%' must be escaped as '%%' (argparse %-formats help text)
+                    help=(f"Default: ON. Retries the whole transcription once with "
                           f"'{config.RETRY_ASR_MODEL}' when ASR quality looks bad: the MXL+LRC primary path's "
                           f"own ASR-placement-rate gate (< {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%}), or, in "
                           f"the standard fallback path, either a right-song reference-lyrics match with weak "
@@ -176,7 +156,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                           f"it actually scores better than the original. The actual re-transcription only runs "
                           f"in --batch mode (roughly doubles this run's ASR time) -- outside --batch, a "
                           f"triggered condition logs a WARNING suggesting --batch or a manual --whisper-model "
-                          f"large-v3 instead. See CLAUDE.md.").replace("%", "%%"))
+                          f"large-v3 instead.").replace("%", "%%"))
     p.add_argument("--no-retry-low-quality-asr", dest="retry_low_quality_asr", action="store_false")
     p.add_argument("--musicxml-reference", default=None,
                     help="Path to a MusicXML/.mxl file for this song (e.g. hand-downloaded sheet "
@@ -184,7 +164,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "output and corrects a syllable's PITCH CLASS (never octave, never timing) "
                          "where they disagree, once a per-song calibration offset can be trusted "
                          "(see config.MUSICXML_MIN_CALIBRATION_SAMPLES/_CONFIDENCE). No automatic "
-                         "fetch exists for this file -- see CLAUDE.md.")
+                         "fetch exists for this file.")
     p.add_argument("--musicxml-part", default=None,
                     help="Hint: which part name in the MusicXML file carries the lead vocal line, "
                          "for duet/ensemble arrangements where multiple parts have lyrics (e.g. a "
@@ -196,10 +176,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "matching synced lyrics are both available, generate from those directly "
                          "(MusicXML for pitch, LRCLIB line starts as real-time anchors, real "
                          "transcription to place words within a line) instead of the standard "
-                         "audio-only pass 1-4 pipeline -- validated real end-to-end: 100%% pitch-class "
-                         "accuracy, 99%% timing within 500ms (see CLAUDE.md). Quality-gated: falls back "
-                         "to the standard pipeline (with a warning) whenever no MusicXML/matching "
-                         "lyrics are available or the result doesn't pass a consistency check.")
+                         "audio-only pass 1-4 pipeline. Quality-gated: falls back to the standard "
+                         "pipeline (with a warning) whenever no MusicXML/matching lyrics are "
+                         "available or the result doesn't pass a consistency check.")
     p.add_argument("--no-mxl-lrc-primary", dest="mxl_lrc_primary", action="store_false",
                     help="Always use the standard audio-only pass 1-4 pipeline, even when a MusicXML "
                          "file and matching lyrics are available.")
@@ -262,24 +241,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "rounded confidence-weighted mode; when the top-2 candidate pitch classes are "
                          "genuinely close (--ambiguity-margin-threshold), breaks the tie using the "
                          "song's own detected key (published Krumhansl-Kessler profiles) -- a confident, "
-                         "unambiguous note is never touched, in- or out-of-key. Real-audio validated: "
-                         "weighted +2.4pp pitch-class accuracy across a 12-song roster, 9 songs improved, "
-                         "2 modest regressions (not universal). See CLAUDE.md / pitch_ambiguity.py.")
+                         "unambiguous note is never touched, in- or out-of-key. See pitch_ambiguity.py.")
     p.add_argument("--no-ambiguity-key-tiebreak", dest="ambiguity_key_tiebreak", action="store_false")
     p.add_argument("--ambiguity-margin-threshold", type=float, default=config.AMBIGUITY_MARGIN_THRESHOLD,
                     help="Relative salience-mass margin between the top-2 candidate pitch classes below "
                          "which a note is treated as genuinely ambiguous and eligible for the key-profile "
-                         "tie-break (default: {0}, the single best value found sweeping 0.10-1.00 on real "
-                         "audio -- see config.AMBIGUITY_MARGIN_THRESHOLD's own comment)".format(
-                             config.AMBIGUITY_MARGIN_THRESHOLD))
+                         "tie-break (default: {0})".format(config.AMBIGUITY_MARGIN_THRESHOLD))
     p.add_argument("--pitch-source", default=config.DEFAULT_PITCH_SOURCE, choices=["rmvpe", "swiftf0"],
                     help="Which pass-1 pitch source to use (default: "
                          f"{config.DEFAULT_PITCH_SOURCE!r}). The chosen source alone supplies both "
                          "the pitch value and the voicing decision -- no cross-check, no ensemble "
-                         "with any other source. 'rmvpe': validated 2026-08-09 as a real, "
-                         "reproducible +1.7pp average improvement over the old pyin-primary + "
-                         "CREPE/RMVPE-cross-check ensemble (since removed). 'swiftf0': lightweight "
-                         "CNN pitch detector with a real native voicing decision of its own.")
+                         "with any other source. 'swiftf0': lightweight CNN pitch detector with its "
+                         "own native voicing decision.")
     p.add_argument("--no-pass1-debug", action="store_true",
                     help="Don't write the '[PASS1 DEBUG]' .txt (pass-1 notes only, no lyrics) "
                          "that's written by default into <input-folder>/.ultrastar_work -- load it "
@@ -297,9 +270,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def check_cuda_available() -> Optional[str]:
-    """Returns an error message if CUDA isn't available, else None. Callers
-    (the CLI wrapper below, gui.py) each call this once, up front -- it's
-    not re-checked per song/per batch item."""
+    """Returns an error message if CUDA isn't available, else None."""
     import torch
     if not torch.cuda.is_available():
         return ("CUDA is not available, but this pipeline requires it (CPU support has "
@@ -317,13 +288,7 @@ def delete_work_files(work_dir: Path) -> None:
 
 def _transcribe_words_cancellable(vocals_path: Path, model_name: str, opts: config.PipelineOptions,
                                    debug_log, log: Callable[[str], None]):
-    """Same contract as transcription.transcribe_words, routed through a
-    killable child process (worker_process.run_cancellable) whenever
-    `opts.cancel_requested` is set -- see that module's own docstring for
-    why (a GUI Stop press can then kill this mid-call instead of waiting
-    for it to finish). Falls straight through to the in-process call
-    otherwise (the CLI, which gets real instant cancellation via Ctrl+C
-    for free and shouldn't pay subprocess overhead for nothing)."""
+    """Same contract as transcription.transcribe_words, routed through a killable child process when cancellable."""
     whisperx_vad_options = config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None
     if opts.cancel_requested is None:
         return transcribe_words(
@@ -341,12 +306,8 @@ def _transcribe_words_cancellable(vocals_path: Path, model_name: str, opts: conf
 
 def _detect_notes_cancellable(vocals_path: Path, y, sr, bpm: float, opts: config.PipelineOptions,
                                debug_log, log: Callable[[str], None]):
-    """Same contract as note_detection.detect_notes, routed through a
-    killable child process when `opts.cancel_requested` is set -- see
-    _transcribe_words_cancellable's own docstring for the full reasoning.
-    The subprocess re-loads audio from `vocals_path` itself (cheap, and
-    avoids pickling a potentially large `y` array through the request
-    file) rather than being handed `y`/`sr` directly."""
+    """Same contract as note_detection.detect_notes, routed through a killable child process when cancellable.
+    The subprocess reloads audio from `vocals_path` rather than pickling `y`/`sr`."""
     if opts.cancel_requested is None:
         return detect_notes(
             y, sr, bpm=bpm, pitch_source=opts.pitch_source, smooth_window_sec=opts.pitch_smooth_window,
@@ -375,10 +336,7 @@ def _detect_notes_cancellable(vocals_path: Path, y, sr, bpm: float, opts: config
 def _recover_dropped_reference_words_cancellable(ref_lines, words, vocals_path: Path,
                                                    opts: config.PipelineOptions, debug_log,
                                                    log: Callable[[str], None]):
-    """Same contract as lyrics_lookup.recover_dropped_reference_words,
-    routed through a killable child process whenever `opts.cancel_
-    requested` is set -- see _transcribe_words_cancellable's own
-    docstring."""
+    """Same contract as lyrics_lookup.recover_dropped_reference_words, routed through a killable child process when cancellable."""
     if opts.cancel_requested is None:
         return recover_dropped_reference_words(ref_lines, words, vocals_path, debug_log=debug_log)
     result = run_cancellable(
@@ -392,10 +350,7 @@ def _recover_dropped_reference_words_cancellable(ref_lines, words, vocals_path: 
 def _force_align_reference_lyrics_cancellable(vocals_path: Path, synced_lyrics: str, audio_duration: float,
                                                 opts: config.PipelineOptions, debug_log,
                                                 log: Callable[[str], None]):
-    """Same contract as transcription.force_align_reference_lyrics,
-    routed through a killable child process whenever `opts.cancel_
-    requested` is set -- see _transcribe_words_cancellable's own
-    docstring."""
+    """Same contract as transcription.force_align_reference_lyrics, routed through a killable child process when cancellable."""
     if opts.cancel_requested is None:
         return force_align_reference_lyrics(vocals_path, synced_lyrics, audio_duration, debug_log=debug_log)
     result = run_cancellable(
@@ -407,14 +362,7 @@ def _force_align_reference_lyrics_cancellable(vocals_path: Path, synced_lyrics: 
 
 
 def _retry_transcribe(vocals_path: Path, opts: config.PipelineOptions, debug_log, log: Callable[[str], None]):
-    """PROTOTYPE, see config.RETRY_LOW_QUALITY_ASR's docstring. Re-runs
-    transcription with `config.RETRY_ASR_MODEL` -- shared by both retry
-    sites in `_run_pipeline_body` (the MXL+LRC primary path's own
-    `asr_placement_rate` gate, and the standard fallback path's
-    reference-match-ratio check) so the re-transcribe call itself isn't
-    duplicated. The caller writes its own (more specific, e.g. "MXL+LRC
-    path" vs "standard fallback path") `debug_log.section(...)` marker
-    before calling this -- this only logs the one line common to both."""
+    """Re-transcribes with config.RETRY_ASR_MODEL; shared by both retry call sites in `_run_pipeline_body`."""
     config.check_cancelled(opts.cancel_requested)
     log(f"  Retrying transcription with '{config.RETRY_ASR_MODEL}'...")
     if debug_log is not None:
@@ -424,24 +372,9 @@ def _retry_transcribe(vocals_path: Path, opts: config.PipelineOptions, debug_log
 
 def run_pipeline(input_dir: Path, output_dir: Optional[Path], opts: config.PipelineOptions,
                   *, log: Callable[[str], None] = print) -> PipelineResult:
-    """Runs the full pipeline for one song folder. Never raises on an
-    "expected" failure (no usable audio source, ambiguous folder contents,
-    no notes/words detected, etc.) -- those come back as
-    `PipelineResult(success=False, error=...)` instead, so this can be
-    called directly from the CLI wrapper, `run_batch` (batch.py), or
-    gui.py without any of them needing try/except or exit-code handling
-    for ordinary control flow. `log` defaults to `print` but the GUI
-    passes something that feeds a queue/log widget instead.
+    """Runs the full pipeline for one song folder. Expected failures return PipelineResult(success=False), never raise.
 
-    Thin wrapper around `_run_pipeline_body` so that `opts.
-    delete_work_files` can be honored via `finally`, regardless of
-    which of `_run_pipeline_body`'s several early-return failure paths
-    was taken -- work_dir may be partially populated (e.g. separation
-    already ran) even on a failed run. work_dir's own location is
-    recomputed here rather than threaded back out of the body: it's a
-    pure function of (input_dir, opts.work_dir), so recomputing it can
-    never diverge from what the body itself used.
-    """
+    Wraps `_run_pipeline_body` so `opts.delete_work_files` is honored via `finally` on every exit path."""
     try:
         return _run_pipeline_body(input_dir, output_dir, opts, log=log)
     except config.PipelineCancelled:
@@ -459,26 +392,11 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         *, log: Callable[[str], None] = print) -> PipelineResult:
     input_dir = Path(input_dir)
     output_dir = Path(output_dir) if output_dir is not None else None
-    # work_dir is tied to the INPUT folder, never output_dir -- separation
-    # (and everything cached under it, including which vocals.wav BPM
-    # detection sees) should be reused across multiple runs of the same
-    # song even when --output-dir differs (e.g. comparing --whisper-model
-    # choices into separate output folders). Demucs isn't bit-reproducible
-    # run to run (see CLAUDE.md's "Lessons learned" -- confirmed in
-    # practice: two separations of the same song produced different-
-    # checksum vocals.wav, which was enough to flip detected BPM between
-    # 105.47 and 109.96), so reusing the SAME cached separation avoids
-    # that instability entirely rather than trying to fix Demucs itself.
+    # Tied to input_dir, not output_dir, so cached separation is reused across runs/output dirs.
     work_dir = Path(opts.work_dir).resolve() if opts.work_dir else (input_dir / ".ultrastar_work")
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- YouTube input (feature 7): downloads directly INTO input_dir, then
-    # falls through to the exact same folder-resolution logic as every other
-    # song -- an otherwise-empty folder with one freshly-downloaded mp3/mp4
-    # in it is auto-classified correctly (kind="audio" or "video_as_audio")
-    # with no special-casing needed. A YouTube title isn't a reliable
-    # "Artist - Title" source, so this requires --artist/--title explicitly
-    # (checked here, not just left to fail later at filename-parsing).
+    # YouTube download lands in input_dir, then falls through to normal folder resolution.
     if opts.youtube_url:
         if not (opts.artist and opts.title):
             return PipelineResult(success=False, error=(
@@ -497,7 +415,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     except (AmbiguousInputError, NoAudioSourceFoundError) as e:
         return PipelineResult(success=False, error=str(e))
 
-    audio_path = resolved.analysis_audio  # real, decodable audio -- feeds Demucs/pass1/WhisperX
+    audio_path = resolved.analysis_audio  # feeds Demucs/pass1/WhisperX
 
     if opts.artist and opts.title:
         artist, title = opts.artist, opts.title
@@ -510,30 +428,15 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         artist = opts.artist or parsed_artist
         title = opts.title or parsed_title
 
-    # Headline-cased for every OUTPUT folder/file name and #ARTIST/#TITLE
-    # tag from here on (e.g. "Beauty And The Beast" -> "Beauty and the
-    # Beast") -- applied uniformly regardless of source (folder name or
-    # explicit --artist/--title), since this is purely about the output
-    # naming convention. Deliberately conservative (see headline_case's
-    # own docstring): never touches an ALL CAPS or unusually-cased word
-    # like "KPop", so intentional stylization survives untouched.
+    # Headline-cased for output folder/file names and #ARTIST/#TITLE tags.
     artist = headline_case(artist)
     title = headline_case(title)
 
-    # --output-dir is now the PARENT folder under which a "<Artist> -
-    # <Title>" folder is created (e.g. --output-dir C:\output produces
-    # C:\output\<Artist> - <Title>\) -- not the final folder itself.
-    # Optional; defaults to <input folder>\Output as that parent.
+    # --output-dir is the PARENT under which "<Artist> - <Title>" is created; defaults to <input>\Output.
     if output_dir is None:
         output_dir = input_dir / "Output"
     output_dir = output_dir / sanitize_filename(f"{artist} - {title}")
 
-    # Checked here (not earlier) since it needs the FINAL folder, which
-    # needs artist/title -- a given/defaulted PARENT equalling input_dir
-    # is fine (e.g. --output-dir <same as input> puts output right inside
-    # the song folder, organized by its own "<Artist> - <Title>"
-    # subfolder); only an exact collision of the final folder itself with
-    # input_dir is a real problem (would overwrite the song's own files).
     if input_dir.resolve() == output_dir.resolve():
         return PipelineResult(success=False, error=(
             f"The output folder ({output_dir}) would be the same as the input folder -- "
@@ -541,12 +444,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Forced/pinned LRCLIB candidate (feature: MXL+LRC primary path) --
-    # An explicit --lrclib-id (CLI) or the GUI's own pre-search pin always
-    # wins over automatic search, everywhere a candidate is needed -- both
-    # the new MXL+LRC primary path below AND, on fallback, the old
-    # reference-lyrics-fetch step. `pinned_lyrics` (a full object, already
-    # resolved) takes priority if somehow both are set.
+    # A pinned/forced LRCLIB candidate always wins over automatic search.
     forced_lrc_candidate = opts.pinned_lyrics
     if forced_lrc_candidate is None and opts.lrclib_id is not None:
         log(f"Fetching pinned LRCLIB entry (id={opts.lrclib_id})...")
@@ -564,16 +462,12 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
     if debug_log_path is not None:
         log(f"Writing debug log to: {debug_log_path}")
 
-    # Mirrors a decision-narration message into the debug log FILE too, not just the console/GUI `log`
-    # callback -- otherwise the file only shows a retry's raw ASR data (via `debug_log` threaded into
-    # transcribe_words/try_mxl_lrc_primary) with no record of WHY it fired or what was decided, forcing
-    # anyone auditing the file alone to go dig up separately-captured console output instead. Used by
-    # both ASR-quality retry sites below (see config.RETRY_LOW_QUALITY_ASR's docstring).
+    # Logs to both the console/GUI `log` callback and the debug log file.
     def dlog(msg: str) -> None:
         log(msg)
         debug_log.line(msg)
 
-    # --- 1. Companion files (already resolved above) -------------------------
+    # --- 1. Companion files ---
     for note in resolved.notes:
         log(note)
     if resolved.output_video_source:
@@ -590,16 +484,13 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 "or no network).")
     if resolved.background:
         log(f"Found background: {resolved.background.name}")
-    # An explicit --musicxml-reference always wins; otherwise falls back to
-    # whatever file_discovery.find_companions auto-detected in the song's
-    # own folder (may be zero, one, or several). Used by BOTH the MXL+LRC
-    # primary path below and, on fallback, pass 4.
+    # Explicit --musicxml-reference wins; else falls back to auto-detected files. Used by MXL+LRC path and pass 4.
     mxl_paths = [opts.musicxml_reference] if opts.musicxml_reference else [str(p) for p in resolved.musicxml]
     if resolved.musicxml and not opts.musicxml_reference:
         names = ", ".join(p.name for p in resolved.musicxml)
         log(f"Found MusicXML reference file(s): {names}")
 
-    # --- 2. Vocal isolation --------------------------------------------------
+    # --- 2. Vocal isolation ---
     config.check_cancelled(opts.cancel_requested)
     if opts.skip_separation:
         if not opts.vocals_path:
@@ -614,31 +505,19 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             return PipelineResult(success=False, error=f"Vocal isolation failed: {e}")
     log(f"Vocals: {vocals_path}")
 
-    # --- 3. Load vocal audio for pitch analysis + tempo detection -----------
+    # --- 3. Load vocal audio for pitch analysis + tempo detection ---
     import librosa
     y, sr = librosa.load(str(vocals_path), sr=None, mono=True)
     audio_duration = len(y) / sr
 
     bpm = opts.bpm_override or detect_bpm(y, sr)
-    # write_bpm (not bpm) is used for the actual .txt/#BPM/beat-quantization --
-    # bpm itself stays the real detected tempo for pass 1's own audio analysis,
-    # which is tuned against real beat duration, not display resolution.
-    write_bpm = bpm * config.BPM_WRITE_MULTIPLIER
+    write_bpm = bpm * config.BPM_WRITE_MULTIPLIER  # written #BPM; bpm itself stays the real tempo for pass 1
     log(f"BPM: {bpm} (detected/real tempo, used for pass-1 analysis); "
         f"{write_bpm} written to the .txt for finer beat-grid resolution "
         f"(UltraStar multiplies by 4 for the real note grid).")
 
-    # --- 4. Transcription (lyrics text + rough timing) -- moved ahead of pass 1
-    # so the MXL+LRC primary path below can use it without a second, redundant
-    # transcription call; pass 1's own note detection never depended on it.
-    # `no_transcribe` (DIAGNOSTIC, --no-transcribe, default off): bypasses this
-    # entirely -- the WhisperX DECODER never runs, so it can never hallucinate/
-    # drop content in the first place (see force_align_reference_lyrics's own
-    # docstring, and the Magic Dance 'ic ic ic...' case in CLAUDE.md that
-    # motivated this). Needs a pinned LRC candidate WITH synced lyrics already
-    # resolved above (forced_lrc_candidate); falls back to normal transcription
-    # with a warning otherwise, same as any other unmet-precondition case in
-    # this pipeline.
+    # --- 4. Transcription (lyrics text + rough timing) ---
+    # --no-transcribe (diagnostic): skips the decoder, force-aligns a pinned LRC candidate's text instead.
     forced_align_only = False
     if opts.no_transcribe and forced_lrc_candidate is not None and forced_lrc_candidate.synced_lyrics:
         log("--no-transcribe: skipping the WhisperX decoder entirely -- force-aligning the pinned LRC "
@@ -668,33 +547,14 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                                error="No words were transcribed -- check the audio / vocal isolation quality.")
     log(f"Transcribed {len(words)} words.")
 
-    # --- 5. MXL+LRC primary generation (default path) -- MusicXML for pitch,
-    # LRCLIB synced-lyrics line starts as real-time anchors, real transcription
-    # (above) to place words within a line. Quality-gated: falls back to the
-    # standard pass 1-4 pipeline below whenever no MusicXML is available, no
-    # LRC candidate can be found/forced, or the result fails the quality gate
-    # -- see mxl_lrc_generator.py's module docstring for why the gate is
-    # trusted over trying to perfect upfront candidate selection.
+    # --- 5. MXL+LRC primary generation (default path); quality-gated, falls back to pass 1-4 below ---
     syllables = None
     ref_lines = None
     synced_lyrics_text = None
-    # Set True only by the standard fallback path below, when
-    # lyrics_lookup.is_lrc_line_tracking_confident trusted real LRC line
-    # timing against this song's own audio -- NOT simply whenever
-    # synced_lyrics_text is set (that also happens on the unrelated
-    # MXL+LRC primary path, which has its own separate word-placement
-    # logic and was never validated against phrasing.py's strict mode).
-    # Tells build_lines to trust every word's line_id completely (break
-    # IFF the reference line changed, no other heuristic) instead of the
-    # default gap/length-based safety net -- user's explicit directive:
-    # when using LRC, match it 100%, no exceptions. See phrasing.py.
+    # Set True only by the standard fallback path, once LRC line timing is trusted; tells build_lines
+    # to break lines exactly on reference line_id, skipping the gap/length heuristics.
     strict_line_breaks_from_lrc = False
-    # Tracks whichever model's transcription `words` currently holds --
-    # NOT always opts.whisper_model, since a low-quality-ASR retry below
-    # may have already swapped `words` for a config.RETRY_ASR_MODEL
-    # transcription. Guards both retry sites so a song that retries once
-    # in the MXL+LRC path never retries a second, redundant time in the
-    # standard fallback path below.
+    # Tracks which model `words` currently holds, since a retry below may swap it to RETRY_ASR_MODEL.
     current_asr_model = opts.whisper_model
     if opts.mxl_lrc_primary and mxl_paths:
         config.check_cancelled(opts.cancel_requested)
@@ -704,21 +564,8 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             forced_candidate=forced_lrc_candidate, preferred_part_name=opts.musicxml_part,
             vocals_path=vocals_path, debug_log=debug_log,
         )
-        # PROTOTYPE ASR-quality retry, see config.RETRY_LOW_QUALITY_ASR's
-        # docstring. Reuses the SAME asr_placement_rate/MXL_LRC_MIN_ASR_
-        # PLACEMENT_RATE gate `generate_from_mxl_and_lrc` already computes
-        # for its own "does the matched candidate really correspond to
-        # this recording" check -- if that's what's failing (not e.g. "no
-        # candidate found at all", which a bigger ASR model can't fix),
-        # retry the whole transcription once with config.RETRY_ASR_MODEL
-        # and re-run try_mxl_lrc_primary against it, keeping whichever
-        # attempt has the higher placement rate. A song where this retry
-        # succeeds gets the retried transcription carried forward into
-        # `words` even if used later (e.g. the standard fallback path).
-        # PROTOTYPE ASR-quality retry gating (2026-08-10, user's explicit request): a whole-song
-        # re-transcription roughly doubles this run's ASR time -- a reasonable cost to pay automatically
-        # in an unattended --batch run, but not one to silently eat in a single-song run where the user is
-        # presumably watching. Outside --batch, log a WARNING with the same explanation instead of retrying.
+        # ASR-quality retry (config.RETRY_LOW_QUALITY_ASR): if the placement-rate gate fails, retry
+        # transcription once with RETRY_ASR_MODEL and keep whichever attempt scores higher.
         mxl_retry_triggered = (opts.retry_low_quality_asr and mxl_lrc_result is not None
                                 and mxl_lrc_result.quality is not None
                                 and mxl_lrc_result.quality.asr_placement_rate < config.MXL_LRC_MIN_ASR_PLACEMENT_RATE
@@ -801,9 +648,9 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         log("No MusicXML file found for MXL+LRC primary generation; using standard audio-based generation.")
 
     if syllables is None:
-        # --- FALLBACK: standard audio-based pass 1 -> lyrics fetch -> pass 3 -> pass 4, unchanged. ---
+        # --- FALLBACK: standard audio-based pass 1 -> lyrics fetch -> pass 3 -> pass 4 ---
 
-        # --- PASS 1: pitch/timing from audio alone, no lyrics involved -------
+        # --- PASS 1: pitch/timing from audio alone ---
         config.check_cancelled(opts.cancel_requested)
         log("Pass 1: detecting notes from audio (pitch + timing only)...")
         notes = _detect_notes_cancellable(vocals_path, y, sr, bpm, opts, debug_log, log)
@@ -818,7 +665,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             log(f"Wrote pass-1 debug file (notes only, no lyrics): {debug_path}")
             log("  -> load this in the UltraStar editor to check timing/pitch BEFORE lyrics are involved.")
 
-        # --- Reference lyrics: correct ASR text AND mark phrase/line breaks --
+        # --- Reference lyrics: correct ASR text and mark phrase/line breaks ---
         if opts.fetch_lyrics:
             if forced_lrc_candidate is not None:
                 log(f"Using pinned lyrics: {forced_lrc_candidate.track_name} - "
@@ -840,12 +687,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         "forced line breaks).")
             if reference:
                 candidate_lines = parse_lyrics_lines(reference.plain_lyrics)
-                # Force-align known gaps (see recover_dropped_reference_words's own
-                # docstring). Gated on the SAME wrong-song floor as everything else
-                # in this block (reference_match_ratio computed on the ORIGINAL
-                # ASR words, before any recovery) -- running this against a
-                # wrong-song/wrong-language reference would force garbage text
-                # onto our own audio, not recover anything real.
+                # Force-align known gaps; gated on the same wrong-song floor as the rest of this block.
                 if reference_match_ratio(candidate_lines, words) >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO:
                     words, n_recovered = _recover_dropped_reference_words_cancellable(
                         candidate_lines, words, vocals_path, opts, debug_log, log)
@@ -855,27 +697,13 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                              f"CTC forced alignment.")
                 match_ratio = reference_match_ratio(candidate_lines, words)
                 unmatched_run = largest_unmatched_reference_run(candidate_lines, words)
-                # PROTOTYPE ASR-quality retry, see config.RETRY_LOW_QUALITY_ASR's
-                # docstring. Only fires once this reference has already cleared
-                # REFERENCE_LYRICS_MIN_MATCH_RATIO's much lower "is this even the
-                # right song" bar -- below that bar means wrong song/language,
-                # which a bigger model can't fix. Two INDEPENDENT triggers above
-                # that bar: a low whole-song ratio (ASR mistranscribed a lot,
-                # spread thinly), or a long unmatched-reference run (real case:
-                # Trixie Mattel - Gold -- ASR completely dropped one repeat of
-                # the "Doo doo doo doo doo. They start to play." chorus while the
-                # rest of the 326-word transcript was fine, which kept the
-                # aggregate ratio well above the bar and would have hidden this
-                # from a whole-song-only check).
+                # ASR-quality retry: two independent triggers once past the wrong-song floor -- a low
+                # whole-song match ratio, or one long dropped-passage run a healthy aggregate can hide.
                 low_ratio_trigger = (config.REFERENCE_LYRICS_MIN_MATCH_RATIO <= match_ratio
                                       < config.RETRY_ASR_MIN_REFERENCE_MATCH_RATIO)
                 dropped_passage_trigger = (match_ratio >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO
                                             and unmatched_run >= config.RETRY_ASR_MIN_UNMATCHED_REFERENCE_RUN)
-                # PROTOTYPE ASR-quality retry gating (2026-08-10, user's explicit request): a whole-song
-                # re-transcription roughly doubles this run's ASR time -- a reasonable cost to pay
-                # automatically in an unattended --batch run, but not one to silently eat in a single-song
-                # run where the user is presumably watching. Outside --batch, log a WARNING with the same
-                # explanation instead of retrying.
+                # Retry only in --batch (roughly doubles ASR time); outside --batch, just warn.
                 standard_retry_triggered = (opts.retry_low_quality_asr and (low_ratio_trigger or dropped_passage_trigger)
                                              and current_asr_model != config.RETRY_ASR_MODEL)
                 if standard_retry_triggered and not opts.batch:
@@ -904,10 +732,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                              f"but ASR quality looks weak) -- retrying before accepting this transcription.")
                     retry_words = _retry_transcribe(vocals_path, opts, debug_log, log)
                     if retry_words:
-                        # Apply the SAME gap-recovery to the retry's own transcription before comparing --
-                        # otherwise accepting the retry (its raw ratio can look better on the WHOLE song)
-                        # silently throws away whatever the first pass's gap-recovery already found, and
-                        # there's no guarantee the bigger model independently recovers the same passage.
+                        # Apply the same gap-recovery to the retry before comparing.
                         if (reference_match_ratio(candidate_lines, retry_words)
                                 >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
                             retry_words, retry_n_recovered = _recover_dropped_reference_words_cancellable(
@@ -917,9 +742,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                                      f"{retry_n_recovered} more word(s).")
                         retry_ratio = reference_match_ratio(candidate_lines, retry_words)
                         retry_unmatched_run = largest_unmatched_reference_run(candidate_lines, retry_words)
-                        # Accept if it's better on WHICHEVER signal actually triggered the retry -- comparing
-                        # only the ratio could miss a retry that fixes one dropped passage (a handful of
-                        # words out of hundreds barely moves the aggregate) without making it worse either.
+                        # Accept if better on whichever signal triggered the retry.
                         if retry_ratio > match_ratio or retry_unmatched_run < unmatched_run:
                             dlog(f"  Retry with '{config.RETRY_ASR_MODEL}' improved: reference match "
                                  f"{match_ratio:.0%} -> {retry_ratio:.0%}, largest dropped-passage run "
@@ -959,9 +782,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                             log("  Confidently trusted LRC line tracking -- line breaks will match it "
                                 "exactly (no gap/length heuristics).")
                     diffs = alignment_diff_summary(words, corrected)
-                    # corrected is always the same length as words now --
-                    # a dropped word is flagged via Word.dropped, not
-                    # omitted (see its own docstring for why).
+                    # corrected stays the same length as words; a dropped word is flagged via Word.dropped, not omitted.
                     n_dropped = sum(1 for w in corrected if w.dropped)
                     if diffs:
                         log(f"  Corrected/dropped {len(diffs)} word(s) against the reference lyrics"
@@ -974,14 +795,10 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         log("  ASR text already matched the reference; no corrections needed.")
                     debug_log.log_reference_corrections(diffs)
                     words = corrected
-            # else: reference is None -- already logged (and, in the GUI,
-            # confirmed via no_lrc_fallback_callback) right after the fetch
-            # above; nothing further to do here but continue with ASR text
-            # and gap-based phrasing, same as if lyric lookup were disabled.
         else:
             log("Lyric lookup disabled (--no-fetch-lyrics); using ASR text and gap-based phrasing only.")
 
-        # --- PASS 3: fit words onto the pass-1 note grid (timing untouched) --
+        # --- PASS 3: fit words onto the pass-1 note grid (timing untouched) ---
         log("Pass 3: fitting words onto the pass-1 note grid...")
         syllables, stats = align_words(words, notes, y, sr, debug_log=debug_log)
         log(f"  {stats.words_with_notes}/{stats.total_words} words matched to pass-1 notes directly "
@@ -1005,7 +822,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
             log(f"    reference-text override: forced {n_replaced} word(s) to match reference "
                 f"lyrics exactly")
 
-        # --- PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s).
+        # --- PASS 4 (optional): confirm/correct pitch class against MusicXML reference file(s) ---
         if mxl_paths:
             log(f"Pass 4: cross-checking pitch against {len(mxl_paths)} MusicXML reference file(s)...")
             syllables, mxl_stats_list = apply_musicxml_references(
@@ -1023,9 +840,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         f"({mxl_stats.calibration_confidence:.0%} agreement), "
                         f"{len(mxl_stats.corrections)} syllable(s) corrected")
 
-    # --- 7c. LRC line-timing check (optional, off by default): flags lines whose
-    # assigned start disagrees with LRCLIB's synced-lyrics timing. DIAGNOSTIC
-    # ONLY -- never moves anything, see lrc_timing.py's module docstring for why.
+    # --- LRC line-timing check (optional, diagnostic only -- never moves anything) ---
     if opts.lrc_timing_check and synced_lyrics_text:
         log("Checking line timing against LRCLIB's synced lyrics (diagnostic only)...")
         lrc_stats = apply_lrc_timing_check(syllables, synced_lyrics_text,
@@ -1039,16 +854,11 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
 
     entries = build_lines(syllables, strict_reference_lines=strict_line_breaks_from_lrc)
 
-    # --- 8. GAP = start of the first syllable --------------------------------
+    # --- GAP = start of the first syllable ---
     first_syllable = next((e for e in entries if isinstance(e, Syllable)), None)
     gap_ms = int(round(first_syllable.start * 1000)) if first_syllable else 0
 
-    # --- 9. VIDEOGAP ----------------------------------------------------
-    # Skipped entirely (not just "no video") when the video and analysis
-    # audio are the same file, or one was extracted directly from the
-    # other (mp4-as-audio / avi-extract) -- correlating a signal against
-    # itself or a trimmed copy of itself is meaningless, not just wasted
-    # work.
+    # --- VIDEOGAP --- skipped when video and analysis audio are the same/derived file
     videogap = None
     if resolved.output_video_source and resolved.videogap_applicable and not opts.no_video_sync:
         log("Estimating VIDEOGAP from the video's audio track...")
@@ -1058,14 +868,10 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         else:
             log("Video has no usable audio track (or ffmpeg unavailable); leaving VIDEOGAP unset.")
 
-    # --- 10. Preview start: default to first vocal, nudged back slightly ----
+    # --- Preview start: first vocal, nudged back slightly ---
     preview_start = max(0.0, (first_syllable.start - 0.5)) if first_syllable else None
 
-    # --- 11. Copy the companions this output actually references into
-    # output_dir (input and output folders are required to differ -- see
-    # the check at the top of this function), renamed to "<Artist> -
-    # <Title>[.ext]" (images keep their own "[CO]"/"[BG]" tag) regardless
-    # of what they were called in the input folder -----------------------
+    # --- Copy referenced companions into output_dir, renamed to "<Artist> - <Title>[.ext]" ---
     staged = stage_companions_to_output(
         output_dir, artist, title,
         mp3_src=resolved.output_mp3_source,
@@ -1074,8 +880,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
         background_src=resolved.background,
     )
 
-    # --- 12. Assemble + write Song. Companion staging above already ran --
-    # an output_dir != input_dir still needs to be self-contained.
+    # --- Assemble + write Song ---
     out_name = sanitize_filename(f"{artist} - {title}.txt")
     out_path = output_dir / out_name
 
@@ -1107,9 +912,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
 
 
 def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
-    """Builds a PipelineOptions from argparse's Namespace -- the CLI's own
-    way of constructing the same options object gui.py builds directly
-    from widget state."""
+    """Builds a PipelineOptions from argparse's Namespace."""
     pinned_lyrics = None
     if args.lrc_file:
         pinned_lyrics = load_lrc_file(args.lrc_file, artist=args.artist or "", title=args.title or "")
@@ -1143,17 +946,11 @@ def _opts_from_args(args: argparse.Namespace) -> config.PipelineOptions:
 
 
 def run(argv=None) -> int:
-    # Python fully block-buffers stdout by default whenever it isn't a live
-    # terminal (redirected to a file, piped through `| grep`, etc.) -- on a
-    # long run this can leave progress output invisible for the ENTIRE run,
-    # only appearing all at once when the process exits or the buffer fills.
-    # Force line buffering so every print (including the progress lines
-    # below and in verification.py) shows up promptly regardless of how
-    # stdout is connected.
+    # Force line buffering so progress output isn't invisible when stdout is redirected/piped.
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except (AttributeError, ValueError):
-        pass  # not a reconfigurable text stream -- nothing to do
+        pass
 
     args = build_arg_parser().parse_args(argv)
 

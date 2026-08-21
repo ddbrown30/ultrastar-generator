@@ -1,10 +1,4 @@
-"""Tempo (BPM) and vocal-onset (GAP) estimation.
-
-UltraStar's #BPM is multiplied by 4 internally to get the note-beat grid
-(see the format spec), so the value we write should be a plausible *real*
-musical tempo, not the x4'd grid rate. We fold octave errors from the
-detector into config.MIN_BPM..MAX_BPM.
-"""
+"""Tempo (BPM) and vocal-onset (GAP) estimation. UltraStar's #BPM is multiplied by 4 internally for the note-beat grid, so the written value must be a real musical tempo, not the x4'd rate; octave errors are folded into config.MIN_BPM..MAX_BPM."""
 
 from __future__ import annotations
 
@@ -33,8 +27,7 @@ def detect_bpm(y: np.ndarray, sr: int) -> float:
 
 
 def beat_duration_ms(bpm_as_written: float) -> float:
-    """Duration of one UltraStar note-beat, in ms, per the format spec:
-    the txt #BPM value is multiplied by 4 to get the real note-grid BPM."""
+    """Duration of one UltraStar note-beat, in ms (#BPM is multiplied by 4 for the real note-grid BPM)."""
     grid_bpm = bpm_as_written * 4
     return 60000.0 / grid_bpm
 
@@ -45,21 +38,12 @@ def seconds_to_beat(t_sec: float, gap_ms: int, bpm_as_written: float) -> int:
 
 
 def seconds_to_beat_length(duration_sec: float, bpm_as_written: float) -> int:
-    """FLOORS (never rounds up) -- user's explicit request, 2026-08-10: a
-    note that's a bit too SHORT is preferable to one that's a bit too
-    LONG. round() would overshoot on any duration whose fractional beat
-    count is >= 0.5; floor() always undershoots (or lands exact), never
-    overshoots, at the cost of a slightly shorter note on average.
-    `max(1, ...)` still guarantees every note gets written (never 0
-    beats), same as before."""
+    """Floors (never rounds up) -- a too-short note is preferable to a too-long one; always at least 1 beat."""
     ms = duration_sec * 1000.0
     length = int(math.floor(ms / beat_duration_ms(bpm_as_written)))
     return max(1, length)
 
 
 def beat_to_seconds(beat: int, gap_ms: int, bpm_as_written: float) -> float:
-    """Inverse of seconds_to_beat -- used to parse an EXISTING .txt file's
-    own beat numbers back into seconds, using the GAP/BPM values read from
-    THAT file's own header (not necessarily this run's own detected
-    values). See usdx_parser.py."""
+    """Inverse of seconds_to_beat -- parses an existing .txt's beat numbers back into seconds using its own header GAP/BPM."""
     return (gap_ms + beat * beat_duration_ms(bpm_as_written)) / 1000.0

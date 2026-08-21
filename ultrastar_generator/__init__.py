@@ -1,12 +1,3 @@
-"""
-ultrastar_generator
-====================
-
-Generates UltraStar Deluxe .txt song files from a raw audio file (mp3/ogg/oga/m4a),
-by isolating vocals, transcribing lyrics, detecting pitch/timing, and writing
-a spec-compliant UltraStar txt file.
-
-See README.md for usage.
-"""
+"""Generates UltraStar Deluxe .txt karaoke files from raw audio. See README.md for usage."""
 
 __version__ = "0.1.0"

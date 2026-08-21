@@ -1,14 +1,4 @@
-"""Writes an intermediate, notes-only UltraStar .txt file: pass 1's raw
-detected notes, correctly timed and pitched, with placeholder text
-instead of real lyrics. This is a real, loadable UltraStar song file --
-open it in the editor to check timing/pitch in isolation, with no chance
-of a later pass (lyric fitting) having touched anything.
-
-Each note's placeholder text is its note name (e.g. "G#3"), which is
-usually more useful for debugging than a generic dot or number: you can
-directly compare what was detected against what you expect to hear,
-without needing to eyeball the editor's piano roll.
-"""
+"""Writes a real, loadable UltraStar .txt of pass 1's raw detected notes, with each note's name (e.g. "G#3") as placeholder text instead of real lyrics -- for checking timing/pitch before lyric fitting touches anything."""
 
 from __future__ import annotations
 
@@ -23,10 +13,7 @@ from .pitch import ultrastar_pitch_to_note_name
 
 
 def notes_to_debug_entries(notes: List[NoteEvent], line_gap_sec: float = None) -> List[object]:
-    """Converts a raw NoteEvent list into Song.entries: one "word" (the
-    note name) per note, with a line break inserted after any silence gap
-    at least `line_gap_sec` long (defaults to config.MIN_LINE_GAP_SEC),
-    purely so the debug file doesn't render as one giant unbroken line."""
+    """Converts a raw NoteEvent list into Song.entries, one "word" (the note name) per note, with a line break after any gap >= `line_gap_sec`."""
     if line_gap_sec is None:
         line_gap_sec = config.MIN_LINE_GAP_SEC
 

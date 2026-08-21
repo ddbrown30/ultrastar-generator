@@ -1,22 +1,7 @@
-"""Downloads a YouTube video as the primary source for a song folder
-(feature 7), via `yt-dlp` -- an optional dependency, only ever imported
-when `--youtube-url` is actually used, same "gracefully degrade if
-missing" convention as `whisperx`/`rmvpe_onnx` elsewhere in this project.
+"""Downloads a YouTube video (via `yt-dlp`, optional dependency) as the primary source for a song folder.
 
-Deliberately does NOT name the downloaded file from the video's own
-title -- YouTube titles aren't a reliable "Artist - Title" source, which
-is exactly why `--youtube-url` requires `--artist`/`--title` explicitly
-(enforced in main.py, not here).
-
-Also downloads the video's thumbnail and converts it to
-'youtube_download [CO].jpg' -- the " [CO]" tag matches file_discovery.
-find_companions' own existing cover-detection convention by construction
-(it matches any "<audio file's own stem> [CO]" image, and the audio/video
-file here is always named "youtube_download.<ext>"), so the thumbnail is
-picked up as the cover with ZERO new code in file_discovery.py/
-song_input.py. Best-effort: a missing/failed thumbnail never fails the
-overall download, since the real audio/video content is what matters.
-"""
+`--artist`/`--title` are required separately (enforced in main.py) since YouTube titles aren't reliable.
+Also downloads the thumbnail as 'youtube_download [CO].jpg' so it's picked up as the cover automatically."""
 
 from __future__ import annotations
 
@@ -24,18 +9,11 @@ from pathlib import Path
 
 
 class YoutubeDownloadError(RuntimeError):
-    """yt-dlp isn't installed, the download failed (network, private/
-    removed/geo-blocked video, etc.), or it "succeeded" but the expected
-    output file isn't where it should be."""
+    """yt-dlp isn't installed, the download failed, or the expected output file is missing."""
 
 
 def download_youtube_source(url: str, dest_dir: Path, *, audio_only: bool) -> Path:
-    """Downloads `url` into dest_dir as a single, deterministically-named
-    file: 'youtube_download.mp3' (audio_only=True, yt-dlp's own audio
-    extraction via ffmpeg) or 'youtube_download.mp4' (audio_only=False,
-    best available muxed video+audio). Returns the downloaded file's path.
-    Raises YoutubeDownloadError on any failure -- never returns a path
-    that doesn't actually exist."""
+    """Downloads `url` into dest_dir as 'youtube_download.mp3' or '.mp4'. Returns the downloaded file's path."""
     try:
         import yt_dlp
     except ImportError:
@@ -91,11 +69,7 @@ def download_youtube_source(url: str, dest_dir: Path, *, audio_only: bool) -> Pa
 
 
 def _rename_thumbnail_to_cover(dest_dir: Path) -> None:
-    """Best-effort: renames yt-dlp's converted 'youtube_download.jpg'
-    thumbnail to 'youtube_download [CO].jpg' so it's picked up by
-    file_discovery.find_companions' existing [CO]-tag convention. Never
-    raises -- a missing thumbnail (yt-dlp couldn't fetch/convert one for
-    this video) is a silent no-op, not a failure."""
+    """Best-effort rename of the downloaded thumbnail to the [CO]-tag cover convention. Never raises."""
     thumb = dest_dir / "youtube_download.jpg"
     if not thumb.is_file():
         return

@@ -1,49 +1,19 @@
-"""Alignment-only mode: given a FINISHED UltraStar .txt and its audio (or a
-video that stands in for it, same as the main pipeline), re-times the
-file's own notes to better match the audio -- GAP, note start time, and
-note length -- WITHOUT touching pitch and without adding, removing, or
-reordering a single note. Assumes the input file's notes are already in
-the right order and its lyric TEXT is correct; makes no other assumption
-about the file's own timing (it could be hand-authored, machine-generated
-by a different tool, or -- the degenerate case this is explicitly designed
-to survive -- a flat list of equal-length placeholder notes that don't
-correspond to the audio at all).
+"""Alignment-only mode: re-times an existing UltraStar .txt's notes to
+match its audio (GAP, note start/length only) -- never touches pitch or
+adds/removes/reorders notes. Assumes note order and lyric text are
+correct; makes no assumption about timing quality.
 
-The existing file being realigned is treated as READ-ONLY, unconditionally
-and permanently -- `run_realign_pipeline` never writes to it, defaults to
-a separate "<name> [REALIGNED].txt" output, and hard-refuses to run at all
-if an explicit output path is ever given that resolves to the SAME path as
-the existing file (see its own `output_path` check). No override exists
-for this on purpose -- don't add one.
+The existing file is always read-only: never overwritten, output
+defaults to "<name> [REALIGNED].txt", refuses to run if an explicit
+output path resolves to the same file.
 
-Design mirrors `mxl_lrc_generator.py`'s proven shape (real transcription of
-OUR OWN audio as the primary signal, LRCLIB synced-lyrics line starts as a
-secondary anchor when available, nearest-confident-anchor interpolation
-for everything else) but adapted for a fundamentally different situation:
-mxl_lrc_generator trusts the MXL's own relative offsets/durations as a
-reliable rhythm template and only needs LRC to anchor per-LINE windows,
-because MXL data is professionally authored. Here the INPUT FILE's own
-timing is exactly what's being corrected, so it can't be trusted as a
-rhythm template OR used to window the ASR search the way MXL+LRC windows
-each line by +-0.5s -- a badly-off input file would just miss the correct
-ASR words entirely under that scheme. Instead:
-
-  - ASR matching is a single WHOLE-SONG, order-preserving text alignment
-    (existing words vs. ASR words), not time-windowed at all -- text order
-    is the only thing this mode can trust the input file for.
-  - The existing word's own ORIGINAL start time is used purely as a
-    proportional "offset" for interpolating between confident anchors
-    (exactly the role MXL's quarter-note offset plays in
-    mxl_lrc_generator.place_words_via_asr) -- if the original timing
-    already roughly tracks the audio, this recovers real local tempo
-    variation; if the original timing is degenerate (e.g. uniform
-    single-beat notes), it degrades gracefully to even spacing between
-    confident anchors, no worse.
-  - Unlike mxl_lrc_generator (which has no "original" to fall back to and
-    so must always guess something), this mode always has the original
-    timing as a safe default -- a word with NO confident anchor anywhere
-    in the whole song keeps its original timing untouched rather than
-    extrapolating from nothing.
+Since the input's own timing may not be trustworthy, it can't window
+the ASR search:
+  - ASR matching is a whole-song, order-preserving text alignment, not
+    time-windowed.
+  - A word's original start is used only as a proportional offset for
+    interpolating between confident anchors.
+  - A word with no confident anchor anywhere keeps its original timing.
 """
 
 from __future__ import annotations
@@ -71,11 +41,8 @@ from .worker_process import run_cancellable, WorkerError
 
 @dataclass
 class ExistingWord:
-    """One word from the EXISTING file, reconstructed from its own
-    word-start-tagged syllable run (see `usdx_parser.parse_usdx_file` --
-    `is_word_start` now correctly handles both the leading-space
-    convention this project's own writer uses AND the trailing-space
-    convention real hand/SingStar-authored files use)."""
+    """One word from the existing file, reconstructed from its
+    word-start-tagged syllable run."""
     entry_indices: List[int]   # indices into ParsedSong.entries for this word's syllables
     text: str
     norm: str
@@ -84,9 +51,7 @@ class ExistingWord:
 
 
 def extract_words(entries: List[Union[Syllable, LineBreak]]) -> List[ExistingWord]:
-    """Groups the parsed entries into words, in order. LineBreaks are not
-    part of any word -- they're repositioned separately once every word's
-    new timing is known (see `_reposition_line_breaks`)."""
+    """Groups parsed entries into words, in order; LineBreaks aren't part of any word."""
     words: List[ExistingWord] = []
     cur_indices: List[int] = []
     cur_text = ""
@@ -119,17 +84,11 @@ class RealignQuality:
     n_words: int = 0
     n_asr_matched: int = 0
     n_lrc_seeded: int = 0
-    n_force_aligned: int = 0  # see _force_align_unconfident_runs's own docstring
+    n_force_aligned: int = 0  # see _force_align_unconfident_runs
     n_interpolated: int = 0
     n_kept_original: int = 0
-    # Longest CONSECUTIVE run of words with no real anchor (asr/lrc/
-    # force-align) at all -- see config.RETRY_ASR_MIN_UNCONFIDENT_RUN.
-    # A per-PASSAGE signal, independent of anchor_rate: real case (David
-    # Bowie - Magic Dance, small.en) had a song-wide anchor rate of 58%
-    # (well above the retry bar) while one hallucinated decoder segment
-    # still dragged a real, contiguous passage ~12-14s off in the final
-    # output -- an aggregate rate spread across an otherwise well-matched
-    # song hid it completely.
+    # Longest consecutive run of words with no anchor at all -- a per-passage
+    # signal (an aggregate rate can hide one bad passage).
     longest_unconfident_run: int = 0
 
     @property
@@ -139,8 +98,7 @@ class RealignQuality:
 
 
 def _longest_false_run(confident: List[bool]) -> int:
-    """Longest consecutive run of `False` in `confident` -- see
-    `RealignQuality.longest_unconfident_run`'s docstring."""
+    """Longest consecutive run of `False` in `confident`."""
     best = cur = 0
     for c in confident:
         cur = 0 if c else cur + 1
@@ -152,31 +110,11 @@ def _force_align_unconfident_runs(words_text: List[str], starts: List[Optional[f
                                    ends: List[Optional[float]], confident: List[bool],
                                    vocals_path: Path, *, debug_log: Optional[DebugLog] = None
                                    ) -> int:
-    """For each
-    contiguous run of `confident[i] == False`, forces the EXISTING file's
-    OWN text for that run onto the audio window between the nearest
-    CONFIDENT neighbors (or 0.0/audio-end at the edges), via
-    `transcription.force_align_words_in_window` -- a real, measured
-    wav2vec2 CTC forced alignment, not a guess. Unlike a local text-search
-    rematch (searches ASR's own already-decoded words in the window --
-    useless if the decoder produced none there; tried as `realign.
-    rematch_local_gaps`, removed 2026-08-15 as a net regression, see
-    CLAUDE.md), this doesn't depend on ASR having transcribed anything at
-    all in the gap.
-
-    Mutates `starts`/`ends`/`confident` in place for any run that
-    succeeds; leaves a run untouched (falls through to
-    `interpolate_fallback` as before) if the window's too short or the
-    alignment result doesn't validate. Returns how many words were
-    recovered this way. Lazily loads the audio/align model at most once,
-    and only if there's actually an unconfident run to try -- a clean
-    file with no gaps never pays this cost.
-
-    Takes plain `words_text` (not the existing file's own ExistingWord
-    objects) -- the only thing this ever needed from each word was its
-    own text -- so a cancellable-subprocess caller (see
-    _force_align_unconfident_runs_cancellable/worker_process.py) can
-    serialize the input as plain strings, no reconstruction needed."""
+    """For each contiguous run of unconfident words, force-aligns the
+    existing text onto the audio window between confident neighbors via
+    wav2vec2 CTC. Mutates `starts`/`ends`/`confident` in place for runs
+    that succeed; leaves failed runs for `interpolate_fallback`. Returns
+    the count recovered. Lazily loads audio/model only if needed."""
     if not any(not c for c in confident):
         return 0
     from .transcription import force_align_words_in_window
@@ -236,13 +174,9 @@ def _force_align_unconfident_runs_cancellable(words_text: List[str], starts: Lis
                                                cancel_requested: Optional[Callable[[], bool]],
                                                debug_log: Optional[DebugLog] = None,
                                                log: Callable[[str], None] = print) -> int:
-    """Same contract as `_force_align_unconfident_runs` (mutates
-    starts/ends/confident in place, returns the promoted count) -- routes
-    through a killable child process (worker_process.run_cancellable)
-    when `cancel_requested` is given, so the GUI's Stop button can kill
-    this mid-call instead of waiting for it to finish; falls straight
-    through to the in-process call otherwise (the CLI, and any other
-    caller with no cancel_requested at all)."""
+    """Same as `_force_align_unconfident_runs`, but runs in a killable
+    child process when `cancel_requested` is given; otherwise calls
+    in-process."""
     if cancel_requested is None:
         return _force_align_unconfident_runs(words_text, starts, ends, confident, vocals_path,
                                                debug_log=debug_log)
@@ -259,11 +193,8 @@ def _force_align_unconfident_runs_cancellable(words_text: List[str], starts: Lis
 
 
 def _line_chunks(line_of_word: List[int]) -> List[Tuple[int, int]]:
-    """Groups consecutive existing-word indices sharing the same real
-    line index into (start, end) chunk bounds, in order -- the natural
-    unit `match_words_to_asr` chunks by when real line info is given
-    (see its own docstring for why a real line beats an arbitrary
-    fixed-size chunk)."""
+    """Groups consecutive word indices sharing the same line index into
+    (start, end) chunks, in order."""
     chunks: List[Tuple[int, int]] = []
     if not line_of_word:
         return chunks
@@ -281,50 +212,23 @@ def _line_chunks(line_of_word: List[int]) -> List[Tuple[int, int]]:
 def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word],
                         line_of_word: Optional[List[int]] = None
                         ) -> Tuple[List[Optional[float]], List[Optional[float]], List[bool]]:
-    """Whole-song, order-preserving text match of the existing file's own
-    words against real ASR words -- deliberately NOT TIME-windowed (see
-    module docstring for why: this mode can't trust the input file's own
-    timing enough to window a search with it).
+    """Whole-song, order-preserving text match of the existing file's
+    words against ASR words -- not time-windowed (input timing isn't
+    trusted).
 
-    The window search itself (forward-only cursor, tight-vs-wide, quality
-    gates -- the part responsible for this project's own recurring
-    "repeated-phrase disambiguation" failure class, see CLAUDE.md's
-    "Lessons learned") is `lrc_timing.find_cursor_window_match` -- see its
-    own docstring for the full real-bug history behind it, and CLAUDE.md's
-    "Shared cursor-window matching" note for the full list of callers to
-    re-check whenever that shared function changes. This function's own
-    remaining job is CHUNKING existing words and interpreting a winning
-    match for this shape: mark every individually-matched word's own
-    start/end/confidence, with a fuzzy-ratio fallback for a `"replace"`
-    block (ASR mishearing a word differently than the reference text,
-    same technique `mxl_lrc_generator.place_words_via_asr` already
-    validated) -- neither of which lives in the shared search itself,
-    since interpreting a match is genuinely caller-specific (this wants
-    every individual word's own position; `match_asr_to_lrc_lines` wants
-    just the line's own single earliest-word anchor).
+    The window search (forward-only cursor, tight-vs-wide, quality gates
+    -- avoids matching the wrong occurrence of a repeated phrase) is
+    `lrc_timing.find_cursor_window_match`; this function chunks existing
+    words and interprets the winning match, with a fuzzy-ratio fallback
+    for ASR mishearing.
 
-    Processes existing words in CHUNKS, not one at a time -- a single
-    common word (e.g. "the"/"a") has almost no power to disambiguate ITS
-    OWN position in a repeat-heavy song on its own; a several-word chunk
-    does. `line_of_word` (`_word_line_indices`, when the caller has real
-    entries to derive it from), when given, chunks by REAL LYRIC LINES
-    -- the same unit `reconcile_line_structure`/`match_asr_to_lrc_lines`
-    already use successfully for this exact failure class -- rather than
-    an arbitrary fixed word count. This mattered in practice: an EARLIER
-    version of this fix used fixed-size 6-word chunks and, even after
-    several rounds of tightening the shared search's own guards, still
-    occasionally accepted a wrong match on a real repeated-chorus stretch
-    -- an arbitrary chunk boundary can slice a real line in half, leaving
-    neither half enough distinctive content to reliably self-disambiguate.
-    A real line varies its own length to match real content and rarely
-    straddles a phrase boundary, which made the difference. Falls back
-    to a fixed-size chunk (`CHUNK_SIZE`) when `line_of_word` isn't given
-    (e.g. a caller/test with no entries to derive real lines from) --
-    still real cursor-based matching, just without the line-boundary
-    quality improvement.
+    Chunks by real line (`line_of_word`) when given -- a line rarely
+    straddles a phrase boundary, so it disambiguates against nearby
+    repeats better than a fixed chunk boundary that can slice a line in
+    half. Falls back to fixed-size `CHUNK_SIZE` chunks otherwise.
 
     Returns (starts, ends, confident), parallel to `existing_words` --
-    unmatched/low-confidence words are None/False."""
+    unmatched words are None/False."""
     CHUNK_SIZE = 6
     MAX_PENDING_WORDS = 60
 
@@ -342,14 +246,9 @@ def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
         chunks = [(i, min(i + CHUNK_SIZE, n)) for i in range(0, n, CHUNK_SIZE)]
 
     def _apply_match(opcodes, window: List[str], chunk_tokens: List[str], chunk_start: int, cursor: int) -> Optional[int]:
-        """Marks every confirmed word from `opcodes` as matched. Returns
-        the offset (within `window`) of the last ACTUALLY CONFIRMED
-        match -- never a raw, unconfirmed opcode boundary (a `"replace"`
-        block's own span is just wherever difflib decided the mismatched
-        region ends, not a real match; real bug found via Pink Pony Club
-        validation: using that raw boundary to advance the cursor could
-        jump it all the way to the edge of a large window even though the
-        real match sat much earlier)."""
+        """Marks every confirmed word from `opcodes`. Returns the offset
+        of the last confirmed match -- never a raw unconfirmed opcode
+        boundary, which could jump far past the real match."""
         last_confirmed_offset: Optional[int] = None
         for tag, wa1, wa2, ca1, ca2 in opcodes:
             if tag == "equal":
@@ -362,12 +261,7 @@ def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
                         confident[ex_idx] = True
                         last_confirmed_offset = max(last_confirmed_offset or 0, wa1 + k)
             elif tag == "replace" and (ca2 - ca1) == 1:
-                # A single unmatched existing word against one or more ASR
-                # words in this window slice -- try every candidate, keep
-                # the best fuzzy match, same technique `mxl_lrc_generator.
-                # place_words_via_asr` already validated for exactly this
-                # failure mode (ASR mishearing a word differently than the
-                # reference text).
+                # Try every candidate ASR word, keep the best fuzzy match (handles mishearing).
                 best_ratio = 0.0
                 best_asr_w = None
                 best_wk = None
@@ -395,11 +289,7 @@ def match_words_to_asr(existing_words: List[ExistingWord], asr_words: List[Word]
         found = find_cursor_window_match(cursor, b_norm, chunk_tokens, pending_word_count,
                                           lenient_min_matches=1)
         if found is None:
-            # Not confirmable in either window -- don't advance the
-            # cursor; the NEXT chunk's own search starts from the same
-            # position, its window growing to cover this chunk's skipped
-            # content too. Every word in this chunk stays None/False for
-            # interpolate_fallback.
+            # No match -- cursor stays put, next chunk's window grows to include this one.
             continue
         opcodes, window = found
 
@@ -423,11 +313,7 @@ class LrcSeedResult:
 @dataclass
 class LrcPrep:
     """Result of candidate selection + time calibration + per-word line
-    assignment -- the part of LRC integration that's IDENTICAL regardless
-    of how the lines get used afterward (seeding a single anchor per line
-    vs. windowing the ASR search for every word in the line). Factored
-    out so both strategies share one candidate-selection/calibration
-    path, not two."""
+    assignment -- shared by both LRC integration strategies."""
     lrc_match: object
     lrc_lines: List[Tuple[float, str]]   # calibrated (or raw, if calibration failed)
     word_lines: List[Optional[int]]      # per existing_word, its assigned LRC line index
@@ -437,10 +323,8 @@ class LrcPrep:
 
 
 def _reconstruct_our_lines(entries: List[Union[Syllable, LineBreak]]) -> List[str]:
-    """Rebuilds the existing file's own display lines (delimited by its own
-    LineBreak markers) -- used to compare repeat STRUCTURE against an LRC
-    candidate's own lines (see `check_repeat_structure`), the same "-"
-    boundaries phrasing.build_lines writes for a freshly-generated song."""
+    """Rebuilds the existing file's display lines (delimited by LineBreak)
+    for comparing repeat structure against an LRC candidate."""
     lines: List[str] = []
     cur: List[str] = []
     for e in entries:
@@ -459,17 +343,10 @@ def _reconstruct_our_lines(entries: List[Union[Syllable, LineBreak]]) -> List[st
 def _word_line_indices(entries: List[Union[Syllable, LineBreak]],
                         existing_words: List[ExistingWord]) -> List[int]:
     """Parallel to `existing_words` -- which `_reconstruct_our_lines`
-    display-line index (SAME numbering, built from the SAME walk over
-    `entries`) each word belongs to. Exists so `prepare_lrc` can turn
-    `reconcile_line_structure`'s own `our_line_index` (which of OUR
-    lines each reconciled LRC entry came from) directly into a per-WORD
-    LRC-line mapping -- reusing the correspondence reconcile_line_
-    structure already established at the (more reliable) LINE level,
-    instead of re-deriving it via `assign_words_to_lines`'s own
-    independent whole-song WORD-level diff, which has no line-boundary
-    information at all and can disagree with reconcile_line_structure's
-    own answer (real confirmed case, 2026-08-15: Trixie Mattel - Video
-    Games -- see LineReconciliation's own docstring)."""
+    line index each word belongs to. Lets `prepare_lrc` build a
+    word-to-LRC-line mapping directly from `reconcile_line_structure`'s
+    line-level correspondence instead of re-deriving it via
+    `assign_words_to_lines`'s independent word-level diff."""
     entry_line: List[int] = []
     line_idx = 0
     cur_has_content = False
@@ -478,22 +355,14 @@ def _word_line_indices(entries: List[Union[Syllable, LineBreak]],
             if cur_has_content:
                 line_idx += 1
                 cur_has_content = False
-            entry_line.append(-1)  # never looked up -- a word's own
-                                     # entry_indices never include a
-                                     # LineBreak (extract_words skips them)
+            entry_line.append(-1)  # never looked up; words never include LineBreaks
             continue
         entry_line.append(line_idx)
         cur_has_content = True
     return [entry_line[w.entry_indices[0]] for w in existing_words]
 
 
-# `check_repeat_structure` moved to lrc_timing.py, 2026-08-11 (re-exported
-# here unchanged so `from .realign import check_repeat_structure` --
-# including test_dry_run.py's own import -- keeps working) -- lrc_timing.
-# py's own tier-3 rescue gate (see `two_tier_time_calibration`'s
-# `structural_check` param) needed the exact same check and can't import
-# FROM realign.py (this module already imports FROM lrc_timing.py), so it
-# moved to the shared module instead of being duplicated a second time.
+# Re-exported from lrc_timing.py for backward-compat imports.
 
 
 def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
@@ -503,38 +372,17 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
                  our_line_of_word: Optional[List[int]] = None,
                  log: Optional[Callable[[str], None]] = None) -> Optional[LrcPrep]:
     """Selects an LRC candidate, calibrates its line timestamps against
-    OUR audio's real ASR transcription, and assigns each existing word to
-    a line -- shared setup for both `seed_lrc_anchors` (LRC seeds ONE
-    anchor per line, ASR is primary everywhere else) and
-    `match_words_to_asr_windowed` (LRC lines WINDOW the ASR search for
-    EVERY word, ASR only resolves position within a line -- mirrors
-    mxl_lrc_generator.place_words_via_asr's design). Returns None if no
-    usable candidate exists at all (real confirmed case: BATB has none --
-    see CLAUDE.md) -- both callers then fall through to whole-song,
-    LRC-free matching.
+    real ASR, and assigns each existing word to a line -- shared setup
+    for `seed_lrc_anchors` and `match_words_to_asr_windowed`. Returns
+    None if no usable candidate exists.
 
-    `select_lrc_candidate`/`assign_words_to_lines` are reused as-is from
-    mxl_lrc_generator.py -- they only ever read `MxlWord.norm`, so
-    existing words are wrapped in real `MxlWord` instances with harmless
-    placeholder `offset`/`syllables` rather than duplicating that
-    candidate-selection/line-assignment logic a third time.
+    Reuses `select_lrc_candidate`/`assign_words_to_lines` from
+    mxl_lrc_generator.py by wrapping existing words as `MxlWord`s.
 
-    `our_lines` (the existing file's own display lines, see
-    `_reconstruct_our_lines`) -- when given -- additionally RECONCILES a
-    candidate whose REPEAT STRUCTURE doesn't match ours (see
-    `reconcile_line_structure`; real confirmed case: David Bowie - "I'm
-    Afraid of Americans", CLAUDE.md) instead of rejecting it outright: a
-    localized repeat-count difference (an edition with a few extra/
-    missing chorus repeats) gets the extra lines on whichever side
-    dropped, and the candidate's own lines used from here on are the
-    reconciled subset, not its raw lines. Still rejects outright (returns
-    None) when reconciliation can't find a real correspondence for most
-    of our own lines at all (see `reconcile_line_structure`'s own
-    `min_match_ratio`) -- a genuinely different recording/arrangement,
-    not just a differing repeat count. Optional and skipped (no
-    reconciliation/rejection) when not given, since not every caller has
-    the original entries handy (e.g. `seed_lrc_anchors`'s own standalone/
-    test-only call path)."""
+    `our_lines`, when given, reconciles a candidate whose repeat
+    structure doesn't match ours (see `reconcile_line_structure`)
+    instead of rejecting it outright; still returns None if
+    reconciliation can't match most of our lines at all."""
     fake_words = [MxlWord(text=w.text, norm=w.norm, offset=float(i), syllables=[])
                   for i, w in enumerate(existing_words)]
 
@@ -561,17 +409,9 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
                     f"{reconciliation.n_our_unmatched} of our own line(s) have no LRC counterpart")
         candidate_lrc_lines = reconciliation.lrc_lines
 
-    # Calibrate away a systematic offset between LRC's own line timestamps
-    # and OUR audio's real timing (e.g. different lead-in silence) BEFORE
-    # trusting a line start as an anchor -- same technique/function
-    # mxl_lrc_generator uses, factored into lrc_timing.py for exactly this
-    # kind of reuse. `structural_check` deliberately reuses check_repeat_
-    # structure against the candidate's RAW (un-reconciled) lines, not the
-    # filtered ones above -- it's answering a different question (is this
-    # fundamentally the WRONG recording, e.g. a choral cover) than the
-    # reconciliation above (is this the right recording with a differing
-    # repeat count) -- gates tier 3's own "rescue" case (see
-    # two_tier_time_calibration's own docstring).
+    # Calibrate LRC line timestamps against real ASR timing before trusting them.
+    # structural_check reuses raw (un-reconciled) lines -- checks if this is the
+    # wrong recording, not just a differing repeat count.
     time_candidates = match_asr_to_lrc_lines(asr_words, candidate_lrc_lines)
     structural_check = None
     if our_lines is not None:
@@ -583,21 +423,9 @@ def prepare_lrc(existing_words: List[ExistingWord], asr_words: List[Word],
     if offset is not None:
         lrc_lines = [(correction_fn(t), text) for t, text in lrc_lines]
 
-    # Word-to-line assignment: when reconciliation ran AND the caller gave
-    # us a per-word line mapping (`our_line_of_word`, see
-    # `_word_line_indices`), build word_lines DIRECTLY from reconcile_
-    # line_structure's own `our_line_index` -- reusing the correspondence
-    # already established at the LINE level -- instead of calling
-    # assign_words_to_lines, whose own independent whole-song WORD-level
-    # diff has no line-boundary information at all and can disagree with
-    # reconcile_line_structure's own answer (real confirmed regression,
-    # 2026-08-15: Trixie Mattel - Video Games -- a 3x-repeated chorus
-    # correctly resolved by reconcile_line_structure was still placed
-    # ~30s off the real audio by assign_words_to_lines's own re-diff; see
-    # LineReconciliation's own docstring for the full case). Falls back
-    # to assign_words_to_lines when reconciliation wasn't used at all
-    # (`our_lines`/`our_line_of_word` not given -- e.g. seed_lrc_anchors's
-    # own standalone/test-only call path).
+    # Build word_lines from reconcile_line_structure's line-level mapping when
+    # available (more reliable than assign_words_to_lines's word-level diff);
+    # fall back to assign_words_to_lines otherwise.
     if reconciliation is not None and our_line_of_word is not None:
         our_idx_to_li = {our_idx: li for li, our_idx in enumerate(reconciliation.our_line_index)}
         word_lines = [our_idx_to_li.get(our_line) for our_line in our_line_of_word]
@@ -615,18 +443,12 @@ def seed_lrc_anchors(existing_words: List[ExistingWord], asr_words: List[Word],
                       forced_candidate: Optional[LrcLibCandidate] = None,
                       our_lines: Optional[List[str]] = None,
                       log: Optional[Callable[[str], None]] = None) -> Optional[LrcSeedResult]:
-    """"seed" strategy: fills in a real-time anchor, from LRCLIB's
-    synced-lyrics LINE starts, for the first not-yet-confident word of
-    each line the candidate's lyrics can be matched to -- mutates
-    `starts`/`ends`/`confident` in place. ASR (whole-song, see
-    `match_words_to_asr`) is the PRIMARY signal in this strategy; LRC
-    only fills in the residual gaps ASR couldn't reach. Returns None (no
-    mutation) if no usable LRC candidate exists for this song at all.
+    """"seed" strategy: fills a real-time anchor (LRC line start) for the
+    first not-yet-confident word of each matched line -- mutates
+    `starts`/`ends`/`confident` in place. ASR is primary; LRC only fills
+    gaps. Returns None if no usable candidate exists.
 
-    See `match_words_to_asr_windowed` for the alternative "windowed"
-    strategy (LRC lines are primary, ASR only resolves position within a
-    line) -- kept as a separate code path pending real end-to-end
-    comparison of the two (see CLAUDE.md)."""
+    See `match_words_to_asr_windowed` for the "windowed" alternative."""
     prep = prepare_lrc(existing_words, asr_words, artist, title, audio_duration, forced_candidate,
                         our_lines=our_lines, log=log)
     if prep is None:
@@ -637,11 +459,10 @@ def seed_lrc_anchors(existing_words: List[ExistingWord], asr_words: List[Word],
 def seed_from_prep(existing_words: List[ExistingWord], prep: "LrcPrep",
                     starts: List[Optional[float]], ends: List[Optional[float]],
                     confident: List[bool]) -> LrcSeedResult:
-    """The actual seeding loop from `seed_lrc_anchors`, taking an
-    already-prepared `LrcPrep` -- split out so `realign_song` can reuse a
-    single `prepare_lrc` call (one candidate search, one calibration)
-    across BOTH deciding whether "windowed" mode is usable AND falling
-    back to "seed" mode, instead of preparing LRC data twice."""
+    """The seeding loop from `seed_lrc_anchors`, taking an already-
+    prepared `LrcPrep` -- split out so `realign_song` can reuse one
+    `prepare_lrc` call for both deciding "windowed" usability and
+    falling back to "seed"."""
     result = LrcSeedResult(lrc_match=prep.lrc_match, calibration_offset=prep.calibration_offset,
                             calibration_kind=prep.calibration_kind,
                             calibration_confidence=prep.calibration_confidence)
@@ -664,25 +485,14 @@ def seed_from_prep(existing_words: List[ExistingWord], prep: "LrcPrep",
 def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: List[Optional[int]],
                                  lrc_lines: List[Tuple[float, str]], asr_words: List[Word]
                                  ) -> Tuple[List[Optional[float]], List[Optional[float]], List[bool]]:
-    """"windowed" strategy (PROTOTYPE, see CLAUDE.md for the real-audio
-    comparison against "seed"): LRC line starts are trusted PRIMARY
-    anchors -- for each line, only ASR words whose own timestamp falls
-    near that line's real-time window are candidates for ITS words,
-    mirroring mxl_lrc_generator.place_words_via_asr's Pass 1 exactly
-    (same matching technique: exact match, plus a fuzzy-ratio "replace"
-    fallback for ASR's own mishearing), just matching against the
-    EXISTING file's own already-trusted text instead of MXL's OCR'd text
-    (so there's no "clean text" substitution step needed here -- the
-    existing words ARE the clean text).
+    """"windowed" strategy: LRC line starts are trusted primary anchors
+    -- for each line, only ASR words near that line's window are
+    candidates (mirrors mxl_lrc_generator.place_words_via_asr's Pass 1:
+    exact match plus a fuzzy fallback for mishearing).
 
-    Unlike `match_words_to_asr` (whole-song, no time information used at
-    all), this can mis-place a word if the LRC candidate's calibration is
-    wrong/unreliable -- the whole point of comparing this against "seed"
-    is to measure whether windowing's improved local disambiguation is
-    worth that added dependency on LRC quality. Returns (starts, ends,
-    confident) parallel to `existing_words`, same shape as
-    `match_words_to_asr` -- unwindowed/unmatched words are left
-    None/False for `interpolate_fallback` to handle exactly as before."""
+    Only used when calibration is confident (a wrong calibration can
+    mis-place a word). Returns (starts, ends, confident) parallel to
+    `existing_words`; unmatched words are None/False."""
     n = len(existing_words)
     starts: List[Optional[float]] = [None] * n
     ends: List[Optional[float]] = [None] * n
@@ -716,28 +526,14 @@ def match_words_to_asr_windowed(existing_words: List[ExistingWord], word_lines: 
 def interpolate_fallback(existing_words: List[ExistingWord],
                           starts: List[Optional[float]], ends: List[Optional[float]],
                           confident: List[bool]) -> Tuple[int, int]:
-    """PASS 2: every word still without a confident anchor is placed
-    relative to its nearest confident neighbor(s) -- mutates `starts`/
-    `ends` in place. Returns (n_interpolated, n_kept_original).
+    """Places every word without a confident anchor relative to its
+    nearest confident neighbor(s) -- mutates `starts`/`ends` in place.
+    Returns (n_interpolated, n_kept_original).
 
-    Two confident anchors on both sides: the existing word's own ORIGINAL
-    start (never trusted as absolute truth elsewhere in this module) is
-    used purely as a proportional offset to interpolate BETWEEN the two
-    real anchors -- recovers real local tempo variation the original file
-    got wrong, while degrading gracefully (even spacing) if the original
-    offsets carry no real information at all (e.g. uniform single-beat
-    placeholder notes).
-
-    Only one side has an anchor: interpolation has nothing to rate against,
-    so this instead applies that anchor's own constant (start - orig_start)
-    SHIFT to this word -- safer than extrapolating a rate from a single
-    data point out into open territory.
-
-    No anchor anywhere in the whole song: nothing here can be verified
-    against the audio at all, so the word's ORIGINAL timing is kept
-    completely unchanged rather than guessed -- this mode always has a
-    safe fallback available, unlike mxl_lrc_generator's equivalent pass,
-    which has no "original" to fall back to."""
+    Two anchors: interpolates proportionally using the word's original
+    start as an offset. One anchor: applies that anchor's constant shift
+    (safer than extrapolating a rate from one point). No anchor
+    anywhere: keeps original timing."""
     n = len(existing_words)
     confident_idxs = [i for i in range(n) if confident[i]]
     n_interpolated = 0
@@ -781,9 +577,7 @@ def interpolate_fallback(existing_words: List[ExistingWord],
                 est_start = starts[pb] + (w.orig_start - wb.orig_start) * rate
                 est_end = est_start + orig_dur * rate
             else:
-                # Degenerate (identical/out-of-order original offsets) --
-                # fall back to a constant shift from the nearer anchor
-                # rather than trust a zero/negative rate.
+                # Degenerate offsets -- fall back to a constant shift instead.
                 shift = starts[pb] - wb.orig_start
                 est_start = w.orig_start + shift
                 est_end = est_start + orig_dur
@@ -802,20 +596,8 @@ def interpolate_fallback(existing_words: List[ExistingWord],
         ends[i] = est_end
         n_interpolated += 1
 
-    # Non-decreasing starts -- but a CONFIDENT word's own real match is a
-    # FIXED POINT, never moved by a neighboring fallback word's estimate.
-    # Real bug found (David Bowie - "I'm Afraid of Americans", a song with
-    # many near-identical repeated short lines): one fallback word's
-    # over-extrapolated estimate exceeded FOURTEEN subsequent, genuinely
-    # confident ASR matches -- the old forward-only clamp (which treated
-    # every index identically regardless of `confident`) dragged all
-    # fourteen of them up to that single wrong value instead of trusting
-    # them, destroying real information, not just filling a gap. Only
-    # fallback words are adjusted in either direction here: pass 1 pushes
-    # a fallback word forward past a larger PRECEDING value; pass 2 (in
-    # reverse) pulls a fallback word back if it exceeds the next
-    # CONFIDENT word's own value. Confident words themselves are never
-    # rewritten by either pass.
+    # Clamp to non-decreasing starts, but never move a confident word --
+    # only fallback words get pushed/pulled.
     for i in range(1, n):
         if confident[i]:
             continue
@@ -839,12 +621,9 @@ def interpolate_fallback(existing_words: List[ExistingWord],
 
 def _redistribute_syllables(entries: List[Union[Syllable, LineBreak]], word: ExistingWord,
                              new_start: float, new_end: float) -> List[Tuple[int, float, float]]:
-    """Splits a word's new [new_start, new_end) span across its own
-    syllables using their ORIGINAL relative sub-word timing (pitch is
-    never touched anywhere in this module -- only start/end). Falls back
-    to an even split if the word's original span was zero-width (e.g.
-    every syllable crammed onto one beat) rather than collapsing every
-    syllable onto the same point."""
+    """Splits a word's new span across its syllables using their original
+    relative timing; falls back to an even split if the original span
+    was zero-width."""
     idxs = word.entry_indices
     lo, hi = word.orig_start, word.orig_end
     out: List[Tuple[int, float, float]] = []
@@ -865,11 +644,8 @@ def _redistribute_syllables(entries: List[Union[Syllable, LineBreak]], word: Exi
 
 def _reposition_line_breaks(entries: List[Union[Syllable, LineBreak]],
                              new_start_by_idx: dict, new_end_by_idx: dict) -> None:
-    """A LineBreak's own start/end aren't independently meaningful -- they
-    just mark the gap between the syllable before it and the syllable
-    after (see phrasing.build_lines, which sets them the same way). Once
-    every syllable has a new time, line breaks are simply re-anchored to
-    their new neighbors -- never guessed independently."""
+    """Re-anchors each LineBreak's start/end to its new neighboring
+    syllables (a LineBreak has no independent timing of its own)."""
     n = len(entries)
     for i, e in enumerate(entries):
         if not isinstance(e, LineBreak):
@@ -907,67 +683,27 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                   log: Callable[[str], None] = print,
                   debug_log: Optional[DebugLog] = None,
                   cancel_requested: Optional[Callable[[], bool]] = None) -> RealignResult:
-    """Core realignment step: given an already-parsed existing song and
-    already-transcribed ASR words, returns a new `Song`
-    with the SAME notes (never added/removed/reordered, pitch untouched)
-    but corrected start/end times. See module docstring for the overall
-    approach.
+    """Core realignment step: given a parsed existing song and ASR words,
+    returns a new `Song` with the same notes but corrected start/end
+    times.
 
-    `lrc_mode` picks between two LRC integration strategies (no-op if
-    `use_lrc` is False or no usable candidate exists -- both fall through
-    to whole-song ASR matching identically either way):
-      - "windowed" (DEFAULT as of 2026-08-09): LRC line starts are
-        PRIMARY anchors; ASR only resolves word POSITION within each
-        line's own real-time window, mirroring mxl_lrc_generator's
-        design -- ONLY actually used when the LRC candidate's time
-        calibration confidently succeeds (`LrcPrep.calibration_offset is
-        not None`); an unconfident/failed calibration transparently
-        falls back to the exact same whole-song-ASR-plus-seed behavior
-        "seed" (below) always uses -- i.e. this mode is ALREADY an
-        auto-select ("use windowing when the LRC timing can be trusted,
-        otherwise fall back"), not a strict alternative to "seed". Real
-        end-to-end comparison (BATB/Stars/Chicago, see CLAUDE.md) found
-        it never worse than "seed" once this gate was added, and a clear
-        win when calibration was confident even at just 54% agreement
-        (BATB: 63%->84% of words landing within 100ms of ground truth) --
-        made the shipped default on that evidence.
-      - "seed": ASR (whole-song, no time information) is PRIMARY always,
-        even when a confidently-calibrated LRC candidate exists; LRC only
-        seeds a single anchor for the first not-yet-confident word of
-        each matched line. Kept as an explicit opt-out / for A-B testing
-        against "windowed" -- not needed for normal use now that
-        "windowed" already degrades to equivalent behavior on its own
-        whenever LRC can't be trusted.
+    `lrc_mode` (no-op if `use_lrc` is False or no candidate exists):
+      - "windowed" (default): LRC line starts are primary anchors, ASR
+        resolves word position within each line; only used when
+        calibration is confident, else falls back to whole-song ASR
+        matching (same as "seed").
+      - "seed": ASR is always primary; LRC only seeds one anchor per
+        matched line. Kept as an explicit opt-out.
 
-    If "windowed" mode's own result still ends up with fewer than
-    `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE` of words getting a real anchor
-    (a low anchor rate under a CONFIDENTLY-calibrated candidate means the
-    per-line window itself is probably mis-targeted to this file's own line
-    structure, not that ASR can't find the words at all -- same class of
-    problem as `realign_song_validate`'s own fallback, just triggered by a
-    different mechanism), this transparently retries once with
-    `lrc_mode="seed"` and returns THAT result instead. Never retries a
-    second time -- "seed" mode's own low anchor rate (or "windowed" already
-    having degraded to "seed" behavior because calibration wasn't
-    confident) is left as the final, if disappointing, answer.
+    If "windowed" results in too few anchored words
+    (`config.MXL_LRC_MIN_ASR_PLACEMENT_RATE`), retries once with
+    `lrc_mode="seed"` and returns that result instead. Never retries
+    twice.
 
-    Force-aligns the existing file's OWN text for any STILL-unconfident run (after the
-    above) onto the audio window between its nearest confident neighbors
-    via a real wav2vec2 CTC forced alignment (`transcription.
-    force_align_words_in_window`) -- unlike a text-search-based rematch,
-    this doesn't need ASR to have transcribed anything in the gap at all,
-    since it isn't searching a transcript, it's measuring where the GIVEN
-    text fits. Requires `vocals_path` (the loaded audio + align model are
-    only paid for if there's an actual gap to try). Adapted from
-    UltraStarKaraokeMaker's own `realign_gap_windows` -- see CLAUDE.md."""
-    # A deep copy, not just a new list -- the Syllable/LineBreak objects
-    # themselves get mutated in place below (start/end reassigned), and
-    # `existing` is a caller-owned ParsedSong that must come back out
-    # untouched (e.g. so realign_song can be called twice on the SAME
-    # parsed object to compare lrc_mode strategies against each other,
-    # which a shallow `list(existing.entries)` would silently corrupt --
-    # the second call would then be realigning the FIRST call's output,
-    # not the original file).
+    Force-aligns the existing text for any still-unconfident run onto
+    the audio window between confident neighbors via wav2vec2 CTC
+    forced alignment. Requires `vocals_path`."""
+    # Deep copy: entries get mutated in place, and `existing` must come back untouched.
     entries = copy.deepcopy(existing.entries)
     words = extract_words(entries)
     if not words:
@@ -981,25 +717,8 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
                                 audio_duration, forced_candidate=forced_lrc_candidate,
                                 our_lines=our_lines, our_line_of_word=our_line_of_word, log=log)
 
-    # BOTH strategies require a CONFIDENT time calibration before an LRC
-    # candidate is trusted at all -- real comparison (see CLAUDE.md, BATB/
-    # Stars/Chicago) already found windowing raw, UNCALIBRATED LRC lines
-    # actively harmful for "windowed" (every word's match routes through the
-    # same untrusted signal). A SECOND real case (David Bowie - "Heroes")
-    # showed "seed" is NOT safe either, despite it only ever seeding a
-    # handful of words directly: the LRC candidate found was a Kolacny
-    # Brothers CHORAL COVER (confirmed via calibration_confidence=0.0, a
-    # real "zero agreement" case, not just "not enough samples") -- ONE bad
-    # seed anchor landed later in time than several of its own already-
-    # correctly-ASR-matched NEIGHBORS, and `interpolate_fallback`'s
-    # monotonic clamp (forward-push only, no notion of "this anchor might
-    # itself be wrong") then dragged every one of those correct neighbors
-    # forward to match the bad anchor -- corrupting real, independently-
-    # confirmed-correct ASR matches, not just filling a genuine gap. Once
-    # confirmed, this obsoleted the earlier "seed's blast radius is small
-    # by construction" reasoning: a single bad anchor's blast radius is
-    # actually unbounded once the monotonic clamp propagates it forward,
-    # regardless of strategy. Both strategies now use the exact same gate.
+    # Both strategies require confident calibration -- an uncalibrated anchor's
+    # blast radius is unbounded once the monotonic clamp propagates it.
     lrc_seed = None
     lrc_confident = lrc_prep is not None and lrc_prep.calibration_offset is not None
     if lrc_mode == "windowed" and lrc_prep is not None and not lrc_confident:
@@ -1119,23 +838,13 @@ def realign_song(existing: ParsedSong, asr_words: List[Word], *,
     return RealignResult(success=True, song=song, quality=quality, lrc_seed=lrc_seed)
 
 
-# --- "validate" strategy (PROTOTYPE, see CLAUDE.md) -------------------------
+# --- "validate" strategy (default) --------------------------------------
 #
-# `realign_song` above always REPLACES a matched word's timing with ASR's
-# own value, even when the existing file was already correct there. This
-# alternative strategy instead VALIDATES first: a note whose original
-# position (after a single global GAP/drift correction -- see
-# `compute_gap_calibration`, user's own framing: "sometimes the song file
-# is nearly perfect but the GAP is wrong so everything is offset") is
-# independently confirmed by a confident ASR match is left COMPLETELY
-# UNTOUCHED, position and length both -- never overwritten by ASR's own,
-# less precise, value. Only words that don't validate get repositioned, the
-# same way `realign_song`'s fallback words already do (reusing
-# `interpolate_fallback` unchanged -- a validated word is exactly as
-# trustworthy an anchor as a directly-ASR-matched one, so no new
-# interpolation logic is needed). NOT YET wired into the CLI/GUI as a real
-# selectable strategy -- prototype only, pending real-audio comparison
-# against `realign_song`'s existing "replace" behavior.
+# Unlike `realign_song` (always replaces a matched word's timing with
+# ASR's value), this strategy validates first: a word whose original
+# position (after a global GAP/drift correction) is confirmed by ASR is
+# left untouched. Only unvalidated words get repositioned via
+# `interpolate_fallback`.
 
 
 @dataclass
@@ -1143,43 +852,26 @@ class GapCalibration:
     offset: Optional[float]
     slope: float
     confidence: float
-    kind: Optional[str]           # "constant", "drift", "piecewise", "isotonic", or None if uncalibrated
+    kind: Optional[str]           # "constant", "drift", "piecewise", "isotonic", or None
     skipped_reason: Optional[str]
-    asr_starts: List[Optional[float]]   # whole-song match_words_to_asr's own raw results,
-    asr_ends: List[Optional[float]]     # reused directly by validate_words_against_asr
-    asr_confident: List[bool]           # so it's never recomputed a second time
-    # `correction_fn(orig_start) -> corrected_real_time`, populated for
-    # every successful `kind` (incl. constant/drift, for API uniformity)
-    # -- see two_tier_time_calibration's own docstring. Defaults to None
-    # so a manually-constructed GapCalibration (e.g. in tests) still
-    # works via the offset/slope fallback in validate_words_against_asr.
-    correction_fn: Optional[Callable[[float], float]] = None
+    asr_starts: List[Optional[float]]   # match_words_to_asr's raw results, reused by validate_words_against_asr
+    asr_ends: List[Optional[float]]
+    asr_confident: List[bool]
+    correction_fn: Optional[Callable[[float], float]] = None  # orig_start -> corrected time; None falls back to offset/slope
 
 
 def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[Word],
                              line_of_word: Optional[List[int]] = None) -> GapCalibration:
-    """FIRST PASS: checks whether the whole file can be explained by a
-    single constant real-time offset (or slow linear drift) from its OWN
-    original timing -- i.e. #GAP (or a slow drift) is the only real
-    problem, and the file's own relative note timing/rhythm is already
-    correct.
+    """Checks whether the whole file can be explained by a single
+    constant offset (or slow drift) from its own original timing --
+    i.e. #GAP is the only problem.
 
-    Reuses `match_words_to_asr` (the same whole-song, order-preserving,
-    repeat-safe ASR matching used elsewhere in this module) to find
-    confident (original_start, real_asr_start) pairs, then feeds them into
-    `two_tier_time_calibration` (the SAME robust, repeat-safe two-tier fit
-    already validated for LRC line calibration -- don't reimplement a
-    third time) using each word's own original start (seconds) as the "x"
-    axis, exactly mirroring how LRC line timestamps are used there.
+    Reuses `match_words_to_asr` for confident (original, ASR) pairs,
+    then `two_tier_time_calibration` (same robust fit used for LRC
+    calibration) with each word's original start as the "x" axis.
 
-    No `structural_check` passed -- unlike LRC candidate calibration,
-    there's no separate "candidate identity" to verify here (both sides
-    are the SAME existing file's own words vs. the SAME audio's own
-    ASR, just two different timing views of one source, never a
-    different recording). Tier 3's "rescue" case therefore never fires
-    for GAP calibration -- only "refine" (tier 1/2 already found some
-    real support) -- which is the safe, correct default for this call
-    site, not a missing feature."""
+    No `structural_check` -- both sides are the same file/audio, never
+    a different recording, so tier 3's rescue case never fires here."""
     starts, ends, confident = match_words_to_asr(existing_words, asr_words, line_of_word=line_of_word)
     candidates = [(i, w.orig_start, starts[i] - w.orig_start)
                   for i, w in enumerate(existing_words) if confident[i]]
@@ -1192,53 +884,19 @@ def compute_gap_calibration(existing_words: List[ExistingWord], asr_words: List[
 def validate_words_against_asr(existing_words: List[ExistingWord], gap: GapCalibration,
                                 tolerance_sec: float = config.REALIGN_VALIDATE_TOLERANCE_SEC
                                 ) -> Tuple[List[Optional[float]], List[Optional[float]], List[bool]]:
-    """For each word: computes its expected start after applying the global
-    GAP correction found above (a no-op shift of 0 if no confident
-    calibration was found -- validates against the ORIGINAL timing
-    directly in that case). If a confident whole-song ASR match ALSO
-    exists for this word and its own real START lands within
-    `tolerance_sec` of that expected position, the word VALIDATES -- but
-    its final position is ASR's OWN start (not the original/expected
-    one), on the same original duration. Length is never touched by ASR
-    either way (see below).
+    """For each word, computes its expected start after the global GAP
+    correction (no-op if none found). If a confident ASR match agrees
+    within `tolerance_sec`, the word validates -- final position is
+    ASR's own start (more precise) on the original duration; length is
+    never touched.
 
-    Real bug found via real hand-timed ground truth (2026-08-15, Our Lady
-    Peace - "Somewhere Out There", user's own `truth.txt`): the ORIGINAL
-    version of this function kept the GAP-corrected ORIGINAL start
-    EXACTLY, discarding ASR's own (already-known-close, since it just
-    passed this exact check) position entirely. When the original file's
-    own timing carried a small systematic bias (~0.12s here, well inside
-    the default 0.3s tolerance), every validated word inherited that same
-    bias -- and so did every INTERPOLATED word between validated anchors,
-    since interpolation is relative to them. Real comparison against
-    `truth.txt`: only 27.6%/51.2% of words landed within 100ms/150ms
-    tolerance, vs. 51.9%/74.2% for `--strategy replace` on the identical
-    audio -- confirming ASR's own reading is measurably more precise here
-    once it clears the tolerance bar at all.
+    Requires ASR to already agree with the (corrected) original -- a
+    real mismatch is still rejected and left for `interpolate_fallback`.
 
-    This is NOT equivalent to `replace` with extra steps: `replace`
-    (`match_words_to_asr`) trusts ANY confident ASR match unconditionally,
-    with no comparison to the word's own original position at all. This
-    function still requires ASR to already AGREE with the (GAP-corrected)
-    original within `tolerance_sec` before trusting it at all -- a word
-    where ASR found something wildly different (a real mismatch, e.g. the
-    wrong occurrence of a repeated phrase) is still correctly rejected
-    and left for `interpolate_fallback`, exactly as before. Only within
-    that already-validated agreement zone does this now prefer ASR's
-    reading over the original's for the small extra precision -- the
-    safety net `validate` exists for is unchanged.
+    Only ASR's start is used, never its end (ASR is unreliable at
+    detecting held-note ends).
 
-    Only ASR's START is ever used, never its END: ASR is known-unreliable
-    at detecting the end of a sustained/held note (see CLAUDE.md's
-    "Lessons learned" -- "Don't trust individual ASR word timestamps for
-    fine-grained boundaries"), so a word's own already-correct LENGTH is
-    always trusted from the input file, applied on top of ASR's start,
-    rather than second-guessed by ASR's own, less reliable, end
-    timestamp.
-
-    Words that don't validate are left None/False for `interpolate_fallback`
-    to resolve using validated neighbors (and, optionally, LRC anchors) as
-    anchors."""
+    Unvalidated words are left None/False for `interpolate_fallback`."""
     n = len(existing_words)
     starts: List[Optional[float]] = [None] * n
     ends: List[Optional[float]] = [None] * n
@@ -1277,20 +935,14 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
                            validate_tolerance_sec: float = config.REALIGN_VALIDATE_TOLERANCE_SEC,
                            log: Callable[[str], None] = print,
                            debug_log: Optional[DebugLog] = None) -> RealignResult:
-    """PROTOTYPE strategy -- see the module comment above `GapCalibration`.
-    Same overall shape/contract as `realign_song` (never raises, returns
-    `RealignResult`, never touches pitch/note count/order), but each word
-    is either VALIDATED (kept exactly as-is beyond a single global GAP
-    correction) or repositioned via `interpolate_fallback` using validated
-    (+ optional LRC) anchors -- never simply overwritten with ASR's own
-    value the way `realign_song` does.
+    """"validate" strategy -- see the module comment above
+    `GapCalibration`. Same contract as `realign_song`, but each word is
+    either validated (kept as-is beyond a global GAP correction) or
+    repositioned via `interpolate_fallback`.
 
-    If fewer than `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE` of words end up
-    validated or LRC-anchored, that's a sign the file's own original timing
-    can't be trusted -- exactly the case this strategy is bad at (it only
-    ever repositions relative to that untrusted timing). Falls back to
-    `realign_song(lrc_mode="seed")` instead, which replaces every word's
-    timing from ASR/LRC directly rather than trusting the input at all."""
+    Falls back to `realign_song(lrc_mode="seed")` if too few words
+    validate or get an LRC anchor -- a sign the original timing can't
+    be trusted."""
     entries = copy.deepcopy(existing.entries)
     words = extract_words(entries)
     if not words:
@@ -1396,9 +1048,7 @@ def realign_song_validate(existing: ParsedSong, asr_words: List[Word], *,
 
 
 def _song_from_existing(existing: ParsedSong, entries: List[object], gap_ms: int) -> Song:
-    """Builds the output Song, carrying every OTHER header tag from the
-    existing file through completely untouched -- this mode only ever
-    changes GAP and note start/length."""
+    """Builds the output Song, carrying every other header tag through untouched."""
     tags = existing.raw_tags
 
     def _float(name):
@@ -1424,36 +1074,20 @@ def _song_from_existing(existing: ParsedSong, entries: List[object], gap_ms: int
 
 
 class AmbiguousExistingTxtError(ValueError):
-    """Raised by `find_existing_txt_in_folder` when the folder doesn't
-    have exactly one obvious existing .txt to realign -- fails closed,
-    same convention as `file_discovery.AmbiguousInputError` (never
-    silently guesses which file the user meant)."""
+    """Raised when a folder doesn't have exactly one obvious .txt to realign -- fails closed."""
 
 
 def find_existing_txt_in_folder(folder: Path, *, exclude_markers: Tuple[str, ...] = ("[REALIGNED]",)) -> Path:
-    """Auto-detects the single existing UltraStar .txt to realign within
-    a folder -- used when no explicit --existing-txt is given (required
-    for batch mode, where a single explicit path can't apply across
-    multiple subfolders; optional convenience in single-song mode too).
+    """Auto-detects the single existing UltraStar .txt to realign in a folder.
 
-    Excludes this module's OWN "[REALIGNED]" output naming convention --
-    otherwise re-running on a folder that already has a previous run's
-    output would either see two candidates (falsely "ambiguous") or,
-    worse, pick the REALIGNED file itself as this run's new INPUT,
-    compounding drift across repeated runs instead of always realigning
-    the same original file. `exclude_markers` is overridable so a sibling
-    module with its own output naming convention (e.g. `pitch_refresh.py`'s
-    "[PITCH_REFRESHED]") can reuse this same auto-detection logic and
-    exclude its OWN prior output too, without either module needing to
-    know about the other's marker by default.
+    Excludes this module's own "[REALIGNED]" naming so a prior output is
+    never picked as the next input; `exclude_markers` lets a sibling
+    module (e.g. `pitch_refresh.py`'s "[PITCH_REFRESHED]") reuse this
+    with its own marker.
 
-    When more than one real candidate remains, tries ONE further
-    disambiguation before giving up: a file named exactly "<folder
-    name>.txt" (case-insensitive) -- the common convention this project's
-    own output/companion files already follow elsewhere (e.g. `#COVER`/
-    `#BACKGROUND` matching by basename in file_discovery.py). Only trusted
-    when it narrows the field to EXACTLY one match; still fails closed
-    (never guesses) otherwise."""
+    If multiple candidates remain, a file named "<folder name>.txt"
+    disambiguates if it narrows to exactly one match; otherwise fails
+    closed."""
     folder = Path(folder)
     candidates = sorted(
         p for p in folder.glob("*.txt") if not any(marker in p.stem for marker in exclude_markers)
@@ -1475,23 +1109,17 @@ def find_existing_txt_in_folder(folder: Path, *, exclude_markers: Tuple[str, ...
 
 
 def resolve_realign_output_path(existing_txt_path: Path, output_path_override: Optional[str]) -> Path:
-    """Where a realigned .txt gets written -- an explicit override if given,
-    else a NEW file alongside the existing one, never the existing file
-    itself. Pure path logic, factored out from `run_realign_pipeline` so it
-    (and `check_output_not_existing_file` below) can be unit-tested without
-    needing real audio/ASR."""
+    """Where a realigned .txt gets written -- an explicit override, else
+    a new file alongside the existing one, never the existing file itself."""
     existing_txt_path = Path(existing_txt_path)
     return (Path(output_path_override).resolve() if output_path_override
             else existing_txt_path.with_name(existing_txt_path.stem + " [REALIGNED].txt"))
 
 
 def check_output_not_existing_file(output_path: Path, existing_txt_path: Path) -> Optional[str]:
-    """HARD guarantee, not just a default: the existing file being realigned
-    is treated as read-only, unconditionally -- never overwritten, even if
-    an explicit output path is given that resolves to the same path (e.g. a
-    typo, or a future caller assuming "in place" is safe). No override
-    exists for this on purpose -- don't add one. Returns an error message if
-    `output_path` would overwrite `existing_txt_path`, else None."""
+    """Hard guarantee: never overwrite the file being realigned, even if
+    an explicit output path resolves to it. Returns an error message if
+    it would, else None."""
     if Path(output_path).resolve() == Path(existing_txt_path).resolve():
         return (f"Refusing to overwrite the existing file being realigned ({existing_txt_path}) -- "
                 f"the input file is always treated as read-only. Pass a different --output path.")
@@ -1569,8 +1197,7 @@ def build_arg_parser():
                          "debug log.")
     p.add_argument("--retry-low-quality-asr", dest="retry_low_quality_asr", action="store_true",
                     default=config.RETRY_LOW_QUALITY_ASR,
-                    # NOTE: literal '%' in argparse help text must be escaped as '%%' -- argparse
-                    # interpolates the stored help string with %-formatting when rendering --help.
+                    # NOTE: '%' in help text must be '%%' -- argparse does %-formatting on render.
                     help=(f"PROTOTYPE, default: ON. Retries with '{config.RETRY_ASR_MODEL}' if either: fewer "
                           f"than {config.MXL_LRC_MIN_ASR_PLACEMENT_RATE:.0%} of words get a real anchor from "
                           f"ASR/LRC (whole-song), or {config.RETRY_ASR_MIN_UNCONFIDENT_RUN}+ consecutive words "
@@ -1598,9 +1225,7 @@ def build_arg_parser():
 @dataclass
 class RealignPipelineOptions:
     """Every knob `run_realign_pipeline` needs, decoupled from argparse --
-    same shape/purpose as `config.PipelineOptions` for the main pipeline,
-    letting the GUI and the CLI build this the same way and call the exact
-    same pipeline code (see gui.py)."""
+    same shape as `config.PipelineOptions`, shared by GUI and CLI."""
     audio_file: Optional[str] = None
     work_dir: Optional[str] = None
     whisper_model: str = config.DEFAULT_WHISPER_MODEL
@@ -1619,27 +1244,11 @@ class RealignPipelineOptions:
     delete_work_files: bool = False
     no_debug_log: bool = False
     retry_low_quality_asr: bool = config.RETRY_LOW_QUALITY_ASR
-    # Whether this run is part of a --batch invocation -- see
-    # _retry_asr_if_low_quality's own docstring for why the large-v3
-    # retry itself is gated on this (set by run() from args.batch, and by
-    # gui.py's _build_realign_opts from its own _is_batch()).
-    batch: bool = False
-    # "validate" (DEFAULT as of 2026-08-15, see CLAUDE.md): realign_song_
-    # validate -- a word whose original position (after a single global
-    # GAP/drift correction) is independently confirmed by ASR is left
-    # completely untouched instead of being overwritten; automatically
-    # falls back to whole-song ASR-primary matching (the same mechanism
-    # "replace" uses) when too few words validate, so it's safe even on
-    # a file whose own timing turns out not to be trustworthy at all.
-    # "replace": realign_song, a matched word's timing is REPLACED with
-    # ASR's own value directly -- selectable via CLI --strategy or the
-    # GUI's Strategy dropdown.
+    batch: bool = False  # gates the large-v3 retry, see _retry_asr_if_low_quality
+    # "validate": keep validated words untouched, reposition the rest.
+    # "replace": realign_song overwrites matched words with ASR's value.
     strategy: str = "validate"
-    # GUI-only, never set by the CLI -- see config.PipelineOptions.
-    # cancel_requested's own docstring for the full explanation (same
-    # stage-boundary-only convention, shared config.check_cancelled/
-    # PipelineCancelled).
-    cancel_requested: Optional[Callable[[], bool]] = None
+    cancel_requested: Optional[Callable[[], bool]] = None  # GUI-only, see config.PipelineOptions.cancel_requested
 
 
 @dataclass
@@ -1652,9 +1261,8 @@ class RealignPipelineResult:
 def _transcribe_words_cancellable(vocals_path: Path, model_name: str, opts: RealignPipelineOptions,
                                    debug_log: Optional[DebugLog], log: Callable[[str], None]) -> List[Word]:
     """Same contract as `transcription.transcribe_words`, routed through a
-    killable child process (worker_process.run_cancellable) whenever
-    `opts.cancel_requested` is set -- see that module's own docstring.
-    Falls straight through to the in-process call otherwise (the CLI)."""
+    killable child process when `opts.cancel_requested` is set; otherwise
+    runs in-process."""
     whisperx_vad_options = config.WHISPERX_NO_VAD_OPTIONS if opts.whisperx_no_vad else None
     if opts.cancel_requested is None:
         from .transcription import transcribe_words
@@ -1678,45 +1286,22 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
                                forced_candidate: Optional[LrcLibCandidate],
                                debug_log: Optional[DebugLog],
                                log: Callable[[str], None]) -> RealignResult:
-    """PROTOTYPE, see config.RETRY_LOW_QUALITY_ASR's docstring. Only wired
-    up for `realign_song` (strategy="replace") -- `realign_song_validate`
-    uses a differently-shaped `ValidateQuality` with no `anchor_rate`, not
-    addressed here.
+    """See config.RETRY_LOW_QUALITY_ASR. Only wired for `realign_song`
+    (strategy="replace") -- `realign_song_validate` has no `anchor_rate`.
 
-    Two INDEPENDENT triggers, either is enough:
-      - `RealignQuality.anchor_rate` below `config.MXL_LRC_MIN_ASR_PLACEMENT_RATE`
-        (the SAME metric/bar `realign_song` already uses for its own "this
-        file's lyrics may not match this audio at all" warning) -- a
-        whole-song signal.
-      - `RealignQuality.longest_unconfident_run` at or above
-        `config.RETRY_ASR_MIN_UNCONFIDENT_RUN` -- a per-PASSAGE signal
-        (real case: David Bowie - Magic Dance with `small.en`, song-wide
-        anchor rate 58% -- well above the bar -- while one hallucinated
-        decoder segment still dragged a real, contiguous passage ~12-14s
-        off in the final output).
+    Two independent triggers: `anchor_rate` below
+    `MXL_LRC_MIN_ASR_PLACEMENT_RATE`, or `longest_unconfident_run` at/above
+    `RETRY_ASR_MIN_UNCONFIDENT_RUN` (catches one bad passage the aggregate
+    rate can hide).
 
-    Either way, re-transcribes the WHOLE song with `config.RETRY_ASR_MODEL`
-    and re-runs `realign_song` against the new transcription, keeping
-    whichever of the two results is better on WHICHEVER signal actually
-    triggered the retry (comparing only anchor_rate could miss a retry
-    that fixes one bad passage -- a handful of words out of the whole
-    song barely moves the aggregate rate -- without making it worse
-    either). Never retries a second time, and never fires at all if
-    `opts.whisper_model` is already the retry model.
+    Either trigger re-transcribes with `RETRY_ASR_MODEL` and keeps
+    whichever result is better on the signal that triggered the retry.
+    Never retries twice; no-op if already using the retry model.
 
-    `opts.batch` gates whether a triggered retry actually RUNS (2026-08-
-    10, user's explicit request): a whole-song re-transcription roughly
-    doubles this run's ASR time, which is a reasonable cost to pay
-    automatically in an unattended `--batch` run, but a surprising one to
-    silently eat in a single-song run where the user is presumably
-    watching and would rather decide for themselves. Outside `--batch`,
-    a triggered condition logs a WARNING (same explanation, both console
-    and debug log) suggesting `--batch` or a manual `--whisper-model
-    large-v3` instead of retrying automatically."""
-    # Mirrors every top-level decision-narration message into the debug log FILE too, not just the
-    # console/GUI `log` callback -- otherwise the file only shows the retry's raw ASR/realign data (via
-    # `debug_log` threaded into the calls below) with no record of WHY it fired or what was decided,
-    # forcing anyone auditing the file alone to go dig up separately-captured console output instead.
+    `opts.batch` gates whether a triggered retry actually runs (roughly
+    doubles ASR time) -- outside batch, logs a warning suggesting
+    `--batch` or `--whisper-model large-v3` instead."""
+    # Mirrors decision messages into the debug log file too, not just the console/GUI callback.
     def dlog(msg: str) -> None:
         log(msg)
         if debug_log is not None:
@@ -1783,15 +1368,8 @@ def _retry_asr_if_low_quality(result: RealignResult, *, existing: ParsedSong, vo
 
 def run_realign_pipeline(input_dir: Path, existing_txt_path: Optional[Path], opts: RealignPipelineOptions,
                           *, log: Callable[[str], None] = print) -> RealignPipelineResult:
-    """Thin wrapper around `_run_realign_pipeline_body` so `opts.
-    delete_work_files` is honored via `finally`, regardless of which of
-    the body's several early-return failure paths was taken -- work_dir
-    may be partially populated (e.g. separation already ran) even on a
-    failed run. Mirrors `main.run_pipeline`'s own wrapper exactly (see
-    its docstring); work_dir's own location is recomputed here rather
-    than threaded back out of the body, since it's a pure function of
-    (input_dir, opts.work_dir) that can never diverge from what the body
-    itself used."""
+    """Wraps `_run_realign_pipeline_body` so `opts.delete_work_files` is
+    honored via `finally` regardless of which failure path was taken."""
     try:
         return _run_realign_pipeline_body(input_dir, existing_txt_path, opts, log=log)
     except config.PipelineCancelled:
@@ -1808,18 +1386,12 @@ def run_realign_pipeline(input_dir: Path, existing_txt_path: Optional[Path], opt
 
 def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path], opts: RealignPipelineOptions,
                                 *, log: Callable[[str], None] = print) -> RealignPipelineResult:
-    """Runs the full realign CLI/GUI flow for one song: resolves the audio,
-    isolates vocals, transcribes, realigns, and writes the output file.
-    Never raises on an "expected" failure (bad existing file, ambiguous
-    folder, no words transcribed, etc.) -- those come back as
-    `RealignPipelineResult(success=False, error=...)`, same convention as
-    `main.run_pipeline`, so the CLI wrapper and gui.py can both handle
-    failure uniformly.
+    """Runs the full realign flow for one song: resolves audio, isolates
+    vocals, transcribes, realigns, writes output. Never raises on an
+    expected failure -- returns `RealignPipelineResult(success=False,
+    error=...)`.
 
-    `existing_txt_path=None` auto-detects the single .txt in `input_dir`
-    (see `find_existing_txt_in_folder`) -- required for `run_realign_batch`
-    (a single explicit path can't apply across multiple subfolders), and
-    a convenience in single-song mode too."""
+    `existing_txt_path=None` auto-detects the single .txt in `input_dir`."""
     from .song_input import resolve_song_folder
     from .file_discovery import AmbiguousInputError, NoAudioSourceFoundError
     from .separation import isolate_vocals, SeparationError
@@ -1924,20 +1496,9 @@ def _run_realign_pipeline_body(input_dir: Path, existing_txt_path: Optional[Path
 def run_realign_batch(parent_dir: Path, opts: RealignPipelineOptions,
                        *, log: Callable[[str], None] = print) -> List[Tuple[str, RealignPipelineResult]]:
     """Runs `run_realign_pipeline` once per immediate subdirectory of
-    `parent_dir` (mirrors `batch.run_batch`'s shape exactly), auto-
-    detecting each subfolder's own existing .txt to realign (see
-    `find_existing_txt_in_folder`) -- a single explicit path can't apply
-    across multiple subfolders, so `opts.output_path`/a single existing-
-    txt override are never meaningful here; the caller is expected to
-    leave those None (see gui.py/`run`'s own incompatibility checks).
-    Unlike `run_batch`, there's no output-folder mirroring to set up --
-    each result is always written next to ITS OWN subfolder's existing
-    file, so no `output_parent_dir` parameter exists here at all.
-
-    Any exception from a single song -- even one `run_realign_pipeline`
-    itself didn't already catch -- is caught HERE, logged, and recorded
-    as a failed result; one bad song must never abort the rest of the
-    batch, same reasoning as `run_batch`."""
+    `parent_dir`, auto-detecting each subfolder's own existing .txt. One
+    song failing doesn't abort the rest; each result is written next to
+    its own subfolder's file."""
     parent_dir = Path(parent_dir)
     subdirs = sorted(p for p in parent_dir.iterdir() if p.is_dir())
     results: List[Tuple[str, RealignPipelineResult]] = []

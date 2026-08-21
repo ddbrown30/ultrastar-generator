@@ -1,8 +1,4 @@
-"""Multi-song batch processing (feature 10): given a PARENT directory,
-runs the normal single-song pipeline on each of its immediate
-subdirectories (never the parent itself), mirroring the input structure
-into the output.
-"""
+"""Multi-song batch processing: runs the single-song pipeline on each immediate subdirectory of parent_dir."""
 
 from __future__ import annotations
 
@@ -20,24 +16,9 @@ def run_batch(
     *,
     log: Callable[[str], None] = print,
 ) -> List[Tuple[str, PipelineResult]]:
-    """Runs run_pipeline() once per immediate subdirectory of parent_dir
-    (e.g. parent_dir="Songs" containing "Songs/Song A", "Songs/Song B",
-    "Songs/Song C" processes each of A/B/C the same way single-song mode
-    would process it directly). Output mirrors the input structure 1:1 at
-    the top level: output_parent_dir/<song folder name>/ is passed to
-    run_pipeline as ITS OWN output_dir (parent-of-final-folder, per
-    run_pipeline's own contract), which then creates
-    output_parent_dir/<song folder name>/<Artist> - <Title>/ underneath
-    it -- or, if output_parent_dir is None, each song falls through to
-    run_pipeline's own per-song default (<song folder>/Output/<Artist> -
-    <Title>) independently.
+    """Runs run_pipeline() once per immediate subdirectory of parent_dir, mirroring output structure 1:1.
 
-    Any exception from a single song -- even one run_pipeline itself
-    didn't already catch into a PipelineResult -- is caught HERE, logged,
-    and recorded as a failed result. One bad song must never abort the
-    rest of the batch; that's the entire point of this function existing
-    instead of just shelling a loop around the CLI.
-    """
+    Catches any exception per-song so one bad song doesn't abort the rest of the batch."""
     parent_dir = Path(parent_dir)
     output_parent_dir = Path(output_parent_dir) if output_parent_dir is not None else None
 

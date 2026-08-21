@@ -1,27 +1,4 @@
-"""Downloads a cover image online when neither a companion file
-(file_discovery.find_companions) nor an embedded audio tag
-(cover_extract.py) provided one.
-
-Adapted from UltraStarKaraokeMaker's own fetch_assets.py/metadata.py
-cascade (see [[reference-uskmaker]]) -- same source order (MusicBrainz +
-Cover Art Archive, then iTunes, then Deezer), scoped down from its full
-design in two ways:
-  - COVER IMAGE ONLY. USKM's own cascade also enriches #YEAR/#GENRE and
-    fetches a separate 16:9 background from fanart.tv; none of that is
-    built here.
-  - Only the three sources that need no API key/account setup at all.
-    USKM's own Last.fm/Discogs tiers are both gated behind an env var
-    the user has to go create an account and set up first -- skipped
-    here to keep this a true zero-configuration fallback, consistent
-    with how this project's other network lookups (LRCLIB, lyrics.ovh's
-    now-removed successor) work out of the box.
-
-Best-effort, same convention as cover_extract.py and lyrics_lookup.py's
-own network calls: any failure (no network, nothing found, corrupt image
-data, `requests` not installed) falls through to the next source, and a
-total failure returns None -- never raises, never blocks the pipeline on
-a missing cover.
-"""
+"""Downloads a cover image online (fallback when no companion file or embedded tag has one). Tries MusicBrainz+Cover Art Archive, then iTunes, then Deezer; best-effort, never raises."""
 
 from __future__ import annotations
 
@@ -32,17 +9,11 @@ from typing import Optional
 from . import config
 from .cover_extract import _sniff_image_ext
 
-# MusicBrainz requires an honest, identifiable User-Agent or it starts
-# blocking the IP -- see https://musicbrainz.org/doc/MusicBrainz_API.
+# MusicBrainz requires an identifiable User-Agent or it blocks the IP.
 _USER_AGENT = "ultrastar-generator/1.0 (+https://github.com/ddbrown30/ultrastar-generator)"
 _MB_BASE = "https://musicbrainz.org/ws/2"
 _CAA_BASE = "https://coverartarchive.org"
-# MusicBrainz's own rate limit is ~1 request/second; a small margin over
-# that keeps repeated calls (e.g. --batch across many songs) from ever
-# tripping it.
-_MB_MIN_INTERVAL_SEC = 1.1
-# Cover art is enrichment, not a requirement -- never worth blocking the
-# pipeline long waiting on a server that may not have the answer.
+_MB_MIN_INTERVAL_SEC = 1.1  # stays under MusicBrainz's ~1 req/sec limit
 _HTTP_TIMEOUT_SEC = 6
 
 _last_mb_call = 0.0
@@ -79,12 +50,7 @@ def _get_json(url: str, *, headers: Optional[dict] = None, params: Optional[dict
 
 
 def _mb_find_release_mbid(artist: str, title: str) -> Optional[str]:
-    """Finds the most plausible MusicBrainz release MBID for
-    (artist, title). Among every release attached to any matching
-    recording, prefers the one with the EARLIEST known release date (the
-    original release, not a later reissue/compilation) -- falls back to
-    the first release seen at all if none have a date. Returns None if
-    nothing plausible was found."""
+    """Finds the most plausible MusicBrainz release MBID for (artist, title), preferring the earliest release date; None if nothing found."""
     _respect_mb_rate_limit()
     data = _get_json(
         f"{_MB_BASE}/recording",
@@ -94,7 +60,7 @@ def _mb_find_release_mbid(artist: str, title: str) -> Optional[str]:
     if not data:
         return None
 
-    candidates = []  # (mbid, date_str)
+    candidates = []
     fallback_mbid = None
     for rec in data.get("recordings", []):
         for release in rec.get("releases", []):
@@ -108,16 +74,13 @@ def _mb_find_release_mbid(artist: str, title: str) -> Optional[str]:
                 candidates.append((mbid, date_str))
 
     if candidates:
-        candidates.sort(key=lambda c: c[1])  # ISO date strings sort chronologically as text
+        candidates.sort(key=lambda c: c[1])
         return candidates[0][0]
     return fallback_mbid
 
 
 def _mb_caa_cover_bytes(artist: str, title: str) -> Optional[bytes]:
-    """MusicBrainz (to find the release) + Cover Art Archive (to fetch
-    its front cover). The /front-500 endpoint 307-redirects to the real
-    image on the Internet Archive -- `requests` follows redirects by
-    default."""
+    """Looks up the release via MusicBrainz, fetches its front cover from Cover Art Archive."""
     release_mbid = _mb_find_release_mbid(artist, title)
     if not release_mbid:
         return None
@@ -125,8 +88,6 @@ def _mb_caa_cover_bytes(artist: str, title: str) -> Optional[bytes]:
 
 
 def _itunes_cover_bytes(artist: str, title: str) -> Optional[bytes]:
-    """No key/account required; official rate limit (~20 req/min) is
-    irrelevant for one call per song."""
     data = _get_json(
         "https://itunes.apple.com/search",
         headers={"User-Agent": _USER_AGENT},
@@ -138,15 +99,11 @@ def _itunes_cover_bytes(artist: str, title: str) -> Optional[bytes]:
     art_url = results[0].get("artworkUrl100")
     if not art_url:
         return None
-    # Documented community trick: the thumbnail URL accepts other
-    # resolutions by swapping the "100x100" suffix -- 600x600 exists for
-    # nearly the whole catalog.
-    art_url = art_url.replace("100x100", "600x600")
+    art_url = art_url.replace("100x100", "600x600")  # request higher res
     return _get_bytes(art_url, headers={"User-Agent": _USER_AGENT})
 
 
 def _deezer_cover_bytes(artist: str, title: str) -> Optional[bytes]:
-    """No key/account required."""
     data = _get_json(
         "https://api.deezer.com/search",
         headers={"User-Agent": _USER_AGENT},
@@ -166,19 +123,7 @@ _SOURCES = (_mb_caa_cover_bytes, _itunes_cover_bytes, _deezer_cover_bytes)
 
 
 def fetch_cover_online(artist: str, title: str, dest_dir: Path, base_name: str) -> Optional[Path]:
-    """Tries MusicBrainz+Cover Art Archive, then iTunes, then Deezer, in
-    that order, stopping at the first real image any of them returns.
-    Writes dest_dir/'<base_name><config.COVER_TAG_SUFFIX>.<ext>' (the
-    real extension, sniffed from magic bytes) and returns that path, or
-    None if every source failed or `requests` isn't installed -- never
-    raises.
-
-    Results are cached under dest_dir by name (same check-then-fetch
-    idiom `separation.isolate_vocals` uses for Demucs): if a previously
-    downloaded cover already exists there, it's returned directly with
-    no network call at all, so a re-run against the same work_dir never
-    re-downloads.
-    """
+    """Tries each source in turn, writes the first hit to dest_dir/'<base_name><suffix>.<ext>', returns that path or None. Cached: a previously downloaded cover is reused with no network call."""
     dest_dir = Path(dest_dir)
     for ext in (".jpg", ".png"):
         cached = dest_dir / f"{base_name}{config.COVER_TAG_SUFFIX}{ext}"

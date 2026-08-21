@@ -1,13 +1,4 @@
-"""Finds companion files (video, cover, background) next to an audio file.
-
-Rules implemented (per the user's spec):
-  * Audio files are named "<Artist> - <Title>.<ext>" (mp3/ogg/oga/m4a).
-  * If an .avi/.mp4 exists with the SAME base name -> #VIDEO.
-  * If exactly one .jpg/.jpeg exists with the same base name -> used for
-    both #COVER and #BACKGROUND.
-  * If multiple images exist, ones with "[CO]" in the name -> #COVER,
-    ones with "[BG]" in the name -> #BACKGROUND.
-"""
+"""Finds companion files (video, cover, background) next to an audio file."""
 
 from __future__ import annotations
 
@@ -20,13 +11,11 @@ from . import config
 
 
 class AmbiguousInputError(ValueError):
-    """More than one candidate file could plausibly be the song's primary
-    audio/video source, and there's no principled way to auto-pick one."""
+    """More than one candidate could be the song's primary audio/video source."""
 
 
 class NoAudioSourceFoundError(ValueError):
-    """The input folder has no real audio file, no .mp4, and no .avi with
-    an audio track -- nothing usable was found at all."""
+    """No usable audio source found in the input folder."""
 
 
 @dataclass
@@ -34,33 +23,20 @@ class Companions:
     video: Optional[Path] = None
     cover: Optional[Path] = None
     background: Optional[Path] = None
-    musicxml: List[Path] = field(default_factory=list)  # .mxl/.musicxml/.xml
-                                    # reference files for pass 4 -- unlike
-                                    # video/cover, these are matched by
-                                    # EXTENSION ALONE, not basename: a
-                                    # downloaded MuseScore file keeps
-                                    # whatever name the source gave it
-                                    # (e.g. "beauty-and-the-beast.mxl"),
-                                    # never "<Artist> - <Title>.mxl".
+    musicxml: List[Path] = field(default_factory=list)  # matched by extension, not basename
 
 
 def _same_base(candidate: Path, base_stem: str) -> bool:
-    """True if candidate's name starts with base_stem (allowing an
-    optional " [TAG]" suffix before the extension), case-insensitively."""
+    """True if candidate's name matches base_stem, optionally with a " [CO]"/" [BG]" suffix."""
     stem = candidate.stem
     if stem.lower() == base_stem.lower():
         return True
-    # allow "<base> [CO]", "<base>[CO]", "<base> [BG]" etc.
     pattern = re.escape(base_stem) + r"\s*\[(CO|BG)\]$"
     return re.match(pattern, stem, flags=re.IGNORECASE) is not None
 
 
 def _looks_like_musicxml(path: Path) -> bool:
-    """Cheap content sniff for a bare ".xml" file: real MusicXML declares
-    a "score-partwise"/"score-timewise" root somewhere near the top of
-    the file. Reading raw text (not parsing) is enough and avoids paying
-    a full XML-parse cost on every random .xml a song folder happens to
-    contain."""
+    """Content-sniffs a bare ".xml" file for a MusicXML root tag."""
     try:
         head = path.read_text(encoding="utf-8", errors="ignore")[:4096]
     except OSError:
@@ -82,21 +58,12 @@ def find_companions(audio_path: Path) -> Companions:
         if p.suffix.lower() in config.VIDEO_EXTS and _same_base(p, base_stem)
     ]
     if not videos:
-        # No basename-matched video -- if there's exactly one video file
-        # in the folder at all, it's unambiguous even though its name
-        # doesn't relate to the audio file's own name (real case: a
-        # SingStar-style rip where the audio is "music.ogg" but there's a
-        # single "video.mpg" sitting right next to it -- same reasoning
-        # as file_discovery.resolve_artist_title's folder-name fallback:
-        # a strict naming-convention match failing doesn't mean there's
-        # nothing to find, just that this file predates/ignores the
-        # convention).
+        # Fall back to a single unrelated-named video if it's the only one.
         untagged_videos = [p for p in candidates if p.suffix.lower() in config.VIDEO_EXTS]
         if len(untagged_videos) == 1:
             videos = untagged_videos
     if videos:
-        # Prefer exact-stem match over a tagged one, if both somehow exist.
-        videos.sort(key=lambda p: p.stem.lower() != base_stem.lower())
+        videos.sort(key=lambda p: p.stem.lower() != base_stem.lower())  # exact stem match first
         result.video = videos[0]
 
     # --- images ----------------------------------------------------------
@@ -117,56 +84,31 @@ def find_companions(audio_path: Path) -> Companions:
         result.cover = images[0]
         result.background = images[0]
     elif len(images) > 1:
-        # Multiple untagged images: no reliable way to pick, so use the
-        # first for both and let the user know at the call site.
+        # No reliable way to pick among untagged images; use the first for both.
         result.cover = images[0]
         result.background = images[0]
     else:
-        # No basename-matched/tagged image at all -- same single-
-        # unambiguous-candidate fallback as video, above.
+        # Fall back to a single unrelated-named image if it's the only one.
         untagged_images = [p for p in candidates if p.suffix.lower() in config.IMAGE_EXTS]
         if len(untagged_images) == 1:
             result.cover = untagged_images[0]
             result.background = untagged_images[0]
 
     # --- MusicXML reference (pass 4) --------------------------------------
-    # ".mxl"/".musicxml" are unambiguous. Bare ".xml" is NOT -- e.g. these
-    # SingStar rips ship their own "notes.xml" (a different, proprietary
-    # format, root tag "{http://www.singstargame.com}MELODY") right next
-    # to the real audio/lyrics, which crashed music21.converter.parse
-    # when trusted by extension alone. Content-sniff any bare ".xml" so
-    # only files that actually look like MusicXML get picked up.
+    # Bare ".xml" is content-sniffed since some games ship an unrelated "notes.xml".
     xml_candidates = [p for p in candidates if p.suffix.lower() in (".mxl", ".musicxml")]
     xml_candidates += [p for p in candidates if p.suffix.lower() == ".xml" and _looks_like_musicxml(p)]
-    result.musicxml = sorted(xml_candidates, key=lambda p: p.name.lower())  # deterministic order
+    result.musicxml = sorted(xml_candidates, key=lambda p: p.name.lower())
 
     return result
 
 
 def resolve_primary_source(input_dir: Path, audio_file_override: Optional[str] = None) -> Tuple[Path, str]:
-    """Figures out which file in a song folder is the primary audio/video
-    source, and how it should be treated. Returns (path, kind), kind one of:
-      "audio"          -- a real audio file (config.AUDIO_EXTS) was found.
-      "video_as_audio" -- no real audio file, but exactly one video file
-                           UltraStar Deluxe can use directly as #MP3 was
-                           (config.VIDEO_DIRECT_AUDIO_EXTS: .mp4/.mpg/
-                           .mpeg) -- it'll serve as BOTH the audio source
-                           and #VIDEO.
-      "avi_extract"    -- no real audio file and no direct-audio video,
-                           but exactly one .avi was -- UltraStar Deluxe
-                           can't use .avi as #MP3 directly, so its audio
-                           track must be extracted into a real standalone
-                           file (see media_extract.py).
-
-    `audio_file_override` (a bare filename within input_dir) wins outright
-    over all of the above, always resolving to kind "audio" -- this is the
-    escape hatch for a folder with more than one real audio file, which
-    this function otherwise refuses to guess between.
-
-    Raises AmbiguousInputError if more than one candidate exists at
-    whichever tier is reached (naming the candidates), or
-    NoAudioSourceFoundError if nothing usable exists at any tier.
-    """
+    """Finds the primary audio/video source in a song folder. Returns (path, kind):
+    "audio" (real audio file), "video_as_audio" (single .mp4/.mpg/.mpeg, serves as both
+    #MP3 and #VIDEO), or "avi_extract" (single .avi, audio track needs extracting).
+    `audio_file_override` picks a specific file, always resolving to "audio".
+    Raises AmbiguousInputError on multiple candidates, NoAudioSourceFoundError on none."""
     input_dir = Path(input_dir)
 
     if audio_file_override:
@@ -215,9 +157,7 @@ def resolve_primary_source(input_dir: Path, audio_file_override: Optional[str] =
 
 
 def _split_artist_title(name: str) -> tuple[str, str]:
-    """Splits on the FIRST " - " occurrence, since artist or title names
-    could themselves contain hyphens without surrounding spaces (e.g.
-    "Jean-Luc")."""
+    """Splits on the FIRST " - " occurrence."""
     if " - " not in name:
         raise ValueError(
             f'Could not parse "<Artist> - <Title>" from {name!r}. '
@@ -228,26 +168,13 @@ def _split_artist_title(name: str) -> tuple[str, str]:
 
 
 def parse_artist_title(audio_path: Path) -> tuple[str, str]:
-    """Parses "<Artist> - <Title>.<ext>" into (artist, title) from the
-    AUDIO FILE's own name."""
+    """Parses "<Artist> - <Title>.<ext>" into (artist, title) from the audio file's name."""
     return _split_artist_title(Path(audio_path).stem)
 
 
 def resolve_artist_title(audio_path: Path, input_dir: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Input is folder-based (see module docstring), so the INPUT FOLDER's
-    own name is the sole, authoritative "<Artist> - <Title>" source -- a
-    file inside can be named anything at all (a ripped/downloaded file
-    keeping a generic name like "music.ogg", multiple companion files with
-    unrelated names, etc; real confirmed case: this project's own
-    "Beauty And The Beast - Beauty And The Beast" SingStar-rip test song).
-    `audio_path` is accepted but intentionally unused -- kept so call
-    sites don't need special-casing depending on which source they have
-    handy. Uses the folder's raw `.name` (not `.stem`, which would
-    wrongly treat a dot inside a folder name as a file extension to
-    strip, since folders don't have real extensions). Returns (None,
-    None) if the folder name doesn't parse -- never raises, unlike
-    `parse_artist_title` itself."""
-    del audio_path
+    """Gets the artist and title from the input folder name, formatted as "<Artist> - <Title>"."""
+    del audio_path  # unused; kept so call sites don't need special-casing
     try:
         return _split_artist_title(Path(input_dir).name)
     except ValueError:
@@ -263,15 +190,9 @@ _MINOR_WORDS = {
 
 
 def _word_case_shape(word: str) -> str:
-    """Classifies a word's letters-only casing so `headline_case` knows
-    whether it's safe to touch: "simple" (all-lowercase, or exactly one
-    leading capital + the rest lowercase -- including single-letter
-    words, which are inherently ambiguous either way) can be safely
-    re-cased; "upper" (2+ letters, ALL of them uppercase -- an acronym or
-    stylized name, e.g. "AND") and "mixed" (any other pattern, e.g.
-    "KPop", "McDonald") must be left completely alone since we can't
-    safely guess whether that capitalization is intentional; "none" (no
-    letters at all, e.g. "&") is never touched either."""
+    """Classifies a word's casing: "simple" (lowercase or Capitalized, safe to re-case),
+    "upper" (all-caps acronym), "mixed" (e.g. "KPop"), or "none" (no letters) -- only
+    "simple" words are safe to touch."""
     letters = [c for c in word if c.isalpha()]
     if not letters:
         return "none"
@@ -295,28 +216,16 @@ _WINDOWS_ILLEGAL_FILENAME_CHARS = '<>:"/\\|?*'
 
 
 def sanitize_filename(text: str) -> str:
-    """Strips characters Windows forbids in a file/folder name (e.g. the
-    "?" in a real title like "Shall We Dance?") plus trailing dots/spaces
-    (also illegal as a Windows filename's last character) -- for use ONLY
-    when turning an artist/title into an actual filesystem path component.
-    Never apply this to a #ARTIST/#TITLE tag's own value, which should
-    keep the real, unmodified text."""
+    """Strips Windows-illegal filename characters and trailing dots/spaces. Only for
+    filesystem path components, never for a #ARTIST/#TITLE tag's own value."""
     out = "".join(c for c in text if c not in _WINDOWS_ILLEGAL_FILENAME_CHARS)
     return out.rstrip(" .")
 
 
 def headline_case(text: str) -> str:
-    """Title-cases `text` for display in output folder/file names (e.g.
-    "Beauty And The Beast" -> "Beauty and the Beast") -- minor words
-    (articles/conjunctions/short prepositions, see `_MINOR_WORDS`) are
-    lowercased unless they're the first or last word. Deliberately NOT
-    aggressive: only words in an unambiguous "simple" case shape (see
-    `_word_case_shape`) are ever touched -- an ALL CAPS word (e.g. "AND")
-    or one with unusual internal capitalization (e.g. "KPop") is left
-    completely untouched, since forcing it into "and"/"Kpop" would
-    destroy what's very likely intentional stylization. Splits on
-    whitespace only; any punctuation attached to a word (e.g. "Beast,",
-    "Don't") stays attached and untouched."""
+    """Title-cases text, lowercasing minor words (see `_MINOR_WORDS`) unless first/last.
+    Only touches "simple"-shaped words (see `_word_case_shape`); leaves stylized
+    capitalization (e.g. "KPop", "AND") alone."""
     words = text.split(" ")
     n = len(words)
     out = []

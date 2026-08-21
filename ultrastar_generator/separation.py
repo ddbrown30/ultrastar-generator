@@ -1,12 +1,4 @@
-"""Vocal isolation using Demucs.
-
-Demucs is invoked as a subprocess (its own CLI) rather than imported,
-which sidesteps a lot of version/import fragility and matches how most
-people already have it installed (`pip install demucs`), and -- as of
-the `cancel_requested` param below -- also means a caller with a real
-cancellation signal (the GUI's Stop button) can kill it OUTRIGHT the
-moment cancellation is requested, not just check for it before/after.
-"""
+"""Vocal isolation using Demucs, invoked as a subprocess (not imported) so it can be killed outright on cancellation."""
 
 from __future__ import annotations
 
@@ -21,9 +13,7 @@ from typing import Callable, List, Optional
 
 from . import config
 
-# See media_extract.py's own comment on this exact constant -- suppresses
-# the console window Windows otherwise pops up for a subprocess when the
-# parent has none of its own (the GUI, launched via pythonw.exe).
+# Suppresses console-window flashing when launched from the GUI (pythonw.exe); no-op on non-Windows.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 _POLL_INTERVAL_SEC = 0.15
 _TERMINATE_GRACE_SEC = 5.0
@@ -46,18 +36,7 @@ def isolate_vocals(
     *,
     cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> Path:
-    """Runs Demucs two-stem separation and returns the path to vocals.wav.
-
-    Results are cached under work_dir/separated/<model>/<track>/vocals.wav;
-    if that file already exists, separation is skipped.
-
-    `cancel_requested`, if given, is polled every _POLL_INTERVAL_SEC while
-    Demucs runs -- the moment it returns True, the Demucs subprocess is
-    killed OUTRIGHT (terminate, then kill if it doesn't die promptly) and
-    config.PipelineCancelled is raised immediately, without waiting for
-    Demucs to finish. None (the CLI's own default) means no cancellation
-    is possible here at all, same as before this param existed.
-    """
+    """Runs Demucs two-stem separation and returns the path to vocals.wav. Cached under work_dir/separated/<model>/<track>/vocals.wav. `cancel_requested`, if given, is polled while Demucs runs; if it returns True, the subprocess is killed and config.PipelineCancelled is raised."""
     audio_path = Path(audio_path)
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -78,15 +57,7 @@ def isolate_vocals(
     demucs_args = ["--two-stems", "vocals", "-n", model, "-d", "cuda", "-o", str(out_dir), str(audio_path)]
 
     if os.name == "nt":
-        # demucs's own AudioFile (demucs/audio.py) unconditionally shells out
-        # to ffmpeg/ffprobe to read ANY input format -- a call site we don't
-        # own, same problem class as whisperx.audio.load_audio (see
-        # transcription.py's own identical fix and its comment for the full
-        # explanation). But demucs runs as its own separate Python process
-        # here (see module docstring for why it's a subprocess, not an
-        # import), so our process's own subprocess.Popen patch never reaches
-        # it -- bootstrap the SAME patch into demucs's own process before
-        # demucs itself starts, via -c instead of -m.
+        # Demucs shells out to ffmpeg/ffprobe itself; patch its own process for no-window before it starts.
         _bootstrap = (
             "import sys, subprocess, runpy\n"
             "sys.argv = ['demucs'] + sys.argv[1:]\n"

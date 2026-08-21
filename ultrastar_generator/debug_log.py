@@ -1,24 +1,6 @@
-"""Persistent per-run debug log, ON by default (--no-debug-log to skip).
-
-Captures pipeline decisions that are otherwise only visible via
---verbose console output (which isn't saved anywhere) or not surfaced at
-all (raw ASR confidence, reference-line grouping, note-zone boundary
-math, syllable-proportional splits) -- written to
-`<Artist> - <Title> [DEBUG LOG].txt` next to the other output files.
-
-Exists because of a real, confirmed failure mode (see CLAUDE.md's
-"Lessons learned" on ASR timestamp trust): WhisperX's forced alignment
-can produce a run of severely wrong, LOW-CONFIDENCE word timestamps --
-confirmed correlated with sustained/held notes, where a long vowel with
-no new phonetic content gives the wav2vec2 CTC aligner nothing to anchor
-a boundary to. Pass 3 currently trusts every word timestamp equally
-regardless of confidence, so this silently distorts reference-line zone
-boundaries downstream. This log makes the whole chain (raw ASR timing +
-confidence -> reference-line grouping -> zone boundaries -> notes
-assigned per group -> syllable-proportional split) inspectable after the
-fact, so a bad final position can be traced back to exactly where it
-went wrong instead of guessed at.
-"""
+"""Persistent per-run debug log, ON by default (--no-debug-log to skip). Writes pipeline decisions
+not otherwise surfaced (ASR confidence, reference-line grouping, note-zone math, syllable splits) to
+`<Artist> - <Title> [DEBUG LOG].txt`."""
 
 from __future__ import annotations
 
@@ -30,8 +12,7 @@ if TYPE_CHECKING:
 
 
 class DebugLog:
-    """No-op if constructed with path=None (--no-debug-log) -- callers
-    don't need to branch on whether logging is enabled."""
+    """No-op if constructed with path=None (--no-debug-log)."""
 
     def __init__(self, path: Optional[Path]):
         self.path = path
@@ -50,15 +31,8 @@ class DebugLog:
         self._f.write(text + "\n")
 
     def log_frames(self, rows: List[str], header: str) -> None:
-        """Dumps one line per pass-1 analysis frame (one row per ~11.6ms of
-        audio, so this is large -- a full song is several thousand lines).
-        `rows` are pre-formatted strings (one per frame, caller controls
-        exact columns); this just wraps them in a section so the raw
-        pitch-source output (before any smoothing, merging, or
-        energy-gating) is directly inspectable instead of only visible as
-        post-processed notes -- exists specifically to distinguish "pass
-        1's underlying pitch tracker got this frame wrong" from "a later
-        merge/cleanup pass distorted an originally-correct reading." """
+        """Dumps one pre-formatted line per pass-1 analysis frame (raw pitch-source output, before
+        smoothing/merging/gating) under a section header."""
         if self._f is None:
             return
         self.section(header)
@@ -66,17 +40,8 @@ class DebugLog:
             self.line(r)
 
     def log_notes(self, notes: "List[NoteEvent]", label: str) -> None:
-        """Dumps a NoteEvent list with FULL FLOAT-SECOND precision -- unlike
-        the '[PASS1 DEBUG]' .txt file, which quantizes every
-        note's start/end to integer beats for the UltraStar format (lossy:
-        a note's true continuous-time boundary gets rounded, and a very
-        short note's true duration can be invisibly stretched to the
-        minimum 1-beat display width). Reverse-converting those quantized
-        beat numbers back to seconds to compare against pass 3's own
-        (full-precision) note handling was confirmed to give misleading
-        results -- this exists specifically so a real pass-1-vs-pass-3
-        pitch/timing mismatch can be told apart from a quantization-display
-        artifact."""
+        """Dumps a NoteEvent list at full float-second precision, unlike the beat-quantized
+        '[PASS1 DEBUG]' .txt file."""
         if self._f is None:
             return
         self.section(f"RAW NOTES ({label}, full float-second precision, no beat quantization)")
@@ -88,11 +53,7 @@ class DebugLog:
     def log_lyrics_selection(self, *, source: str, track_name: str = "", artist_name: str = "",
                               lrclib_id: Optional[int] = None, duration: Optional[float] = None,
                               synced: bool = False, extra: str = "") -> None:
-        """Records which specific lyrics candidate this run actually used
-        -- id/duration/track/artist, not just "got a reference from
-        lrclib" -- so a wrong-recording pick (right song, different
-        performer/version) can be diagnosed after the fact instead of
-        only inferred from downstream symptoms."""
+        """Records which lyrics candidate this run used (id/duration/track/artist)."""
         if self._f is None:
             return
         self.section("LYRICS SELECTION")
@@ -116,14 +77,8 @@ class DebugLog:
                 self.line(f"  {d}")
 
     def append_raw(self, text: str) -> None:
-        """Appends pre-formatted text (already including its own section
-        markers, e.g. output from another DebugLog instance's own write
-        calls) directly into this log's file. Used to merge a
-        cancellable-subprocess worker's own DebugLog output (see
-        worker_process.py) into the main process's log after the fact --
-        two processes can't safely share one open file handle while the
-        worker is running, so the worker writes to its own temp file and
-        the result is stitched in here once the worker finishes."""
+        """Appends pre-formatted text (its own section markers included) directly to this log's file.
+        Used to merge a worker subprocess's own DebugLog output (worker_process.py) in after the fact."""
         if self._f is None:
             return
         self._f.write(text)
