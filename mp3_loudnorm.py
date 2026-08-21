@@ -530,7 +530,7 @@ def normalize_file(path: Path, target_lufs: float, target_tp: float, info: dict,
 
 
 def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool,
-                  force: bool, stop_on_error: bool):
+                  force: bool, stop_on_error: bool, create_backup: bool):
     check_tools()
     backup_root = Path(BACKUP_DIRNAME) / root.relative_to(root.anchor)
     files = find_files(root)
@@ -650,7 +650,7 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
                     break
                 continue
 
-            if not backup_exists:
+            if not backup_exists and create_backup:
                 backup_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, backup_path)
                 if not verify_backup(path, backup_path):
@@ -701,7 +701,8 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
 
     if not dry_run:
         print(f"\n{processed} normalized, {skipped} skipped, {errors} error(s).")
-        print(f"Backups stored under: {backup_root}")
+        if create_backup:
+            print(f"Backups stored under: {backup_root}")
 
 
 def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failure: bool):
@@ -895,6 +896,10 @@ def main():
         help="List files that would be processed without changing anything (normalize mode only)",
     )
     parser.add_argument(
+        "--create-backup", action="store_true",
+        help="Creates a backup of the file before normalizing)",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Process files even if a backup already exists. The existing "
              "backup is preserved, never overwritten (normalize mode only)",
@@ -940,7 +945,7 @@ def main():
     elif args.verify:
         do_verify(root, args.lufs, args.tp, args.restore_on_failure)
     else:
-        do_normalize(root, args.lufs, args.tp, args.dry_run, args.force, args.stop_on_error)
+        do_normalize(root, args.lufs, args.tp, args.dry_run, args.force, args.stop_on_error, args.create_backup)
 
 
 if __name__ == "__main__":
