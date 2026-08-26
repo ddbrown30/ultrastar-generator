@@ -78,7 +78,12 @@ def _weighted_mode_pitch(pitches: List[float], confs: List[float]) -> int:
     votes = {}
     for r, w in zip(rounded, weights):
         votes[r] = votes.get(r, 0.0) + w
-    return max(votes, key=votes.get)
+    # int(...): `r`/dict keys are numpy.int64 (from iterating an ndarray) -- without this cast,
+    # every NoteEvent.pitch traced back to this function silently carries a numpy scalar, which
+    # dataclasses.asdict doesn't convert and json.dumps then rejects (real bug: crashed the GUI's
+    # worker-process path, which serializes detect_notes' result to JSON -- the CLI never hits
+    # this since it calls detect_notes in-process).
+    return int(max(votes, key=votes.get))
 
 
 def _trim_attack(
