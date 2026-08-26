@@ -146,6 +146,25 @@ ENABLE_WHISPERX_NO_VAD = True  # on by default; --whisperx-vad opts back into wh
 # assignment -- separate from MIN_LINE_GAP_SEC (display line breaks).
 NOTE_ASSIGNMENT_MAX_GAP_SEC = 0.35
 
+# A note-assignment group's zone (_assign_notes_to_groups) can span a genuine multi-second
+# instrumental/silence gap between two lyric lines when the ARITHMETIC MIDPOINT between them
+# happens to fall far from either line's own real content -- every pass-1 note on the far side
+# of that gap then gets attributed to whichever line's zone it landed in, even though it's a
+# separate, unrelated musical event. _trim_notes_to_reachable_span keeps a group's own zone
+# notes reachable from its own real ASR span by a chain of notes each within this gap of its
+# neighbor (so a genuine melisma tail extending well past an imprecise ASR word-end timestamp
+# is still kept, as long as it's one continuous run of detected pitch with no real silence) --
+# but drops anything past an actual silence gap this wide. Real case (2026-08-25, David Bowie -
+# "I'm Afraid of Americans"): pass-1's own note stream shows real ~3.0-3.4s silence gaps
+# immediately before/after "Johnny's in America, Low techs at the wheel." (15.05-18.12s) on
+# both sides, yet the zone assigned to that line reached from 9.68s to 22.61s (because the next
+# line doesn't start until 27.05s, so the zone's own trailing boundary -- the midpoint of that
+# real gap -- lands mid-gap, past the point where the FIRST line's own singing actually stopped)
+# -- "Johnny's" and "wheel." (the group's first/last words) then absorbed those unrelated notes.
+# Chosen well above ordinary intra-phrase pauses (MIN_LINE_GAP_SEC=0.35s already forces a new
+# line at that gap) and well below the confirmed-bad real gaps (3.0-3.4s) -- comfortable margin.
+NOTE_GROUP_REACH_MAX_GAP_SEC = 1.0
+
 # lyrics_lookup.align_words_to_reference: in a clamped repeated-token
 # replace block, a word this far from the previous one is too far to be
 # the same repeat run and is left unmatched instead.

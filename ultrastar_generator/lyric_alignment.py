@@ -70,6 +70,29 @@ def _group_words_by_gap(words: List[Word], max_gap_sec: float) -> List[List[int]
     return groups
 
 
+def _trim_notes_to_reachable_span(
+    notes: List[NoteEvent], asr_start: float, asr_end: float, max_gap_sec: float,
+) -> List[NoteEvent]:
+    """Keeps only the notes reachable from [asr_start, asr_end] by a chain of notes each within
+    max_gap_sec of its neighbor -- a genuine melisma tail (one continuous run of detected pitch,
+    no real silence) is kept even far past an imprecise ASR timestamp, but a note on the far
+    side of an actual silence gap this wide is dropped, since it more likely belongs to a
+    separate, unrelated musical event (real case: see config.NOTE_GROUP_REACH_MAX_GAP_SEC's own
+    docstring). `notes` must already be sorted by start time."""
+    if not notes:
+        return notes
+    core = [i for i, n in enumerate(notes) if n.end > asr_start and n.start < asr_end]
+    if not core:
+        mid = (asr_start + asr_end) / 2.0
+        core = [min(range(len(notes)), key=lambda i: min(abs(mid - notes[i].start), abs(mid - notes[i].end)))]
+    lo, hi = min(core), max(core)
+    while lo > 0 and notes[lo].start - notes[lo - 1].end <= max_gap_sec:
+        lo -= 1
+    while hi < len(notes) - 1 and notes[hi + 1].start - notes[hi].end <= max_gap_sec:
+        hi += 1
+    return notes[lo:hi + 1]
+
+
 def _assign_notes_to_groups(
     group_spans: List[Tuple[float, float]], notes: List[NoteEvent], debug_log=None,
     group_labels: Optional[List[str]] = None,
@@ -97,6 +120,11 @@ def _assign_notes_to_groups(
 
     for group in assigned:
         group.sort(key=lambda note: note.start)
+
+    assigned = [
+        _trim_notes_to_reachable_span(group, span[0], span[1], config.NOTE_GROUP_REACH_MAX_GAP_SEC)
+        for group, span in zip(assigned, group_spans)
+    ]
 
     if debug_log is not None:
         debug_log.section("NOTE-ZONE ASSIGNMENT (group spans -> boundaries -> notes per group)")
