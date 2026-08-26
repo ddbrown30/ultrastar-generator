@@ -336,16 +336,28 @@ def _detect_notes_cancellable(vocals_path: Path, y, sr, bpm: float, opts: config
 
 def _recover_dropped_reference_words_cancellable(ref_lines, words, vocals_path: Path,
                                                    opts: config.PipelineOptions, debug_log,
-                                                   log: Callable[[str], None]):
-    """Same contract as lyrics_lookup.recover_dropped_reference_words, routed through a killable child process when cancellable."""
+                                                   log: Callable[[str], None], notes=None):
+    """Same contract as lyrics_lookup.recover_dropped_reference_words, routed through a killable child process when cancellable.
+
+    A recovered word is produced by its OWN separate forced-alignment call, scoped to the gap
+    window -- it can carry the exact same "absorbed a real pause" failure as the original
+    transcription (real case: recovering "Johnny's in America" into a gap gave "Johnny's" alone
+    a 3.35s span, squeezing "in"/"America" into what was left). `notes` (pass-1's own detected
+    notes), when given, re-runs cap_word_durations_to_note_gaps on the result so a recovered
+    word gets the same sanity check as every other word, not just the ones already checked
+    before this function ran."""
     if opts.cancel_requested is None:
-        return recover_dropped_reference_words(ref_lines, words, vocals_path, debug_log=debug_log)
-    result = run_cancellable(
-        "recover_dropped_reference_words",
-        {"ref_lines": ref_lines, "words": [dataclasses.asdict(w) for w in words], "vocals_path": str(vocals_path)},
-        cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
-    )
-    return [Word(**d) for d in result["words"]], result["n_recovered"]
+        new_words, n_recovered = recover_dropped_reference_words(ref_lines, words, vocals_path, debug_log=debug_log)
+    else:
+        result = run_cancellable(
+            "recover_dropped_reference_words",
+            {"ref_lines": ref_lines, "words": [dataclasses.asdict(w) for w in words], "vocals_path": str(vocals_path)},
+            cancel_requested=opts.cancel_requested, debug_log=debug_log, log=log,
+        )
+        new_words, n_recovered = [Word(**d) for d in result["words"]], result["n_recovered"]
+    if notes:
+        new_words = cap_word_durations_to_note_gaps(new_words, notes, debug_log=debug_log)
+    return new_words, n_recovered
 
 
 def _force_align_reference_lyrics_cancellable(vocals_path: Path, synced_lyrics: str, audio_duration: float,
@@ -698,7 +710,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                 # Force-align known gaps; gated on the same wrong-song floor as the rest of this block.
                 if reference_match_ratio(candidate_lines, words) >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO:
                     words, n_recovered = _recover_dropped_reference_words_cancellable(
-                        candidate_lines, words, vocals_path, opts, debug_log, log)
+                        candidate_lines, words, vocals_path, opts, debug_log, log, notes=notes)
                     if n_recovered:
                         dlog(f"  Force-alignment of known gaps: recovered {n_recovered} word(s) from the "
                              f"reference lyrics that ASR produced no word for at all, via a real wav2vec2 "
@@ -744,7 +756,7 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                         if (reference_match_ratio(candidate_lines, retry_words)
                                 >= config.REFERENCE_LYRICS_MIN_MATCH_RATIO):
                             retry_words, retry_n_recovered = _recover_dropped_reference_words_cancellable(
-                                candidate_lines, retry_words, vocals_path, opts, debug_log, log)
+                                candidate_lines, retry_words, vocals_path, opts, debug_log, log, notes=notes)
                             if retry_n_recovered:
                                 dlog(f"  Force-alignment of known gaps (retry transcription): recovered "
                                      f"{retry_n_recovered} more word(s).")

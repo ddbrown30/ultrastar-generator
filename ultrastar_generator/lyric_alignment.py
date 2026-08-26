@@ -56,7 +56,17 @@ def cap_word_durations_to_note_gaps(
 
     Only ever shrinks a word's own end, never its start or any other word's timing; a word with
     no pass-1 note anywhere in its own span is left untouched (no independent evidence either
-    way). `notes` must be sorted by start (pass-1's own output already is)."""
+    way). `notes` must be sorted by start (pass-1's own output already is).
+
+    A note is only counted as real evidence for THIS word if it actually STARTS at or after the
+    word's own claimed start -- a note that merely trails in from before (the tail end of a
+    neighboring word's own, legitimately-adjacent note) doesn't count, even if it technically
+    overlaps by a sliver. Without this, two back-to-back words sharing an exact boundary (real
+    case: a word recovered by force-aligning a dropped reference gap starting exactly where the
+    PRECEDING word's own end was just capped to) can have that shared boundary point itself
+    misread as "real evidence starting right at this word's own start," found immediately
+    followed by a real gap, collapsing the word to zero length instead of correctly finding no
+    reliable evidence at all and leaving it untouched."""
     if not words or not notes:
         return words
     out: List[Word] = []
@@ -69,7 +79,7 @@ def cap_word_durations_to_note_gaps(
         for note in notes:
             if note.start >= w.end:
                 break
-            if note.end <= w.start:
+            if note.start < w.start:
                 continue
             if prev_end is not None and note.start - prev_end > max_gap_sec:
                 new_end = prev_end
@@ -244,11 +254,38 @@ def _drop_leading_slivers(word_notes: List[NoteEvent]) -> List[NoteEvent]:
     config.SLIVER_DROP_MAX_DURATION_SEC (usually an ASR word-start landing early on
     an unvoiced consonant) rather than stretching the surviving note backward to
     cover them. Never drops a piece with protected_start=True (a confirmed
-    re-articulation, not an artifact)."""
+    re-articulation, not an artifact).
+
+    Two tiers, since a genuine artifact and a genuinely-short-but-real fragment need different
+    tests to tell apart:
+
+    Tier 1 -- a leading piece under config.MIN_NOTE_GAP_SEC (10ms -- far below any real syllable
+    fragment, but comfortably above the sub-millisecond slivers this catches) is always dropped,
+    unconditionally: it's too short to be anything but a floating-point boundary artifact, not a
+    real (if brief) note. Typically a sliver from an adjacent word's own note ending right at
+    this word's own start (real case: a word recovered by force-aligning a dropped reference
+    gap, starting exactly where the PRECEDING word's own end was capped to elsewhere -- the
+    preceding word's last real note can leave a sub-millisecond trailing fragment right on that
+    shared boundary).
+
+    Tier 2 -- a leading piece under SLIVER_DROP_MAX_DURATION_SEC is dropped only while at least
+    one piece AFTER it is itself substantial (>= the same threshold) -- otherwise there's no
+    "real" note to protect by dropping the artifact, and popping anyway can strip a word made
+    entirely of several genuinely brief fragments (a quickly-spoken word, not an ASR artifact)
+    down to just its last, equally-brief piece. Real case, same song: "pretend" -- 3 real
+    ~65-95ms fragments, none individually meeting the threshold, used to collapse to just the
+    last one (75ms, ~1 beat) once an earlier fix correctly shrank the word's own claimed ASR
+    span to its true short duration (before that fix, the word's own inflated 7s+ span gave this
+    function plenty of later, longer pieces to fall back on, masking the bug)."""
     notes = list(word_notes)
     while (len(notes) > 1
-           and (notes[0].end - notes[0].start) < config.SLIVER_DROP_MAX_DURATION_SEC
+           and (notes[0].end - notes[0].start) < config.MIN_NOTE_GAP_SEC
            and not notes[0].protected_start):
+        notes.pop(0)
+    while (len(notes) > 1
+           and (notes[0].end - notes[0].start) < config.SLIVER_DROP_MAX_DURATION_SEC
+           and not notes[0].protected_start
+           and any((n.end - n.start) >= config.SLIVER_DROP_MAX_DURATION_SEC for n in notes[1:])):
         notes.pop(0)
     return notes
 
