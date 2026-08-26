@@ -22,7 +22,7 @@ Algorithm:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -33,6 +33,58 @@ from .note_detection import NoteEvent
 from .syllables import hyphenate, chunk_to_count
 from .pitch import median_pitch_in_span, hz_to_ultrastar_pitch
 from .postprocess import enforce_monotonic
+
+
+def cap_word_durations_to_note_gaps(
+    words: List[Word], notes: List[NoteEvent], max_gap_sec: float = config.NOTE_GROUP_REACH_MAX_GAP_SEC,
+    debug_log=None,
+) -> List[Word]:
+    """Truncates a word's own END when pass-1's independently-detected notes show a genuine
+    silence gap inside the word's claimed ASR span -- forced alignment can misattribute a real
+    pause to the preceding word (real case: David Bowie - "I'm Afraid of Americans", "pretend"
+    reported spanning 7.1 real seconds when pass-1's own notes show it actually ends after
+    ~0.6s, followed by a genuine 3.2s silence gap). Left uncorrected, this doesn't just corrupt
+    the word's own placement in pass 3 -- lyrics_lookup.recover_dropped_reference_words trusts
+    an adjacent word's own timestamp as a hard window bound when force-aligning reference text
+    ASR dropped entirely, so one bad word can also corrupt a whole separate phrase's own
+    recovery window (real case, same song: the next phrase, "Johnny's in America", got force-
+    aligned into a 1.16s window instead of its own real ~2s+ span, bounded by "pretend"'s own
+    corrupted end on one side).
+
+    Called once, early -- BEFORE recover_dropped_reference_words and any reference-lyrics
+    correction -- so every downstream consumer sees the corrected timing, not just pass 3.
+
+    Only ever shrinks a word's own end, never its start or any other word's timing; a word with
+    no pass-1 note anywhere in its own span is left untouched (no independent evidence either
+    way). `notes` must be sorted by start (pass-1's own output already is)."""
+    if not words or not notes:
+        return words
+    out: List[Word] = []
+    for w in words:
+        if w.end <= w.start:
+            out.append(w)
+            continue
+        prev_end: Optional[float] = None
+        new_end = w.end
+        for note in notes:
+            if note.start >= w.end:
+                break
+            if note.end <= w.start:
+                continue
+            if prev_end is not None and note.start - prev_end > max_gap_sec:
+                new_end = prev_end
+                break
+            prev_end = note.end if prev_end is None else max(prev_end, note.end)
+        if new_end < w.end:
+            if debug_log is not None:
+                debug_log.line(
+                    f"[word-duration-capped] {w.text!r} {w.start:.3f}-{w.end:.3f}s "
+                    f"({w.end - w.start:.2f}s) -> {w.start:.3f}-{new_end:.3f}s: pass-1's own notes show a "
+                    f"real silence gap inside this word's claimed ASR span"
+                )
+            w = replace(w, end=new_end)
+        out.append(w)
+    return out
 
 
 @dataclass

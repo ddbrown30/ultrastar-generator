@@ -27,6 +27,7 @@ from .transcription import transcribe_words, force_align_reference_lyrics
 from .tempo import detect_bpm
 from .note_detection import detect_notes, NoteEvent
 from .alignment import align_words
+from .lyric_alignment import cap_word_durations_to_note_gaps
 from .phrasing import build_lines
 from .lyrics_lookup import (fetch_reference_lyrics, parse_lyrics_lines, align_words_to_reference,
                              is_lrc_line_tracking_confident, alignment_diff_summary, reference_match_ratio,
@@ -664,6 +665,13 @@ def _run_pipeline_body(input_dir: Path, output_dir: Optional[Path], opts: config
                                                  output_dir=work_dir)
             log(f"Wrote pass-1 debug file (notes only, no lyrics): {debug_path}")
             log("  -> load this in the UltraStar editor to check timing/pitch BEFORE lyrics are involved.")
+
+        # Sanity-check ASR word durations against pass-1's own independently-detected notes,
+        # BEFORE anything below (reference-text correction, dropped-word gap-recovery, pass 3)
+        # trusts a word's own timestamp -- a forced-alignment word that absorbed a real pause
+        # can otherwise corrupt not just its own placement but an adjacent dropped-word's
+        # recovery window too (see cap_word_durations_to_note_gaps's own docstring).
+        words = cap_word_durations_to_note_gaps(words, notes, debug_log=debug_log)
 
         # --- Reference lyrics: correct ASR text and mark phrase/line breaks ---
         if opts.fetch_lyrics:
