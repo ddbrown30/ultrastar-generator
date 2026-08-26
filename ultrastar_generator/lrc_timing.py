@@ -38,6 +38,121 @@ def words_in_time_window(words: List[Word], t0: float, t1: float, slack: float =
     return [w for w in words if t0 - slack <= w.start <= t1 + slack]
 
 
+def detect_word_order_scrambling(target_tokens: List[str], asr_words: List[Word]) -> List[str]:
+    """Flags target (reference-lyrics) tokens that appear somewhere in `asr_words` (by normalized
+    text) but out of the RELATIVE order the reference itself specifies -- a signal for decoder
+    word-reordering hallucination (confirmed real case: Kingdom Hearts - "Simple and Clean",
+    WhisperX medium.en decoded "...to let it go hard with me..." for real "...hard to let it go,
+    hold me...", so "hard" reads present in the ASR transcript but out of sequence relative to
+    "to"/"let"/"it"/"go"). No ground truth needed -- this only needs the reference lyrics text
+    already available anywhere this project matches against LRC/MXL text, comparing ASR's own
+    reported word ORDER against it independent of whether individual words are trusted as
+    "matched" for placement purposes elsewhere.
+
+    Deliberately NOT a bag-of-words vs. exact-match-rate comparison (i.e. NOT "ordered match rate
+    is much lower than unordered overlap") -- per-word forced-alignment CONFIDENCE is not a safe
+    signal for this (a real case: "all" in the same song's own melisma-undershoot bug scored 0.93
+    confidence despite being catastrophically wrong on duration; the analogous risk here is that a
+    coarse overlap-vs-order-rate gap conflates "reordered" with "one word simply mistranscribed",
+    which isn't the same failure and would need a different response). Instead: for each reference
+    token also present in the ASR stream (matched to ASR occurrences in first-seen order; a
+    repeated token in the reference is paired against ASR occurrences of the same normalized text
+    in order, not exact-occurrence-safe, but good enough for a diagnostic), find the LONGEST
+    INCREASING SUBSEQUENCE of their ASR-stream positions when walked in the reference's OWN order.
+    Every matched token NOT part of that subsequence is the specific word(s) breaking the
+    increasing run -- i.e. the ones most likely displaced by decoder reordering, not just "some
+    words are out of order" in aggregate. Real genuinely-missing content (never transcribed at
+    all) is invisible here by construction (no ASR position exists to pair it with), so this
+    can't be confused with plain decoder hallucination/dropping -- that's already covered by
+    existing placement-rate gates elsewhere.
+
+    Diagnostic only -- callers decide what (if anything) to do with the result; this never
+    changes placement/timing/text itself.
+
+    A token appearing MORE THAN ONCE in `target_tokens` is skipped entirely, never paired at
+    all -- this project's own recurring "repeated-phrase disambiguation" failure class (see
+    CLAUDE.md's own "Lessons learned"): real case found validating this exact function (Great Big
+    Sea - "Ordinary Day", line "Yeah, I win now and sometimes I lose" -- two "i" tokens in the
+    reference, but the decoder only transcribed ONE real "I" in that stretch at all; naive
+    first-seen-order pairing assigned that sole ASR "I" to the WRONG (first) reference occurrence,
+    manufacturing a fake inversion that wasn't real reordering at all, just occurrence-matching
+    guesswork). Never guessing among ambiguous repeats -- rather than picking one and risking a
+    false positive -- is the same principle this project's own forward-cursor line-matching
+    mechanisms already apply elsewhere; a real, unique word like "hard" (the actual Kingdom Hearts
+    case this function was built for) is completely unaffected by this exclusion.
+
+    Also excludes any ASR word below `MXL_LRC_MIN_ASR_WORD_CONFIDENCE` from participating at all
+    -- NOT the same claim as "confidence isn't a safe signal" documented elsewhere in this
+    project (that finding was about HIGH confidence failing to guarantee a duration is correct,
+    an asymmetric risk); a very LOW confidence score is a much more ordinary signal that the
+    word's own timestamp is a forced-alignment artifact, not a real position, and letting a
+    near-zero-confidence word's bogus timestamp participate in an ORDER comparison risks exactly
+    the same kind of manufactured-inversion false positive as the repeated-token cases above (real
+    case: Les Misérables - "Stars", a genuinely coherent, correctly-ordered passage flagged "you"/
+    "and"/"this" as scrambled purely because of nearby near-zero-confidence words like "aim"
+    (confidence 0.002) landing at implausible timestamps).
+
+    The SAME exclusion also applies when a token repeats on the ASR side only, even if it's
+    unique in `target_tokens` -- real case, same song, a few lines later: reference "I say
+    way-hey-hey..." has "say" only once, but the real ad-lib performance sings "...to say, I
+    say..." (two real "say"s WhisperX correctly transcribed); greedily consuming the FIRST "say"
+    occurrence for the target's one "say" slot left the wrong ASR "say" bound to it, which then
+    displaced the otherwise-perfectly-ordered "I" match relative to it -- not a real reordering of
+    "I" at all, just bookkeeping fallout from a DIFFERENT word's own ad-lib repetition the
+    reference text doesn't capture. Excluding "say" from pairing entirely (ASR-side repeat) never
+    lets that bookkeeping collision happen in the first place."""
+    target_counts = Counter(t for t in target_tokens if t)
+    confident_words = [w for w in asr_words if w.confidence >= config.MXL_LRC_MIN_ASR_WORD_CONFIDENCE]
+    asr_norm = [_normalize(w.text) for w in confident_words]
+    positions: Dict[str, List[int]] = {}
+    for idx, t in enumerate(asr_norm):
+        if t:
+            positions.setdefault(t, []).append(idx)
+    consumed: Dict[str, int] = {}
+    pairs: List[Tuple[int, str]] = []  # (asr_index, token), built in reference order
+    for tok in target_tokens:
+        if not tok or target_counts[tok] > 1 or len(positions.get(tok, ())) > 1:
+            continue
+        lst = positions.get(tok)
+        if not lst:
+            continue
+        ci = consumed.get(tok, 0)
+        if ci >= len(lst):
+            continue
+        pairs.append((lst[ci], tok))
+        consumed[tok] = ci + 1
+    if len(pairs) < 2:
+        return []
+
+    # Patience-sorting LIS over the ASR-index sequence (pairs are already in reference order).
+    n = len(pairs)
+    tails_idx: List[int] = []   # index into `pairs` ending each patience pile
+    tails_val: List[int] = []   # that pair's own asr_index
+    prev = [-1] * n
+    for i, (asr_idx, _tok) in enumerate(pairs):
+        lo, hi = 0, len(tails_val)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if tails_val[mid] < asr_idx:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == len(tails_val):
+            tails_val.append(asr_idx)
+            tails_idx.append(i)
+        else:
+            tails_val[lo] = asr_idx
+            tails_idx[lo] = i
+        prev[i] = tails_idx[lo - 1] if lo > 0 else -1
+
+    lis_members: set = set()
+    k = tails_idx[-1] if tails_idx else -1
+    while k != -1:
+        lis_members.add(k)
+        k = prev[k]
+    return [pairs[i][1] for i in range(n) if i not in lis_members]
+
+
 def match_block_to_candidates(
     target_norm: List[str],
     candidate_words: List[Word],

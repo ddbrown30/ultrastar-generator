@@ -583,43 +583,43 @@ print("\n--- usdx_writer._merge_connected_melisma_tails: beat-adjacent same-pitc
 from ultrastar_generator.usdx_writer import _merge_connected_melisma_tails, render_song as _render_merge
 
 mcm_input = [
-    ("syl", 261, 1, 1, "Bare", True, ":"),
-    ("syl", 263, 1, 3, "ly", False, ":"),
-    ("syl", 264, 3, 3, "~", False, ":"),        # same pitch (3) as "ly", adjacent -> merges into "ly"
-    ("syl", 268, 1, 5, " even", True, ":"),
-    ("syl", 269, 1, 6, "~", False, ":"),        # different pitch than "even" -- stays separate...
-    ("syl", 270, 1, 6, "~", False, ":"),        # ...but same pitch as previous '~', adjacent -> merges into one
-    ("syl", 272, 2, 8, " friends", True, ":"),
-    ("syl", 274, 3, 8, "~", False, ":"),        # same pitch (8) as "friends", adjacent -> merges into "friends"
+    ("syl", 261, 1, 1, "Bare", True, ":", False),
+    ("syl", 263, 1, 3, "ly", False, ":", False),
+    ("syl", 264, 3, 3, "~", False, ":", False),        # same pitch (3) as "ly", adjacent -> merges into "ly"
+    ("syl", 268, 1, 5, " even", True, ":", False),
+    ("syl", 269, 1, 6, "~", False, ":", False),        # different pitch than "even" -- stays separate...
+    ("syl", 270, 1, 6, "~", False, ":", False),        # ...but same pitch as previous '~', adjacent -> merges into one
+    ("syl", 272, 2, 8, " friends", True, ":", False),
+    ("syl", 274, 3, 8, "~", False, ":", False),        # same pitch (8) as "friends", adjacent -> merges into "friends"
 ]
 mcm_out = _merge_connected_melisma_tails(mcm_input)
 assert mcm_out == [
-    ("syl", 261, 1, 1, "Bare", True, ":"),
-    ("syl", 263, 4, 3, "ly", False, ":"),       # 1+3=4
-    ("syl", 268, 1, 5, " even", True, ":"),
-    ("syl", 269, 2, 6, "~", False, ":"),        # 1+1=2, still untexted
-    ("syl", 272, 5, 8, " friends", True, ":"),  # 2+3=5
+    ("syl", 261, 1, 1, "Bare", True, ":", False),
+    ("syl", 263, 4, 3, "ly", False, ":", False),       # 1+3=4
+    ("syl", 268, 1, 5, " even", True, ":", False),
+    ("syl", 269, 2, 6, "~", False, ":", False),        # 1+1=2, still untexted
+    ("syl", 272, 5, 8, " friends", True, ":", False),  # 2+3=5
 ], mcm_out
 print("OK:", mcm_out)
 
 mcm_gap_input = [
-    ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 3, 2, 4, "~", False, ":"),   # same pitch but not adjacent -> no merge
+    ("syl", 0, 2, 4, "held", True, ":", False),
+    ("syl", 3, 2, 4, "~", False, ":", False),   # same pitch but not adjacent -> no merge
 ]
 assert _merge_connected_melisma_tails(mcm_gap_input) == mcm_gap_input, _merge_connected_melisma_tails(mcm_gap_input)
 print("OK: a same-pitch '~' separated by even a 1-beat gap is left alone (not a genuine continuation)")
 
 mcm_pitch_input = [
-    ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 2, 2, 5, "~", False, ":"),   # adjacent, but DIFFERENT pitch -> no merge
+    ("syl", 0, 2, 4, "held", True, ":", False),
+    ("syl", 2, 2, 5, "~", False, ":", False),   # adjacent, but DIFFERENT pitch -> no merge
 ]
 assert _merge_connected_melisma_tails(mcm_pitch_input) == mcm_pitch_input
 print("OK: an adjacent but different-pitch '~' is left alone (a real pitch change, not noise)")
 
 mcm_linebreak_input = [
-    ("syl", 0, 2, 4, "held", True, ":"),
+    ("syl", 0, 2, 4, "held", True, ":", False),
     ("break", 2, 2),
-    ("syl", 2, 2, 4, "~", False, ":"),   # same pitch but across a LineBreak -> must not merge
+    ("syl", 2, 2, 4, "~", False, ":", False),   # same pitch but across a LineBreak -> must not merge
 ]
 assert _merge_connected_melisma_tails(mcm_linebreak_input) == mcm_linebreak_input
 print("OK: a '~' right after a LineBreak never merges backward across it, even at the same pitch")
@@ -646,29 +646,41 @@ print("\n--- usdx_writer._remove_orphan_short_melisma_tails: a lone 1-beat '~' i
 from ultrastar_generator.usdx_writer import _remove_orphan_short_melisma_tails
 
 orphan_input = [
-    ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 2, 1, 6, "~", False, ":"),   # different pitch so merge pass leaves it, but 1 beat -> deleted here
-    ("syl", 4, 2, 4, "held", True, ":"),
+    ("syl", 0, 2, 4, "held", True, ":", False),
+    ("syl", 2, 1, 6, "~", False, ":", False),   # different pitch so merge pass leaves it, but 1 beat -> deleted here
+    ("syl", 4, 2, 4, "held", True, ":", False),
 ]
 orphan_out = _remove_orphan_short_melisma_tails(orphan_input)
 assert orphan_out == [
-    ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 4, 2, 4, "held", True, ":"),
+    ("syl", 0, 2, 4, "held", True, ":", False),
+    ("syl", 4, 2, 4, "held", True, ":", False),
 ], orphan_out
 print("OK: a 1-beat, different-pitch '~' is deleted outright, leaving a gap:", orphan_out)
 
 orphan_multi_beat_input = [
-    ("syl", 0, 2, 4, "held", True, ":"),
-    ("syl", 2, 2, 6, "~", False, ":"),   # 2 beats: not an orphan, survives
+    ("syl", 0, 2, 4, "held", True, ":", False),
+    ("syl", 2, 2, 6, "~", False, ":", False),   # 2 beats: not an orphan, survives
 ]
 assert _remove_orphan_short_melisma_tails(orphan_multi_beat_input) == orphan_multi_beat_input
 print("OK: a '~' longer than 1 beat is never touched by this pass, only the same-pitch merge above can shrink it")
 
 orphan_texted_input = [
-    ("syl", 0, 1, 4, "a", True, ":"),    # real 1-beat word syllable, must never be deleted
+    ("syl", 0, 1, 4, "a", True, ":", False),    # real 1-beat word syllable, must never be deleted
 ]
 assert _remove_orphan_short_melisma_tails(orphan_texted_input) == orphan_texted_input
 print("OK: a genuine 1-beat WORD syllable (not the melisma-continuation placeholder) is left alone")
+
+# BUG REGRESSION: a `protected` 1-beat '~' (e.g. from an MXL score note) must survive even
+# though it looks IDENTICAL to ordinary tracking noise otherwise -- this project's own hard
+# rule is that a real notated note must never simply vanish (Kingdom Hearts - "Simple and
+# Clean"'s "all." melisma was silently losing real MXL-notated continuation notes this way).
+orphan_protected_input = [
+    ("syl", 0, 2, 4, "held", True, ":", False),
+    ("syl", 2, 1, 6, "~", False, ":", True),   # different pitch, 1 beat, but protected -> must survive
+    ("syl", 4, 2, 4, "held", True, ":", False),
+]
+assert _remove_orphan_short_melisma_tails(orphan_protected_input) == orphan_protected_input
+print("OK: a `protected` 1-beat '~' is never deleted, unlike an otherwise-identical unprotected one")
 
 # End-to-end: both steps chain -- same-pitch '~' folds in, different-pitch orphan '~' disappears.
 orphan_song = Song(
@@ -686,6 +698,95 @@ assert orphan_txt_on.count("~") == 0, orphan_txt_on
 assert orphan_txt_off.count("~") == 2, orphan_txt_off
 print("OK: end-to-end, merge_connected_melisma=True both merges the same-pitch '~' AND deletes the "
       "different-pitch 1-beat orphan '~', leaving zero '~' in the output; =False leaves both untouched")
+
+protected_orphan_song = Song(
+    title="T", artist="A", mp3="a.mp3", bpm=240.0, gap_ms=0,
+    entries=[
+        Syllable("held", 0.0, 0.125, 4, is_word_start=True),   # 2 beats
+        Syllable("~", 0.125, 0.1875, 7, is_word_start=False, protected=True),  # 1 beat, different
+                                                                                # pitch, but protected
+        Syllable("next", 0.1875, 0.3125, 4, is_word_start=True),  # 2 beats
+    ],
+)
+protected_orphan_txt = _render_merge(protected_orphan_song, merge_connected_melisma=True)
+assert protected_orphan_txt.count("~") == 1, protected_orphan_txt
+print("OK: end-to-end, a real MXL-sourced (`protected=True`) note survives merge_connected_melisma=True "
+      "even where an otherwise-identical unprotected note would have been deleted as orphan noise")
+
+print("\n--- lrc_timing.detect_word_order_scrambling: flags reference words present in ASR but out of order, without any ground truth ---")
+from ultrastar_generator.lrc_timing import detect_word_order_scrambling as _detect_scramble
+
+# BUG REGRESSION (real case): Kingdom Hearts - "Simple and Clean", WhisperX medium.en
+# decoded "...to let it go hard with me..." for real "...hard to let it go, hold me...".
+_scramble_target = ["its", "hard", "to", "let", "it", "go"]
+_scramble_asr = [
+    Word(text="To", start=203.209, end=203.350),
+    Word(text="let", start=203.390, end=203.930),
+    Word(text="it", start=204.130, end=204.410),
+    Word(text="go", start=204.450, end=204.791),
+    Word(text="hard", start=204.911, end=205.992),
+    Word(text="with", start=206.032, end=206.172),
+    Word(text="me", start=206.272, end=206.632),
+]
+assert _detect_scramble(_scramble_target, _scramble_asr) == ["hard"]
+print("OK: 'hard' (the one word decoded out of its reference-lyrics order) is flagged, "
+      "and no others -- pinpoints the specific displaced word, not just 'something is off'")
+
+# A normal, in-order line must never be flagged.
+_clean_target = ["hard", "to", "let", "it", "go"]
+_clean_asr = [
+    Word(text="hard", start=1.0, end=1.2), Word(text="to", start=1.3, end=1.4),
+    Word(text="let", start=1.5, end=1.6), Word(text="it", start=1.7, end=1.8),
+    Word(text="go", start=1.9, end=2.0),
+]
+assert _detect_scramble(_clean_target, _clean_asr) == []
+print("OK: an in-order line is never flagged")
+
+# Genuinely missing content (never transcribed at all) has no ASR position to pair against,
+# so it must be invisible here -- this is a distinct failure class from reordering, already
+# covered by this project's existing placement-rate gates, not something to conflate with this.
+_missing_target = ["hard", "to", "let", "it", "go"]
+_missing_asr = [Word(text="to", start=1.0, end=1.1), Word(text="let", start=1.2, end=1.3)]
+assert _detect_scramble(_missing_target, _missing_asr) == []
+print("OK: reference words never transcribed at all (no ASR occurrence to pair with) are not "
+      "flagged as 'scrambled' -- that's plain missing content, a different failure class")
+
+# BUG REGRESSION (real case): Great Big Sea - "Ordinary Day", line "Yeah, I win now and
+# sometimes I lose" -- two "i" tokens in the reference, but the decoder only really
+# transcribed ONE "I" in that stretch (the OTHER phrase, "I win now", was itself
+# mistranscribed as something else entirely). Naive first-seen-order pairing assigned the
+# sole real "I" to the WRONG (first) reference occurrence, manufacturing a fake inversion.
+_repeat_target = ["yeah", "i", "win", "now", "and", "sometimes", "i", "lose"]
+_repeat_asr = [
+    Word(text="yeah", start=31.6, end=31.9), Word(text="im", start=32.2, end=32.4),
+    Word(text="in", start=32.5, end=32.7), Word(text="doubt", start=32.8, end=33.2),
+    Word(text="sometimes", start=33.3, end=34.0), Word(text="i", start=34.3, end=34.4),
+    Word(text="lose", start=34.5, end=34.9),
+]
+assert _detect_scramble(_repeat_target, _repeat_asr) == [], _detect_scramble(_repeat_target, _repeat_asr)
+print("OK: a repeated reference token ('i' appearing twice) is never paired/flagged at all -- "
+      "avoids guessing which occurrence a lone ASR match really belongs to")
+
+# BUG REGRESSION (real case, same song): reference "I say way-hey-hey, it's just an ordinary
+# day" has "say" only ONCE, but the real ad-lib performance sings "...to say, I say..." (two
+# real "say"s, both correctly transcribed). Greedily consuming the FIRST "say" for the
+# reference's one "say" slot left the WRONG occurrence bound to it, which then displaced the
+# otherwise perfectly-ordered "I" match relative to it -- a false positive caused entirely by
+# a DIFFERENT word's own ASR-side repetition, not target-side repetition (already handled
+# above) and not real reordering of "I" itself.
+_asrrepeat_target = ["i", "say", "its", "just", "an", "ordinary", "day"]
+_asrrepeat_asr = [
+    Word(text="say", start=160.6, end=160.9), Word(text="i", start=161.0, end=161.2),
+    Word(text="say", start=161.2, end=161.6), Word(text="wait", start=161.6, end=162.0),
+    Word(text="its", start=162.8, end=162.9), Word(text="just", start=163.0, end=163.2),
+    Word(text="an", start=163.3, end=163.4), Word(text="ordinary", start=163.6, end=164.3),
+    Word(text="day", start=164.4, end=164.6),
+]
+assert _detect_scramble(_asrrepeat_target, _asrrepeat_asr) == [], \
+    _detect_scramble(_asrrepeat_target, _asrrepeat_asr)
+print("OK: a token repeated on the ASR side only ('say', unique in the reference but sung twice) "
+      "is also never paired -- prevents its own bookkeeping collision from falsely displacing a "
+      "different, genuinely-in-order word ('i')")
 
 print("\nALL DRY-RUN CHECKS PASSED")
 

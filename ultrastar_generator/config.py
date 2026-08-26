@@ -324,6 +324,22 @@ MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3
 # span falls back to its own note-value-implied duration instead.
 MXL_LRC_MAX_ASR_DURATION_MULTIPLIER = 4.0
 
+# A Pass-1-matched word's real ASR duration is distrusted (falls back to its own note-value-
+# implied duration, same as the multiplier check above) when it's a genuine multi-note MXL word
+# (a real melisma/multi-syllable word, len(w.syllables) > 1) AND trusting it would give each of
+# those notes, on average, less real time than this floor -- a forced-alignment END landing right
+# at the word's own spoken/sung onset, with none of the notated held/melisma tail included, is far
+# more likely than a real melisma performed in a fraction of a beat per note. Real case
+# (2026-08-26, Kingdom Hearts - "Simple and Clean"): "all." notated as 5 sub-notes (~1.5s at this
+# song's tempo) but wav2vec2 gave it a 0.06s span (0.012s/note average) three separate times --
+# the genuine ~2.5s melismatic hold that follows became an unclaimed inter-line gap instead of
+# notes, and the resulting near-zero-length continuation notes were then deleted outright by
+# usdx_writer._remove_orphan_short_melisma_tails as apparent tracking noise. Never applies to a
+# single-note word (a short real ASR duration there is completely ordinary), and mirrors
+# SLIVER_DROP_MAX_DURATION_SEC's own value rather than inventing an unrelated number, since both
+# describe the same "too short to be a real note" boundary.
+MXL_LRC_MIN_AVG_SYLLABLE_SEC = 0.12
+
 # The first LRC line sets #GAP for the whole file, so an error there has a
 # much larger blast radius than elsewhere. If a direct real-ASR anchor for
 # line 0 disagrees with the calibrated value by more than this many

@@ -27,6 +27,7 @@ class Syllable:
     note_type: str = ":"    # ':' normal, '*' golden, 'F' freestyle, etc.
     line_id: Optional[int] = None  # propagated from the owning Word; forces a line break here
     confidence: float = 1.0  # propagated from owning NoteEvent; weights pitch-class calibration trust. Defaults 1.0 so "absent" reads as trusted, not bad
+    protected: bool = False  # a real, independently-sourced note (e.g. an MXL score note) that usdx_writer must never delete, only ever merge
 
 
 @dataclass

@@ -15,7 +15,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from . import config
 from .lyrics_lookup import LrcLibCandidate, search_lrclib, effective_lrc_duration
 from .lrc_timing import (parse_lrc, two_tier_time_calibration, match_asr_to_lrc_lines, lrc_line_window,
-                          match_block_to_candidates, words_in_time_window, find_cursor_window_match)
+                          match_block_to_candidates, words_in_time_window, find_cursor_window_match,
+                          detect_word_order_scrambling)
 from .models import Syllable, Word
 from .syllables import hyphenate, chunk_to_count
 from .text_normalize import (normalize_word as _normalize,
@@ -514,6 +515,82 @@ def _neighbor_lines_for_orphan(
     return li_prev, li_next
 
 
+def recover_dropped_line_text(
+    mxl_words: List[MxlWord],
+    lrc_lines: List[Tuple[float, str]],
+    reconciliation: "MxlLineReconciliation",
+    word_clean_text: List[Optional[str]],
+    word_group: List[int],
+    word_group_text: dict,
+    word_syllable_override: dict,
+    word_lrc_candidate: dict,
+) -> None:
+    """A line `reconcile_mxl_to_lrc_lines` DROPS (too little exact-token overlap with the MXL's own,
+    possibly badly-OCR'd, text to safely anchor POSITION on its own) still deserves an OCR-correction
+    attempt for its own DISPLAY TEXT once position is no longer in question -- i.e. when it's the
+    ONLY dropped line sandwiched between two already-CONFIRMED neighbors, the orphan MXL word run
+    between them unambiguously belongs to this one dropped line (there is no other candidate it
+    could be), even though the exact-token gate -- correctly conservative about repeated-phrase
+    disambiguation -- wasn't willing to use it to anchor POSITION on its own. Reuses
+    `_reconcile_line_text_block`'s own fuzzy block-similarity matching completely unchanged; this
+    only widens WHEN it's tried, not HOW.
+
+    Real case (Kingdom Hearts - "Simple and Clean"): the MXL's own "We"/"goodless" mis-OCRs
+    "Regardless" badly enough that the exact-token gate saw only "of" (1 of 3 line tokens) and
+    correctly declined to anchor position on it -- but `_reconcile_line_text_block`'s own
+    whole-block fuzzy ratio for "wegoodless"~"regardless" is 0.7, comfortably above
+    `MXL_LRC_FUZZY_TEXT_MIN_RATIO` (0.6), and the line's position is already pinned exactly by its
+    two confirmed neighbors either side.
+
+    Deliberately scoped to ISOLATED single-line drops only (never a run of 2+ consecutive dropped
+    lines) -- with more than one dropped line in a gap, which orphan MXL words belong to which
+    dropped line is genuinely ambiguous, the same repeated-phrase-disambiguation risk the exact-
+    token gate exists to avoid in the first place. Never touches timing (that's
+    `recover_orphan_mxl_runs`'s own job, run separately) -- only ever fills in `word_clean_text`/
+    `word_group`/`word_group_text`/`word_syllable_override`/`word_lrc_candidate` for words a
+    dropped line's orphan MXL range would otherwise leave completely unset."""
+    dropped_set = set(reconciliation.dropped_lrc_lines)
+    considered = sorted(set(reconciliation.line_mxl_range) | dropped_set)
+    n = len(considered)
+    i = 0
+    while i < n:
+        li = considered[i]
+        if li not in dropped_set:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and considered[j] in dropped_set:
+            j += 1
+        run_len = j - i
+        if run_len == 1 and i > 0 and j < n:
+            li_prev, li_next = considered[i - 1], considered[j]
+            start_i = reconciliation.line_mxl_range[li_prev][1] + 1
+            end_i = reconciliation.line_mxl_range[li_next][0] - 1
+            if start_i <= end_i:
+                line_dict: Dict[int, str] = {}
+                # word_group/word_group_text are passed as throwaway copies, deliberately never
+                # merged back into the caller's real ones -- grouping several MXL words together
+                # activates place_words_via_asr's Pass 0, which searches a whole recovered word
+                # against ASR across the ENTIRE line's own time window, no per-word confidence gate
+                # and no tight-vs-wide occurrence disambiguation the way Pass 1 has. That's an
+                # acceptable risk for an already fully-CONFIRMED line (this function's own caller,
+                # assign_words_to_lines, already accepts it there), but this function operates on
+                # exactly the songs/passages MOST prone to the repeated-phrase-disambiguation
+                # failure class (real case: Weird Al Yankovic - "Nature Trail to Hell"'s densely-
+                # repeated "In 3-D" ad-lib outro -- grouping its "3"+"d" MXL words let Pass 0's
+                # whole-line-window search grab a WRONG nearby occurrence's real ASR timestamp,
+                # corrupting that word's timing by seconds even though its recovered TEXT was
+                # correct). This function's only job is DISPLAY TEXT for an already-positioned
+                # (by its own confirmed neighbors) orphan run -- it must never change TIMING at all.
+                _reconcile_line_text_block(
+                    mxl_words, start_i, end_i, lrc_lines[li][1].split(),
+                    line_dict, list(word_group), {}, word_syllable_override, word_lrc_candidate,
+                )
+                for k, v in line_dict.items():
+                    word_clean_text[k] = v
+        i = j
+
+
 def recover_orphan_mxl_runs(
     mxl_words: List[MxlWord],
     lrc_lines: List[Tuple[float, str]],
@@ -889,6 +966,12 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
                 mxl_norm_line.append(mxl_words[i].norm)
                 used_candidate.append(False)
         matched_local = match_block_to_candidates(mxl_norm_line, asr_in_window)
+        scrambled = detect_word_order_scrambling(mxl_norm_line, asr_in_window)
+        if scrambled:
+            print(f"[mxl-lrc] possible decoder word-order scrambling near {t0:.1f}-{t1:.1f}s: "
+                  f"{scrambled} appear in the ASR transcript but out of the reference lyrics' own "
+                  f"order -- may indicate hallucinated reordering (--batch/--whisper-model "
+                  f"large-v3 can sometimes fix this for a specific song)")
 
         for local_i, global_i in enumerate(idxs):
             if local_i not in matched_local:
@@ -899,12 +982,21 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
             starts[global_i] = asr_w.start
             asr_dur = asr_w.end - asr_w.start
             expected_dur = word_qtr_dur * config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC
+            n_syllables = len(w.syllables)
             # A real ASR duration wildly beyond what this word's own MXL note value expects is
             # more likely wav2vec2 misattributing a real pause/rest to this word than a
             # genuinely long note (real case: Nature Trail to Hell's "trail", see config's own
             # MXL_LRC_MAX_ASR_DURATION_MULTIPLIER docstring) -- the ASR's own START is still
             # trusted (onsets are far less prone to this than a forced-alignment's own END).
-            if 0 < asr_dur <= expected_dur * config.MXL_LRC_MAX_ASR_DURATION_MULTIPLIER:
+            # The mirror-image failure also happens: a genuine multi-note MXL word (a melisma)
+            # immediately followed by a long wordless vocalization gets a near-zero ASR duration,
+            # since forced alignment ends the word at its own spoken/sung onset and has no
+            # awareness of the notated held tail that follows (see config's own
+            # MXL_LRC_MIN_AVG_SYLLABLE_SEC docstring for the real case this fixes).
+            too_short = (n_syllables > 1
+                         and 0 < asr_dur
+                         and asr_dur / n_syllables < config.MXL_LRC_MIN_AVG_SYLLABLE_SEC)
+            if 0 < asr_dur <= expected_dur * config.MXL_LRC_MAX_ASR_DURATION_MULTIPLIER and not too_short:
                 ends[global_i] = asr_w.start + asr_dur
             else:
                 ends[global_i] = asr_w.start + expected_dur
@@ -1154,6 +1246,11 @@ def build_syllables(mxl_words: List[MxlWord], word_starts: List[float], word_end
             syllables.append(Syllable(
                 text=text, start=t0 + frac0 * (t1 - t0), end=t0 + frac1 * (t1 - t0),
                 midi_note=midi - 60, is_word_start=is_start, line_id=word_lines[i],
+                # Every syllable here corresponds 1:1 to a real MXL score note -- usdx_writer must
+                # never delete it outright (only ever merge same-pitch adjacent ones), no matter how
+                # short its real-time duration ends up. See config.MXL_LRC_MIN_AVG_SYLLABLE_SEC's own
+                # docstring for why a note can end up this short in the first place.
+                protected=True,
             ))
     return syllables
 
@@ -1328,6 +1425,14 @@ def generate_from_mxl_and_lrc(mxl_path: str, artist: str, title: str, audio_dura
 
     word_lines, word_clean_text, word_group, word_group_text, word_syllable_override, word_lrc_candidate = \
         assign_words_to_lines(mxl_words, lrc_match.lrc_lines, reconciliation=reconciliation)
+    n_recovered_before = sum(1 for t in word_clean_text if t is not None)
+    recover_dropped_line_text(mxl_words, lrc_match.lrc_lines, reconciliation,
+                               word_clean_text, word_group, word_group_text,
+                               word_syllable_override, word_lrc_candidate)
+    n_dropped_line_words_recovered = sum(1 for t in word_clean_text if t is not None) - n_recovered_before
+    if n_dropped_line_words_recovered:
+        print(f"[mxl-lrc] dropped-line text recovery: {n_dropped_line_words_recovered} word(s) got a "
+              f"clean-text correction from an isolated dropped line's own neighboring anchors")
     word_starts, word_ends, quality = place_words_via_asr(mxl_words, word_lines, lrc_match.lrc_lines, asr_words,
                                                             word_clean_text=word_clean_text,
                                                             word_group=word_group,

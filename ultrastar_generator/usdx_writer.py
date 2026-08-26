@@ -38,7 +38,8 @@ def _quantize_entries(entries: List[object], bpm: float, gap_ms: int) -> List[tu
             length_beats = max(1, length_beats)
             end_beat = start_beat + length_beats
             occupied_until = end_beat
-            out.append(("syl", start_beat, length_beats, entry.midi_note, entry.text, entry.is_word_start, entry.note_type))
+            out.append(("syl", start_beat, length_beats, entry.midi_note, entry.text, entry.is_word_start,
+                        entry.note_type, entry.protected))
         elif isinstance(entry, LineBreak):
             start_beat = seconds_to_beat(entry.start, gap_ms, bpm)
             if occupied_until is not None and start_beat < occupied_until:
@@ -66,7 +67,8 @@ def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
                 and item[3] == out[-1][3]  # same pitch (midi_note)
                 and item[1] == out[-1][1] + out[-1][2]):  # beat-adjacent: start == prev start+length
             prev = out[-1]
-            out[-1] = (prev[0], prev[1], prev[2] + item[2], prev[3], prev[4], prev[5], prev[6])
+            out[-1] = (prev[0], prev[1], prev[2] + item[2], prev[3], prev[4], prev[5], prev[6],
+                       prev[7] or item[7])
         else:
             out.append(item)
     return out
@@ -74,10 +76,14 @@ def _merge_connected_melisma_tails(quantized: List[tuple]) -> List[tuple]:
 
 def _remove_orphan_short_melisma_tails(quantized: List[tuple]) -> List[tuple]:
     """Deletes any melisma-continuation ('~') entry still only 1 beat long after
-    _merge_connected_melisma_tails -- likely tracking noise, not a real continuation."""
+    _merge_connected_melisma_tails -- likely tracking noise, not a real continuation.
+    Never deletes a `protected` entry (a real, independently-sourced note, e.g. from an MXL
+    score) -- for those, "still only 1 beat" is a legitimately short real note, not noise, and
+    this project's own hard rule is that a real notated note must never simply vanish."""
     return [
         item for item in quantized
-        if not (item[0] == "syl" and item[4].strip() == config.MELISMA_CONTINUATION_TEXT and item[2] == 1)
+        if not (item[0] == "syl" and item[4].strip() == config.MELISMA_CONTINUATION_TEXT
+                and item[2] == 1 and not item[7])
     ]
 
 
@@ -121,7 +127,7 @@ def render_song(song: Song, merge_connected_melisma: bool = False) -> str:
     first_syllable_seen = False
     for item in quantized:
         if item[0] == "syl":
-            _, start_beat, length_beats, midi_note, text, is_word_start, note_type = item
+            _, start_beat, length_beats, midi_note, text, is_word_start, note_type, _protected = item
             if is_word_start and first_syllable_seen:
                 text = " " + text
             first_syllable_seen = True
