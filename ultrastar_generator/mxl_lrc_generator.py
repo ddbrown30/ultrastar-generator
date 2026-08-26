@@ -898,8 +898,16 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
             word_qtr_dur = sum(s[1] for s in w.syllables)
             starts[global_i] = asr_w.start
             asr_dur = asr_w.end - asr_w.start
-            ends[global_i] = (asr_w.start + asr_dur if asr_dur > 0
-                               else asr_w.start + word_qtr_dur * config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC)
+            expected_dur = word_qtr_dur * config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC
+            # A real ASR duration wildly beyond what this word's own MXL note value expects is
+            # more likely wav2vec2 misattributing a real pause/rest to this word than a
+            # genuinely long note (real case: Nature Trail to Hell's "trail", see config's own
+            # MXL_LRC_MAX_ASR_DURATION_MULTIPLIER docstring) -- the ASR's own START is still
+            # trusted (onsets are far less prone to this than a forced-alignment's own END).
+            if 0 < asr_dur <= expected_dur * config.MXL_LRC_MAX_ASR_DURATION_MULTIPLIER:
+                ends[global_i] = asr_w.start + asr_dur
+            else:
+                ends[global_i] = asr_w.start + expected_dur
             confident[global_i] = True
             quality.n_asr_placed += 1
             if used_candidate[local_i] and word_clean_text is not None:
@@ -955,31 +963,44 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
 
         pb = nearest_before(i)
         pa = nearest_after(i)
+        anchored_both_sides = pb is not None and pa is not None
         rate = None
-        base_idx = None
+        base_time = None
+        base_offset = None
         if pb is not None and pa is not None:
-            off_delta = mxl_words[pa].offset - mxl_words[pb].offset
+            # Anchor forward interpolation on pb's own real END and its own note-value-implied
+            # end offset, not its start -- pb's own real ASR duration can legitimately run long
+            # (a genuinely held note), and using its start as the origin silently steals that
+            # overrun from every word between it and pa (real case: Nature Trail to Hell beat
+            # ~1103: "hell" held 1.34s real seconds, well over its average per-quarter-note share,
+            # leaving too little of the true remaining gap for "in"/"3"/"d" and collapsing "d" to
+            # zero via the final end-vs-next-start clamp).
+            pb_qtr_dur = sum(s[1] for s in mxl_words[pb].syllables)
+            base_time = ends[pb]
+            base_offset = mxl_words[pb].offset + pb_qtr_dur
+            off_delta = mxl_words[pa].offset - base_offset
             if off_delta > 0:
-                rate = (starts[pa] - starts[pb]) / off_delta
-            base_idx = pb
+                rate = (starts[pa] - base_time) / off_delta
         elif pb is not None:
             pbb = nearest_before(pb)
             if pbb is not None:
                 off_delta = mxl_words[pb].offset - mxl_words[pbb].offset
                 if off_delta > 0:
                     rate = (starts[pb] - starts[pbb]) / off_delta
-            base_idx = pb
+            pb_qtr_dur = sum(s[1] for s in mxl_words[pb].syllables)
+            base_time = ends[pb]
+            base_offset = mxl_words[pb].offset + pb_qtr_dur
         elif pa is not None:
             paa = nearest_after(pa)
             if paa is not None:
                 off_delta = mxl_words[paa].offset - mxl_words[pa].offset
                 if off_delta > 0:
                     rate = (starts[paa] - starts[pa]) / off_delta
-            base_idx = pa
+            base_time = starts[pa]
+            base_offset = mxl_words[pa].offset
 
-        if rate is not None and base_idx is not None:
-            base = mxl_words[base_idx]
-            est_start = starts[base_idx] + (w.offset - base.offset) * rate
+        if rate is not None and base_time is not None:
+            est_start = base_time + (w.offset - base_offset) * rate
         else:
             # No anchor anywhere: fall back to whole-line-proportional placement.
             idxs = sorted(line_word_idxs[li])
@@ -990,8 +1011,43 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
             est_start = t0 + frac * (t1 - t0)
             rate = (t1 - t0) / span if span > 0 else config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC
 
-        # Backstop: never escape this word's own LRC line window.
-        est_start = max(t0, min(est_start, t1))
+        est_start_raw = est_start
+
+        # Backstop: never escape this word's own LRC line window -- but only the LOWER bound
+        # (this word's own line start, and its own predecessor) applies when anchored on BOTH
+        # sides by real confident matches. The upper bound (t1) exists to guard against runaway
+        # drift when extrapolating past the last known anchor (the `elif` branches above, and the
+        # no-anchor-at-all fallback); it's actively harmful for a well-anchored estimate, where
+        # both real neighbors already show where this word belongs. A whole run of consecutive
+        # fallback words squeezed by a too-tight line ceiling (a near-back-to-back repeat's own
+        # next LRC line starting almost on top of this one) otherwise gets flattened toward that
+        # same ceiling, corrupting one of them into a near/exactly-zero-length note via the later
+        # end-vs-next-start clamp (real cases: Nature Trail to Hell beats 1223/2248/2412's runs of
+        # "in"/"3"/"d" and "trail"/"to"/"hell", see project memory).
+        # The relevant floor is the immediately preceding word's own real END where known (its
+        # start alone isn't enough -- a Pass-1 match's own END can independently land later than
+        # this word's window-clamped start, which the clamp below can't see yet since it only
+        # compares starts; using ends[i-1] catches that case too).
+        predecessor_bound = None
+        if i > 0:
+            predecessor_bound = ends[i - 1] if ends[i - 1] is not None else starts[i - 1]
+
+        lower_bound = t0
+        if predecessor_bound is not None:
+            lower_bound = max(lower_bound, predecessor_bound)
+        if anchored_both_sides:
+            est_start = max(lower_bound, est_start)
+        else:
+            est_start = max(lower_bound, min(est_start, t1))
+            # One-sided extrapolation can ALSO squeeze a whole run of consecutive fallback words
+            # toward the same ceiling once the last known anchor is far behind them (real case:
+            # Nature Trail to Hell's tail-end "in"/"3"/"d"/melisma run, extrapolating past the
+            # last confident match with nothing else left later in the song to anchor against).
+            # If the ceiling would tie or invert this word against its own immediate predecessor,
+            # trust the raw extrapolated estimate instead, same safety valve as the anchored-
+            # both-sides case above.
+            if predecessor_bound is not None and est_start <= predecessor_bound:
+                est_start = max(lower_bound, est_start_raw)
         starts[i] = est_start
         ends[i] = est_start + word_qtr_dur * (rate if rate and rate > 0 else config.MXL_LRC_DEFAULT_QUARTER_NOTE_SEC)
         quality.n_fallback += 1

@@ -295,6 +295,16 @@ MXL_LRC_BLOCK_MAX_WORDS = 10
 # Last-resort real-seconds-per-quarter-note rate when no local tempo anchor is available at all.
 MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3
 
+# A Pass-1-matched word's real ASR duration beyond (its own MXL note value's expected duration,
+# at the default rate) times this multiplier is trusted for its START but not its END -- wav2vec2
+# forced alignment occasionally misattributes a real pause/rest to the preceding word instead of
+# leaving it as a gap. Real case (2026-08-25, "Nature Trail to Hell" beat 2412): "trail", a plain
+# 1.0-quarter-note word, got a real ASR span of 1.52s (~6x any structurally-identical neighbor),
+# swallowing the following words' own real time. Scales with the word's own note value, so a
+# genuinely long/melisma word is unaffected -- only a short word with an implausibly long real
+# span falls back to its own note-value-implied duration instead.
+MXL_LRC_MAX_ASR_DURATION_MULTIPLIER = 4.0
+
 # The first LRC line sets #GAP for the whole file, so an error there has a
 # much larger blast radius than elsewhere. If a direct real-ASR anchor for
 # line 0 disagrees with the calibrated value by more than this many
