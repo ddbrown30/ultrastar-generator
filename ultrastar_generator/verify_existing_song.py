@@ -1,17 +1,19 @@
 """Verifies an EXISTING UltraStar .txt file's pitch/timing against a FRESH
 pipeline run of the same song. Word-level sequence alignment; pitch compared
-at PITCH CLASS (mod 12); nothing excluded from scoring denominators."""
+at PITCH CLASS (mod 12). Filler/ad-lib "noise" (na na na, ah ah ah, mmm, ...) is
+discarded from both sides entirely before scoring -- everything else counts,
+nothing else is excluded from scoring denominators."""
 
 from __future__ import annotations
 
-import difflib
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from . import config
-from .models import Syllable
+from .lrc_timing import find_cursor_window_match
+from .models import LineBreak, Syllable
 from .usdx_parser import ParsedSong
-from .text_normalize import normalize_word as _normalize
+from .text_normalize import normalize_word as _normalize, is_filler_token
 
 
 @dataclass
@@ -32,16 +34,62 @@ class ExistingSongVerification:
     f1: float = 0.0
 
 
-def _word_start_words(syllables: List[Syllable]) -> List[Tuple[str, float, int]]:
-    """(normalized_text, start_sec, midi_note) for each word-start syllable."""
-    out = []
-    for s in syllables:
-        if not s.is_word_start:
-            continue
-        n = _normalize(s.text)
-        if n:
-            out.append((n, s.start, s.midi_note))
-    return out
+@dataclass
+class _WordSpan:
+    text: str
+    start: float
+    midi_note: int
+
+
+def _line_chunks(entries: List[object]) -> List[List[_WordSpan]]:
+    """Groups a syllable stream into whole real (non-empty, non-filler) WORDS, chunked into
+    lines split at `LineBreak` markers (one chunk covering everything if the entry list has no
+    LineBreak at all, e.g. a synthetically-built syllable list, or is used flat for the "fresh"
+    side).
+
+    A word is reconstructed by concatenating a word-start syllable's own text with all of its
+    own trailing continuation syllables (skipping melisma-continuation markers,
+    `config.MELISMA_CONTINUATION_TEXT`) -- comparing only the word-start syllable's OWN isolated
+    fragment (e.g. "John") instead of the whole word (e.g. "Johnny's") was a real bug: two
+    independently-generated files can split the very same sung word across a different number of
+    syllables (rhythm/melisma reasons unrelated to the word itself), which then could never
+    text-match its counterpart at all even though the real word is identical.
+
+    Ad-lib "noise" (na na na, ah ah ah, mmm, ...) is discarded entirely here, not just tolerated,
+    so it never counts toward either side's denominators (coverage/recall/precision) and never
+    needs to text-match its counterpart's own choice of nonsense syllable."""
+    chunks: List[List[_WordSpan]] = []
+    cur: List[_WordSpan] = []
+    pending: Optional[Syllable] = None
+    parts: List[str] = []
+
+    def flush() -> None:
+        nonlocal pending, parts
+        if pending is not None:
+            text = "".join(parts)
+            n = _normalize(text)
+            if n and not is_filler_token(n):
+                cur.append(_WordSpan(text=text, start=pending.start, midi_note=pending.midi_note))
+        pending, parts = None, []
+
+    for e in entries:
+        if isinstance(e, LineBreak):
+            flush()
+            if cur:
+                chunks.append(cur)
+            cur = []
+        elif isinstance(e, Syllable):
+            piece = e.text.strip()
+            if e.is_word_start:
+                flush()
+                pending = e
+                parts = [piece] if piece != config.MELISMA_CONTINUATION_TEXT else []
+            elif pending is not None and piece and piece != config.MELISMA_CONTINUATION_TEXT:
+                parts.append(piece)
+    flush()
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 def verify_existing_song(
@@ -58,34 +106,56 @@ def verify_existing_song(
 ) -> ExistingSongVerification:
     """Compares `existing` (parsed .txt) against `fresh_syllables` (this run's
     fresh output). Returns stats only, never modifies either input. Too few
-    matched words yields verdict "COULD_NOT_VERIFY", never "PASS"."""
-    existing_words = _word_start_words([
-        s for s in existing.entries if isinstance(s, Syllable)
-    ])
-    fresh_words = _word_start_words(fresh_syllables)
+    matched words yields verdict "COULD_NOT_VERIFY", never "PASS".
 
-    a = [w for w, _, _ in existing_words]
-    b = [w for w, _, _ in fresh_words]
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    Matching is a forward-only cursor over fresh's word stream, one EXISTING line (split at
+    `LineBreak`) at a time (`lrc_timing.find_cursor_window_match` -- the same mechanism already
+    used for MXL-vs-LRC and LRC-vs-ASR line reconciliation elsewhere in this project), not one
+    whole-song `difflib` diff -- a repeated phrase later in the song can no longer be confused
+    with an earlier occurrence. Real bug this fixed: a whole-song diff on a heavily-repeated song
+    could match an early existing-file line against a much later fresh occurrence of the same
+    text, reporting a spurious 60+ second "timing mismatch" that was actually just the wrong
+    pairing, not a real placement error."""
+    existing_chunks = _line_chunks(existing.entries)
+    existing_words: List[_WordSpan] = [s for chunk in existing_chunks for s in chunk]
+    fresh_words: List[_WordSpan] = [w for chunk in _line_chunks(fresh_syllables) for w in chunk]
+    fresh_norm = [_normalize(w.text) for w in fresh_words]
+
+    MAX_PENDING_WORDS = 60  # mirrors lrc_timing.match_asr_to_lrc_lines's own cap
+    cursor = 0
+    pending_word_count = 0
     candidates = []  # (text, existing_start, fresh_start, existing_pc, fresh_pc)
-    matched_existing_idxs = set()
-    matched_fresh_idxs = set()
-    for tag, a0, a1, b0, b1 in sm.get_opcodes():
-        if tag != "equal":
+    matched_existing_ids = set()
+    matched_fresh_ids = set()
+    for chunk in existing_chunks:
+        tokens = [_normalize(s.text) for s in chunk]
+        pending_word_count = min(pending_word_count + len(tokens), MAX_PENDING_WORDS)
+        found = find_cursor_window_match(cursor, fresh_norm, tokens, pending_word_count)
+        if found is None:
+            # No match anywhere in range -- don't advance the cursor, next chunk's window grows.
             continue
-        for k in range(a1 - a0):
-            ei, fi = a0 + k, b0 + k
-            text, e_start, e_pitch = existing_words[ei]
-            _, f_start, f_pitch = fresh_words[fi]
-            candidates.append((text, e_start, f_start, e_pitch % 12, f_pitch % 12))
-            matched_existing_idxs.add(ei)
-            matched_fresh_idxs.add(fi)
+        opcodes, _window = found
+        last_offset = None
+        for tag, a1, a2, b1, b2 in opcodes:
+            if tag != "equal":
+                continue
+            for k in range(a2 - a1):
+                f_syl = fresh_words[cursor + a1 + k]
+                e_syl = chunk[b1 + k]
+                candidates.append((e_syl.text, e_syl.start, f_syl.start,
+                                    e_syl.midi_note % 12, f_syl.midi_note % 12))
+                matched_existing_ids.add(id(e_syl))
+                matched_fresh_ids.add(id(f_syl))
+            last_offset = a2 - 1 if last_offset is None else max(last_offset, a2 - 1)
+        if last_offset is not None:
+            cursor += last_offset + 1
+            pending_word_count = 0
 
     stats = ExistingSongVerification(n_matched=len(candidates))
     stats.coverage_existing = len(candidates) / len(existing_words) if existing_words else 0.0
     stats.coverage_fresh = len(candidates) / len(fresh_words) if fresh_words else 0.0
-    stats.unmatched_existing = [w for i, (w, _, _) in enumerate(existing_words) if i not in matched_existing_idxs]
-    stats.unmatched_fresh = [w for i, (w, _, _) in enumerate(fresh_words) if i not in matched_fresh_idxs]
+    stats.unmatched_existing = [s.text for s in existing_words if id(s) not in matched_existing_ids]
+    stats.unmatched_fresh = [w.text for w in fresh_words if id(w) not in matched_fresh_ids]
 
     if len(candidates) < min_matched:
         stats.reason = (f"only {len(candidates)} word(s) matched by text (< {min_matched} required) -- "

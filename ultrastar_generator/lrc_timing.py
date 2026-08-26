@@ -16,7 +16,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from . import config
 from .models import Syllable, Word
-from .text_normalize import normalize_word as _normalize
+from .text_normalize import (normalize_word as _normalize, is_filler_token,
+                              normalize_for_fuzzy_match as _normalize_fuzzy, is_all_filler)
 
 _LRC_TAG_RE = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
 
@@ -70,16 +71,11 @@ def match_block_to_candidates(
     return matched
 
 
-# Ad-lib/connector words transcribers commonly add or drop without the line meaning being different; kept short and conservative.
-FILLER_WORDS = frozenset({
-    "ooh", "ooo", "oh", "ohh", "mmm", "mm",
-    "yeah", "and", "but",
-})
-
-
 def _strip_filler_flat(normalized_line: str) -> str:
-    """Whitespace-flattened `normalized_line` with FILLER_WORDS tokens removed; used only as a fallback alongside the raw flattened form."""
-    return "".join(tok for tok in normalized_line.split() if tok not in FILLER_WORDS)
+    """Whitespace-flattened `normalized_line` with filler/ad-lib tokens (`text_normalize.
+    is_filler_token` -- FILLER_WORDS plus a bare/repeated vocalise syllable like "na"/"ahahah")
+    removed; used only as a fallback alongside the raw flattened form."""
+    return "".join(tok for tok in normalized_line.split() if not is_filler_token(tok))
 
 
 def check_repeat_structure(our_lines: List[str], lrc_line_texts: List[str],
@@ -608,17 +604,23 @@ def match_asr_to_lrc_lines(asr_words: List[Word], lrc_lines: List[Tuple[float, s
                             ) -> List[Tuple[int, float, float]]:
     """Matches ASR's word stream against LRC lines' text to find, per LRC line, the earliest real ASR word confidently belonging to it -- a real-time anchor per line for calibrating away a systematic LRC-vs-audio offset before trusting LRC timestamps as placement anchors. Returns (lrc_line_index, lrc_start, delta) candidates, delta = ASR start minus LRC's declared start.
 
-    Uses `find_cursor_window_match` for the window search; advances the cursor to just past the last matched word, never a raw unconfirmed opcode boundary. Shared by `mxl_lrc_generator.py` and `realign.py`."""
+    Uses `find_cursor_window_match` for the window search; advances the cursor to just past the last matched word, never a raw unconfirmed opcode boundary. Shared by `mxl_lrc_generator.py` and `realign.py`.
+
+    Matching tolerates filler/ad-lib vocalise variation (`text_normalize.normalize_for_fuzzy_match`
+    -- "ah-ah-ah" vs "na na na" transcribing the same real sound shouldn't count as a mismatch),
+    except a line that's ENTIRELY filler is skipped outright (`is_all_filler`) -- no real content
+    to safely anchor a match on."""
     MAX_PENDING_WORDS = 60
 
-    asr_norm = [_normalize(w.text) for w in asr_words]
+    asr_norm = [_normalize_fuzzy(w.text) for w in asr_words]
     cursor = 0
     pending_word_count = 0
     candidates = []
     for li, (lrc_start, text) in enumerate(lrc_lines):
         line_tokens = [t for t in (_normalize(tok) for tok in text.split()) if t]
-        if not line_tokens:
+        if not line_tokens or is_all_filler(line_tokens):
             continue
+        line_tokens = [_normalize_fuzzy(tok) for tok in text.split() if _normalize(tok)]
         pending_word_count = min(pending_word_count + len(line_tokens), MAX_PENDING_WORDS)
         found = find_cursor_window_match(cursor, asr_norm, line_tokens, pending_word_count)
         if found is None:

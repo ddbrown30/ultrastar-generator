@@ -72,8 +72,14 @@ def isolate_vocals(
     else:
         cmd = [sys.executable, "-m", "demucs"] + demucs_args
 
+    # Demucs/ffmpeg's own console output isn't guaranteed to be encodable in the system's default
+    # codepage (real case: a byte not valid in cp1252 crashed the drain thread below, which then
+    # left the pipe undrained -- Demucs blocks once its own stdout buffer fills, hanging the whole
+    # run). encoding="utf-8" is deliberately paired with errors="replace", not "strict": a
+    # replacement character in this diagnostic-only captured output is harmless, an uncaught
+    # decode exception here is not.
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             creationflags=_NO_WINDOW)
+                             encoding="utf-8", errors="replace", creationflags=_NO_WINDOW)
     output_chunks: List[str] = []
     reader = threading.Thread(target=_drain_stdout, args=(proc.stdout, output_chunks), daemon=True)
     reader.start()

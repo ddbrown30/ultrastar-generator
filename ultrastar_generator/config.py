@@ -257,8 +257,19 @@ REFERENCE_LYRICS_MIN_MATCH_RATIO = 0.25
 ENABLE_MXL_LRC_PRIMARY = True
 
 # Candidate selection stays permissive -- the real gate is MXL_LRC_MIN_ASR_PLACEMENT_RATE below.
-MXL_LRC_DURATION_TOLERANCE_SEC = 15.0
 MXL_LRC_MIN_CONTENT_MATCH_RATIO = 0.3
+
+# select_lrc_candidate's ranking, once artist-match is tied, only lets duration proximity
+# override content-match ratio for candidates within the SAME coarse ratio bucket -- a large
+# ratio gap always wins outright, duration is never a hard filter at all (real bug, Beauty and
+# the Beast, 2026-08-25): our own artist tag is a show/movie TITLE, which is a substring of
+# nearly every cast recording's artist string, so `_artist_matches` alone can't decisively
+# separate the real matching arrangement from a structurally different one (e.g. a
+# "Finale"/reprise cut with a shortened middle section); and our own SingStar-ripped audio can
+# legitimately run 30+ seconds shorter than an OST candidate's own full-length duration while
+# still being the correct, best-content-matching candidate -- a hard duration cutoff excluded
+# it from scoring entirely, before ratio ever got a say.
+MXL_LRC_CANDIDATE_RATIO_TIE_BUCKET = 0.25
 
 # Decisive quality gate: does our own audio's ASR transcript agree with
 # the matched LRC candidate's line timings?
@@ -274,8 +285,12 @@ MXL_LRC_MIN_ASR_WORD_CONFIDENCE = 0.3
 MXL_LRC_FUZZY_TEXT_MIN_RATIO = 0.6
 
 # Largest word-block size attempted for whole-block fuzzy matching (OCR
-# merge/split cases), bounded on both sides by real matches either way.
-MXL_LRC_BLOCK_MAX_WORDS = 6
+# merge/split cases), bounded on both sides by real matches either way. Real case that needed
+# raising this from 6 to 10 (2026-08-25, Weird Al Yankovic - "Nature Trail to Hell"): the MXL
+# notated "homicidal maniac" as 7 separate single-syllable "words" (ho/mi/ci/dal/man/i/ac) --
+# still gated by MXL_LRC_FUZZY_TEXT_MIN_RATIO afterward (their concatenation is an exact-ratio
+# match for the real word), so raising the SIZE cap doesn't loosen the actual acceptance bar.
+MXL_LRC_BLOCK_MAX_WORDS = 10
 
 # Last-resort real-seconds-per-quarter-note rate when no local tempo anchor is available at all.
 MXL_LRC_DEFAULT_QUARTER_NOTE_SEC = 0.3

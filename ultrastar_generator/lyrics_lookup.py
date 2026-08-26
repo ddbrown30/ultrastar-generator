@@ -337,24 +337,51 @@ def is_lrc_line_tracking_confident(words: List[Word], synced_lyrics_text: str) -
 def assign_lrc_line_ids_sequentially(words: List[Word], synced_lyrics_text: str) -> Optional[List[Word]]:
     """Assigns LRC line ids via a forward-only cursor over ASR words, never a time/gap window --
     a repeated phrase later in the song can't be confused with an earlier occurrence.
-    Returns None when `is_lrc_line_tracking_confident` distrusts this candidate."""
-    from .lrc_timing import parse_lrc
+    Returns None when `is_lrc_line_tracking_confident` distrusts this candidate.
+
+    Window sizing/cursor-advance reuses `lrc_timing.find_cursor_window_match` (the same shared
+    mechanism `match_asr_to_lrc_lines` and `mxl_lrc_generator.reconcile_mxl_to_lrc_lines` use for
+    this identical problem): a miss grows the NEXT line's search window instead of leaving it
+    fixed at that line's own small size. A real bug fixed by this (found via a real reported
+    case, a heavily-repeated-chorus song): the previous fixed-size-per-line window never grew on
+    a miss, so once one line's own text genuinely didn't match nearby ASR (a real LRC/audio
+    structural difference -- an extra/missing repeat, a differently-worded ad-lib), every
+    subsequent line could permanently lose sync too, since the window never grew wide enough to
+    reach the next real occurrence. The actual text correction/reference-tagging within a chosen
+    window still goes through `align_words_to_reference` unchanged -- only the window-sizing
+    logic around it changed.
+
+    Window-finding tolerates filler/ad-lib vocalise variation (`text_normalize.
+    normalize_for_fuzzy_match` -- "ah-ah-ah" vs "na na na" transcribing the same real sound
+    shouldn't count as a mismatch), except a line that's ENTIRELY filler is skipped outright
+    (`is_all_filler`) -- no real content to safely anchor a match on. The actual text/reference
+    tagging within a located window still goes through `align_words_to_reference`'s own exact
+    matching, unaffected."""
+    from .lrc_timing import parse_lrc, find_cursor_window_match
+    from .text_normalize import normalize_for_fuzzy_match as _normalize_fuzzy, is_all_filler
 
     lrc_lines = parse_lrc(synced_lyrics_text)
     if not is_lrc_line_tracking_confident(words, synced_lyrics_text):
         return None
 
-    # Deliberately tight so a coincidentally-shared word doesn't jump the cursor into a later line.
-    WINDOW_WORD_MULTIPLIER = 2
-    WINDOW_WORD_SLACK = 8
-
+    MAX_PENDING_WORDS = 60  # mirrors lrc_timing.match_asr_to_lrc_lines's own cap
+    asr_norm = [_normalize_fuzzy(w.text) for w in words]
     cursor = 0
+    pending_word_count = 0
     n = len(words)
     out: List[Word] = []
     for li, (_t, line_text) in enumerate(lrc_lines):
-        line_word_count = max(1, len(line_text.split()))
-        window_end = min(cursor + line_word_count * WINDOW_WORD_MULTIPLIER + WINDOW_WORD_SLACK, n)
-        window_words = words[cursor:window_end]
+        line_tokens = [t for t in (_normalize(tok) for tok in line_text.split()) if t]
+        if not line_tokens or is_all_filler(line_tokens):
+            continue
+        line_tokens = [_normalize_fuzzy(tok) for tok in line_text.split() if _normalize(tok)]
+        pending_word_count = min(pending_word_count + len(line_tokens), MAX_PENDING_WORDS)
+        found = find_cursor_window_match(cursor, asr_norm, line_tokens, pending_word_count)
+        if found is None:
+            # No match anywhere in range -- don't advance the cursor, next line's window grows.
+            continue
+        _opcodes, window = found
+        window_words = words[cursor:cursor + len(window)]
         if not window_words:
             continue
         aligned = align_words_to_reference(window_words, [line_text])
@@ -373,6 +400,7 @@ def assign_lrc_line_ids_sequentially(words: List[Word], synced_lyrics_text: str)
                 line_id=li, reference_text=w.reference_text, dropped=w.dropped,
             ))
         cursor += last_matched_offset + 1
+        pending_word_count = 0
 
     # Trailing content after the last line's window (e.g. outro ad-lib) stays unmatched.
     out.extend(words[cursor:])
