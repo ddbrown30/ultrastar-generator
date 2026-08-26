@@ -565,7 +565,22 @@ def recover_orphan_mxl_runs(
         target_norm = [run_words[i].norm for i in real_positions]
         if not target_norm:
             continue
-        matched = match_block_to_candidates(target_norm, asr_in_window)
+        # Exclude ASR words a neighboring, already-line-matched MXL word is itself expected to
+        # claim -- an orphan's fuzzy match can otherwise steal an ASR word that merely resembles
+        # it (e.g. "two" vs "to") but rightfully belongs to that other, already-confirmed word
+        # (real case: Nature Trail to Hell's "two"/MXL vs "Part II"/LRC mismatch orphaned "two",
+        # whose fuzzy match then stole "to"'s own ASR word instead of the real, unheard-of-by-
+        # text-similarity "2" sitting right next to it -- see project memory).
+        reserved_norms: set = set()
+        for boundary_li in (li_prev, li_next):
+            if boundary_li is not None and boundary_li in reconciliation.line_mxl_range:
+                lo, hi = reconciliation.line_mxl_range[boundary_li]
+                reserved_norms.update(mxl_words[j].norm for j in range(lo, hi + 1) if mxl_words[j].norm)
+        reserved_norms -= set(target_norm)
+        asr_candidates = [a for a in asr_in_window if _normalize(a.text) not in reserved_norms]
+        if not asr_candidates:
+            continue
+        matched = match_block_to_candidates(target_norm, asr_candidates)
         if len(matched) < max(1, (len(target_norm) + 1) // 2):
             continue  # too sparse to trust -- leave this run to the existing fallback
         for local_idx, ridx in enumerate(real_positions):
@@ -890,6 +905,27 @@ def place_words_via_asr(mxl_words: List[MxlWord], word_lines: List[int], lrc_lin
             if used_candidate[local_i] and word_clean_text is not None:
                 # ASR confirmed the rejected LRC candidate -- upgrade display text too.
                 word_clean_text[global_i] = word_lrc_candidate[global_i]
+
+    # Pass -1 (orphan-run recovery) is a fuzzy, potentially wide-window match -- if what it
+    # placed conflicts in ORDER with a neighboring word Pass 0/1 just matched directly and
+    # confidently, the orphan's match is more likely a wrong/stolen ASR word than the genuinely-
+    # matched neighbor is (real case: Nature Trail to Hell's orphaned "two" fuzzy-matched an
+    # earlier neighbor's own "to", landing before it -- see project memory). Demote it back to
+    # unconfident so Pass 2's own nearest-anchor interpolation places it instead of corrupting
+    # into a zero-length note via the later monotonic-order clamp.
+    if preplaced:
+        confident_order = sorted(i for i in range(n) if confident[i])
+        for pos, i in enumerate(confident_order):
+            if i not in preplaced:
+                continue
+            prev_i = confident_order[pos - 1] if pos > 0 else None
+            next_i = confident_order[pos + 1] if pos + 1 < len(confident_order) else None
+            if (prev_i is not None and starts[i] < starts[prev_i]) or \
+                    (next_i is not None and starts[i] > starts[next_i]):
+                confident[i] = False
+                starts[i] = None
+                ends[i] = None
+                quality.n_asr_placed -= 1
 
     # --- Pass 2: nearest-confident-anchor interpolation for everything else. ---
     confident_idxs = [i for i in range(n) if confident[i]]
