@@ -5,6 +5,9 @@ process_media_library.py
 Single entry point that runs this project's standalone media-library
 maintenance scripts against a folder tree, in one pass:
 
+  0. file-utilities.py --clean-all -- delete leftover .bak/.usdb files
+     and .ultrastar_work directories before anything else runs, so
+     later stages never trip over stale intermediate artifacts.
   1. strip_audio_from_video.py  -- remove a video's own embedded audio
      track when a real sibling audio file (mp3/ogg/m4a/etc.) already
      covers the same song, so the video's audio isn't redundant weight.
@@ -15,7 +18,7 @@ maintenance scripts against a folder tree, in one pass:
   4. find_large_vids.py + reduce_large_vids.py -- detect videos above
      720p/30fps and re-encode them down (H.264 CRF, resized/capped fps).
 
-Each of the four stages is a real, independent, already-existing script
+Each of the five stages is a real, independent, already-existing script
 -- this is an orchestrator, not a reimplementation. Every stage is
 invoked as its own subprocess, exactly as if it had been run by hand,
 so their tested behavior is unchanged.
@@ -33,7 +36,10 @@ they keep their original relative order at the front.
 Every real change is gated behind a single --apply flag. Without it,
 every stage runs in preview/detection-only mode (no file is modified
 or deleted) -- this mirrors the safest option each underlying script
-already offers, made uniform across all four. --create-backup is
+already offers, made uniform across all four. The one exception is
+stage 0 (file-utilities.py --clean-all): that script has no preview
+mode of its own, so without --apply it's skipped entirely rather than
+deleting anything unasked. --create-backup is
 passed to mp3_loudnorm.py by default (its own docstring documents
 "backing up originals first" as the intended default behavior, even
 though its own --create-backup flag defaults off) since loudness
@@ -80,6 +86,19 @@ def run_step(name, cmd):
         print(f"WARNING: {name} exited with code {result.returncode} -- continuing with remaining steps.")
 
     return result.returncode
+
+
+def step_clean_all(root, apply_changes):
+    if not apply_changes:
+        print()
+        print("=" * 70)
+        print("STEP: Clean leftover .bak/.usdb/.ultrastar_work files (skipped in preview mode)")
+        print("=" * 70)
+        print("  file-utilities.py --clean-all has no preview mode -- pass --apply to run it.")
+        return None
+
+    cmd = [sys.executable, str(SCRIPT_DIR / "file-utilities.py"), "--clean-all", str(root)]
+    return run_step("Clean leftover .bak/.usdb/.ultrastar_work files", cmd)
 
 
 def step_strip_audio(root, apply_changes):
@@ -150,6 +169,7 @@ def main():
         help="Actually make changes. Without this, every stage only previews/detects.",
     )
 
+    parser.add_argument("--skip-clean", action="store_true", help="Skip stage 0 (clean leftover .bak/.usdb/.ultrastar_work)")
     parser.add_argument("--skip-strip-audio", action="store_true", help="Skip stage 1 (strip redundant video audio)")
     parser.add_argument("--skip-normalize", action="store_true", help="Skip stage 2 (loudness normalization)")
     parser.add_argument("--skip-static", action="store_true", help="Skip stage 3 (static video removal)")
@@ -177,6 +197,9 @@ def main():
 
     print(f"Root: {root}")
     print(f"Mode: {'APPLY' if args.apply else 'PREVIEW (pass --apply to make real changes)'}")
+
+    if not args.skip_clean:
+        step_clean_all(root, args.apply)
 
     if not args.skip_strip_audio:
         step_strip_audio(root, args.apply)
