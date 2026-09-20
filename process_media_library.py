@@ -11,27 +11,33 @@ maintenance scripts against a folder tree, in one pass:
   1. strip_audio_from_video.py  -- remove a video's own embedded audio
      track when a real sibling audio file (mp3/ogg/m4a/etc.) already
      covers the same song, so the video's audio isn't redundant weight.
-  2. mp3_loudnorm.py             -- EBU R128 loudness-normalize every
+  2. strip_lyrics_from_video.py -- remove an embedded "lyrics" container
+     metadata tag and/or any subtitle stream from a video, so it never
+     visually clashes with UltraStar's own on-screen lyrics.
+  3. mp3_loudnorm.py             -- EBU R128 loudness-normalize every
      real audio file (and any mp4 with no sibling audio file).
-  3. find_static_videos.py --delete -- detect and delete videos that are
+  4. find_static_videos.py --delete -- detect and delete videos that are
      essentially a single still image, removing their #VIDEO tag too.
-  4. find_large_vids.py + reduce_large_vids.py -- detect videos above
+  5. find_large_vids.py + reduce_large_vids.py -- detect videos above
      720p/30fps and re-encode them down (H.264 CRF, resized/capped fps).
 
-Each of the five stages is a real, independent, already-existing script
+Each of the six stages is a real, independent, already-existing script
 -- this is an orchestrator, not a reimplementation. Every stage is
 invoked as its own subprocess, exactly as if it had been run by hand,
 so their tested behavior is unchanged.
 
 Reordering for speed (deliberately NOT the order listed above): static-
-video deletion (stage 3) runs BEFORE the large-video reduction (stage
-4), even though the task described them in the opposite order. Static
+video deletion (stage 4) runs BEFORE the large-video reduction (stage
+5), even though the task described them in the opposite order. Static
 detection is cheap (two downscaled frame grabs); reduction is a slow
 x264 "preset=slow" re-encode of the whole video. Deleting static videos
 first means reduce_large_vids.py never wastes a slow re-encode on a
-video that's about to be deleted anyway. Stages 1 (strip audio) and 2
-(normalize) have no ordering dependency on each other or on 3/4, so
-they keep their original relative order at the front.
+video that's about to be deleted anyway. Stages 1-3 (strip audio, strip
+lyrics, normalize) have no ordering dependency on each other or on 4/5,
+so they keep their original relative order at the front -- strip-audio
+and strip-lyrics are both cheap remux-only passes over the video
+container, so they run back-to-back before the slower audio-decode
+work in normalization.
 
 Every real change is gated behind a single --apply flag. Without it,
 every stage runs in preview/detection-only mode (no file is modified
@@ -108,6 +114,13 @@ def step_strip_audio(root, apply_changes):
     return run_step("Strip redundant audio from videos", cmd)
 
 
+def step_strip_lyrics(root, apply_changes):
+    cmd = [sys.executable, str(SCRIPT_DIR / "strip_lyrics_from_video.py"), str(root)]
+    if apply_changes:
+        cmd.append("--apply")
+    return run_step("Strip embedded lyrics from videos", cmd)
+
+
 def step_normalize_audio(root, apply_changes, lufs, tp, create_backup):
     cmd = [sys.executable, str(SCRIPT_DIR / "mp3_loudnorm.py"), str(root),
            "--lufs", str(lufs), "--tp", str(tp)]
@@ -120,8 +133,10 @@ def step_normalize_audio(root, apply_changes, lufs, tp, create_backup):
 
 def step_remove_static_videos(root, apply_changes, workers):
     log_path = root / "still_videos.txt"
+    crc_cache_path = root / "static_video_crc_cache.json"
     cmd = [sys.executable, str(SCRIPT_DIR / "find_static_videos.py"), str(root),
-           "--workers", str(workers), "--log", str(log_path)]
+           "--workers", str(workers), "--log", str(log_path),
+           "--crc-cache", str(crc_cache_path)]
     if apply_changes:
         cmd.append("--delete")
     return run_step("Find/remove static (still-image) videos", cmd)
@@ -171,9 +186,10 @@ def main():
 
     parser.add_argument("--skip-clean", action="store_true", help="Skip stage 0 (clean leftover .bak/.usdb/.ultrastar_work)")
     parser.add_argument("--skip-strip-audio", action="store_true", help="Skip stage 1 (strip redundant video audio)")
-    parser.add_argument("--skip-normalize", action="store_true", help="Skip stage 2 (loudness normalization)")
-    parser.add_argument("--skip-static", action="store_true", help="Skip stage 3 (static video removal)")
-    parser.add_argument("--skip-reduce", action="store_true", help="Skip stage 4 (oversized video reduction)")
+    parser.add_argument("--skip-strip-lyrics", action="store_true", help="Skip stage 2 (strip embedded video lyrics)")
+    parser.add_argument("--skip-normalize", action="store_true", help="Skip stage 3 (loudness normalization)")
+    parser.add_argument("--skip-static", action="store_true", help="Skip stage 4 (static video removal)")
+    parser.add_argument("--skip-reduce", action="store_true", help="Skip stage 5 (oversized video reduction)")
 
     parser.add_argument("--lufs", type=float, default=DEFAULT_LUFS, help=f"Loudnorm target LUFS (default: {DEFAULT_LUFS})")
     parser.add_argument("--tp", type=float, default=DEFAULT_TP, help=f"Loudnorm true peak ceiling dBTP (default: {DEFAULT_TP})")
@@ -203,6 +219,9 @@ def main():
 
     if not args.skip_strip_audio:
         step_strip_audio(root, args.apply)
+
+    if not args.skip_strip_lyrics:
+        step_strip_lyrics(root, args.apply)
 
     if not args.skip_normalize:
         step_normalize_audio(root, args.apply, args.lufs, args.tp, create_backup=not args.no_audio_backup)

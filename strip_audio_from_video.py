@@ -47,7 +47,7 @@ def get_streams(path):
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         )
 
@@ -178,8 +178,14 @@ def main():
             return False
 
         try:
-            data = song_file.read_text(encoding="cp1252")
-        except (OSError, UnicodeError) as e:
+            data = song_file.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                data = song_file.read_text(encoding="cp1252")
+            except (OSError, UnicodeError) as e:
+                print(f"  ERROR reading song file: {e}")
+                return False
+        except OSError as e:
             print(f"  ERROR reading song file: {e}")
             return False
             
