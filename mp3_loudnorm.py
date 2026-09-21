@@ -61,9 +61,21 @@ independent of the backups folder, so it survives a --cleanup:
 
     <directory>/.loudnorm_crc.json
 
-On each run, a file's current checksum is compared against the log:
+Each entry also records the file's size and mtime alongside its CRC32.
+Before touching a file at all, its current size/mtime are compared
+against those recorded values -- a match skips the file immediately
+(one stat() call), never reading its content. This is what keeps a
+repeat run over an already-normalized library fast (previously every
+file's ENTIRE content was re-read to compute a fresh CRC32 on every
+run, even when nothing had changed -- the dominant cost on a large
+library, especially over a network share). Only when size/mtime don't
+match (a genuinely new/changed file, a moved/renamed one, or an entry
+from before this shortcut existed) does the full logic below run,
+which still reads the whole file's content via CRC32 as the real
+source of truth:
   - Checksum matches the value recorded for this exact path -> already
-    normalized, skip it.
+    normalized, skip it (and backfill size/mtime so the next run can
+    use the fast path above).
   - Checksum matches a value recorded under a DIFFERENT path -> this is a
     file that was already normalized and has since been moved or renamed.
     The log entry is updated to the new path and the file is skipped
@@ -107,18 +119,15 @@ Usage
 import argparse
 import filecmp
 import json
-import os
 import shutil
 import stat
 import subprocess
 import sys
-import time
-import uuid
-import zlib
 from pathlib import Path
 
+from crc_cache import CrcCache, compute_crc32, crc_key_for
+
 BACKUP_DIRNAME = r"Z:\.loudnorm_backups"  # fixed location, not relative to the processed root
-CRC_LOG_FILENAME = r"Z:\.loudnorm_crc.json"  # fixed location, not relative to the processed root
 DURATION_ABORT_TOLERANCE = 0.5    # seconds; skip replacing file if exceeded
 DURATION_VERIFY_TOLERANCE = 0.05  # seconds; flagged in --verify
 LOUDNESS_VERIFY_TOLERANCE = 1.0   # LUFS
@@ -225,106 +234,9 @@ def restore_file(backup_path: Path, current_path: Path):
     shutil.copy2(backup_path, current_path)
 
 
-def compute_crc32(path: Path) -> str:
-    """CRC32 checksum of a file's contents, as 8 hex digits."""
-    crc = 0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            crc = zlib.crc32(chunk, crc)
-    return format(crc & 0xFFFFFFFF, "08x")
-
-
-def crc_key_for(path: Path, root: Path) -> str:
-    """Registry key for a file: its path relative to its own drive (e.g.
-    "Songs/Foo/track.mp3"), not relative to whatever subfolder was passed
-    as root. Needed because the CRC log is a single shared file rather
-    than one per root -- keys have to mean the same thing regardless of
-    which subfolder the script was pointed at for a given run."""
-    return path.relative_to(root.anchor).as_posix()
-
-
-def load_crc_registry(root: Path) -> dict:
-    """Load the {drive_relative_path: crc32} log from its fixed location.
-    Also merges in a legacy per-root log (<root>\\.loudnorm_crc.json, from
-    before the log became a single shared file), re-keying its entries
-    from root-relative to drive-relative so they still match correctly.
-    New-location entries win if a key exists in both. Missing/unreadable
-    files are simply skipped -> {}."""
-    registry = {}
-
-    log_path = Path(CRC_LOG_FILENAME)
-    if log_path.exists():
-        try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                registry.update(data)
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    legacy_log_path = root / log_path.name
-    if legacy_log_path != log_path and legacy_log_path.exists():
-        try:
-            with open(legacy_log_path, "r", encoding="utf-8") as f:
-                legacy_data = json.load(f)
-            if isinstance(legacy_data, dict):
-                for old_key, crc in legacy_data.items():
-                    try:
-                        new_key = crc_key_for(root / old_key, root)
-                    except ValueError:
-                        continue
-                    registry.setdefault(new_key, crc)
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    return registry
-
-
-def save_crc_registry(root: Path, registry: dict):
-    """Write the CRC log atomically (write to a temp file, then replace).
-    Called after every file, not batched, so a mid-run cancellation doesn't
-    lose progress already made.
-
-    do_normalize is single-threaded, so two saves never literally run at
-    once from our own code -- but on network shares (UNC paths, mapped
-    drives) something external -- antivirus, the SMB server itself, a
-    sync/backup agent -- can transiently hold the freshly-written temp
-    file open for a moment, and since skips are fast, saves can land close
-    enough together to hit that window. So: use a unique temp filename per
-    attempt (never reuses a name a lingering lock could be holding), retry
-    briefly on failure, and never let a save error crash the run -- since
-    we always write the FULL current registry, the next successful save
-    (from the next file) naturally includes whatever this one failed to
-    persist.
-
-    root is accepted but unused -- the log now lives at a fixed location
-    regardless of root -- kept only for symmetry with load_crc_registry,
-    which still needs root to locate/merge a legacy per-root log."""
-    log_path = Path(CRC_LOG_FILENAME)
-    data = json.dumps(registry, indent=2, sort_keys=True)
-
-    last_error = None
-    for attempt in range(5):
-        tmp_path = log_path.with_name(f"{log_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        try:
-            ensure_writable(log_path)
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(data)
-            tmp_path.replace(log_path)
-            return
-        except OSError as e:
-            last_error = e
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            time.sleep(0.25 * (attempt + 1))
-
-    print(f"WARNING: could not save the CRC log after several attempts ({last_error}). "
-          f"Continuing -- this update will be retried on the next save.")
+    # compute_crc32/crc_key_for/load_crc_registry/save_crc_registry all
+    # moved to crc_cache.py (shared across every CRC-caching maintenance
+    # script in this project -- see its own module docstring).
 
 
 def find_legacy_backup(root: Path, rel: Path):
@@ -543,11 +455,7 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
     if dry_run:
         print("(dry run -- no files will be changed)\n")
 
-    crc_registry = load_crc_registry(root)
-    # Reverse index (checksum -> path) so a file that's been moved or
-    # renamed since it was normalized can still be recognized by content,
-    # not just by its old path.
-    hash_to_path = {h: p for p, h in crc_registry.items()}
+    cache = CrcCache("mp3_loudnorm")
 
     processed = 0
     skipped = 0
@@ -555,7 +463,29 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
 
     for path in files:
         rel = path.relative_to(root)
-        rel_key = crc_key_for(path, root)
+
+        try:
+            result = cache.check(path, root, force=force)
+        except OSError as e:
+            print(f"ERROR: could not stat {rel}: {e}")
+            errors += 1
+            if stop_on_error:
+                print("Stopping (--stop-on-error).")
+                break
+            continue
+
+        # Fast path: if size AND mtime already match what we recorded the
+        # last time this exact file was confirmed normalized, trust that
+        # without ever reading the whole file. This is the same quick-check
+        # rsync/make use -- it's what makes a repeat run over a library
+        # that's already fully normalized cheap (one stat() per file)
+        # instead of a full CRC32 read of every file's entire content
+        # every single time (see crc_cache.py's own module docstring).
+        if result.fast_hit:
+            print(f"SKIP (already normalized, size/mtime unchanged): {rel}")
+            skipped += 1
+            continue
+
         backup_path = backup_root / rel
         backup_exists = backup_path.exists()
 
@@ -572,35 +502,26 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
                     print(f"  WARNING: found a legacy backup for {rel} but could not "
                           f"migrate it ({e}); treating as no backup.")
 
-        try:
-            current_hash = compute_crc32(path)
-        except OSError as e:
-            print(f"ERROR: could not read {rel} to compute its checksum: {e}")
-            errors += 1
-            if stop_on_error:
-                print("Stopping (--stop-on-error).")
-                break
-            continue
-
-        recorded_hash = crc_registry.get(rel_key)
+        current_hash = result.crc
+        recorded_hash = result.cached_entry.get("crc") if result.cached_entry else None
 
         if not force:
             if recorded_hash is not None and recorded_hash == current_hash:
                 print(f"SKIP (already normalized, CRC matches recorded value): {rel}")
+                cache.record(result.rel_key, current_hash, result.size, result.mtime_ns)
                 skipped += 1
                 continue
 
-            moved_from = hash_to_path.get(current_hash)
-            if moved_from is not None and moved_from != rel_key:
+            if result.moved_from is not None:
                 # Same content, recorded under a different path -> this file
                 # was already normalized and has since been moved/renamed.
                 verb = "would update" if dry_run else "updating"
-                print(f"SKIP (already normalized -- matches {moved_from}, {verb} recorded path): {rel}")
+                print(f"SKIP (already normalized -- matches {result.moved_from}, {verb} recorded path): {rel}")
                 if not dry_run:
-                    del crc_registry[moved_from]
-                    crc_registry[rel_key] = current_hash
-                    hash_to_path[current_hash] = rel_key
-                    save_crc_registry(root, crc_registry)
+                    cache.record(
+                        result.rel_key, current_hash, result.size, result.mtime_ns,
+                        moved_from=result.moved_from,
+                    )
                 skipped += 1
                 continue
 
@@ -608,9 +529,7 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
                 verb = "would record" if dry_run else "recording"
                 print(f"SKIP (backup exists but no CRC recorded yet -- {verb} current CRC): {rel}")
                 if not dry_run:
-                    crc_registry[rel_key] = current_hash
-                    hash_to_path[current_hash] = rel_key
-                    save_crc_registry(root, crc_registry)
+                    cache.record(result.rel_key, current_hash, result.size, result.mtime_ns)
                 skipped += 1
                 continue
 
@@ -671,9 +590,10 @@ def do_normalize(root: Path, target_lufs: float, target_tp: float, dry_run: bool
             tmp_out.replace(path)
             tmp_out = None
 
-            crc_registry[rel_key] = new_hash
-            hash_to_path[new_hash] = rel_key
-            save_crc_registry(root, crc_registry)
+            # Stat the file fresh post-replace -- result.size/mtime_ns
+            # above are now stale (they described the OLD content).
+            new_st = path.stat()
+            cache.record(result.rel_key, new_hash, new_st.st_size, new_st.st_mtime_ns)
 
             print(f"  Done. ({old_lufs:.1f} LUFS -> {target_lufs:.1f} LUFS target, "
                   f"{orig_duration:.3f}s)")
@@ -712,7 +632,7 @@ def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failu
         print("No backup directory found; nothing to verify.")
         return
 
-    crc_registry = load_crc_registry(root) if restore_on_failure else None
+    cache = CrcCache("mp3_loudnorm") if restore_on_failure else None
 
     backups = sorted(
         p for p in backup_root.rglob("*")
@@ -790,9 +710,7 @@ def do_verify(root: Path, target_lufs: float, target_tp: float, restore_on_failu
             if restore_on_failure:
                 try:
                     restore_file(backup_path, current_path)
-                    rel_key = crc_key_for(current_path, root)
-                    if crc_registry.pop(rel_key, None) is not None:
-                        save_crc_registry(root, crc_registry)
+                    cache.remove(crc_key_for(current_path, root))
                     print(f"    -> restored from backup")
                     restored += 1
                 except Exception as e:
@@ -826,7 +744,7 @@ def do_restore(root: Path):
         print("Cancelled.")
         return
 
-    crc_registry = load_crc_registry(root)
+    cache = CrcCache("mp3_loudnorm")
 
     restored = 0
     errors = 0
@@ -835,9 +753,7 @@ def do_restore(root: Path):
         current_path = root / rel
         try:
             restore_file(backup_path, current_path)
-            rel_key = crc_key_for(current_path, root)
-            if crc_registry.pop(rel_key, None) is not None:
-                save_crc_registry(root, crc_registry)
+            cache.remove(crc_key_for(current_path, root))
             print(f"Restored: {rel}")
             restored += 1
         except Exception as e:

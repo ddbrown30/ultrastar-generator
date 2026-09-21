@@ -1,19 +1,18 @@
 import argparse
 import concurrent.futures
-import json
 import os
 import re
 import struct
 import subprocess
 import threading
 import time
-import uuid
-import zlib
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+
+from crc_cache import CrcCache
 
 
 # Keep child processes (ffprobe/ffmpeg) out of the console's Ctrl+C
@@ -59,7 +58,7 @@ FAST_THRESHOLD = 2.0
 
 LOG_FILE = "still_videos.txt"
 DEFAULT_WORKERS = 32
-CRC_CACHE_FILE = "static_video_crc_cache.json"
+CRC_NAMESPACE = "static_video"
 
 
 @contextmanager
@@ -71,94 +70,6 @@ def _timed(timing, key):
         yield
     finally:
         timing[key] += time.perf_counter() - start
-
-
-def compute_crc32(path):
-    """
-    CRC32 checksum of a file's contents, as 8 hex digits.
-
-    Read once per run regardless of outcome -- this is the cost that
-    buys skipping the far more expensive ffprobe/ffmpeg analysis below
-    on repeat runs against a video that hasn't changed.
-    """
-
-    crc = 0
-
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-
-            if not chunk:
-                break
-
-            crc = zlib.crc32(chunk, crc)
-
-    return format(crc & 0xFFFFFFFF, "08x")
-
-
-def load_crc_cache(cache_path):
-    """
-    Load the {video path: {"crc", "is_static", "difference"}} cache.
-
-    Missing/unreadable/malformed files are treated as an empty cache
-    rather than raised -- the cache is purely an optimization, never a
-    correctness requirement.
-    """
-
-    if not cache_path.is_file():
-        return {}
-
-    try:
-        with open(cache_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-    return data if isinstance(data, dict) else {}
-
-
-def save_crc_cache(cache_path, cache):
-    """
-    Write the CRC cache atomically (write to a temp file, then replace).
-
-    Uses a unique temp filename per attempt and retries briefly on
-    failure -- mirrors mp3_loudnorm.py's save_crc_registry, since on a
-    network share something external can transiently hold a
-    just-written temp file open, and this is called after every video
-    that wasn't already cached, so a mid-run cancellation doesn't lose
-    progress already made.
-    """
-
-    data = json.dumps(cache, indent=2, sort_keys=True)
-
-    last_error = None
-
-    for attempt in range(5):
-        tmp_path = cache_path.with_name(
-            f"{cache_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        )
-
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(data)
-
-            tmp_path.replace(cache_path)
-            return
-        except OSError as e:
-            last_error = e
-
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-            time.sleep(0.25 * (attempt + 1))
-
-    print(
-        f"WARNING: could not save the CRC cache after several attempts "
-        f"({last_error}). Continuing -- this update will be retried on "
-        f"the next save."
-    )
 
 
 def get_video_duration(path, stop_event=None):
@@ -541,51 +452,61 @@ def fast_pass(video_path, stop_event=None, timing=None):
     return max_difference <= FAST_THRESHOLD, max_difference
 
 
-def analyze_video(video_path, stop_event=None, cached_entry=None, force=False):
+def analyze_video(video_path, root, stop_event=None, cache=None, force=False):
     """
     Worker function for parallel video analysis.
 
-    Checks the file's CRC32 against `cached_entry` (this video's own
-    entry from a previous run's cache, if any) before doing any real
-    work -- a match means the file is byte-identical to what was
-    already analyzed, so the cached verdict is reused instead of
-    re-running ffprobe/ffmpeg. `force` skips trusting the cache, but
-    the CRC is still computed so the caller can refresh the entry.
+    Uses `cache` (a crc_cache.CrcCache for the "static_video" namespace)
+    to skip fast_pass entirely when the file's own size/mtime already
+    match a previous run's result -- no ffprobe/ffmpeg, and no full
+    CRC32 read of the video's content either (see crc_cache.py's own
+    module docstring). A file recorded under a DIFFERENT path with the
+    same content (moved/renamed) is recognized the same way. `force`
+    skips trusting the cache either way, but the check is still
+    performed so the caller can refresh the entry afterward.
 
     Returns:
-        (video_path, result, difference, timing, crc, from_cache)
+        (video_path, result, difference, timing, check)
     """
 
     timing = defaultdict(float)
 
     try:
         with _timed(timing, "crc"):
-            crc = compute_crc32(video_path)
+            check = cache.check(video_path, root, force=force)
     except OSError as e:
-        return video_path, None, str(e), timing, None, False
+        return video_path, None, str(e), timing, None
 
-    if not force and cached_entry is not None and cached_entry.get("crc") == crc:
+    if check.fast_hit:
         return (
             video_path,
-            cached_entry.get("is_static"),
-            cached_entry.get("difference"),
+            check.cached_entry.get("is_static"),
+            check.cached_entry.get("difference"),
             timing,
-            crc,
-            True,
+            check,
+        )
+
+    if not force and check.moved_from is not None and check.moved_entry is not None:
+        return (
+            video_path,
+            check.moved_entry.get("is_static"),
+            check.moved_entry.get("difference"),
+            timing,
+            check,
         )
 
     try:
         result = fast_pass(video_path, stop_event=stop_event, timing=timing)
 
         if result is None:
-            return video_path, None, None, timing, crc, False
+            return video_path, None, None, timing, check
 
         is_static, difference = result
 
-        return video_path, is_static, difference, timing, crc, False
+        return video_path, is_static, difference, timing, check
 
     except Exception as e:
-        return video_path, None, str(e), timing, crc, False
+        return video_path, None, str(e), timing, check
 
 
 def find_song_file(video_path):
@@ -772,29 +693,30 @@ def _print_timing_summary(walk_time, analysis_time, analyzed_count, totals, coun
     print("=" * 60)
 
 
-def find_static_videos(root, workers, stop_event, crc_cache_path, force=False):
+def find_static_videos(root, workers, stop_event, force=False):
     """
     Find static videos using parallel fast-pass analysis.
 
     Ctrl+C causes queued work to be cancelled. Videos already being
     processed are allowed to finish their current operation.
 
-    A video whose CRC32 matches `crc_cache_path`'s entry from a
-    previous run is skipped without re-running ffprobe/ffmpeg -- the
-    cache is updated (and saved) after every freshly-analyzed video,
-    so a mid-run cancellation doesn't lose progress already made.
+    A video whose CRC32 matches its own entry (or, if moved/renamed,
+    some OTHER entry with the same content) from a previous run is
+    skipped without re-running ffprobe/ffmpeg -- the cache is updated
+    (and saved) after every freshly-analyzed video, so a mid-run
+    cancellation doesn't lose progress already made.
     """
 
     walk_start = time.perf_counter()
     videos = find_video_files(root)
     walk_time = time.perf_counter() - walk_start
 
-    crc_cache = load_crc_cache(crc_cache_path)
+    cache = CrcCache(CRC_NAMESPACE)
 
     print(f"Found {len(videos)} video files.")
     print(f"Directory scan took {walk_time:.2f}s.")
     print(f"Using {workers} workers.")
-    print(f"CRC cache: {crc_cache_path} ({len(crc_cache)} entries loaded)")
+    print(f"CRC cache: {len(cache.entries)} entries loaded ({CRC_NAMESPACE})")
     print("Press Ctrl+C to stop after current operations finish.")
     print()
 
@@ -820,8 +742,9 @@ def find_static_videos(root, workers, stop_event, crc_cache_path, force=False):
             future = executor.submit(
                 analyze_video,
                 path,
+                root,
                 stop_event,
-                crc_cache.get(str(path)),
+                cache,
                 force,
             )
 
@@ -835,9 +758,7 @@ def find_static_videos(root, workers, stop_event, crc_cache_path, force=False):
                 path = futures[future]
 
                 try:
-                    video_path, result, difference, timing, crc, from_cache = (
-                        future.result()
-                    )
+                    video_path, result, difference, timing, check = future.result()
                 except Exception as e:
                     print()
                     print(f"ERROR: {path}")
@@ -864,19 +785,23 @@ def find_static_videos(root, workers, stop_event, crc_cache_path, force=False):
                         print("  SKIPPED: Could not analyze")
                     continue
 
-                if from_cache:
+                if check.fast_hit:
                     cache_hits += 1
                     print(f"  CACHED (unchanged): difference={difference:.2f}")
+                elif check.moved_from is not None:
+                    cache_hits += 1
+                    cache.record(
+                        check.rel_key, check.crc, check.size, check.mtime_ns,
+                        moved_from=check.moved_from,
+                        is_static=bool(result), difference=difference,
+                    )
+                    print(f"  CACHED (moved from {check.moved_from}): difference={difference:.2f}")
                 else:
                     print(f"  Difference: {difference:.2f}")
-
-                    if crc is not None:
-                        crc_cache[str(video_path)] = {
-                            "crc": crc,
-                            "is_static": bool(result),
-                            "difference": difference,
-                        }
-                        save_crc_cache(crc_cache_path, crc_cache)
+                    cache.record(
+                        check.rel_key, check.crc, check.size, check.mtime_ns,
+                        is_static=bool(result), difference=difference,
+                    )
 
                 if not result:
                     continue
@@ -1013,16 +938,6 @@ def main():
     )
 
     parser.add_argument(
-        "--crc-cache",
-        default=CRC_CACHE_FILE,
-        help=(
-            f"CRC cache file tracking already-analyzed videos, so a "
-            f"repeat run skips ones that haven't changed "
-            f"(default: {CRC_CACHE_FILE})"
-        ),
-    )
-
-    parser.add_argument(
         "--force",
         action="store_true",
         help="Re-analyze every video even if its CRC cache entry is still valid",
@@ -1081,8 +996,6 @@ def main():
         print("Static videos will be deleted and #VIDEO tags removed.")
         print()
 
-    crc_cache_path = Path(args.crc_cache).expanduser().resolve()
-
     stop_event = threading.Event()
 
     try:
@@ -1090,7 +1003,6 @@ def main():
             root,
             workers=args.workers,
             stop_event=stop_event,
-            crc_cache_path=crc_cache_path,
             force=args.force,
         )
 

@@ -25,6 +25,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from crc_cache import CrcCache, compute_crc32
+
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -40,6 +42,7 @@ VIDEO_EXTENSIONS = {
 }
 
 LYRICS_TAG_NAME = "lyrics"
+CRC_NAMESPACE = "lyrics"
 
 
 def find_tag_key(tags):
@@ -56,7 +59,10 @@ def get_lyrics_info(path):
     """
     Inspect a video's own container for embedded lyrics.
 
-    Returns (format_tag_key, stream_tag_hits, subtitle_indices):
+    Returns (ok, format_tag_key, stream_tag_hits, subtitle_indices):
+      - ok: False if ffprobe/parsing failed (caller must not cache this
+        as "no lyrics found" -- it's an unknown, not a verified clean
+        result).
       - format_tag_key: the container-level metadata key holding lyrics
         (e.g. "lyrics"), or None.
       - stream_tag_hits: [(stream_index, tag_key), ...] for any stream
@@ -94,7 +100,7 @@ def get_lyrics_info(path):
     except Exception as e:
         print(f"ERROR reading {path}")
         print(f"  {e}")
-        return None, [], []
+        return False, None, [], []
 
     format_tags = data.get("format", {}).get("tags", {}) or {}
     format_tag_key = find_tag_key(format_tags)
@@ -112,7 +118,7 @@ def get_lyrics_info(path):
         if stream_tag_key is not None:
             stream_tag_hits.append((stream["index"], stream_tag_key))
 
-    return format_tag_key, stream_tag_hits, subtitle_indices
+    return True, format_tag_key, stream_tag_hits, subtitle_indices
 
 
 def remove_lyrics(video_path, format_tag_key, stream_tag_hits, subtitle_indices):
@@ -202,25 +208,85 @@ def main():
         help="Actually remove embedded lyrics from matching videos",
     )
 
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-probe every video even if its CRC cache entry is still valid",
+    )
+
     args = parser.parse_args()
 
     root = Path(args.directory).expanduser().resolve()
 
     matches = find_video_files(root)
+    cache = CrcCache(CRC_NAMESPACE)
 
+    print(f"CRC cache: {len(cache.entries)} entries loaded ({CRC_NAMESPACE})")
     print()
 
     videos_with_lyrics = 0
+    cache_hits = 0
 
     for video in matches:
-        format_tag_key, stream_tag_hits, subtitle_indices = get_lyrics_info(video)
+        try:
+            check = cache.check(video, root, force=args.force)
+        except OSError as e:
+            print(video)
+            print(f"  ERROR reading file: {e}")
+            print()
+            continue
 
-        if format_tag_key is None and not stream_tag_hits and not subtitle_indices:
+        entry = None
+
+        if check.fast_hit:
+            entry = check.cached_entry
+        elif check.moved_from is not None:
+            entry = check.moved_entry
+
+        if entry is not None:
+            format_tag_key = entry.get("format_tag_key")
+            stream_tag_hits = [tuple(hit) for hit in entry.get("stream_tag_hits", [])]
+            subtitle_indices = entry.get("subtitle_indices", [])
+            from_cache = True
+        else:
+            ok, format_tag_key, stream_tag_hits, subtitle_indices = get_lyrics_info(video)
+            from_cache = False
+
+            if not ok:
+                # A failed probe is an unknown, not a verified "no
+                # lyrics" result -- don't cache it either way.
+                continue
+
+        if from_cache:
+            cache_hits += 1
+
+        has_lyrics = format_tag_key is not None or bool(stream_tag_hits) or bool(subtitle_indices)
+
+        def _record(fields):
+            cache.record(
+                check.rel_key, check.crc, check.size, check.mtime_ns,
+                moved_from=check.moved_from, **fields,
+            )
+
+        if not has_lyrics:
+            if not check.fast_hit:
+                _record({
+                    "format_tag_key": None,
+                    "stream_tag_hits": [],
+                    "subtitle_indices": [],
+                })
+
             continue
 
         videos_with_lyrics += 1
 
         print(video)
+
+        if from_cache:
+            if check.moved_from is not None:
+                print(f"  CACHED (moved from {check.moved_from})")
+            else:
+                print("  CACHED (unchanged since last check)")
 
         if format_tag_key is not None:
             print(f"  Container 'lyrics' metadata tag found ({format_tag_key})")
@@ -233,11 +299,29 @@ def main():
 
         if not args.apply:
             print("  DRY RUN: would remove embedded lyrics")
+
+            if not check.fast_hit:
+                _record({
+                    "format_tag_key": format_tag_key,
+                    "stream_tag_hits": list(stream_tag_hits),
+                    "subtitle_indices": subtitle_indices,
+                })
+
             continue
 
         try:
             remove_lyrics(video, format_tag_key, stream_tag_hits, subtitle_indices)
             print("  Lyrics removed")
+
+            # The file was just re-muxed, so its CRC has changed --
+            # record the new one along with the now-known-clean state
+            # rather than re-probing the freshly written file.
+            new_crc = compute_crc32(video)
+            new_st = video.stat()
+            cache.record(
+                check.rel_key, new_crc, new_st.st_size, new_st.st_mtime_ns,
+                format_tag_key=None, stream_tag_hits=[], subtitle_indices=[],
+            )
 
         except Exception as e:
             print(f"  ERROR: {e}")
@@ -247,6 +331,7 @@ def main():
     print()
     print(f"Matching videos found: {len(matches)}")
     print(f"Videos with embedded lyrics: {videos_with_lyrics}")
+    print(f"Cache hits (skipped re-probe): {cache_hits}")
     print(f"Mode: {'APPLY' if args.apply else 'DRY RUN'}")
 
 

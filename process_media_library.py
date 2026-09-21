@@ -133,10 +133,8 @@ def step_normalize_audio(root, apply_changes, lufs, tp, create_backup):
 
 def step_remove_static_videos(root, apply_changes, workers):
     log_path = root / "still_videos.txt"
-    crc_cache_path = root / "static_video_crc_cache.json"
     cmd = [sys.executable, str(SCRIPT_DIR / "find_static_videos.py"), str(root),
-           "--workers", str(workers), "--log", str(log_path),
-           "--crc-cache", str(crc_cache_path)]
+           "--workers", str(workers), "--log", str(log_path)]
     if apply_changes:
         cmd.append("--delete")
     return run_step("Find/remove static (still-image) videos", cmd)
